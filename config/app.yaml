@@ -1,0 +1,22 @@
+app:
+  name: ai-support
+  version: v0.2.0
+
+deployment:
+  default_dir: /opt/crisp-ai
+  bind_address: 127.0.0.1
+  timezone: Europe/London
+
+paths:
+  config: config
+  knowledge: knowledge
+  workflows: n8n
+  data: data
+  logs: logs
+  backups: backups
+
+services:
+  n8n:
+    internal_url: http://n8n:5678
+  postgres:
+    internal_url: postgres://postgres:5432
