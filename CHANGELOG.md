@@ -1,5 +1,20 @@
 # 更新日志
 
+## v0.3.0
+
+日期：2026-09-04
+
+修改：
+
+- 集成 AnythingLLM、内置 LanceDB 与原生自动分块流程。
+- 增加 OpenAI Compatible Provider、客服 Prompt 配置模板。
+- 增加知识库目录规范和配置文档。
+
+影响：
+
+- 可通过 AnythingLLM 管理知识文档、检索内容和连续会话。
+- API Key 仅保存于被 Git 忽略的 `.env`，不会写入 Provider 配置文件。
+
 ## v0.2.0
 
 日期：2026-09-04

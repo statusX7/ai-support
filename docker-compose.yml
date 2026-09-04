@@ -24,6 +24,50 @@ services:
     networks:
       - backend
 
+  anythingllm:
+    image: ${ANYTHINGLLM_IMAGE:-mintplexlabs/anythingllm:latest}
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${ANYTHINGLLM_PORT:-3001}:3001"
+    environment:
+      SERVER_PORT: "3001"
+      STORAGE_DIR: /app/server/storage
+      AUTH_TOKEN: ${ANYTHINGLLM_AUTH_TOKEN:?请在 .env 中设置 ANYTHINGLLM_AUTH_TOKEN}
+      JWT_SECRET: ${ANYTHINGLLM_JWT_SECRET:?请在 .env 中设置 ANYTHINGLLM_JWT_SECRET}
+      SIG_KEY: ${ANYTHINGLLM_SIG_KEY:?请在 .env 中设置 ANYTHINGLLM_SIG_KEY}
+      SIG_SALT: ${ANYTHINGLLM_SIG_SALT:?请在 .env 中设置 ANYTHINGLLM_SIG_SALT}
+      LLM_PROVIDER: generic-openai
+      GENERIC_OPEN_AI_BASE_PATH: ${AI_API_BASE_URL:?请在 .env 中设置 AI_API_BASE_URL}
+      GENERIC_OPEN_AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
+      GENERIC_OPEN_AI_MODEL_PREF: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
+      GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: ${AI_MODEL_TOKEN_LIMIT:-8192}
+      EMBEDDING_ENGINE: native
+      VECTOR_DB: lancedb
+      DISABLE_TELEMETRY: "true"
+      WORKSPACE_DELETION_PROTECTION: enable
+      TZ: ${TIMEZONE:-UTC}
+    volumes:
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/anythingllm
+        target: /app/server/storage
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/knowledge
+        target: /opt/crisp-ai/knowledge
+        read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3001/api/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - backend
+
   n8n:
     image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2}
     restart: unless-stopped
