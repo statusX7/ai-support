@@ -1,0 +1,12 @@
+{
+  "feedback": {
+    "enabled": true,
+    "prompt": "是否解决问题？\n\n👍 是\n\n👎 否",
+    "positive_keywords": ["👍 是", "👍", "是", "已解决", "解决了"],
+    "negative_keywords": ["👎 否", "👎", "否", "未解决", "没有解决"],
+    "positive_message": "感谢您的反馈。",
+    "negative_message": "感谢反馈。您可以补充更多细节，或输入“人工客服”请求转接。",
+    "expires_after_seconds": 86400,
+    "max_text_chars": 500
+  }
+}

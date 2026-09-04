@@ -262,6 +262,19 @@ run_restore() {
   esac
 }
 
+run_rollback() {
+  local snapshot confirm
+  "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
+  printf '请输入要回滚的版本快照 ID：'
+  IFS= read -r snapshot
+  [[ -n "$snapshot" ]] || { warn "未选择快照"; return; }
+  printf '回滚会恢复程序、配置、workflow 与 AnythingLLM 数据，但保留密钥和统计数据。确认继续？[y/N] '
+  IFS= read -r confirm
+  case "$confirm" in
+    y|Y|yes|YES) "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --snapshot "$snapshot" ;;
+  esac
+}
+
 while true; do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
   printf '\n%s\n' '================================'
@@ -277,6 +290,10 @@ while true; do
   printf '8. 恢复\n'
   printf '9. 更新\n'
   printf '10. 卸载\n'
+  printf '11. 回滚版本\n'
+  printf '12. 查看历史版本\n'
+  printf '13. 知识库分析\n'
+  printf '14. 回答质量反馈\n'
   printf '0. 退出\n\n请选择：'
   IFS= read -r CHOICE
   case "$CHOICE" in
@@ -321,6 +338,22 @@ while true; do
       require_installation
       "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR"
       exit 0
+      ;;
+    11)
+      require_installation
+      run_rollback
+      ;;
+    12)
+      require_installation
+      "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
+      ;;
+    13)
+      require_installation
+      "${DEPLOY_DIR}/scripts/analytics.sh" knowledge --deploy-dir "$DEPLOY_DIR"
+      ;;
+    14)
+      require_installation
+      "${DEPLOY_DIR}/scripts/analytics.sh" feedback --deploy-dir "$DEPLOY_DIR"
       ;;
     0) exit 0 ;;
     *) warn "无效选项" ;;

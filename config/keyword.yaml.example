@@ -32,8 +32,8 @@
       "match": ["退款"],
       "case_sensitive": false,
       "action": {
-        "type": "handoff",
-        "reason": "退款问题"
+        "type": "prompt",
+        "prompt": "优先检索退款规则，说明适用条件与办理步骤；信息不足时明确要求访客补充。"
       }
     }
   ]

@@ -36,7 +36,7 @@
       "title": "订阅问题：",
       "options": {
         "1": {"label": "导入订阅", "action": {"type": "prompt", "prompt": "按订阅导入流程回答。"}},
-        "2": {"label": "充值未到账", "action": {"type": "handoff", "reason": "付款问题"}},
+        "2": {"label": "充值未到账", "action": {"type": "prompt", "prompt": "检索充值未到账处理流程，说明核对步骤；不要执行账户或付款操作。"}},
         "0": {"label": "返回主菜单", "action": {"type": "menu", "target": "main"}}
       }
     }

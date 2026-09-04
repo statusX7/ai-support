@@ -5,7 +5,7 @@
 - `.env` 保存部署路径、端口和密钥，仅允许部署账户读取，不得提交到 Git。
 - `config/provider.yaml` 保存 Provider 类型、地址、模型和能力检测结果，不保存 API Key。
 - `config/prompt.md` 保存客服系统提示词。
-- `config/keyword.yaml`、`config/menu.yaml` 和 `config/handoff.yaml` 保存业务规则。
+- `config/keyword.yaml`、`config/menu.yaml`、`config/handoff.yaml`、`config/tags.yaml` 和 `config/feedback.yaml` 保存业务规则。
 - 带 `.example` 后缀的文件是可公开提交的模板，不得填入真实凭据。
 
 ## AI Provider
@@ -16,7 +16,7 @@
 
 AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceDB。基础地址应包含 API 的 `/v1` 前缀；脚本会自动避免重复拼接 `/v1`。
 
-`keyword.yaml`、`menu.yaml` 和 `handoff.yaml` 使用 JSON 语法书写；JSON 本身是合法 YAML，这使 n8n 无需额外解析依赖即可安全读取。修改后可通过管理菜单校验格式并重载工作流。
+上述业务配置使用 JSON 语法书写；JSON 本身是合法 YAML，这使 n8n 无需额外解析依赖即可安全读取。首次安装由对应 `.example` 模板生成实际配置，实际配置被 Git 忽略。修改后应运行健康检查并重新发布工作流。
 
 ## AnythingLLM 初始化
 
@@ -34,9 +34,32 @@ Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/
 
 图片 URL 默认只接受 HTTPS 的 `crisp.chat` 子域名。确需使用其他可信图片主机时，可在 `.env` 的 `CRISP_IMAGE_HOSTS` 中填写逗号分隔的精确主机名。
 
-## 自动转人工
+## 人工接管
 
-访客输入转人工关键词、命中投诉/付款/账户规则、AnythingLLM 没有来源、模型置信度不足或 API 调用失败时，会话会进入人工接管状态。人工消息也会自动延长接管时间。接管期间工作流记录访客消息但不发送 AI 回复，到达 `resume_after_seconds` 后才允许 AI 在下一条消息恢复。
+`handoff.yaml` 的 `keywords` 是唯一的自动识别入口，默认包含“人工”“人工客服”“转人工”和“真人客服”。关键词列表完全来自配置，工作流不内置业务主题词。访客命中关键词或明确选择菜单中的人工选项后，工作流先按 `notify_user.enabled` 回复 `message`，再按 `disable_ai` 关闭当前 conversation 的 AI，并添加人工标签。
+
+真实 operator 回复也会立即关闭当前 conversation 的 AI。接管期间访客消息仍可进入有限会话历史，但不会触发 AI 回复。`resume_after_seconds` 到期后，AI 会在下一条访客消息恢复；设为 `0` 表示只允许 operator 发送 `resume_keywords` 中的控制词恢复。
+
+知识库未命中、低置信度、图片理解失败和 API 失败不会关闭 AI。相应提示可通过 `no_answer_message`、`low_confidence_message` 和 `failure_message` 修改。
+
+## Conversation 标签
+
+`tags.yaml` 配置项目管理的四类标签：`ai_resolved`、`knowledge_miss`、`low_confidence` 和 `human_required`。标签值不得包含空格或控制字符；设 `enabled` 为 `false` 可关闭自动标签。
+
+更新标签时，工作流先读取 Crisp conversation 当前 `segments`，保留所有非本项目管理的标签，再替换项目管理标签。读取失败时会跳过更新，避免误清空已有标签。Website Token 或 Plugin Token 必须具备读取和修改 conversation meta 的权限。
+
+## 回答反馈与统计
+
+`feedback.yaml` 控制回答后的“是否解决问题”提示、正负反馈词、致谢消息、有效期与最大文本长度。反馈只在成功生成的知识库或视觉回答后询问；菜单、欢迎语、失败提示和转人工通知不会重复询问。
+
+`data/analytics/events.jsonl` 保存追加式事件。问题数、AI 回复数、命中、未命中和转人工事件不保存消息内容。反馈事件按需求保存 `session`、`question`、`answer` 和 `feedback`，其中 session 使用 HMAC 匿名化，问题和回答会过滤常见 Token、Secret、邮箱和号码并截断。管理员仍应避免把敏感个人信息写入反馈，并按数据保留政策定期清理该文件。
+
+查看统计：
+
+```bash
+sudo /opt/crisp-ai/scripts/analytics.sh knowledge
+sudo /opt/crisp-ai/scripts/analytics.sh feedback
+```
 
 ## Prompt
 

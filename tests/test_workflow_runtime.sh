@@ -25,12 +25,17 @@ const codeFor = (name) => {
   return node.parameters.jsCode;
 };
 
+const eventLines = [];
 const configFs = {
   readFileSync(requestedPath, encoding) {
     const name = path.basename(requestedPath);
     let localPath = path.join(projectRoot, 'config', name);
     if (!fs.existsSync(localPath)) localPath += '.example';
     return fs.readFileSync(localPath, encoding);
+  },
+  appendFileSync(requestedPath, value) {
+    assert(requestedPath.endsWith('/data/analytics/events.jsonl'));
+    eventLines.push(...String(value).trim().split('\n').filter(Boolean));
   },
 };
 const controlledRequire = (name) => {
@@ -42,6 +47,8 @@ const controlledRequire = (name) => {
 const router = new Function('$input', '$env', '$getWorkflowStaticData', 'require', codeFor('校验并分类事件'));
 const knowledgeFormatter = new Function('$input', '$', '$getWorkflowStaticData', codeFor('整理知识库回复'));
 const visionFormatter = new Function('$input', '$', '$getWorkflowStaticData', codeFor('整理视觉回复'));
+const prepareReply = new Function('$input', '$getWorkflowStaticData', 'require', codeFor('准备回复与统计'));
+const mergeTags = new Function('$input', '$', codeFor('合并 Crisp 标签'));
 
 const websiteId = '11111111-1111-1111-1111-111111111111';
 const secret = 'test-only-webhook-secret';
@@ -149,9 +156,16 @@ assert.strictEqual(result.route, 'reply');
 assert(result.reply.includes('人工客服服务时间'));
 
 result = runRouter(makeMessage('我要退款')).json;
+assert.strictEqual(result.route, 'ai_text');
+assert(result.anythingBody.message.includes('退款规则'));
+
+const explicitHandoffState = {};
+const explicitHandoff = makeMessage('请转人工客服', { session_id: 'session_handoff1234' });
+result = runRouter(explicitHandoff, { state: explicitHandoffState }).json;
 assert.strictEqual(result.route, 'reply');
-assert.strictEqual(result.handoffReason, '退款问题');
-assert(result.reply.includes('转接人工客服'));
+assert(result.reply.includes('正在为您转接'));
+assert.strictEqual(explicitHandoffState.sessions[explicitHandoff.data.session_id].aiEnabled, false);
+assert(result.tagsToApply.includes('human-required'));
 
 result = runRouter(makeMessage('菜单')).json;
 assert.strictEqual(result.route, 'reply');
@@ -167,8 +181,10 @@ const sharedSession = 'session_operator1234';
 const operatorMessage = makeMessage('人工处理意见', { session_id: sharedSession, from: 'operator' });
 operatorMessage.event = 'message:received';
 result = runRouter(operatorMessage, { state: handoffState }).json;
-assert.strictEqual(result.route, 'ignore');
-assert(handoffState.sessions[sharedSession].handoffUntil > Date.now());
+assert.strictEqual(result.route, 'tag_only');
+assert.strictEqual(handoffState.sessions[sharedSession].aiEnabled, false);
+assert(handoffState.sessions[sharedSession].aiResumeAt > Date.now());
+assert(result.tagsToApply.includes('human-required'));
 result = runRouter(makeMessage('还有问题', { session_id: sharedSession }), { state: handoffState }).json;
 assert.strictEqual(result.route, 'ignore');
 const resumeMessage = makeMessage('恢复AI', { session_id: sharedSession, from: 'operator' });
@@ -222,19 +238,31 @@ const formatKnowledge = (context, payload, state) => knowledgeFormatter(
 let formatterState = {};
 let routed = runRouter(makeMessage('需要知识库回答'), { state: formatterState }).json;
 result = formatKnowledge(routed, { data: { textResponse: '无来源回答', sources: [] } }, formatterState);
+assert(result.reply.includes('知识库暂时没有足够信息'));
+assert.strictEqual(result.analyticsOutcome, 'knowledge_miss');
+assert(result.tagsToApply.includes('knowledge-miss'));
+assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
+prepareReply({ first: () => ({ json: result }) }, () => formatterState, controlledRequire);
+
+formatterState = {};
+routed = runRouter(makeMessage('低分依据的问题'), { state: formatterState }).json;
+result = formatKnowledge(routed, { data: { textResponse: '低分回答', sources: [{ score: 0.1 }] } }, formatterState);
 assert(result.reply.includes('可信度不足'));
-assert(formatterState.sessions[routed.sessionId].handoffUntil > Date.now());
+assert(result.tagsToApply.includes('low-confidence'));
+assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
 
 formatterState = {};
 routed = runRouter(makeMessage('已有依据的问题'), { state: formatterState }).json;
 result = formatKnowledge(routed, { data: { textResponse: '有依据的回答', sources: [{ score: 0.9 }] } }, formatterState);
 assert(result.reply.includes('有依据的回答'));
+assert.strictEqual(result.analyticsOutcome, 'knowledge_hit');
+assert(result.tagsToApply.includes('ai-resolved'));
 
 formatterState = {};
 routed = runRouter(makeMessage('触发 API 失败'), { state: formatterState }).json;
 result = formatKnowledge(routed, { error: { message: 'test failure' } }, formatterState);
 assert(result.reply.includes('自动客服暂时不可用'));
-assert.strictEqual(formatterState.sessions[routed.sessionId].handoffReason, 'AI 调用失败');
+assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
 
 const formatVision = (context, payload, state) => visionFormatter(
   { first: () => ({ json: payload }) },
@@ -249,7 +277,41 @@ formatterState = {};
 routed = runRouter(makeMessage('图片后续问题'), { state: formatterState }).json;
 result = formatVision(routed, {}, formatterState);
 assert(result.reply.includes('自动客服暂时不可用'));
-assert.strictEqual(formatterState.sessions[routed.sessionId].handoffReason, '图片理解失败');
+assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
+assert(result.tagsToApply.includes('low-confidence'));
+
+const feedbackState = {};
+const feedbackQuestion = makeMessage('接口 token=should-not-leak 为什么失败', { session_id: 'session_feedback1234' });
+routed = runRouter(feedbackQuestion, { state: feedbackState }).json;
+let answered = formatKnowledge(routed, { data: { textResponse: '请按文档步骤操作', sources: [{ score: 0.95 }] } }, feedbackState);
+answered = prepareReply(
+  { first: () => ({ json: answered }) },
+  () => feedbackState,
+  controlledRequire,
+)[0].json;
+assert(answered.reply.includes('是否解决问题？'));
+assert(feedbackState.sessions[feedbackQuestion.data.session_id].pendingFeedback);
+result = runRouter(makeMessage('👎', { session_id: feedbackQuestion.data.session_id }), { state: feedbackState }).json;
+assert.strictEqual(result.feedbackRecorded, true);
+const events = eventLines.map((line) => JSON.parse(line));
+const negative = events.find((entry) => entry.type === 'feedback' && entry.feedback === 'negative');
+assert(negative);
+assert.notStrictEqual(negative.session, feedbackQuestion.data.session_id);
+assert(!JSON.stringify(negative).includes('should-not-leak'));
+assert(events.some((entry) => entry.type === 'knowledge_hit'));
+assert(events.some((entry) => entry.type === 'knowledge_miss'));
+assert(events.some((entry) => entry.type === 'ai_reply'));
+
+const merged = mergeTags(
+  { first: () => ({ json: { data: { segments: ['customer-vip', 'knowledge-miss'] } } }) },
+  (name) => {
+    assert.strictEqual(name, '准备回复与统计');
+    return { first: () => ({ json: answered }) };
+  },
+)[0].json;
+assert(merged.mergedSegments.includes('customer-vip'));
+assert(merged.mergedSegments.includes('ai-resolved'));
+assert(!merged.mergedSegments.includes('knowledge-miss'));
 
 process.stdout.write('工作流行为测试：通过\n');
 NODE

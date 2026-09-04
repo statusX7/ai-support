@@ -1,21 +1,17 @@
 {
   "handoff": {
-    "keywords": ["人工", "客服", "真人"],
-    "resume_keywords": ["恢复AI", "AI恢复"],
-    "topic_keywords": {
-      "complaint": ["投诉", "举报"],
-      "payment": ["付款", "扣款", "支付失败", "未到账"],
-      "account": ["账户被盗", "账号被盗", "无法登录", "身份验证"]
+    "keywords": ["人工", "人工客服", "转人工", "真人客服"],
+    "disable_ai": true,
+    "notify_user": {
+      "enabled": true
     },
+    "message": "您已请求人工客服，正在为您转接，请稍候。",
+    "resume_keywords": ["恢复AI", "AI恢复"],
     "resume_after_seconds": 1800,
-    "on_operator_message": true,
-    "on_low_confidence": true,
-    "on_no_answer": true,
-    "confirmation": "已为您转接人工客服，AI 将暂停回复。",
     "while_active": "人工客服正在接管此会话，请稍候。",
-    "no_answer_message": "知识库暂时没有足够信息，已为您转接人工客服。",
-    "low_confidence_message": "当前答案可信度不足，已为您转接人工客服。",
-    "failure_message": "当前自动客服暂时不可用，已为您转接人工客服。",
+    "no_answer_message": "知识库暂时没有足够信息，请换一种方式描述问题。",
+    "low_confidence_message": "当前答案可信度不足，请补充更多问题细节。",
+    "failure_message": "当前自动客服暂时不可用，请稍后再试。",
     "low_confidence": {
       "require_sources": true,
       "minimum_score": 0.25

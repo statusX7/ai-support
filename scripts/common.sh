@@ -158,12 +158,41 @@ docker_compose() {
     "$@"
 }
 
+wait_for_local_health() {
+  local deploy_dir=$1
+  local attempts=${2:-30}
+  local interval=${3:-2}
+  local n8n_port anything_port running
+
+  require_command docker
+  require_command curl
+  docker_compose "$deploy_dir" config --quiet
+  n8n_port=$(env_get "${deploy_dir}/.env" N8N_PORT 2>/dev/null || printf '5678')
+  anything_port=$(env_get "${deploy_dir}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    running=$(docker_compose "$deploy_dir" ps --services --filter status=running 2>/dev/null || true)
+    if grep -Fxq postgres <<< "$running" \
+      && grep -Fxq anythingllm <<< "$running" \
+      && grep -Fxq n8n <<< "$running" \
+      && curl --silent --fail --connect-timeout 3 --max-time 10 "http://127.0.0.1:${n8n_port}/healthz" >/dev/null 2>&1 \
+      && curl --silent --fail --connect-timeout 3 --max-time 10 "http://127.0.0.1:${anything_port}/api/ping" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$interval"
+  done
+  warn "本地服务健康检查超时"
+  return 1
+}
+
 secure_permissions() {
   local deploy_dir=$1
-  chmod 700 "$deploy_dir" "${deploy_dir}/data" "${deploy_dir}/logs" "${deploy_dir}/backups" "${deploy_dir}/tmp" 2>/dev/null || true
+  chmod 700 "$deploy_dir" "${deploy_dir}/data" "${deploy_dir}/logs" "${deploy_dir}/backups" \
+    "${deploy_dir}/backups/versions" "${deploy_dir}/tmp" 2>/dev/null || true
   chmod 750 "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" "${deploy_dir}/scripts" "${deploy_dir}/docs" 2>/dev/null || true
+  chmod 770 "${deploy_dir}/data/analytics" 2>/dev/null || true
   [[ -f "${deploy_dir}/.env" ]] && chmod 600 "${deploy_dir}/.env"
   [[ -f "${deploy_dir}/config/provider.yaml" ]] && chmod 600 "${deploy_dir}/config/provider.yaml"
+  [[ -f "${deploy_dir}/data/analytics/events.jsonl" ]] && chmod 660 "${deploy_dir}/data/analytics/events.jsonl"
   find "${deploy_dir}/config" -maxdepth 1 -type f ! -name 'provider.yaml' -exec chmod 640 {} + 2>/dev/null || true
   find "${deploy_dir}/knowledge" -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
 }
@@ -171,22 +200,30 @@ secure_permissions() {
 copy_project_files() {
   local source_dir=$1
   local deploy_dir=$2
-  local file
+  local file directory
   local regular_files=(
     VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
+    config/tags.yaml.example config/feedback.yaml.example
     n8n/workflow.json knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md
   )
   local executable_files=(
     install.sh manage.sh update.sh uninstall.sh
     scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
+    scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
     "${deploy_dir}/scripts" "${deploy_dir}/docs" "${deploy_dir}/data/n8n" "${deploy_dir}/data/postgres" \
-    "${deploy_dir}/data/anythingllm" "${deploy_dir}/logs" "${deploy_dir}/backups" "${deploy_dir}/tmp"
+    "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/analytics" "${deploy_dir}/logs" \
+    "${deploy_dir}/backups" "${deploy_dir}/backups/versions" "${deploy_dir}/tmp"
+  for directory in config knowledge n8n scripts docs data data/n8n data/postgres data/anythingllm \
+    data/analytics logs backups backups/versions tmp; do
+    [[ -d "${deploy_dir}/${directory}" && ! -L "${deploy_dir}/${directory}" ]] \
+      || die "受管理目录缺失或是符号链接：${deploy_dir}/${directory}"
+  done
 
   if [[ "$(realpath -m -- "$source_dir")" == "$(realpath -m -- "$deploy_dir")" ]]; then
     return 0
@@ -208,11 +245,49 @@ copy_project_files() {
 initialize_config_files() {
   local deploy_dir=$1
   local name
-  for name in provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml; do
+  for name in provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
     if [[ ! -e "${deploy_dir}/config/${name}" ]]; then
       install -m 0640 -- "${deploy_dir}/config/${name}.example" "${deploy_dir}/config/${name}"
     fi
   done
+}
+
+migrate_config_files() {
+  local deploy_dir=$1
+  local handoff_file="${deploy_dir}/config/handoff.yaml"
+  local handoff_temp
+
+  [[ -f "$handoff_file" && ! -L "$handoff_file" ]] || die "人工接管配置缺失或不安全"
+  require_command jq
+  handoff_temp=$(mktemp "${handoff_file}.tmp.XXXXXX")
+  jq '
+    if .handoff.keywords == ["人工", "客服", "真人"] then
+      .handoff.keywords = ["人工", "人工客服", "转人工", "真人客服"]
+    else . end |
+    if (.handoff | has("disable_ai")) then . else .handoff.disable_ai = true end |
+    if (.handoff.notify_user | type) == "object" then . else .handoff.notify_user = {} end |
+    if (.handoff.notify_user | has("enabled")) then . else .handoff.notify_user.enabled = true end |
+    if ((.handoff.message // "") | length) > 0 then .
+    elif (.handoff.confirmation // "") == "已为您转接人工客服，AI 将暂停回复。" then
+      .handoff.message = "您已请求人工客服，正在为您转接，请稍候。"
+    elif ((.handoff.confirmation // "") | length) > 0 then .handoff.message = .handoff.confirmation
+    else .handoff.message = "您已请求人工客服，正在为您转接，请稍候。" end |
+    if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
+      .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
+    else . end |
+    if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
+      .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
+    else . end |
+    if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
+      .handoff.failure_message = "当前自动客服暂时不可用，请稍后再试。"
+    else . end |
+    del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence, .handoff.on_no_answer, .handoff.confirmation)
+  ' "$handoff_file" > "$handoff_temp" || {
+    rm -f -- "$handoff_temp"
+    die "人工接管配置迁移失败"
+  }
+  chmod 640 "$handoff_temp"
+  mv -f -- "$handoff_temp" "$handoff_file"
 }
 
 normalize_api_base() {

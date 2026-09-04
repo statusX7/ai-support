@@ -5,8 +5,22 @@ if [[ -n "${MOCK_DOCKER_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 fi
 
+if [[ "${1:-}" == image ]]; then
+  shift
+  case "${1:-}" in
+    inspect)
+      if [[ "$*" == *'--format'* ]]; then
+        printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+      fi
+      exit 0
+      ;;
+    tag) exit 0 ;;
+    *) printf 'docker image 测试桩不支持命令：%s\n' "$*" >&2; exit 2 ;;
+  esac
+fi
+
 [[ "${1:-}" == compose ]] || {
-  printf 'docker 测试桩只支持 compose\n' >&2
+  printf 'docker 测试桩只支持 compose 或 image\n' >&2
   exit 2
 }
 shift
@@ -33,7 +47,16 @@ if [[ "${MOCK_DOCKER_FAIL_IMPORT:-0}" == 1 && "$COMMAND" == exec && "$*" == *'im
   exit 1
 fi
 case "$COMMAND" in
-  config|up|down|pull|restart)
+  config)
+    if [[ "$*" == *'--images'* ]]; then
+      printf 'postgres:16-alpine\nmintplexlabs/anythingllm:latest\ndocker.n8n.io/n8nio/n8n:2\n'
+    fi
+    exit 0
+    ;;
+  pull)
+    [[ "${MOCK_DOCKER_FAIL_PULL:-0}" != 1 ]]
+    ;;
+  up|down|stop|restart)
     exit 0
     ;;
   ps)

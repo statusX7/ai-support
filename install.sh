@@ -89,6 +89,7 @@ fi
 umask 077
 copy_project_files "$SCRIPT_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
+migrate_config_files "$DEPLOY_DIR"
 
 MARKER_TEMP=$(mktemp "${DEPLOY_DIR}/${INSTALL_MARKER}.tmp.XXXXXX")
 {
@@ -186,9 +187,14 @@ else
   info '检测到已有配置；本次重复安装将保留 .env 和实际配置文件'
 fi
 
+[[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
 chown -R root:1000 "${DEPLOY_DIR}/config" "${DEPLOY_DIR}/knowledge" "${DEPLOY_DIR}/n8n" \
-  "${DEPLOY_DIR}/data/n8n" "${DEPLOY_DIR}/data/anythingllm" 2>/dev/null || true
+  "${DEPLOY_DIR}/data/n8n" "${DEPLOY_DIR}/data/anythingllm" "${DEPLOY_DIR}/data/analytics" 2>/dev/null || true
 chmod 0750 "${DEPLOY_DIR}/data/n8n" "${DEPLOY_DIR}/data/anythingllm"
+touch -- "${DEPLOY_DIR}/data/analytics/events.jsonl"
+chown root:1000 "${DEPLOY_DIR}/data/analytics/events.jsonl" 2>/dev/null || true
+chmod 0770 "${DEPLOY_DIR}/data/analytics"
+chmod 0660 "${DEPLOY_DIR}/data/analytics/events.jsonl"
 chmod 0700 "${DEPLOY_DIR}/data/postgres"
 secure_permissions "$DEPLOY_DIR"
 

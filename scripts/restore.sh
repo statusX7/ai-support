@@ -72,7 +72,7 @@ is_allowed_archive_path() {
     VERSION|manifest.json|checksums.sha256|n8n|n8n/workflow.json|data|data/knowledge-manifest.json|config|knowledge)
       return 0
       ;;
-    config/app.yaml|config/provider.yaml|config/provider.yaml.example|config/prompt.md|config/prompt.md.example|config/keyword.yaml|config/keyword.yaml.example|config/menu.yaml|config/menu.yaml.example|config/handoff.yaml|config/handoff.yaml.example)
+    config/app.yaml|config/provider.yaml|config/provider.yaml.example|config/prompt.md|config/prompt.md.example|config/keyword.yaml|config/keyword.yaml.example|config/menu.yaml|config/menu.yaml.example|config/handoff.yaml|config/handoff.yaml.example|config/tags.yaml|config/tags.yaml.example|config/feedback.yaml|config/feedback.yaml.example)
       return 0
       ;;
     knowledge/*)
@@ -121,7 +121,7 @@ done < "${STAGING}/checksums.sha256"
   sha256sum --check --strict checksums.sha256 >/dev/null
 ) || die "备份完整性校验失败"
 
-for config_name in keyword.yaml menu.yaml handoff.yaml; do
+for config_name in keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
   if [[ -f "${STAGING}/config/${config_name}" ]]; then
     jq empty "${STAGING}/config/${config_name}" || die "配置 JSON/YAML 无效：${config_name}"
   fi
@@ -138,11 +138,12 @@ if (( SAFETY_BACKUP )); then
   info "已创建恢复前安全备份：$SAFETY_FILE"
 fi
 
-for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example; do
+for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example; do
   if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
     install -m 0640 -- "${STAGING}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
   fi
 done
+migrate_config_files "$DEPLOY_DIR"
 if [[ -f "${STAGING}/n8n/workflow.json" ]]; then
   install -m 0640 -- "${STAGING}/n8n/workflow.json" "${DEPLOY_DIR}/n8n/workflow.json"
 fi

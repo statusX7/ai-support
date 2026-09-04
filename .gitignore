@@ -7,6 +7,8 @@ config/prompt.md
 config/keyword.yaml
 config/menu.yaml
 config/handoff.yaml
+config/tags.yaml
+config/feedback.yaml
 config/*.local.yaml
 *.pem
 *.key

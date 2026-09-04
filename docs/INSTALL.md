@@ -69,3 +69,26 @@ sudo /opt/crisp-ai/scripts/healthcheck.sh
 ```bash
 sudo /opt/crisp-ai/scripts/healthcheck.sh --offline
 ```
+
+只检查容器与本地健康接口：
+
+```bash
+sudo /opt/crisp-ai/scripts/healthcheck.sh --local
+```
+
+## 更新与回滚
+
+管理菜单中的“更新系统”会先停止 n8n 与 AnythingLLM 写入，创建迁移备份和本机版本快照，再执行源码拉取、镜像拉取、重启、workflow 发布和本地健康检查。任何关键步骤失败都会自动恢复更新前快照。
+
+从旧版升级时，脚本会幂等补齐 `handoff.yaml` 的新字段，并只把 `v0.6.0` 的旧默认关键词和默认提示迁移为新语义；自定义关键词、恢复时间与自定义提示会保留。
+
+版本快照包含配置、Prompt、workflow、知识文件、程序文件、AnythingLLM 数据以及可用的本地镜像 ID，不包含 `.env`、PostgreSQL、n8n 数据库、统计事件或日志。可在管理菜单查看历史并选择回滚，也可运行：
+
+```bash
+sudo /opt/crisp-ai/scripts/rollback.sh --list
+sudo /opt/crisp-ai/scripts/rollback.sh --snapshot <快照ID>
+```
+
+回滚保留现有 `.env`、PostgreSQL、n8n 数据库、匿名统计和历史快照。如果对应历史镜像已从本机删除，脚本只能恢复文件与数据，可能仍需从镜像仓库重新取得旧镜像。
+
+从不含快照脚本的 `v0.6.0` 首次升级到本版本时，应从独立的新源码目录运行新版 `update.sh --deploy-dir <现有部署目录> --source-dir <新源码目录> --no-pull`；新版脚本会从源码调用首个快照工具。旧版 `update.sh` 本身无法预先提供新增的自动回滚能力。

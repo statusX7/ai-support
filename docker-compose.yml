@@ -136,6 +136,9 @@ services:
         source: ${DEPLOY_DIR:-/opt/crisp-ai}/n8n
         target: /opt/crisp-ai/n8n
         read_only: true
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/analytics
+        target: /opt/crisp-ai/data/analytics
     tmpfs:
       - /tmp:size=128m,mode=1777
     healthcheck:

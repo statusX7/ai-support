@@ -38,6 +38,7 @@ assert_file() {
 SHELL_FILES=(
   install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
+  scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
   tests/run.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/mocks/curl tests/mocks/docker
 )
@@ -58,9 +59,11 @@ jq empty \
   "${PROJECT_ROOT}/n8n/workflow.json" \
   "${PROJECT_ROOT}/config/keyword.yaml.example" \
   "${PROJECT_ROOT}/config/menu.yaml.example" \
-  "${PROJECT_ROOT}/config/handoff.yaml.example"
-[[ "$(<"${PROJECT_ROOT}/VERSION")" == v0.6.0 ]] || fail "VERSION 不是 v0.6.0"
-grep -Fq 'version: v0.6.0' "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
+  "${PROJECT_ROOT}/config/handoff.yaml.example" \
+  "${PROJECT_ROOT}/config/tags.yaml.example" \
+  "${PROJECT_ROOT}/config/feedback.yaml.example"
+[[ "$(<"${PROJECT_ROOT}/VERSION")" == v0.6.1 ]] || fail "VERSION 不是 v0.6.1"
+grep -Fq 'version: v0.6.1' "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
 pass "版本与 JSON/YAML 格式"
 
 grep -Fq 'no-new-privileges:true' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 缺少权限收紧"
@@ -68,6 +71,7 @@ grep -Fq '127.0.0.1' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 未�
 grep -Fq 'N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"' "${PROJECT_ROOT}/docker-compose.yml" || fail "n8n 无法读取受控环境变量"
 grep -Fq 'NODE_FUNCTION_ALLOW_BUILTIN: crypto,fs' "${PROJECT_ROOT}/docker-compose.yml" || fail "n8n 内置模块白名单无效"
 grep -Fq "source: \${DEPLOY_DIR:-/opt/crisp-ai}/data/postgres" "${PROJECT_ROOT}/docker-compose.yml" || fail "PostgreSQL 数据未集中保存"
+grep -Fq "source: \${DEPLOY_DIR:-/opt/crisp-ai}/data/analytics" "${PROJECT_ROOT}/docker-compose.yml" || fail "匿名统计数据未集中保存"
 pass "Docker Compose 静态安全契约"
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
@@ -124,7 +128,10 @@ env \
 
 assert_file "${DEPLOY_DIR}/.crisp-ai-installation"
 assert_file "${DEPLOY_DIR}/config/provider.yaml"
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "安装版本错误"
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.1 ]] || fail "安装版本错误"
+assert_file "${DEPLOY_DIR}/config/tags.yaml"
+assert_file "${DEPLOY_DIR}/config/feedback.yaml"
+assert_file "${DEPLOY_DIR}/data/analytics/events.jsonl"
 [[ "$(stat -c '%a' "${DEPLOY_DIR}/.env")" == 600 ]] || fail ".env 权限不是 0600"
 grep -Fq 'model: "gpt-vision-test"' "${DEPLOY_DIR}/config/provider.yaml" || fail "未选择检测到的模型"
 grep -Fq 'responses: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "未检测 Responses API"
@@ -202,6 +209,27 @@ jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
 pass "知识库添加、同步、重新索引与删除"
 
+printf '%s\n' \
+  '{"type":"question","at":"2026-09-04T00:00:00Z"}' \
+  '{"type":"question","at":"2026-09-04T00:00:01Z"}' \
+  '{"type":"ai_reply","at":"2026-09-04T00:00:02Z"}' \
+  '{"type":"ai_reply","at":"2026-09-04T00:00:03Z"}' \
+  '{"type":"knowledge_hit","at":"2026-09-04T00:00:04Z"}' \
+  '{"type":"knowledge_miss","at":"2026-09-04T00:00:05Z"}' \
+  '{"type":"handoff","at":"2026-09-04T00:00:06Z","reason":"user_request"}' \
+  '{"type":"feedback","at":"2026-09-04T00:00:07Z","session":"anonymous-a","question":"已解决问题","answer":"回答","feedback":"positive"}' \
+  '{"type":"feedback","at":"2026-09-04T00:00:08Z","session":"anonymous-b","question":"失败问题","answer":"回答","feedback":"negative"}' \
+  > "${DEPLOY_DIR}/data/analytics/events.jsonl"
+ANALYTICS_JSON=$("${DEPLOY_DIR}/scripts/analytics.sh" all --deploy-dir "$DEPLOY_DIR" --json)
+jq -e '
+  .total_questions == 2 and .ai_replies == 2 and
+  .knowledge_hits == 1 and .knowledge_misses == 1 and
+  .handoffs == 1 and .hit_rate == 50 and
+  .positive_feedback == 1 and .negative_feedback == 1 and
+  .positive_rate == 50 and .frequent_failures[0].question == "失败问题"
+' <<< "$ANALYTICS_JSON" >/dev/null || fail "知识库或反馈统计错误"
+pass "知识库命中、未命中、转人工与用户反馈统计"
+
 ARCHIVE="${DEPLOY_DIR}/backups/test-backup.tar.gz"
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 PROMPT_HASH=$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')
@@ -214,6 +242,9 @@ if tar -xOzf "$ARCHIVE" | grep -F "$TEST_PROVIDER_KEY" >/dev/null; then
   fail "备份包含 API Key"
 fi
 tar -xOzf "$ARCHIVE" ./manifest.json | jq -e '.contains_secrets == false' >/dev/null || fail "备份清单未声明排除密钥"
+ARCHIVE_LIST=$(tar -tzf "$ARCHIVE")
+grep -Fq './config/tags.yaml' <<< "$ARCHIVE_LIST" || fail "备份未包含标签配置"
+grep -Fq './config/feedback.yaml' <<< "$ARCHIVE_LIST" || fail "备份未包含反馈配置"
 printf '临时 Prompt，恢复后应被替换。\n' > "${DEPLOY_DIR}/config/prompt.md"
 rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md"
 "${DEPLOY_DIR}/scripts/restore.sh" \
@@ -233,15 +264,53 @@ fi
 cp -- "${TEST_ROOT}/provider.safe.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 pass "备份敏感字段拒绝"
 
+printf 'rollback-state-before\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
+SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason test-manual --quiet)
+SNAPSHOT_LIST=$(tar -tzf "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/snapshot.tar.gz")
+if grep -Eq '(^|/)\.env$|data/analytics' <<< "$SNAPSHOT_LIST"; then
+  fail "版本快照包含 .env 或匿名统计"
+fi
+grep -Fq 'payload/data/anythingllm/rollback-state.txt' <<< "$SNAPSHOT_LIST" || fail "版本快照未包含 AnythingLLM 数据"
+printf 'rollback-state-after\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
+printf '临时回滚 Prompt\n' > "${DEPLOY_DIR}/config/prompt.md"
+"${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --snapshot "$SNAPSHOT_ID" \
+  --skip-start --no-safety-snapshot > "${TEST_ROOT}/rollback.log" 2>&1
+grep -Fq 'rollback-state-before' "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt" || fail "AnythingLLM 数据未回滚"
+[[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "配置未随版本快照回滚"
+"${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list | grep -Fq "$SNAPSHOT_ID" || fail "版本历史未列出快照"
+pass "版本快照、AnythingLLM 数据与手动回滚"
+
+printf 'v0.6.0\n' > "${DEPLOY_DIR}/VERSION"
+printf '%s\n' '{"handoff":{"keywords":["人工","客服","真人"],"resume_keywords":["恢复AI"],"topic_keywords":{"payment":["付款"]},"resume_after_seconds":1800,"on_operator_message":true,"on_low_confidence":true,"on_no_answer":true,"confirmation":"已为您转接人工客服，AI 将暂停回复。","no_answer_message":"知识库暂时没有足够信息，已为您转接人工客服。","low_confidence_message":"当前答案可信度不足，已为您转接人工客服。","failure_message":"当前自动客服暂时不可用，已为您转接人工客服。","low_confidence":{"require_sources":true,"minimum_score":0.25}}}' \
+  > "${DEPLOY_DIR}/config/handoff.yaml"
+rm -f -- "${DEPLOY_DIR}/scripts/analytics.sh" "${DEPLOY_DIR}/scripts/snapshot.sh" "${DEPLOY_DIR}/scripts/rollback.sh"
+if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
+  --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/update-rollback.log" 2>&1; then
+  fail "镜像拉取失败时更新被错误报告为成功"
+fi
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "更新失败后未恢复旧版本"
+grep -Fq '已自动回滚到更新前版本' "${TEST_ROOT}/update-rollback.log" || fail "更新失败未报告自动回滚"
+pass "更新失败自动回滚"
+
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull --skip-start \
   > "${TEST_ROOT}/update.log" 2>&1
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "更新后版本错误"
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.1 ]] || fail "更新后版本错误"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
+jq -e '
+  .handoff.disable_ai == true and .handoff.notify_user.enabled == true and
+  (.handoff.keywords | index("转人工") != null) and
+  (.handoff | has("topic_keywords") | not) and
+  (.handoff | has("on_low_confidence") | not) and
+  (.handoff.no_answer_message | contains("转接人工") | not)
+' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null || fail "旧人工接管配置未安全迁移"
 [[ -n "$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f -name 'pre-update-*.tar.gz' -print -quit)" ]] \
   || fail "更新前未创建备份"
-pass "更新与配置保留"
+[[ -n "$(find "${DEPLOY_DIR}/backups/versions" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] \
+  || fail "更新前未创建版本快照"
+pass "更新、备份与配置保留"
 
 "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --keep-data --yes \
   > "${TEST_ROOT}/uninstall-keep.log" 2>&1

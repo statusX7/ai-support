@@ -74,7 +74,8 @@ fi
 CONFIG_FILES=(
   app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example
   keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example
-  handoff.yaml handoff.yaml.example
+  handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example
+  feedback.yaml feedback.yaml.example
 )
 for name in "${CONFIG_FILES[@]}"; do
   if [[ -f "${DEPLOY_DIR}/config/${name}" && ! -L "${DEPLOY_DIR}/config/${name}" ]]; then
