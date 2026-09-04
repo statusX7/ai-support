@@ -1,0 +1,40 @@
+{
+  "keywords": [
+    {
+      "id": "connection",
+      "match": ["无法连接", "打不开"],
+      "case_sensitive": false,
+      "action": {
+        "type": "prompt",
+        "prompt": "优先检索连接故障排查知识，并按最少必要步骤引导访客。"
+      }
+    },
+    {
+      "id": "service-hours",
+      "match": ["服务时间"],
+      "case_sensitive": false,
+      "action": {
+        "type": "reply",
+        "text": "人工客服服务时间请以网站公告为准；其他时间可先留言。"
+      }
+    },
+    {
+      "id": "subscription",
+      "match": ["充值", "订阅"],
+      "case_sensitive": false,
+      "action": {
+        "type": "menu",
+        "target": "subscription"
+      }
+    },
+    {
+      "id": "refund",
+      "match": ["退款"],
+      "case_sensitive": false,
+      "action": {
+        "type": "handoff",
+        "reason": "退款问题"
+      }
+    }
+  ]
+}
