@@ -19,6 +19,8 @@ backups/
 tmp/
 *.log
 *.pid
+.test-runtime.*
+.test-tools/
 
 # 导入导出产物
 backup.tar.gz

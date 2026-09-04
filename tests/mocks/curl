@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTPUT_FILE=""
+WRITE_OUT=""
+URL=""
+FAIL_ON_HTTP=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --output|-o)
+      OUTPUT_FILE=$2
+      shift 2
+      ;;
+    --write-out|-w)
+      WRITE_OUT=$2
+      shift 2
+      ;;
+    --header|-H|--data|--data-raw|--form|-F|--connect-timeout|--max-time|--request|-X)
+      shift 2
+      ;;
+    --fail|-f)
+      FAIL_ON_HTTP=1
+      shift
+      ;;
+    --silent|-s|--show-error|-S)
+      shift
+      ;;
+    http://*|https://*)
+      URL=$1
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$URL" ]] || {
+  printf 'curl 测试桩未收到 URL\n' >&2
+  exit 2
+}
+
+STATUS=200
+BODY='{"ok":true}'
+case "$URL" in
+  */models)
+    if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
+      STATUS=503
+      BODY='{"error":{"message":"测试 Provider 不可用"}}'
+    else
+      BODY='{"data":[{"id":"gpt-vision-test"},{"id":"deepseek-test"}]}'
+    fi
+    ;;
+  */responses|*/chat/completions)
+    if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
+      STATUS=503
+      BODY='{"error":{"message":"测试 Provider 不可用"}}'
+    else
+      BODY='{"id":"test-response"}'
+    fi
+    ;;
+  https://api.crisp.chat/*)
+    if [[ "${MOCK_CRISP_FAIL:-0}" == 1 ]]; then
+      STATUS=503
+      BODY='{"error":"测试 Crisp 不可用"}'
+    else
+      BODY='{"error":false}'
+    fi
+    ;;
+  */api/v1/document/upload)
+    BODY='{"success":true,"documents":[{"location":"custom-documents/test-knowledge.json"}]}'
+    ;;
+  */api/v1/workspace/*/update-embeddings|*/api/v1/workspace/*/update|*/api/v1/workspace/new)
+    BODY='{"success":true}'
+    ;;
+  */api/v1/workspace/*|*/api/v1/auth)
+    BODY='{"success":true}'
+    ;;
+  */healthz|*/api/ping)
+    BODY='{"status":"ok"}'
+    ;;
+esac
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+  printf '%s' "$BODY" > "$OUTPUT_FILE"
+else
+  printf '%s' "$BODY"
+fi
+if [[ -n "$WRITE_OUT" ]]; then
+  printf '%s' "$STATUS"
+fi
+
+if (( FAIL_ON_HTTP )) && (( STATUS >= 400 )); then
+  exit 22
+fi

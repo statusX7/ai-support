@@ -232,7 +232,7 @@
         "sendBody": true,
         "contentType": "raw",
         "rawContentType": "application/json",
-        "body": "={{ JSON.stringify({ type: 'text', from: 'operator', origin: 'chat', content: $json.reply, automated: true, properties: { ai_support: true, ai_support_version: 'v0.4.0' } }) }}",
+        "body": "={{ JSON.stringify({ type: 'text', from: 'operator', origin: 'chat', content: $json.reply, automated: true, properties: { ai_support: true, ai_support_version: 'v0.6.0' } }) }}",
         "options": {"timeout": 30000}
       },
       "type": "n8n-nodes-base.httpRequest",
@@ -301,7 +301,7 @@
     "saveManualExecutions": false,
     "callerPolicy": "workflowsFromSameOwner"
   },
-  "versionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  "versionId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
   "meta": {
     "templateCredsSetupCompleted": true
   },

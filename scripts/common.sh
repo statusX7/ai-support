@@ -177,7 +177,7 @@ copy_project_files() {
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
     n8n/workflow.json knowledge/README.md
-    docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md
+    docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md
   )
   local executable_files=(
     install.sh manage.sh update.sh uninstall.sh
@@ -414,9 +414,18 @@ sync_prompt_to_anythingllm() {
 import_and_publish_workflow() {
   local deploy_dir=$1
   require_command docker
-  docker_compose "$deploy_dir" exec -T n8n n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null
-  docker_compose "$deploy_dir" exec -T n8n n8n publish:workflow --id="$WORKFLOW_ID" >/dev/null
-  docker_compose "$deploy_dir" restart n8n >/dev/null
+  if ! docker_compose "$deploy_dir" exec -T n8n n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null; then
+    warn "n8n workflow 导入失败"
+    return 1
+  fi
+  if ! docker_compose "$deploy_dir" exec -T n8n n8n publish:workflow --id="$WORKFLOW_ID" >/dev/null; then
+    warn "n8n workflow 发布失败"
+    return 1
+  fi
+  if ! docker_compose "$deploy_dir" restart n8n >/dev/null; then
+    warn "n8n workflow 已发布，但服务重启失败"
+    return 1
+  fi
   info "n8n 工作流已导入并发布"
 }
 

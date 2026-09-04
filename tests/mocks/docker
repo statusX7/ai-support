@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${MOCK_DOCKER_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+fi
+
+[[ "${1:-}" == compose ]] || {
+  printf 'docker 测试桩只支持 compose\n' >&2
+  exit 2
+}
+shift
+
+if [[ "${1:-}" == version ]]; then
+  printf 'Docker Compose version v2.99.0-test\n'
+  exit 0
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --project-directory|--env-file|-f)
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+COMMAND=${1:-}
+shift || true
+if [[ "${MOCK_DOCKER_FAIL_IMPORT:-0}" == 1 && "$COMMAND" == exec && "$*" == *'import:workflow'* ]]; then
+  exit 1
+fi
+case "$COMMAND" in
+  config|up|down|pull|restart)
+    exit 0
+    ;;
+  ps)
+    printf 'postgres\nanythingllm\nn8n\n'
+    ;;
+  exec)
+    if [[ "$*" == *'n8n --version'* ]]; then
+      printf '2.99.0-test\n'
+    fi
+    ;;
+  logs)
+    printf '测试日志：未连接真实服务。\n'
+    ;;
+  *)
+    printf 'docker compose 测试桩不支持命令：%s\n' "$COMMAND" >&2
+    exit 2
+    ;;
+esac
