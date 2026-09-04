@@ -25,7 +25,7 @@ pause_screen() {
 }
 
 recreate_ai_services() {
-  require_command docker
+  require_docker_runtime
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm n8n
 }
@@ -87,7 +87,7 @@ configure_crisp() {
   case "$secret_choice" in
     y|Y|yes|YES) env_set "${DEPLOY_DIR}/.env" CRISP_WEBHOOK_SECRET "$(random_hex 32)" ;;
   esac
-  require_command docker
+  require_docker_runtime
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   info "Crisp 配置已更新；如已轮换 Secret，请同步修改 Crisp Webhook URL"
 }
@@ -314,7 +314,7 @@ while true; do
       ;;
     5)
       require_installation
-      require_command docker
+      require_docker_runtime
       warn "日志可能包含会话内容，请勿公开分享"
       docker_compose "$DEPLOY_DIR" logs --tail 200
       ;;

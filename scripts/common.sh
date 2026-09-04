@@ -24,6 +24,12 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
 }
 
+require_docker_runtime() {
+  require_command docker
+  docker compose version >/dev/null 2>&1 || die "未检测到 Docker Compose v2"
+  docker info >/dev/null 2>&1 || die "无法连接 Docker daemon，请确认 Docker Engine 已启动且当前用户有权限访问"
+}
+
 validate_deploy_dir() {
   local requested=${1:-}
   local resolved
@@ -255,23 +261,26 @@ initialize_config_files() {
 migrate_config_files() {
   local deploy_dir=$1
   local handoff_file="${deploy_dir}/config/handoff.yaml"
-  local handoff_temp
+  local handoff_temp tags_file tags_temp
 
   [[ -f "$handoff_file" && ! -L "$handoff_file" ]] || die "人工接管配置缺失或不安全"
   require_command jq
   handoff_temp=$(mktemp "${handoff_file}.tmp.XXXXXX")
   jq '
-    if .handoff.keywords == ["人工", "客服", "真人"] then
-      .handoff.keywords = ["人工", "人工客服", "转人工", "真人客服"]
+    if .handoff.keywords == ["人工", "客服", "真人"] or
+       .handoff.keywords == ["人工", "人工客服", "转人工", "真人客服"] then
+      .handoff.keywords = ["人工", "人工客服", "转人工", "真人", "真人客服"]
     else . end |
     if (.handoff | has("disable_ai")) then . else .handoff.disable_ai = true end |
     if (.handoff.notify_user | type) == "object" then . else .handoff.notify_user = {} end |
     if (.handoff.notify_user | has("enabled")) then . else .handoff.notify_user.enabled = true end |
-    if ((.handoff.message // "") | length) > 0 then .
+    if (.handoff.message // "") == "您已请求人工客服，正在为您转接，请稍候。" then
+      .handoff.message = "正在为您转接人工客服，请稍候。"
+    elif ((.handoff.message // "") | length) > 0 then .
     elif (.handoff.confirmation // "") == "已为您转接人工客服，AI 将暂停回复。" then
-      .handoff.message = "您已请求人工客服，正在为您转接，请稍候。"
+      .handoff.message = "正在为您转接人工客服，请稍候。"
     elif ((.handoff.confirmation // "") | length) > 0 then .handoff.message = .handoff.confirmation
-    else .handoff.message = "您已请求人工客服，正在为您转接，请稍候。" end |
+    else .handoff.message = "正在为您转接人工客服，请稍候。" end |
     if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
       .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
     else . end |
@@ -288,6 +297,21 @@ migrate_config_files() {
   }
   chmod 640 "$handoff_temp"
   mv -f -- "$handoff_temp" "$handoff_file"
+
+  tags_file="${deploy_dir}/config/tags.yaml"
+  [[ -f "$tags_file" && ! -L "$tags_file" ]] || die "Conversation 标签配置缺失或不安全"
+  tags_temp=$(mktemp "${tags_file}.tmp.XXXXXX")
+  jq '
+    if .tags.ai_resolved == "ai-resolved" then .tags.ai_resolved = "ai_resolved" else . end |
+    if .tags.knowledge_miss == "knowledge-miss" then .tags.knowledge_miss = "knowledge_miss" else . end |
+    if .tags.low_confidence == "low-confidence" then .tags.low_confidence = "low_confidence" else . end |
+    if .tags.human_required == "human-required" then .tags.human_required = "human_required" else . end
+  ' "$tags_file" > "$tags_temp" || {
+    rm -f -- "$tags_temp"
+    die "Conversation 标签配置迁移失败"
+  }
+  chmod 640 "$tags_temp"
+  mv -f -- "$tags_temp" "$tags_file"
 }
 
 normalize_api_base() {

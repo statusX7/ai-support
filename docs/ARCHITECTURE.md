@@ -27,6 +27,6 @@ Website Hook 本身不提供签名，因此必须在 Webhook URL 中携带随机
 
 ## 部署边界
 
-所有持久化数据都位于部署目录，默认是 `/opt/crisp-ai`。匿名统计事件位于 `data/analytics/events.jsonl`；版本快照位于 `backups/versions/`。容器端口默认绑定到 `127.0.0.1`，生产环境应通过带 TLS 的反向代理公开 n8n Webhook，数据库不对宿主机暴露端口。
+所有持久化数据都位于部署目录，默认是 `/opt/crisp-ai`。匿名统计事件位于 `data/analytics/events.jsonl`；版本快照位于 `backups/versions/`，创建前执行容量预检并按配置保留历史。容器端口默认绑定到 `127.0.0.1`，生产环境应通过带 TLS 的反向代理公开 n8n Webhook，数据库不对宿主机暴露端口。
 
 迁移备份不含密钥和运行时用户数据。回滚快照额外包含 AnythingLLM 数据，只用于同一主机的故障恢复，目录权限为仅管理员可访问，不得上传或当作迁移包分发。

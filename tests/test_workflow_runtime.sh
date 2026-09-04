@@ -165,7 +165,8 @@ result = runRouter(explicitHandoff, { state: explicitHandoffState }).json;
 assert.strictEqual(result.route, 'reply');
 assert(result.reply.includes('正在为您转接'));
 assert.strictEqual(explicitHandoffState.sessions[explicitHandoff.data.session_id].aiEnabled, false);
-assert(result.tagsToApply.includes('human-required'));
+assert.strictEqual(result.reply, '正在为您转接人工客服，请稍候。');
+assert(result.tagsToApply.includes('human_required'));
 
 result = runRouter(makeMessage('菜单')).json;
 assert.strictEqual(result.route, 'reply');
@@ -184,7 +185,7 @@ result = runRouter(operatorMessage, { state: handoffState }).json;
 assert.strictEqual(result.route, 'tag_only');
 assert.strictEqual(handoffState.sessions[sharedSession].aiEnabled, false);
 assert(handoffState.sessions[sharedSession].aiResumeAt > Date.now());
-assert(result.tagsToApply.includes('human-required'));
+assert(result.tagsToApply.includes('human_required'));
 result = runRouter(makeMessage('还有问题', { session_id: sharedSession }), { state: handoffState }).json;
 assert.strictEqual(result.route, 'ignore');
 const resumeMessage = makeMessage('恢复AI', { session_id: sharedSession, from: 'operator' });
@@ -240,7 +241,7 @@ let routed = runRouter(makeMessage('需要知识库回答'), { state: formatterS
 result = formatKnowledge(routed, { data: { textResponse: '无来源回答', sources: [] } }, formatterState);
 assert(result.reply.includes('知识库暂时没有足够信息'));
 assert.strictEqual(result.analyticsOutcome, 'knowledge_miss');
-assert(result.tagsToApply.includes('knowledge-miss'));
+assert(result.tagsToApply.includes('knowledge_miss'));
 assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
 prepareReply({ first: () => ({ json: result }) }, () => formatterState, controlledRequire);
 
@@ -248,7 +249,7 @@ formatterState = {};
 routed = runRouter(makeMessage('低分依据的问题'), { state: formatterState }).json;
 result = formatKnowledge(routed, { data: { textResponse: '低分回答', sources: [{ score: 0.1 }] } }, formatterState);
 assert(result.reply.includes('可信度不足'));
-assert(result.tagsToApply.includes('low-confidence'));
+assert(result.tagsToApply.includes('low_confidence'));
 assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
 
 formatterState = {};
@@ -256,7 +257,7 @@ routed = runRouter(makeMessage('已有依据的问题'), { state: formatterState
 result = formatKnowledge(routed, { data: { textResponse: '有依据的回答', sources: [{ score: 0.9 }] } }, formatterState);
 assert(result.reply.includes('有依据的回答'));
 assert.strictEqual(result.analyticsOutcome, 'knowledge_hit');
-assert(result.tagsToApply.includes('ai-resolved'));
+assert(result.tagsToApply.includes('ai_resolved'));
 
 formatterState = {};
 routed = runRouter(makeMessage('触发 API 失败'), { state: formatterState }).json;
@@ -278,7 +279,7 @@ routed = runRouter(makeMessage('图片后续问题'), { state: formatterState })
 result = formatVision(routed, {}, formatterState);
 assert(result.reply.includes('自动客服暂时不可用'));
 assert.strictEqual(formatterState.sessions[routed.sessionId].aiEnabled, true);
-assert(result.tagsToApply.includes('low-confidence'));
+assert(result.tagsToApply.includes('low_confidence'));
 
 const feedbackState = {};
 const feedbackQuestion = makeMessage('接口 token=should-not-leak 为什么失败', { session_id: 'session_feedback1234' });
@@ -303,15 +304,26 @@ assert(events.some((entry) => entry.type === 'knowledge_miss'));
 assert(events.some((entry) => entry.type === 'ai_reply'));
 
 const merged = mergeTags(
-  { first: () => ({ json: { data: { segments: ['customer-vip', 'knowledge-miss'] } } }) },
+  { first: () => ({ json: { data: { segments: ['customer-vip', 'knowledge_miss'] } } }) },
   (name) => {
     assert.strictEqual(name, '准备回复与统计');
     return { first: () => ({ json: answered }) };
   },
 )[0].json;
 assert(merged.mergedSegments.includes('customer-vip'));
-assert(merged.mergedSegments.includes('ai-resolved'));
-assert(!merged.mergedSegments.includes('knowledge-miss'));
+assert(merged.mergedSegments.includes('ai_resolved'));
+assert(!merged.mergedSegments.includes('knowledge_miss'));
+
+const skippedTagUpdate = mergeTags(
+  { first: () => ({ json: { error: { message: 'forbidden' } } }) },
+  (name) => {
+    assert.strictEqual(name, '准备回复与统计');
+    return { first: () => ({ json: answered }) };
+  },
+)[0].json;
+assert.strictEqual(skippedTagUpdate.tagReadOk, false);
+assert.deepStrictEqual(skippedTagUpdate.mergedSegments, []);
+assert(skippedTagUpdate.reply.includes('是否解决问题'));
 
 process.stdout.write('工作流行为测试：通过\n');
 NODE

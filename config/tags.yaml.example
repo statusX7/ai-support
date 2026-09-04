@@ -1,9 +1,9 @@
 {
   "tags": {
     "enabled": true,
-    "ai_resolved": "ai-resolved",
-    "knowledge_miss": "knowledge-miss",
-    "low_confidence": "low-confidence",
-    "human_required": "human-required"
+    "ai_resolved": "ai_resolved",
+    "knowledge_miss": "knowledge_miss",
+    "low_confidence": "low_confidence",
+    "human_required": "human_required"
   }
 }

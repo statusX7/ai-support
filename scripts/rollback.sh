@@ -172,14 +172,14 @@ if [[ -f "${PAYLOAD}/config/provider.yaml" ]] && provider_config_has_secret_fiel
 fi
 
 if (( SKIP_START == 0 )); then
-  require_command docker
+  require_docker_runtime
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" stop n8n anythingllm
   SERVICES_STOPPED=1
 fi
 
 if (( SAFETY_SNAPSHOT )); then
-  SAFETY_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "pre-rollback-${SNAPSHOT_ID}" --quiet)
+  SAFETY_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "pre-rollback-${SNAPSHOT_ID}" --protect "$SNAPSHOT_ID" --quiet)
   info "回滚前安全快照：$SAFETY_ID"
 fi
 

@@ -71,9 +71,16 @@ require_command jq
 require_command openssl
 require_command base64
 require_command sha256sum
+require_command tar
+require_command df
+require_command du
 
 if [[ $EUID -ne 0 ]]; then
   die "安装需要 root 权限，以便设置容器数据目录权限"
+fi
+
+if (( SKIP_START == 0 )); then
+  require_docker_runtime
 fi
 
 EXISTING=0
@@ -117,6 +124,20 @@ env_set "$ENV_FILE" AI_MODEL_TOKEN_LIMIT "${AI_MODEL_TOKEN_LIMIT:-8192}"
 env_set "$ENV_FILE" AI_MAX_OUTPUT_TOKENS "${AI_MAX_OUTPUT_TOKENS:-1200}"
 env_set "$ENV_FILE" ANYTHINGLLM_WORKSPACE "${ANYTHINGLLM_WORKSPACE:-crisp-support}"
 env_set "$ENV_FILE" ANYTHINGLLM_CHAT_MODE "${ANYTHINGLLM_CHAT_MODE:-query}"
+EXISTING_SNAPSHOT_MIN_FREE_MB=$(env_get "$ENV_FILE" SNAPSHOT_MIN_FREE_MB 2>/dev/null || true)
+EXISTING_SNAPSHOT_RETENTION_COUNT=$(env_get "$ENV_FILE" SNAPSHOT_RETENTION_COUNT 2>/dev/null || true)
+SNAPSHOT_MIN_FREE_MB_VALUE=${SNAPSHOT_MIN_FREE_MB:-${EXISTING_SNAPSHOT_MIN_FREE_MB:-1024}}
+SNAPSHOT_RETENTION_COUNT_VALUE=${SNAPSHOT_RETENTION_COUNT:-${EXISTING_SNAPSHOT_RETENTION_COUNT:-10}}
+if [[ ! "$SNAPSHOT_MIN_FREE_MB_VALUE" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || (( 10#$SNAPSHOT_MIN_FREE_MB_VALUE > 2147483647 )); then
+  die "SNAPSHOT_MIN_FREE_MB 必须是 0 到 2147483647 的整数"
+fi
+if [[ ! "$SNAPSHOT_RETENTION_COUNT_VALUE" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || (( 10#$SNAPSHOT_RETENTION_COUNT_VALUE > 1000 )); then
+  die "SNAPSHOT_RETENTION_COUNT 必须是 0 到 1000 的整数"
+fi
+env_set "$ENV_FILE" SNAPSHOT_MIN_FREE_MB "$SNAPSHOT_MIN_FREE_MB_VALUE"
+env_set "$ENV_FILE" SNAPSHOT_RETENTION_COUNT "$SNAPSHOT_RETENTION_COUNT_VALUE"
 
 ensure_secret "$ENV_FILE" N8N_ENCRYPTION_KEY 32
 ensure_secret "$ENV_FILE" POSTGRES_PASSWORD 32
@@ -199,27 +220,22 @@ chmod 0700 "${DEPLOY_DIR}/data/postgres"
 secure_permissions "$DEPLOY_DIR"
 
 if (( SKIP_START == 0 )); then
-  require_command docker
-  docker compose version >/dev/null 2>&1 || die "未检测到 Docker Compose v2"
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d
-
-  for (( attempt = 1; attempt <= 30; attempt++ )); do
-    if docker_compose "$DEPLOY_DIR" exec -T n8n n8n --version >/dev/null 2>&1; then
-      break
-    fi
-    sleep 2
-  done
+  wait_for_local_health "$DEPLOY_DIR" 45 2
   if anythingllm_api_ready "$DEPLOY_DIR"; then
-    sync_prompt_to_anythingllm "$DEPLOY_DIR" || warn "Prompt 尚未同步，请确认 AnythingLLM 工作区已创建"
-    import_and_publish_workflow "$DEPLOY_DIR" || warn "工作流尚未发布，请从管理菜单重试"
+    sync_prompt_to_anythingllm "$DEPLOY_DIR"
+    import_and_publish_workflow "$DEPLOY_DIR"
+    wait_for_local_health "$DEPLOY_DIR" 30 2
+    "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR"
   else
     docker_compose "$DEPLOY_DIR" exec -T n8n n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null || warn "n8n 工作流自动导入失败，请稍后从管理菜单重试"
     warn "AnythingLLM Developer API Key 尚未配置，工作流保持未发布"
+    "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --local
   fi
 fi
 
-printf '\n安装完成。\n'
+printf '\n安装与健康检查完成。\n'
 printf '部署目录：%s\n' "$DEPLOY_DIR"
 printf 'Webhook：%swebhook/crisp-webhook?key=<CRISP_WEBHOOK_SECRET>\n' "$(env_get "$ENV_FILE" PUBLIC_WEBHOOK_URL)"
 printf '下一步：初始化 AnythingLLM 工作区并运行 %s/manage.sh。\n' "$DEPLOY_DIR"

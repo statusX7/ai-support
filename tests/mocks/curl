@@ -5,6 +5,7 @@ OUTPUT_FILE=""
 WRITE_OUT=""
 URL=""
 FAIL_ON_HTTP=0
+FORM_FILE=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -16,7 +17,13 @@ while (( $# > 0 )); do
       WRITE_OUT=$2
       shift 2
       ;;
-    --header|-H|--data|--data-raw|--form|-F|--connect-timeout|--max-time|--request|-X)
+    --form|-F)
+      if [[ "$2" == file=@* ]]; then
+        FORM_FILE=${2#file=@}
+      fi
+      shift 2
+      ;;
+    --header|-H|--data|--data-raw|--connect-timeout|--max-time|--request|-X)
       shift 2
       ;;
     --fail|-f)
@@ -69,7 +76,9 @@ case "$URL" in
     fi
     ;;
   */api/v1/document/upload)
-    BODY='{"success":true,"documents":[{"location":"custom-documents/test-knowledge.json"}]}'
+    DOCUMENT_NAME=$(basename -- "${FORM_FILE:-test-knowledge}")
+    BODY=$(jq -cn --arg location "custom-documents/${DOCUMENT_NAME}.json" \
+      '{success:true,documents:[{location:$location}]}')
     ;;
   */api/v1/workspace/*/update-embeddings|*/api/v1/workspace/*/update|*/api/v1/workspace/new)
     BODY='{"success":true}'

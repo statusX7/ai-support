@@ -94,10 +94,11 @@ jq -e '
   (.handoff.keywords | index("人工") != null) and
   (.handoff.keywords | index("人工客服") != null) and
   (.handoff.keywords | index("转人工") != null) and
+  (.handoff.keywords | index("真人") != null) and
   (.handoff.keywords | index("真人客服") != null) and
   .handoff.disable_ai == true and
   .handoff.notify_user.enabled == true and
-  (.handoff.message | length > 0) and
+  .handoff.message == "正在为您转接人工客服，请稍候。" and
   (.handoff.resume_after_seconds >= 60) and
   (.handoff | has("topic_keywords") | not) and
   (.handoff | has("on_low_confidence") | not) and
@@ -106,10 +107,10 @@ jq -e '
 
 jq -e '
   .tags.enabled == true and
-  .tags.ai_resolved == "ai-resolved" and
-  .tags.knowledge_miss == "knowledge-miss" and
-  .tags.low_confidence == "low-confidence" and
-  .tags.human_required == "human-required"
+  .tags.ai_resolved == "ai_resolved" and
+  .tags.knowledge_miss == "knowledge_miss" and
+  .tags.low_confidence == "low_confidence" and
+  .tags.human_required == "human_required"
 ' "${PROJECT_ROOT}/config/tags.yaml.example" >/dev/null
 
 jq -e '

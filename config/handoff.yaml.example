@@ -1,11 +1,11 @@
 {
   "handoff": {
-    "keywords": ["人工", "人工客服", "转人工", "真人客服"],
+    "keywords": ["人工", "人工客服", "转人工", "真人", "真人客服"],
     "disable_ai": true,
     "notify_user": {
       "enabled": true
     },
-    "message": "您已请求人工客服，正在为您转接，请稍候。",
+    "message": "正在为您转接人工客服，请稍候。",
     "resume_keywords": ["恢复AI", "AI恢复"],
     "resume_after_seconds": 1800,
     "while_active": "人工客服正在接管此会话，请稍候。",

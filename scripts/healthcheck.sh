@@ -129,6 +129,17 @@ else
   pass "provider.yaml 未发现密钥字段"
 fi
 
+SNAPSHOT_MIN_FREE_MB_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_MIN_FREE_MB 2>/dev/null || printf '1024')
+SNAPSHOT_RETENTION_COUNT_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_RETENTION_COUNT 2>/dev/null || printf '10')
+if [[ "$SNAPSHOT_MIN_FREE_MB_VALUE" =~ ^(0|[1-9][0-9]*)$ ]] \
+  && (( 10#$SNAPSHOT_MIN_FREE_MB_VALUE <= 2147483647 )) \
+  && [[ "$SNAPSHOT_RETENTION_COUNT_VALUE" =~ ^(0|[1-9][0-9]*)$ ]] \
+  && (( 10#$SNAPSHOT_RETENTION_COUNT_VALUE <= 1000 )); then
+  pass "版本快照策略有效：预留 ${SNAPSHOT_MIN_FREE_MB_VALUE} MiB，保留 ${SNAPSHOT_RETENTION_COUNT_VALUE} 份（0 表示关闭对应限制）"
+else
+  fail "版本快照策略无效"
+fi
+
 ENV_MODE=$(stat -c '%a' "${DEPLOY_DIR}/.env" 2>/dev/null || printf '777')
 if (( (8#$ENV_MODE & 077) == 0 )); then
   pass ".env 权限未向组或其他用户开放"
@@ -154,6 +165,11 @@ else
     pass "Docker Compose 可用"
   else
     fail "Docker Compose v2 不可用"
+  fi
+  if docker info >/dev/null 2>&1; then
+    pass "Docker daemon 可连接"
+  else
+    fail "Docker daemon 不可连接"
   fi
   if docker_compose "$DEPLOY_DIR" config --quiet >/dev/null 2>&1; then
     pass "docker compose config 有效"

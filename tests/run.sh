@@ -62,8 +62,8 @@ jq empty \
   "${PROJECT_ROOT}/config/handoff.yaml.example" \
   "${PROJECT_ROOT}/config/tags.yaml.example" \
   "${PROJECT_ROOT}/config/feedback.yaml.example"
-[[ "$(<"${PROJECT_ROOT}/VERSION")" == v0.6.1 ]] || fail "VERSION 不是 v0.6.1"
-grep -Fq 'version: v0.6.1' "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
+[[ "$(<"${PROJECT_ROOT}/VERSION")" == v0.7.0 ]] || fail "VERSION 不是 v0.7.0"
+grep -Fq 'version: v0.7.0' "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
 pass "版本与 JSON/YAML 格式"
 
 grep -Fq 'no-new-privileges:true' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 缺少权限收紧"
@@ -105,6 +105,7 @@ export MOCK_DOCKER_LOG="${TEST_ROOT}/docker.log"
 
 DEPLOY_DIR="${TEST_ROOT}/deploy"
 FAILURE_DEPLOY_DIR="${TEST_ROOT}/provider-failure"
+DOCKER_FAILURE_DEPLOY_DIR="${TEST_ROOT}/docker-failure"
 INSTALL_LOG="${TEST_ROOT}/install.log"
 TEST_PROVIDER_KEY='test-only-provider-key'
 TEST_CRISP_KEY='test-only-crisp-key'
@@ -128,7 +129,7 @@ env \
 
 assert_file "${DEPLOY_DIR}/.crisp-ai-installation"
 assert_file "${DEPLOY_DIR}/config/provider.yaml"
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.1 ]] || fail "安装版本错误"
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.7.0 ]] || fail "安装版本错误"
 assert_file "${DEPLOY_DIR}/config/tags.yaml"
 assert_file "${DEPLOY_DIR}/config/feedback.yaml"
 assert_file "${DEPLOY_DIR}/data/analytics/events.jsonl"
@@ -137,11 +138,25 @@ grep -Fq 'model: "gpt-vision-test"' "${DEPLOY_DIR}/config/provider.yaml" || fail
 grep -Fq 'responses: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "未检测 Responses API"
 grep -Fq 'chat_completions: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "未检测 Chat Completions API"
 grep -Fq 'vision: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "视觉能力未保存"
+[[ "$(sed -n 's/^SNAPSHOT_MIN_FREE_MB=//p' "${DEPLOY_DIR}/.env")" == 1024 ]] || fail "快照预留空间默认值错误"
+[[ "$(sed -n 's/^SNAPSHOT_RETENTION_COUNT=//p' "${DEPLOY_DIR}/.env")" == 10 ]] || fail "快照保留数量默认值错误"
 if grep -Fq "$TEST_PROVIDER_KEY" "$INSTALL_LOG"; then
   fail "安装日志泄露 API Key"
 fi
 grep -Fq 'publish:workflow' "$MOCK_DOCKER_LOG" || fail "安装未发布 n8n workflow"
+grep -Fq 'info' "$MOCK_DOCKER_LOG" || fail "安装未检查 Docker daemon"
+grep -Fq '安装与健康检查完成' "$INSTALL_LOG" || fail "安装未完成最终健康检查"
 pass "安装与 Provider 自动检测"
+
+if env MOCK_DOCKER_DAEMON_FAIL=1 "${PROJECT_ROOT}/install.sh" \
+  --deploy-dir "$DOCKER_FAILURE_DEPLOY_DIR" --non-interactive \
+  > "${TEST_ROOT}/docker-daemon-failure.log" 2>&1; then
+  fail "Docker daemon 不可连接时安装被错误报告为成功"
+fi
+grep -Fq '无法连接 Docker daemon' "${TEST_ROOT}/docker-daemon-failure.log" \
+  || fail "Docker daemon 失败没有清晰提示"
+[[ ! -e "$DOCKER_FAILURE_DEPLOY_DIR" ]] || fail "Docker 预检失败后仍创建了部署目录"
+pass "Docker daemon 安装前预检失败路径"
 
 if env MOCK_DOCKER_FAIL_IMPORT=1 bash -c \
   "set -euo pipefail; source \"\$1/scripts/common.sh\"; import_and_publish_workflow \"\$1\"" \
@@ -198,16 +213,24 @@ grep -Fq 'chat_completions: false' "${FAILURE_DEPLOY_DIR}/config/provider.yaml" 
 pass "AI Provider 失败回退"
 
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.pdf"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
 bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync \"\$1\"; knowledge_reindex \"\$1\"" \
   -- "$DEPLOY_DIR" > "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.files["test-knowledge.md"].locations | length > 0' \
   "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "知识文件未写入同步清单"
-rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md"
+jq -e '
+  (.files | keys | sort) == ["test-knowledge.docx","test-knowledge.md","test-knowledge.pdf","test-knowledge.txt"] and
+  ([.files[].locations | length] | all(. > 0))
+' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "四种知识文件格式未全部写入同步清单"
+rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt" \
+  "${DEPLOY_DIR}/knowledge/test-knowledge.pdf" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
 bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync \"\$1\"" \
   -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "删除知识文件后未清理索引清单"
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
-pass "知识库添加、同步、重新索引与删除"
+pass "Markdown、TXT、PDF、DOCX 知识库同步入口、重新索引与删除"
 
 printf '%s\n' \
   '{"type":"question","at":"2026-09-04T00:00:00Z"}' \
@@ -265,24 +288,71 @@ cp -- "${TEST_ROOT}/provider.safe.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 pass "备份敏感字段拒绝"
 
 printf 'rollback-state-before\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
+FREE_KIB=$(df -Pk -- "${DEPLOY_DIR}/backups/versions" | awk 'NR == 2 { print $4 }')
+INSUFFICIENT_RESERVE_MB=$((FREE_KIB / 1024 + 2048))
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_MIN_FREE_MB "$2"' \
+  -- "$DEPLOY_DIR" "$INSUFFICIENT_RESERVE_MB"
+SNAPSHOT_COUNT_BEFORE=$(find "${DEPLOY_DIR}/backups/versions" -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l)
+if "${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason insufficient-space \
+  > "${TEST_ROOT}/snapshot-capacity-failure.log" 2>&1; then
+  fail "空间不足时仍创建了版本快照"
+fi
+grep -Fq '版本快照空间不足' "${TEST_ROOT}/snapshot-capacity-failure.log" || fail "空间不足没有清晰提示"
+SNAPSHOT_COUNT_AFTER=$(find "${DEPLOY_DIR}/backups/versions" -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l)
+[[ "$SNAPSHOT_COUNT_BEFORE" == "$SNAPSHOT_COUNT_AFTER" ]] || fail "容量预检失败后留下了版本快照"
+: > "$MOCK_DOCKER_LOG"
+if "${DEPLOY_DIR}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/update-capacity-failure.log" 2>&1; then
+  fail "快照空间不足时更新被错误报告为成功"
+fi
+grep -Fq '版本快照空间不足' "${TEST_ROOT}/update-capacity-failure.log" || fail "更新未报告快照空间不足"
+if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
+  fail "容量预检失败后仍停止了服务"
+fi
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_MIN_FREE_MB 0' \
+  -- "$DEPLOY_DIR"
+"${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --check-capacity \
+  > "${TEST_ROOT}/snapshot-capacity-success.log" 2>&1
+grep -Fq '快照容量预检通过' "${TEST_ROOT}/snapshot-capacity-success.log" || fail "容量预检成功未输出依据"
+pass "版本快照容量预检"
+
 SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason test-manual --quiet)
 SNAPSHOT_LIST=$(tar -tzf "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/snapshot.tar.gz")
 if grep -Eq '(^|/)\.env$|data/analytics' <<< "$SNAPSHOT_LIST"; then
   fail "版本快照包含 .env 或匿名统计"
 fi
 grep -Fq 'payload/data/anythingllm/rollback-state.txt' <<< "$SNAPSHOT_LIST" || fail "版本快照未包含 AnythingLLM 数据"
+jq -e '.capacity.min_free_mb == 0 and .capacity.estimated_source_kib > 0 and .retention_count == 10' \
+  "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/manifest.json" >/dev/null || fail "快照清单未记录容量与保留策略"
 printf 'rollback-state-after\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
 printf '临时回滚 Prompt\n' > "${DEPLOY_DIR}/config/prompt.md"
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_RETENTION_COUNT 1' \
+  -- "$DEPLOY_DIR"
 "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --snapshot "$SNAPSHOT_ID" \
-  --skip-start --no-safety-snapshot > "${TEST_ROOT}/rollback.log" 2>&1
+  --skip-start > "${TEST_ROOT}/rollback.log" 2>&1
 grep -Fq 'rollback-state-before' "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt" || fail "AnythingLLM 数据未回滚"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "配置未随版本快照回滚"
-"${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list | grep -Fq "$SNAPSHOT_ID" || fail "版本历史未列出快照"
-pass "版本快照、AnythingLLM 数据与手动回滚"
+SNAPSHOT_HISTORY=$("${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list)
+grep -Fq "$SNAPSHOT_ID" <<< "$SNAPSHOT_HISTORY" || fail "版本历史未列出快照"
+grep -Fq '受保护快照使历史数量暂时超过保留上限' "${TEST_ROOT}/rollback.log" || fail "回滚目标未受保留策略保护"
+pass "版本快照、AnythingLLM 数据与受保护手动回滚"
+
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_RETENTION_COUNT 2' \
+  -- "$DEPLOY_DIR"
+for reason in retention-a retention-b retention-c; do
+  RETAINED_SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "$reason" --quiet)
+done
+RETAINED_COUNT=$(find "${DEPLOY_DIR}/backups/versions" -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l)
+[[ "$RETAINED_COUNT" == 2 ]] || fail "版本快照保留数量不是 2"
+[[ -d "${DEPLOY_DIR}/backups/versions/${RETAINED_SNAPSHOT_ID}" ]] || fail "保留策略删除了最新版本快照"
+pass "版本快照历史保留数量策略"
 
 printf 'v0.6.0\n' > "${DEPLOY_DIR}/VERSION"
 printf '%s\n' '{"handoff":{"keywords":["人工","客服","真人"],"resume_keywords":["恢复AI"],"topic_keywords":{"payment":["付款"]},"resume_after_seconds":1800,"on_operator_message":true,"on_low_confidence":true,"on_no_answer":true,"confirmation":"已为您转接人工客服，AI 将暂停回复。","no_answer_message":"知识库暂时没有足够信息，已为您转接人工客服。","low_confidence_message":"当前答案可信度不足，已为您转接人工客服。","failure_message":"当前自动客服暂时不可用，已为您转接人工客服。","low_confidence":{"require_sources":true,"minimum_score":0.25}}}' \
   > "${DEPLOY_DIR}/config/handoff.yaml"
+printf '%s\n' '{"tags":{"enabled":true,"ai_resolved":"customer_resolved","knowledge_miss":"knowledge-miss","low_confidence":"low-confidence","human_required":"human-required"}}' \
+  > "${DEPLOY_DIR}/config/tags.yaml"
+sed -i '/^SNAPSHOT_MIN_FREE_MB=/d; /^SNAPSHOT_RETENTION_COUNT=/d' "${DEPLOY_DIR}/.env"
 rm -f -- "${DEPLOY_DIR}/scripts/analytics.sh" "${DEPLOY_DIR}/scripts/snapshot.sh" "${DEPLOY_DIR}/scripts/rollback.sh"
 if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
@@ -291,21 +361,31 @@ if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
 fi
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "更新失败后未恢复旧版本"
 grep -Fq '已自动回滚到更新前版本' "${TEST_ROOT}/update-rollback.log" || fail "更新失败未报告自动回滚"
+[[ "$(sed -n 's/^SNAPSHOT_MIN_FREE_MB=//p' "${DEPLOY_DIR}/.env")" == 1024 ]] || fail "旧部署未补齐快照预留空间"
+[[ "$(sed -n 's/^SNAPSHOT_RETENTION_COUNT=//p' "${DEPLOY_DIR}/.env")" == 10 ]] || fail "旧部署未补齐快照保留数量"
 pass "更新失败自动回滚"
 
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull --skip-start \
   > "${TEST_ROOT}/update.log" 2>&1
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.1 ]] || fail "更新后版本错误"
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.7.0 ]] || fail "更新后版本错误"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
 jq -e '
   .handoff.disable_ai == true and .handoff.notify_user.enabled == true and
   (.handoff.keywords | index("转人工") != null) and
+  (.handoff.keywords | index("真人") != null) and
+  .handoff.message == "正在为您转接人工客服，请稍候。" and
   (.handoff | has("topic_keywords") | not) and
   (.handoff | has("on_low_confidence") | not) and
   (.handoff.no_answer_message | contains("转接人工") | not)
 ' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null || fail "旧人工接管配置未安全迁移"
+jq -e '
+  .tags.ai_resolved == "customer_resolved" and
+  .tags.knowledge_miss == "knowledge_miss" and
+  .tags.low_confidence == "low_confidence" and
+  .tags.human_required == "human_required"
+' "${DEPLOY_DIR}/config/tags.yaml" >/dev/null || fail "旧默认标签未安全迁移"
 [[ -n "$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f -name 'pre-update-*.tar.gz' -print -quit)" ]] \
   || fail "更新前未创建备份"
 [[ -n "$(find "${DEPLOY_DIR}/backups/versions" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] \

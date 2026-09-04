@@ -36,7 +36,7 @@ Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/
 
 ## 人工接管
 
-`handoff.yaml` 的 `keywords` 是唯一的自动识别入口，默认包含“人工”“人工客服”“转人工”和“真人客服”。关键词列表完全来自配置，工作流不内置业务主题词。访客命中关键词或明确选择菜单中的人工选项后，工作流先按 `notify_user.enabled` 回复 `message`，再按 `disable_ai` 关闭当前 conversation 的 AI，并添加人工标签。
+`handoff.yaml` 的 `keywords` 是唯一的自动识别入口，默认包含“人工”“人工客服”“转人工”“真人”和“真人客服”。关键词列表完全来自配置，工作流不内置业务主题词。访客命中关键词或明确选择菜单中的人工选项后，工作流先按 `notify_user.enabled` 回复“正在为您转接人工客服，请稍候。”，再按 `disable_ai` 关闭当前 conversation 的 AI，并添加人工标签。
 
 真实 operator 回复也会立即关闭当前 conversation 的 AI。接管期间访客消息仍可进入有限会话历史，但不会触发 AI 回复。`resume_after_seconds` 到期后，AI 会在下一条访客消息恢复；设为 `0` 表示只允许 operator 发送 `resume_keywords` 中的控制词恢复。
 
@@ -44,7 +44,7 @@ Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/
 
 ## Conversation 标签
 
-`tags.yaml` 配置项目管理的四类标签：`ai_resolved`、`knowledge_miss`、`low_confidence` 和 `human_required`。标签值不得包含空格或控制字符；设 `enabled` 为 `false` 可关闭自动标签。
+`tags.yaml` 配置项目管理的四类标签，默认值分别是 `ai_resolved`、`knowledge_miss`、`low_confidence` 和 `human_required`。标签值不得包含空格或控制字符；设 `enabled` 为 `false` 可关闭自动标签。
 
 更新标签时，工作流先读取 Crisp conversation 当前 `segments`，保留所有非本项目管理的标签，再替换项目管理标签。读取失败时会跳过更新，避免误清空已有标签。Website Token 或 Plugin Token 必须具备读取和修改 conversation meta 的权限。
 
@@ -60,6 +60,12 @@ Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/
 sudo /opt/crisp-ai/scripts/analytics.sh knowledge
 sudo /opt/crisp-ai/scripts/analytics.sh feedback
 ```
+
+## 版本快照
+
+`.env` 中的 `SNAPSHOT_MIN_FREE_MB` 控制快照完成后必须保留的空间，默认 `1024` MiB。容量预检按待复制数据的两倍加预留空间保守估算，以覆盖临时副本和压缩归档同时存在的阶段。
+
+`SNAPSHOT_RETENTION_COUNT` 控制有效版本快照的最大数量，默认 `10`。设为 `0` 表示不自动清理。自定义值会在重复安装时保留；升级会为旧部署补齐缺失的默认值。
 
 ## Prompt
 

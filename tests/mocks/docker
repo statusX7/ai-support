@@ -19,6 +19,15 @@ if [[ "${1:-}" == image ]]; then
   esac
 fi
 
+if [[ "${1:-}" == info ]]; then
+  if [[ "${MOCK_DOCKER_DAEMON_FAIL:-0}" == 1 ]]; then
+    printf '无法连接测试 Docker daemon\n' >&2
+    exit 1
+  fi
+  printf 'Docker daemon 测试桩可用\n'
+  exit 0
+fi
+
 [[ "${1:-}" == compose ]] || {
   printf 'docker 测试桩只支持 compose 或 image\n' >&2
   exit 2

@@ -3,7 +3,7 @@
 ## 前置条件
 
 - 64 位 Linux 主机与 root 权限。
-- Docker Engine、Docker Compose v2、`curl`、`jq`、`openssl`、`tar`、`git` 和 `sha256sum`。
+- 已启动的 Docker Engine、Docker Compose v2、`curl`、`jq`、`openssl`、`tar`、`git`、`df`、`du` 和 `sha256sum`。
 - 一个可用的 Crisp Website Token 或 Plugin Token。
 - 一个支持 OpenAI Compatible API 的服务。
 - 一个带有效 TLS 证书的公网域名，用于接收 Crisp Webhook。
@@ -17,6 +17,8 @@ sudo ./install.sh
 ```
 
 默认部署到 `/opt/crisp-ai`。安装程序会依次要求 API Base URL 和 API Key，调用 `/v1/models` 后显示模型列表，再检测 `/v1/responses` 与 `/v1/chat/completions`。只有模型列表检测失败时，才会提供手动模型或默认模型选项。
+
+安装程序会在写入部署目录前确认 Docker Compose 与 Docker daemon 可用。启动后会等待 PostgreSQL、AnythingLLM 和 n8n 及其本地健康接口；如果已经提供 AnythingLLM Developer API Key，还会同步 Prompt、发布 workflow，并验证 Provider、Crisp 与 AnythingLLM API。任一必需步骤失败都会以非零状态退出并给出明确错误。
 
 指定其他目录：
 
@@ -78,7 +80,7 @@ sudo /opt/crisp-ai/scripts/healthcheck.sh --local
 
 ## 更新与回滚
 
-管理菜单中的“更新系统”会先停止 n8n 与 AnythingLLM 写入，创建迁移备份和本机版本快照，再执行源码拉取、镜像拉取、重启、workflow 发布和本地健康检查。任何关键步骤失败都会自动恢复更新前快照。
+管理菜单中的“更新系统”会先执行快照容量预检，再停止 n8n 与 AnythingLLM 写入，创建迁移备份和本机版本快照，然后执行源码拉取、镜像拉取、重启、workflow 发布和本地健康检查。快照创建时会再次检查容量；任何关键步骤失败都会自动恢复更新前快照。
 
 从旧版升级时，脚本会幂等补齐 `handoff.yaml` 的新字段，并只把 `v0.6.0` 的旧默认关键词和默认提示迁移为新语义；自定义关键词、恢复时间与自定义提示会保留。
 
@@ -91,4 +93,6 @@ sudo /opt/crisp-ai/scripts/rollback.sh --snapshot <快照ID>
 
 回滚保留现有 `.env`、PostgreSQL、n8n 数据库、匿名统计和历史快照。如果对应历史镜像已从本机删除，脚本只能恢复文件与数据，可能仍需从镜像仓库重新取得旧镜像。
 
-从不含快照脚本的 `v0.6.0` 首次升级到本版本时，应从独立的新源码目录运行新版 `update.sh --deploy-dir <现有部署目录> --source-dir <新源码目录> --no-pull`；新版脚本会从源码调用首个快照工具。旧版 `update.sh` 本身无法预先提供新增的自动回滚能力。
+`.env` 中的 `SNAPSHOT_MIN_FREE_MB` 默认是 `1024`，表示创建快照后仍需保留的最低空间；`SNAPSHOT_RETENTION_COUNT` 默认是 `10`，表示最多保留的有效快照数。任一值设为 `0` 会关闭对应限制。超过数量时最旧快照会被永久删除；正在用于回滚的目标快照会受到保护。
+
+从 `v0.6.x` 首次升级到 `v0.7.0` 时，应从独立的新源码目录运行新版 `update.sh --deploy-dir <现有部署目录> --source-dir <新源码目录> --no-pull`。这样升级前即可使用新版容量预检、快照和回滚逻辑；已安装的旧版 `update.sh` 无法在自身开始执行前获得这些保护。

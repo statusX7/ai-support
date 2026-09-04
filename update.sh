@@ -81,12 +81,22 @@ fi
 
 OLD_VERSION=$(<"${DEPLOY_DIR}/VERSION")
 [[ "$OLD_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "当前 VERSION 格式无效"
-SNAPSHOT_SCRIPT="${DEPLOY_DIR}/scripts/snapshot.sh"
-ROLLBACK_SCRIPT="${DEPLOY_DIR}/scripts/rollback.sh"
-if [[ ! -x "$SNAPSHOT_SCRIPT" ]]; then SNAPSHOT_SCRIPT="${SOURCE_DIR}/scripts/snapshot.sh"; fi
-if [[ ! -x "$ROLLBACK_SCRIPT" ]]; then ROLLBACK_SCRIPT="${SOURCE_DIR}/scripts/rollback.sh"; fi
+SNAPSHOT_SCRIPT="${SOURCE_DIR}/scripts/snapshot.sh"
+ROLLBACK_SCRIPT="${SOURCE_DIR}/scripts/rollback.sh"
+if [[ ! -x "$SNAPSHOT_SCRIPT" ]]; then SNAPSHOT_SCRIPT="${DEPLOY_DIR}/scripts/snapshot.sh"; fi
+if [[ ! -x "$ROLLBACK_SCRIPT" ]]; then ROLLBACK_SCRIPT="${DEPLOY_DIR}/scripts/rollback.sh"; fi
 [[ -x "$SNAPSHOT_SCRIPT" && -x "$ROLLBACK_SCRIPT" ]] \
   || die "当前部署和源码均缺少可执行的快照或回滚脚本"
+
+SNAPSHOT_MIN_FREE_MB_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_MIN_FREE_MB 2>/dev/null || true)
+SNAPSHOT_RETENTION_COUNT_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_RETENTION_COUNT 2>/dev/null || true)
+if [[ -z "$SNAPSHOT_MIN_FREE_MB_VALUE" ]]; then
+  env_set "${DEPLOY_DIR}/.env" SNAPSHOT_MIN_FREE_MB 1024
+fi
+if [[ -z "$SNAPSHOT_RETENTION_COUNT_VALUE" ]]; then
+  env_set "${DEPLOY_DIR}/.env" SNAPSHOT_RETENTION_COUNT 10
+fi
+"$SNAPSHOT_SCRIPT" --deploy-dir "$DEPLOY_DIR" --check-capacity
 
 rollback_on_failure() {
   local status=$?
@@ -110,8 +120,7 @@ rollback_on_failure() {
 trap rollback_on_failure EXIT
 
 if (( SKIP_START == 0 )); then
-  require_command docker
-  docker compose version >/dev/null 2>&1 || die "未检测到 Docker Compose v2"
+  require_docker_runtime
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" stop n8n anythingllm
   SERVICES_STOPPED=1
