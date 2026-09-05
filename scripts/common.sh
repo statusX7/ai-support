@@ -422,20 +422,21 @@ docker_compose() {
 
 wait_for_local_health() {
   local deploy_dir=$1
-  local attempts=${2:-}
+  local timeout_seconds=${2:-}
   local interval=${3:-}
-  local n8n_port anything_port running
+  local n8n_port anything_port running deadline remaining
 
-  if [[ -z "$attempts" ]]; then
-    attempts=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_ATTEMPTS 2>/dev/null || true)
-    [[ "$attempts" =~ ^[0-9]+$ && $attempts -ge 6 && $attempts -le 360 ]] || attempts=180
+  if [[ -z "$timeout_seconds" ]]; then
+    timeout_seconds=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_TIMEOUT_SECONDS 2>/dev/null || true)
+    [[ "$timeout_seconds" =~ ^[0-9]+$ && $timeout_seconds -ge 1 && $timeout_seconds -le 3600 ]] \
+      || timeout_seconds=1800
   fi
   if [[ -z "$interval" ]]; then
     interval=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
     [[ "$interval" =~ ^[0-9]+$ && $interval -ge 1 && $interval -le 30 ]] || interval=5
   fi
-  [[ "$attempts" =~ ^[0-9]+$ && $attempts -ge 1 && $attempts -le 360 ]] \
-    || die "本地健康检查次数必须是 1 到 360 的整数"
+  [[ "$timeout_seconds" =~ ^[0-9]+$ && $timeout_seconds -ge 1 && $timeout_seconds -le 3600 ]] \
+    || die "本地健康检查总时限必须是 1 到 3600 秒的整数"
   [[ "$interval" =~ ^[0-9]+$ && $interval -ge 1 && $interval -le 30 ]] \
     || die "本地健康检查间隔必须是 1 到 30 秒的整数"
 
@@ -444,7 +445,8 @@ wait_for_local_health() {
   docker_compose "$deploy_dir" config --quiet
   n8n_port=$(env_get "${deploy_dir}/.env" N8N_PORT 2>/dev/null || printf '5678')
   anything_port=$(env_get "${deploy_dir}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
-  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+  deadline=$((SECONDS + timeout_seconds))
+  while :; do
     running=$(docker_compose "$deploy_dir" ps --services --filter status=running 2>/dev/null || true)
     if grep -Fxq postgres <<< "$running" \
       && grep -Fxq anythingllm <<< "$running" \
@@ -453,9 +455,15 @@ wait_for_local_health() {
       && curl --silent --fail --connect-timeout 3 --max-time 10 "http://127.0.0.1:${anything_port}/api/ping" >/dev/null 2>&1; then
       return 0
     fi
-    sleep "$interval"
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    if (( interval < remaining )); then
+      sleep "$interval"
+    else
+      sleep "$remaining"
+    fi
   done
-  warn "本地服务健康检查超时（${attempts} 次，每次间隔 ${interval} 秒）"
+  warn "本地服务健康检查超时（总时限 ${timeout_seconds} 秒）"
   return 1
 }
 
@@ -648,8 +656,8 @@ migrate_runtime_env() {
   value=$(env_get "$env_file" CADDY_IMAGE 2>/dev/null || true)
   [[ -n "$value" ]] || env_set "$env_file" CADDY_IMAGE caddy:2.10.2-alpine
 
-  value=$(env_get "$env_file" LOCAL_HEALTH_ATTEMPTS 2>/dev/null || true)
-  [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_ATTEMPTS 180
+  value=$(env_get "$env_file" LOCAL_HEALTH_TIMEOUT_SECONDS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_TIMEOUT_SECONDS 1800
   value=$(env_get "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
   [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 5
 
