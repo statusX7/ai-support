@@ -143,13 +143,16 @@ assert_contains "${PROJECT_ROOT}/manage.sh" \
   "manage.sh 的首次安装入口未调用同目录 install.sh"
 read -r CRISP_CHECK_LINE READY_MARKER_LINE LOCAL_READY_MARKER_LINE WIZARD_CLEANUP_LINE < <(awk '
   index($0, "if crisp_api_check") { crisp_check_line = NR }
-  crisp_check_line > 0 && index($0, "write_installation_marker") && $0 ~ / ready/ {
+  crisp_check_line > 0 && ready_line == 0 \
+    && index($0, "write_installation_marker") && $0 ~ / ready/ {
     ready_line = NR
   }
-  crisp_check_line > 0 && index($0, "write_installation_marker") && $0 ~ / local-ready/ {
+  crisp_check_line > 0 && local_ready_line == 0 \
+    && index($0, "write_installation_marker") && $0 ~ / local-ready/ {
     local_ready_line = NR
   }
-  crisp_check_line > 0 && index($0, "WIZARD_RESULT") && tolower($0) ~ /(rm|remove|delete|cleanup)/ {
+  crisp_check_line > 0 && local_ready_line > 0 && cleanup_line == 0 \
+    && index($0, "WIZARD_RESULT") && tolower($0) ~ /(rm|remove|delete|cleanup)/ {
     cleanup_line = NR
   }
   END { print crisp_check_line + 0, ready_line + 0, local_ready_line + 0, cleanup_line + 0 }

@@ -37,7 +37,7 @@ Website Hook 本身不提供签名，因此必须在 Webhook URL 中携带独立
 
 安装标记经历 `collecting`、`installing` 或 `staged`。Docker、本地容器、Provider、AnythingLLM、Prompt/知识和已发布 workflow 通过后，可进入 `local-ready`；Crisp REST 凭据通过后进入 `ready`。依赖、本地服务、应用配置、Provider、Crisp API、Webhook 和真实 conversation 分别记录 fact，避免把容器启动与客户链路混为一谈。所有变更性维护操作通过同一文件锁串行执行。
 
-n8n 与 AnythingLLM 始终绑定回环地址；PostgreSQL 仅在后端网络。选择受管 HTTPS 时，Compose 的 `managed-https` profile 启动 Caddy并公开 80/443，但 Caddyfile 只转发 `/webhook/crisp-webhook`。选择已有反向代理时不启用该 profile；模式切换只清理本项目 Caddy 容器。
+n8n 与 AnythingLLM 始终绑定回环地址；PostgreSQL 仅在后端网络。选择受管 HTTPS 时，Compose 的 `managed-https` profile 启动 Caddy 并公开 80/443，但 Caddyfile 只转发 `/webhook/crisp-webhook`。选择已有反向代理时不启用该 profile；模式切换只清理本项目 Caddy 容器。
 
 默认卸载是可恢复的生命周期状态：容器、网络和程序文件被移除，安装标记变为 `uninstalled-data-kept`，但权限受限的 `.env`、业务配置、知识文件、数据库、AnythingLLM 数据、备份和日志保留在部署目录。必须从新的可信源码副本重新运行 `install.sh` 才能恢复服务。完整清理属于独立的破坏性流程，需要普通确认和精确输入 `PURGE` 两次确认；其迁移备份始终写到部署目录同级。
 
