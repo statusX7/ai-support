@@ -31,8 +31,22 @@ if [[ "${1:-}" == info ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == container && "${2:-}" == ls ]]; then
+  if [[ "${MOCK_DOCKER_REMAINING_CONTAINERS:-0}" == 1 ]]; then
+    printf 'crisp-ai-test-n8n-1\n'
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == network && "${2:-}" == ls ]]; then
+  if [[ "${MOCK_DOCKER_REMAINING_NETWORKS:-0}" == 1 ]]; then
+    printf 'crisp-ai-test_backend\n'
+  fi
+  exit 0
+fi
+
 [[ "${1:-}" == compose ]] || {
-  printf 'docker 测试桩只支持 compose 或 image\n' >&2
+  printf 'docker 测试桩不支持命令：%s\n' "$*" >&2
   exit 2
 }
 shift
@@ -62,6 +76,8 @@ case "$COMMAND" in
   config)
     if [[ "$*" == *'--images'* ]]; then
       printf 'postgres:16.10-alpine\nmintplexlabs/anythingllm:1.16.1\ndocker.n8n.io/n8nio/n8n:2.33.0\n'
+    elif [[ "$*" == *'--format json'* ]]; then
+      printf '{"name":"crisp-ai-test"}\n'
     fi
     exit 0
     ;;

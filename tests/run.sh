@@ -732,22 +732,24 @@ for output_heading in 删除内容 保留内容 恢复方式; do
 done
 pass "默认安全卸载自动备份、停止服务并保留可恢复数据"
 
+install -m 0600 -- "${DEPLOY_DIR}/.env" "${TEST_ROOT}/preserved-env"
+sed -i 's/^AI_API_KEY=.*/AI_API_KEY=pending-provider-key/' "${DEPLOY_DIR}/.env"
+if "${PROJECT_ROOT}/install.sh" --deploy-dir "$DEPLOY_DIR" --non-interactive \
+  > "${TEST_ROOT}/reinstall-invalid-preserved-config.log" 2>&1; then
+  fail "安全卸载保留占位凭据时重装未安全中止"
+fi
+grep -Fq -- '--reconfigure' "${TEST_ROOT}/reinstall-invalid-preserved-config.log" \
+  || fail "保留配置无效时未明确要求 --reconfigure"
+grep -Fxq 'state=uninstalled-data-kept' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "保留配置验证失败后卸载状态被改写"
+[[ ! -e "${DEPLOY_DIR}/install.sh" && ! -e "${DEPLOY_DIR}/docker-compose.yml" ]] \
+  || fail "保留配置验证失败后程序文件被提前恢复"
+install -m 0600 -- "${TEST_ROOT}/preserved-env" "${DEPLOY_DIR}/.env"
+pass "安全卸载保留配置缺失或占位时要求重新配置"
+
 : > "$MOCK_DOCKER_LOG"
-env \
-  AI_API_BASE_URL=https://provider.invalid \
-  AI_API_KEY="$TEST_PROVIDER_KEY" \
-  AI_MODEL=gpt-vision-test \
-  AI_SUPPORTS_VISION=true \
-  CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111 \
-  CRISP_TOKEN_TIER=website \
-  CRISP_TOKEN_IDENTIFIER=test-only-identifier \
-  CRISP_TOKEN_KEY="$TEST_CRISP_KEY" \
-  ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" \
-  N8N_HOST=support.example.invalid \
-  PUBLIC_WEBHOOK_URL=https://support.example.invalid/ \
-  TIMEZONE=UTC \
-  "${PROJECT_ROOT}/install.sh" \
-    --deploy-dir "$DEPLOY_DIR" --non-interactive > "${TEST_ROOT}/reinstall-after-uninstall.log" 2>&1
+"${PROJECT_ROOT}/install.sh" --deploy-dir "$DEPLOY_DIR" --non-interactive \
+  > "${TEST_ROOT}/reinstall-after-uninstall.log" 2>&1
 [[ -f "${DEPLOY_DIR}/manage.sh" && -f "${DEPLOY_DIR}/docker-compose.yml" \
   && -f "${DEPLOY_DIR}/n8n/workflow.json" ]] || fail "安全卸载后同路径重装未恢复程序"
 grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
@@ -761,6 +763,9 @@ grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
   && -f "${DEPLOY_DIR}/data/uninstall-preserve.txt" ]] \
   || fail "安全卸载后同路径重装未保留数据"
 grep -Eq '(^| )up( |$)' "$MOCK_DOCKER_LOG" || fail "安全卸载后重装未重新启动服务"
+grep -Fq '已验证安全卸载保留的 .env 与实际配置' \
+  "${TEST_ROOT}/reinstall-after-uninstall.log" \
+  || fail "安全卸载后重装未明确说明已验证并复用保留配置"
 pass "安全卸载后同路径重装与数据恢复"
 
 : > "$MOCK_DOCKER_LOG"
@@ -790,6 +795,32 @@ pass "彻底卸载要求普通确认及不可绕过的 PURGE 二次确认"
 
 PURGE_ENV_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')
 PURGE_PROMPT_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')
+: > "$MOCK_DOCKER_LOG"
+if printf 'y\nPURGE\n' | env MOCK_DOCKER_REMAINING_NETWORKS=1 \
+  "${PLUGIN_DEPLOY_DIR}/uninstall.sh" --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
+  > "${TEST_ROOT}/uninstall-network-residual.log" 2>&1; then
+  fail "Docker Compose down 返回 0 但网络残留时完整清理被错误报告为成功"
+fi
+[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  && -f "${PLUGIN_DEPLOY_DIR}/docker-compose.yml" ]] \
+  || fail "Compose 网络残留时服务程序被破坏"
+[[ "$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')" == "$PURGE_ENV_HASH" ]] \
+  || fail "Compose 网络残留时 .env 被改写"
+[[ "$(sha256sum "${PLUGIN_DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PURGE_PROMPT_HASH" ]] \
+  || fail "Compose 网络残留时配置被改写"
+grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" \
+  || fail "Compose 网络残留路径未实际执行 down"
+grep -Eq '^network ls .*com\.docker\.compose\.project=' "$MOCK_DOCKER_LOG" \
+  || fail "Compose down 后未核验项目网络"
+if grep -Eq '^(container|network) (rm|remove)( |$)' "$MOCK_DOCKER_LOG"; then
+  fail "Compose 网络残留时试图强制删除外部容器或网络"
+fi
+grep -Fq '网络可能被外部容器占用' "${TEST_ROOT}/uninstall-network-residual.log" \
+  || fail "Compose 网络残留时未说明可能原因"
+grep -Fq '自动备份位于' "${TEST_ROOT}/uninstall-network-residual.log" \
+  || fail "Compose 网络残留时未说明自动备份位置"
+pass "Compose down 返回 0 但项目网络残留时安全中止"
+
 : > "$MOCK_DOCKER_LOG"
 if printf 'y\nPURGE\n' | env MOCK_DOCKER_FAIL_DOWN=1 "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
   --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \

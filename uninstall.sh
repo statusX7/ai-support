@@ -108,8 +108,34 @@ info "卸载前创建不含密钥的自动备份"
 
 # 容器或网络未能完整移除时必须中止，禁止在仍有进程占用数据时继续删除文件。
 require_docker_runtime
+require_command jq
+COMPOSE_PROJECT_NAME_VALUE=$(
+  docker_compose "$DEPLOY_DIR" config --format json \
+    | jq -er '.name | select(type == "string" and length > 0)'
+) || die "无法确定 Docker Compose 项目名；已安全中止文件清理，自动备份位于：$BACKUP_FILE"
+[[ "$COMPOSE_PROJECT_NAME_VALUE" =~ ^[a-z0-9][a-z0-9_-]*$ ]] \
+  || die "Docker Compose 项目名无效；已安全中止文件清理，自动备份位于：$BACKUP_FILE"
 if ! docker_compose "$DEPLOY_DIR" down --remove-orphans; then
   die "Docker 容器或网络删除失败；已安全中止文件清理，自动备份位于：$BACKUP_FILE"
+fi
+
+# Compose 可能在外部容器仍占用项目网络时输出错误却返回 0。不能因此误删程序或外部容器。
+if ! REMAINING_COMPOSE_CONTAINERS=$(docker container ls --all \
+  --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME_VALUE}" \
+  --format '{{.Names}}'); then
+  die "无法核验 Docker 容器清理结果；已安全中止文件清理，自动备份位于：$BACKUP_FILE"
+fi
+if ! REMAINING_COMPOSE_NETWORKS=$(docker network ls \
+  --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME_VALUE}" \
+  --format '{{.Name}}'); then
+  die "无法核验 Docker 网络清理结果；已安全中止文件清理，自动备份位于：$BACKUP_FILE"
+fi
+if [[ -n "$REMAINING_COMPOSE_CONTAINERS" || -n "$REMAINING_COMPOSE_NETWORKS" ]]; then
+  [[ -z "$REMAINING_COMPOSE_CONTAINERS" ]] \
+    || warn "仍存在本 Compose 项目容器：${REMAINING_COMPOSE_CONTAINERS//$'\n'/, }"
+  [[ -z "$REMAINING_COMPOSE_NETWORKS" ]] \
+    || warn "仍存在本 Compose 项目网络：${REMAINING_COMPOSE_NETWORKS//$'\n'/, }"
+  die "Docker Compose 清理未完成，网络可能被外部容器占用；未删除任何外部容器，也未删除程序文件。请先分离占用者后重试，自动备份位于：$BACKUP_FILE"
 fi
 
 if [[ "$MODE" == purge ]]; then

@@ -31,7 +31,7 @@
 - Provider：`AI_SUPPORT_E2E_PROVIDER_BASE_URL`、`AI_SUPPORT_E2E_PROVIDER_API_KEY`、`AI_SUPPORT_E2E_PROVIDER_MODEL`；使用 Responses 时再设 `AI_SUPPORT_E2E_PROVIDER_API_MODE=responses`。
 - AnythingLLM：`AI_SUPPORT_E2E_ANYTHINGLLM_BASE_URL`、`AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY`、`AI_SUPPORT_E2E_ANYTHINGLLM_WORKSPACE`。
 - Crisp：`AI_SUPPORT_E2E_CRISP_WEBSITE_ID`、`AI_SUPPORT_E2E_CRISP_TOKEN_TIER`、`AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER`、`AI_SUPPORT_E2E_CRISP_TOKEN_KEY`。
-- 会话与图片：`AI_SUPPORT_E2E_TEXT_SESSION_ID`、`AI_SUPPORT_E2E_OPERATOR_SESSION_ID`、`AI_SUPPORT_E2E_HANDOFF_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_URL`。
+- 会话与图片：`AI_SUPPORT_E2E_TEXT_SESSION_ID`、`AI_SUPPORT_E2E_OPERATOR_SESSION_ID`、`AI_SUPPORT_E2E_HANDOFF_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_URL`、`AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT`。测试图片必须清晰展示最后一个变量指定的 6 到 128 位唯一安全标识；测试只比较该标识，不输出图片或回复正文。
 
 变量就绪后，在该 root shell 中运行：
 
@@ -138,8 +138,8 @@ Website Hook 和 Plugin Hook 分别执行一轮，且都订阅 `message:send` �
 
 - 通过管理菜单和命令行分别执行默认安全卸载，确认卸载前在 `backups/uninstall-backup-<UTC时间>-<随机值>.tar.gz` 创建了可校验的迁移备份。
 - 确认本项目容器和 Compose 网络已删除，Compose、程序、脚本和随程序发布的服务配置已移除；`.env`、实际 `config/`、`knowledge/`、`data/`、`backups/`、`logs/` 均保留，`.env` 权限仍为 `0600`，安装状态为 `uninstalled-data-kept`。
-- 从新的可信源码目录对同一路径重新运行 `install.sh`，确认 PostgreSQL、n8n、AnythingLLM、知识索引及原配置可恢复，完整健康检查通过后状态回到 `ready`。
-- 分别模拟 Docker daemon 不可用、Compose 不可用和 `docker compose down` 失败，确认命令非零退出，程序与数据均未删除，且不存在强制离线绕过；即使已生成迁移备份，也不能把该备份误判为卸载完成。
+- 从新的可信源码目录对同一路径重新运行 `install.sh`，不额外传入 Provider/Crisp 环境变量，确认先校验并复用保留的 `.env` 与实际配置；注入缺失项或占位值时必须在改写卸载状态前拒绝并要求 `--reconfigure`。确认 PostgreSQL、n8n、AnythingLLM、知识索引及原配置可恢复，完整健康检查通过后状态回到 `ready`。
+- 分别模拟 Docker daemon 不可用、Compose 不可用、`docker compose down` 失败，以及 `down` 返回成功但外部容器占用导致带本项目标签的网络残留，确认命令非零退出，程序与数据均未删除、不会强制删除外部容器，且不存在强制离线绕过；即使已生成迁移备份，也不能把该备份误判为卸载完成。
 - 在隔离部署中验证完整清理：第一次未输入 `y`/`yes` 或第二次未精确输入 `PURGE` 时目录保持不变；即使指定 `--yes` 也必须完成两次确认。确认后整个部署目录被删除。
 - 确认完整清理前在部署目录同级生成 `crisp-ai-purge-backup-<UTC时间>-<随机值>.tar.gz`，归档校验有效且能导入新部署；确认命令不存在跳过自动备份的选项，并记录该迁移备份不能恢复 `.env`、数据库或 AnythingLLM 运行数据。
 

@@ -36,6 +36,7 @@ REQUIRED_ENV=(
   AI_SUPPORT_E2E_HANDOFF_SESSION_ID
   AI_SUPPORT_E2E_IMAGE_SESSION_ID
   AI_SUPPORT_E2E_IMAGE_URL
+  AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT
 )
 MISSING_ENV=()
 for variable_name in "${REQUIRED_ENV[@]}"; do
@@ -81,12 +82,16 @@ OPERATOR_SESSION=$AI_SUPPORT_E2E_OPERATOR_SESSION_ID
 HANDOFF_SESSION=$AI_SUPPORT_E2E_HANDOFF_SESSION_ID
 IMAGE_SESSION=$AI_SUPPORT_E2E_IMAGE_SESSION_ID
 IMAGE_URL=$AI_SUPPORT_E2E_IMAGE_URL
+IMAGE_EXPECTED_FACT=$AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT
 TIMEOUT_SECONDS=${AI_SUPPORT_E2E_TIMEOUT_SECONDS:-180}
 SETTLE_SECONDS=${AI_SUPPORT_E2E_SETTLE_SECONDS:-20}
 
 safe_base_url "$PROVIDER_BASE" || fail "Provider Base URL 格式无效"
 safe_base_url "$ANYTHING_BASE" || fail "AnythingLLM Base URL 格式无效"
 [[ "$IMAGE_URL" =~ ^https://[^/?#@]+/.+ ]] || fail "图片 URL 必须是 HTTPS"
+[[ "$IMAGE_EXPECTED_FACT" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$ ]] \
+  || fail "图片预期事实标识必须是 6 到 128 位安全字符"
+# 隔离测试图片必须清晰展示该唯一标识；脚本只比较标识，不输出图片或回复正文。
 [[ "$PROVIDER_MODEL" =~ ^[A-Za-z0-9._:/-]{1,256}$ ]] || fail "Provider 模型名称无效"
 [[ "$ANYTHING_WORKSPACE" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || fail "AnythingLLM 工作区无效"
 [[ "$CRISP_WEBSITE_ID" =~ ^[A-Za-z0-9-]{8,128}$ ]] || fail "Crisp Website ID 无效"
@@ -240,39 +245,69 @@ wait_for_ai_count() {
   fail "等待 Crisp AI 回复超时"
 }
 
-wait_for_ai_content() {
+latest_ai_reply_contains() {
   local session_id=$1
   local expected_text=$2
+  local minimum_count=$3
+  local match_status=0
+  crisp_message_snapshot "$session_id"
+  jq -e --arg expected "$expected_text" --argjson minimum "$minimum_count" '
+    [.data[]? | select(
+      .from == "operator" and
+      ((.automated == true) or (.properties.ai_support == true) or
+       ((.properties.ai_support_version // "") != "")))] as $replies
+    | ($replies | length) >= $minimum and
+      (($replies
+        | sort_by(((.timestamp | tonumber?) // 0), ((.fingerprint // "") | tostring))
+        | last
+        | ((.content // "") | tostring)) as $latest
+       | $latest | contains($expected))
+  ' <<< "$HTTP_BODY" >/dev/null || match_status=$?
+  unset HTTP_BODY
+  return "$match_status"
+}
+
+wait_for_latest_ai_content() {
+  local session_id=$1
+  local expected_text=$2
+  local minimum_count=$3
   local started=$SECONDS
   while (( SECONDS - started < TIMEOUT_SECONDS )); do
-    crisp_message_snapshot "$session_id"
-    if jq -e --arg expected "$expected_text" '
-      any(.data[]?;
-        .from == "operator" and
-        ((.automated == true) or (.properties.ai_support == true) or ((.properties.ai_support_version // "") != "")) and
-        ((.content // "") | tostring | contains($expected)))
-    ' <<< "$HTTP_BODY" >/dev/null; then
-      unset HTTP_BODY
-      return 0
-    fi
-    unset HTTP_BODY
+    latest_ai_reply_contains "$session_id" "$expected_text" "$minimum_count" && return 0
     sleep 3
   done
-  fail "Crisp AI 回复未包含预期的非敏感测试标识"
+  fail "Crisp 最新 AI 回复未包含预期的非敏感测试标识"
 }
 
 latest_ai_reply_is_safe() {
   local session_id=$1
+  local expected_fact=$2
+  local minimum_count=$3
+  local configured_failure=$4
   crisp_message_snapshot "$session_id"
-  jq -e '
-    [.data[]? | select(.from == "operator" and ((.automated == true) or (.properties.ai_support == true) or ((.properties.ai_support_version // "") != "")))]
-    | sort_by((.timestamp | tonumber?) // 0)
-    | last
-    | ((.content // "") | tostring) as $reply
-    | ($reply | length) > 0 and
-      ($reply | contains("切换为支持视觉的模型") | not) and
-      ($reply | contains("不支持图片理解") | not) and
-      ($reply | contains("自动客服暂时不可用") | not)
+  jq -e --arg expected "$expected_fact" --arg configured_failure "$configured_failure" \
+    --argjson minimum "$minimum_count" '
+    [.data[]? | select(
+      .from == "operator" and
+      ((.automated == true) or (.properties.ai_support == true) or
+       ((.properties.ai_support_version // "") != "")))] as $replies
+    | ($replies | length) >= $minimum and
+      (($replies
+        | sort_by(((.timestamp | tonumber?) // 0), ((.fingerprint // "") | tostring))
+        | last
+        | ((.content // "") | tostring)) as $reply
+       | ($reply | length) > 0 and
+         ($reply | contains($expected)) and
+         ([
+           "图片地址未通过安全校验",
+           "请重新上传图片",
+           "不支持图片理解",
+           "切换为支持视觉的模型",
+           "自动客服暂时不可用",
+           "请稍后再试",
+           $configured_failure
+         ] | map(select(length > 0))
+           | all(. as $failure_text | ($reply | contains($failure_text) | not))))
   ' <<< "$HTTP_BODY" >/dev/null
   local status=$?
   unset HTTP_BODY
@@ -517,7 +552,7 @@ TEXT_QUESTION="What is the answer for ${MD_MARKER}? Reply with the exact answer 
 crisp_send_text "$TEXT_SESSION" user "$TEXT_QUESTION" "$DUPLICATE_FINGERPRINT"
 crisp_send_text "$TEXT_SESSION" user "$TEXT_QUESTION" "$DUPLICATE_FINGERPRINT"
 wait_for_ai_count "$TEXT_SESSION" "$((TEXT_BASELINE + 1))"
-wait_for_ai_content "$TEXT_SESSION" "$MD_ANSWER"
+wait_for_latest_ai_content "$TEXT_SESSION" "$MD_ANSWER" "$((TEXT_BASELINE + 1))"
 sleep "$SETTLE_SECONDS"
 [[ "$(ai_reply_count "$TEXT_SESSION")" == "$((TEXT_BASELINE + 1))" ]] \
   || fail "相同 Crisp fingerprint 产生了重复 AI 回复"
@@ -525,7 +560,7 @@ CONTEXT_FINGERPRINT=$((DUPLICATE_FINGERPRINT + 1))
 crisp_send_text "$TEXT_SESSION" user \
   '上一条问题的准确答案标识是什么？请只回复该标识。' "$CONTEXT_FINGERPRINT"
 wait_for_ai_count "$TEXT_SESSION" "$((TEXT_BASELINE + 2))"
-wait_for_ai_content "$TEXT_SESSION" "$MD_ANSWER"
+wait_for_latest_ai_content "$TEXT_SESSION" "$MD_ANSWER" "$((TEXT_BASELINE + 2))"
 printf '外部 E2E：文本、同 conversation 上下文与防重复通过。\n'
 
 OPERATOR_BASELINE=$(ai_reply_count "$OPERATOR_SESSION")
@@ -533,7 +568,7 @@ crisp_send_text "$OPERATOR_SESSION" user \
   "What is the answer for ${TXT_MARKER}? Reply with the exact answer token." \
   "$((CONTEXT_FINGERPRINT + 100))"
 wait_for_ai_count "$OPERATOR_SESSION" "$((OPERATOR_BASELINE + 1))"
-wait_for_ai_content "$OPERATOR_SESSION" "$TXT_ANSWER"
+wait_for_latest_ai_content "$OPERATOR_SESSION" "$TXT_ANSWER" "$((OPERATOR_BASELINE + 1))"
 crisp_send_text "$OPERATOR_SESSION" operator "恢复AI" \
   "$((CONTEXT_FINGERPRINT + 101))"
 handoff_wait_started=$SECONDS
@@ -573,7 +608,7 @@ jq -e --arg human "$HUMAN_TAG" 'index($human) == null' <<< "$CURRENT_SEGMENTS" >
   || fail "非精确短语错误触发了转人工"
 crisp_send_text "$HANDOFF_SESSION" user "$EXACT_HANDOFF" "$((CONTEXT_FINGERPRINT + 201))"
 wait_for_ai_count "$HANDOFF_SESSION" "$((HANDOFF_BASELINE + 2))"
-wait_for_ai_content "$HANDOFF_SESSION" "$HANDOFF_MESSAGE"
+wait_for_latest_ai_content "$HANDOFF_SESSION" "$HANDOFF_MESSAGE" "$((HANDOFF_BASELINE + 2))"
 wait_for_segments "$HANDOFF_SESSION" "$PRESERVED_TAG" "$HUMAN_TAG"
 crisp_send_text "$HANDOFF_SESSION" user "AI must stay silent after exact handoff ${NONCE}" \
   "$((CONTEXT_FINGERPRINT + 202))"
@@ -583,9 +618,14 @@ sleep "$SETTLE_SECONDS"
 printf '外部 E2E：精确转人工、AI 停止与 Crisp 标签合并通过。\n'
 
 IMAGE_BASELINE=$(ai_reply_count "$IMAGE_SESSION")
+IMAGE_FAILURE_MESSAGE=$(jq -r '.handoff.failure_message // ""' \
+  "${DEPLOY_DIR}/config/handoff.yaml") || fail "读取视觉失败提示配置失败"
 crisp_send_image "$IMAGE_SESSION" "$IMAGE_URL" "$((CONTEXT_FINGERPRINT + 300))"
 wait_for_ai_count "$IMAGE_SESSION" "$((IMAGE_BASELINE + 1))"
-latest_ai_reply_is_safe "$IMAGE_SESSION" || fail "真实图片理解返回失败或不支持提示"
+latest_ai_reply_is_safe "$IMAGE_SESSION" "$IMAGE_EXPECTED_FACT" "$((IMAGE_BASELINE + 1))" \
+  "$IMAGE_FAILURE_MESSAGE" \
+  || fail "真实图片理解未返回预先约定的唯一图片事实，或返回了安全/视觉失败提示"
+unset IMAGE_FAILURE_MESSAGE
 printf '外部 E2E：Crisp 图片消息与视觉 Provider 通过。\n'
 
 stats_wait_started=$SECONDS

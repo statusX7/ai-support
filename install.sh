@@ -10,6 +10,190 @@ NON_INTERACTIVE=0
 SKIP_START=0
 RECONFIGURE=0
 
+validate_preserved_installation() {
+  local deploy_dir=$1
+  local env_file="${deploy_dir}/.env"
+  local config_file key value hook_mode expected_auth provider_base provider_model provider_mode
+  local normalized_api_base model_token_limit max_output_tokens public_url n8n_protocol
+  local -a required_config_files=(
+    provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml
+  )
+  local -a json_config_files=(keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml)
+  local -a required_env_keys=(
+    DEPLOY_DIR BIND_ADDRESS N8N_PORT ANYTHINGLLM_PORT N8N_HOST PUBLIC_WEBHOOK_URL TIMEZONE
+    N8N_ENCRYPTION_KEY POSTGRES_PASSWORD ANYTHINGLLM_AUTH_TOKEN ANYTHINGLLM_JWT_SECRET
+    ANYTHINGLLM_SIG_KEY ANYTHINGLLM_SIG_SALT AI_API_BASE_URL AI_API_KEY AI_MODEL
+    AI_API_MODE AI_SUPPORTS_VISION AI_MODEL_TOKEN_LIMIT AI_MAX_OUTPUT_TOKENS
+    ANYTHINGLLM_API_KEY ANYTHINGLLM_WORKSPACE ANYTHINGLLM_CHAT_MODE
+    CRISP_WEBSITE_ID CRISP_TOKEN_TIER CRISP_TOKEN_IDENTIFIER CRISP_TOKEN_KEY
+    CRISP_AUTH_B64 CRISP_HOOK_MODE N8N_PROTOCOL N8N_SECURE_COOKIE
+    SNAPSHOT_MIN_FREE_MB SNAPSHOT_RETENTION_COUNT
+  )
+  local -a reconfigure_reasons=()
+  local -a invalid_config=()
+
+  if [[ -e "$env_file" || -L "$env_file" ]]; then
+    [[ -f "$env_file" && ! -L "$env_file" ]] \
+      || die "安全卸载保留的 .env 不是安全普通文件；请先人工检查，未改写保留配置或业务数据"
+    [[ "$(stat -c '%a' "$env_file")" == 600 ]] \
+      || die "安全卸载保留的 .env 权限必须为 0600；请修正权限后重试"
+  else
+    reconfigure_reasons+=(.env)
+  fi
+
+  for config_file in "${required_config_files[@]}"; do
+    if [[ -e "${deploy_dir}/config/${config_file}" || -L "${deploy_dir}/config/${config_file}" ]]; then
+      [[ -f "${deploy_dir}/config/${config_file}" && ! -L "${deploy_dir}/config/${config_file}" ]] \
+        || die "安全卸载保留的配置不是安全普通文件：config/${config_file}；请先人工检查"
+      [[ -s "${deploy_dir}/config/${config_file}" ]] || invalid_config+=("config/${config_file}")
+    else
+      reconfigure_reasons+=("config/${config_file}")
+    fi
+  done
+
+  if [[ -f "$env_file" && ! -L "$env_file" ]]; then
+    for key in "${required_env_keys[@]}"; do
+      value=$(env_get "$env_file" "$key" 2>/dev/null || true)
+      if is_placeholder "$value" || ! validate_env_value "$value"; then
+        reconfigure_reasons+=(".env:${key}")
+      fi
+    done
+
+    value=$(env_get "$env_file" DEPLOY_DIR 2>/dev/null || true)
+    [[ "$value" == "$deploy_dir" ]] || reconfigure_reasons+=(".env:DEPLOY_DIR")
+    value=$(env_get "$env_file" BIND_ADDRESS 2>/dev/null || true)
+    validate_ipv4_address "$value" || reconfigure_reasons+=(".env:BIND_ADDRESS")
+    value=$(env_get "$env_file" N8N_PORT 2>/dev/null || true)
+    validate_port "$value" || reconfigure_reasons+=(".env:N8N_PORT")
+    value=$(env_get "$env_file" ANYTHINGLLM_PORT 2>/dev/null || true)
+    validate_port "$value" || reconfigure_reasons+=(".env:ANYTHINGLLM_PORT")
+    value=$(env_get "$env_file" N8N_HOST 2>/dev/null || true)
+    validate_hostname "$value" || reconfigure_reasons+=(".env:N8N_HOST")
+    public_url=$(env_get "$env_file" PUBLIC_WEBHOOK_URL 2>/dev/null || true)
+    validate_public_url "$public_url" || reconfigure_reasons+=(".env:PUBLIC_WEBHOOK_URL")
+    value=$(env_get "$env_file" AI_API_BASE_URL 2>/dev/null || true)
+    normalized_api_base=$(normalize_api_base "$value" 2>/dev/null || true)
+    [[ -n "$normalized_api_base" && "$normalized_api_base" == "$value" ]] \
+      || reconfigure_reasons+=(".env:AI_API_BASE_URL")
+    value=$(env_get "$env_file" CRISP_WEBSITE_ID 2>/dev/null || true)
+    [[ "$value" =~ ^[A-Za-z0-9-]{8,128}$ ]] || reconfigure_reasons+=(".env:CRISP_WEBSITE_ID")
+    value=$(env_get "$env_file" CRISP_TOKEN_TIER 2>/dev/null || true)
+    [[ "$value" == website || "$value" == plugin ]] || reconfigure_reasons+=(".env:CRISP_TOKEN_TIER")
+    value=$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER 2>/dev/null || true)
+    [[ "$value" != *:* ]] || reconfigure_reasons+=(".env:CRISP_TOKEN_IDENTIFIER")
+    value=$(env_get "$env_file" AI_API_MODE 2>/dev/null || true)
+    [[ "$value" == responses || "$value" == chat_completions ]] \
+      || reconfigure_reasons+=(".env:AI_API_MODE")
+    value=$(env_get "$env_file" AI_SUPPORTS_VISION 2>/dev/null || true)
+    [[ "$value" == true || "$value" == false ]] || reconfigure_reasons+=(".env:AI_SUPPORTS_VISION")
+    value=$(env_get "$env_file" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
+    [[ "$value" == chat ]] || reconfigure_reasons+=(".env:ANYTHINGLLM_CHAT_MODE")
+    n8n_protocol=$(env_get "$env_file" N8N_PROTOCOL 2>/dev/null || true)
+    [[ "$n8n_protocol" == http || "$n8n_protocol" == https ]] \
+      || reconfigure_reasons+=(".env:N8N_PROTOCOL")
+    [[ "$public_url" == "${n8n_protocol}:"* ]] || reconfigure_reasons+=(".env:N8N_PROTOCOL")
+    value=$(env_get "$env_file" N8N_SECURE_COOKIE 2>/dev/null || true)
+    [[ "$value" == true || "$value" == false ]] || reconfigure_reasons+=(".env:N8N_SECURE_COOKIE")
+    if [[ "$public_url" == https://* && "$value" != true ]] \
+      || [[ "$public_url" == http://* && "$value" != false ]]; then
+      reconfigure_reasons+=(".env:N8N_SECURE_COOKIE")
+    fi
+    model_token_limit=$(env_get "$env_file" AI_MODEL_TOKEN_LIMIT 2>/dev/null || true)
+    if [[ ! "$model_token_limit" =~ ^[1-9][0-9]{1,6}$ ]] \
+      || (( 10#${model_token_limit:-0} > 2000000 )); then
+      reconfigure_reasons+=(".env:AI_MODEL_TOKEN_LIMIT")
+    fi
+    max_output_tokens=$(env_get "$env_file" AI_MAX_OUTPUT_TOKENS 2>/dev/null || true)
+    if [[ ! "$max_output_tokens" =~ ^[1-9][0-9]{0,6}$ ]]; then
+      reconfigure_reasons+=(".env:AI_MAX_OUTPUT_TOKENS")
+    elif [[ "$model_token_limit" =~ ^[1-9][0-9]{1,6}$ ]] \
+      && (( 10#$max_output_tokens > 10#$model_token_limit )); then
+      reconfigure_reasons+=(".env:AI_MAX_OUTPUT_TOKENS")
+    fi
+    for key in SNAPSHOT_MIN_FREE_MB SNAPSHOT_RETENTION_COUNT; do
+      value=$(env_get "$env_file" "$key" 2>/dev/null || true)
+      [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || reconfigure_reasons+=(".env:${key}")
+    done
+    value=$(env_get "$env_file" SNAPSHOT_MIN_FREE_MB 2>/dev/null || true)
+    if [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] && (( 10#$value > 2147483647 )); then
+      reconfigure_reasons+=(".env:SNAPSHOT_MIN_FREE_MB")
+    fi
+    value=$(env_get "$env_file" SNAPSHOT_RETENTION_COUNT 2>/dev/null || true)
+    if [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] && (( 10#$value > 1000 )); then
+      reconfigure_reasons+=(".env:SNAPSHOT_RETENTION_COUNT")
+    fi
+    hook_mode=$(env_get "$env_file" CRISP_HOOK_MODE 2>/dev/null || true)
+    case "$hook_mode" in
+      website)
+        value=$(env_get "$env_file" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
+        if is_placeholder "$value" || ! validate_env_value "$value"; then
+          reconfigure_reasons+=(".env:CRISP_WEBSITE_HOOK_SECRET")
+        fi
+        ;;
+      plugin)
+        value=$(env_get "$env_file" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+        if is_placeholder "$value" || ! validate_env_value "$value"; then
+          reconfigure_reasons+=(".env:CRISP_PLUGIN_SIGNING_SECRET")
+        fi
+        ;;
+      *) reconfigure_reasons+=(".env:CRISP_HOOK_MODE") ;;
+    esac
+
+    if ! is_placeholder "$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER 2>/dev/null || true)" \
+      && ! is_placeholder "$(env_get "$env_file" CRISP_TOKEN_KEY 2>/dev/null || true)"; then
+      expected_auth=$(printf '%s' \
+        "$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER):$(env_get "$env_file" CRISP_TOKEN_KEY)" \
+        | base64 | tr -d '\n')
+      [[ "$(env_get "$env_file" CRISP_AUTH_B64 2>/dev/null || true)" == "$expected_auth" ]] \
+        || reconfigure_reasons+=(".env:CRISP_AUTH_B64")
+    fi
+  fi
+
+  for config_file in "${json_config_files[@]}"; do
+    [[ -s "${deploy_dir}/config/${config_file}" ]] || continue
+    case "$config_file" in
+      keyword.yaml) jq -e '.keywords | type == "array"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+      menu.yaml) jq -e '.menus | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+      handoff.yaml) jq -e '.handoff | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+      tags.yaml) jq -e '.tags | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+      feedback.yaml) jq -e '.feedback | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+    esac || invalid_config+=("config/${config_file}")
+  done
+  if [[ -s "${deploy_dir}/config/provider.yaml" ]]; then
+    if provider_config_has_secret_field "${deploy_dir}/config/provider.yaml" \
+      || ! grep -Eq '^[[:space:]]*type:[[:space:]]*openai-compatible[[:space:]]*$' \
+        "${deploy_dir}/config/provider.yaml" \
+      || ! grep -Eq '^[[:space:]]*base_url:[[:space:]]*"?https?://[^"[:space:]]+"?[[:space:]]*$' \
+        "${deploy_dir}/config/provider.yaml" \
+      || ! grep -Eq '^[[:space:]]*api_key_env:[[:space:]]*AI_API_KEY[[:space:]]*$' \
+        "${deploy_dir}/config/provider.yaml" \
+      || ! grep -Eq '^[[:space:]]*model:[[:space:]]*"?[^"[:space:]]+"?[[:space:]]*$' \
+        "${deploy_dir}/config/provider.yaml"; then
+      invalid_config+=(config/provider.yaml)
+    else
+      provider_base=$(sed -n 's/^[[:space:]]*base_url:[[:space:]]*//p' \
+        "${deploy_dir}/config/provider.yaml" | head -n 1)
+      provider_model=$(sed -n 's/^[[:space:]]*model:[[:space:]]*//p' \
+        "${deploy_dir}/config/provider.yaml" | head -n 1)
+      provider_mode=$(sed -n 's/^[[:space:]]*api_mode:[[:space:]]*//p' \
+        "${deploy_dir}/config/provider.yaml" | head -n 1)
+      provider_base=${provider_base#\"}; provider_base=${provider_base%\"}
+      provider_model=${provider_model#\"}; provider_model=${provider_model%\"}
+      [[ "$provider_base" == "$(env_get "$env_file" AI_API_BASE_URL 2>/dev/null || true)" \
+        && "$provider_model" == "$(env_get "$env_file" AI_MODEL 2>/dev/null || true)" \
+        && "$provider_mode" == "$(env_get "$env_file" AI_API_MODE 2>/dev/null || true)" ]] \
+        || invalid_config+=(config/provider.yaml)
+    fi
+  fi
+
+  if (( ${#invalid_config[@]} > 0 )); then
+    die "安全卸载保留的实际配置无效（${invalid_config[*]}）；请从备份恢复，或移除损坏文件后使用 --reconfigure，未改写保留配置或业务数据"
+  fi
+  if (( ${#reconfigure_reasons[@]} > 0 )); then
+    die "安全卸载保留配置缺失、不一致或包含占位值（${reconfigure_reasons[*]}）；请使用 --reconfigure 重新输入 Provider/Crisp 凭据，未改写保留配置或业务数据"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 用法：./install.sh [选项]
@@ -74,6 +258,7 @@ require_command sha256sum
 require_command tar
 require_command df
 require_command du
+require_command stat
 
 if [[ $EUID -ne 0 ]]; then
   die "安装需要 root 权限，以便设置容器数据目录权限"
@@ -84,6 +269,7 @@ if (( SKIP_START == 0 )); then
 fi
 
 EXISTING=0
+REUSE_PRESERVED_CONFIG=0
 PREVIOUS_STATE="new"
 PREVIOUS_VERSION=""
 if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
@@ -91,23 +277,35 @@ if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -
     assert_managed_installation "$DEPLOY_DIR"
     PREVIOUS_STATE=$(installation_state "$DEPLOY_DIR")
     [[ ! -f "${DEPLOY_DIR}/VERSION" ]] || PREVIOUS_VERSION=$(<"${DEPLOY_DIR}/VERSION")
-    if [[ "$PREVIOUS_STATE" == "ready" ]]; then
-      EXISTING=1
-    else
-      warn "检测到未完成或已卸载的部署状态（${PREVIOUS_STATE}），本次将安全重试安装"
-    fi
+    case "$PREVIOUS_STATE" in
+      ready) EXISTING=1 ;;
+      uninstalled-data-kept)
+        if (( RECONFIGURE )); then
+          warn "检测到安全卸载后的保留数据，本次将按 --reconfigure 重新配置"
+        else
+          REUSE_PRESERVED_CONFIG=1
+        fi
+        ;;
+      *)
+        warn "检测到未完成的部署状态（${PREVIOUS_STATE}），本次将安全重试安装"
+        ;;
+    esac
   else
     die "目标目录非空且没有有效安装标记，拒绝覆盖：$DEPLOY_DIR"
   fi
 fi
 
-if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
-  die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
-fi
-
 umask 077
 mkdir -p -- "$DEPLOY_DIR"
 acquire_maintenance_lock "$DEPLOY_DIR"
+if (( REUSE_PRESERVED_CONFIG )); then
+  validate_preserved_installation "$DEPLOY_DIR"
+  EXISTING=1
+  info '已验证安全卸载保留的 .env 与实际配置；本次将直接复用，不重新输入凭据'
+fi
+if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
+  die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
+fi
 write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" installing
 copy_project_files "$SCRIPT_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
