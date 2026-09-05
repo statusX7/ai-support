@@ -76,6 +76,8 @@ services:
       start_period: 60s
     networks:
       - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging: *default-logging
 
   n8n:
@@ -167,6 +169,40 @@ services:
       timeout: 5s
       retries: 10
       start_period: 45s
+    networks:
+      - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *default-logging
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.10.2-alpine}
+    profiles:
+      - managed-https
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/config/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/caddy
+        target: /data
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/caddy-config
+        target: /config
     networks:
       - backend
     logging: *default-logging

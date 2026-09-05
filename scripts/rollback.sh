@@ -107,6 +107,9 @@ for image_key in N8N_IMAGE POSTGRES_IMAGE ANYTHINGLLM_IMAGE; do
   image_value=$(jq -er --arg key "$image_key" '.image_variables[$key] | select(type == "string")' "$MANIFEST")
   [[ "$image_value" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$ ]] || die "快照镜像变量无效：$image_key"
 done
+image_value=$(jq -r '.image_variables.CADDY_IMAGE // "caddy:2.10.2-alpine"' "$MANIFEST")
+[[ "$image_value" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$ ]] \
+  || die "快照镜像变量无效：CADDY_IMAGE"
 
 is_allowed_snapshot_path() {
   local path=${1#./}
@@ -119,10 +122,10 @@ is_allowed_snapshot_path() {
     payload/VERSION|payload/CHANGELOG.md|payload/README.md|payload/LICENSE|payload/AGENTS.md|payload/.env.example|payload/docker-compose.yml|payload/install.sh|payload/manage.sh|payload/update.sh|payload/uninstall.sh|payload/n8n/workflow.json)
       return 0
       ;;
-    payload/config/app.yaml|payload/config/provider.yaml|payload/config/provider.yaml.example|payload/config/prompt.md|payload/config/prompt.md.example|payload/config/keyword.yaml|payload/config/keyword.yaml.example|payload/config/menu.yaml|payload/config/menu.yaml.example|payload/config/handoff.yaml|payload/config/handoff.yaml.example|payload/config/tags.yaml|payload/config/tags.yaml.example|payload/config/feedback.yaml|payload/config/feedback.yaml.example)
+    payload/config/app.yaml|payload/config/provider.yaml|payload/config/provider.yaml.example|payload/config/prompt.md|payload/config/prompt.md.example|payload/config/keyword.yaml|payload/config/keyword.yaml.example|payload/config/menu.yaml|payload/config/menu.yaml.example|payload/config/handoff.yaml|payload/config/handoff.yaml.example|payload/config/tags.yaml|payload/config/tags.yaml.example|payload/config/feedback.yaml|payload/config/feedback.yaml.example|payload/config/Caddyfile|payload/config/Caddyfile.example)
       return 0
       ;;
-    payload/scripts/common.sh|payload/scripts/healthcheck.sh|payload/scripts/backup.sh|payload/scripts/restore.sh|payload/scripts/analytics.sh|payload/scripts/snapshot.sh|payload/scripts/rollback.sh)
+    payload/scripts/common.sh|payload/scripts/healthcheck.sh|payload/scripts/backup.sh|payload/scripts/restore.sh|payload/scripts/analytics.sh|payload/scripts/snapshot.sh|payload/scripts/rollback.sh|payload/scripts/bootstrap.sh|payload/scripts/wizard.sh|payload/scripts/package-release.sh)
       return 0
       ;;
     payload/docs/INSTALL.md|payload/docs/ARCHITECTURE.md|payload/docs/CONFIG.md|payload/docs/SECURITY.md|payload/docs/TESTING.md|payload/docs/RELEASE.md)
@@ -208,11 +211,13 @@ for image_key in N8N_IMAGE POSTGRES_IMAGE ANYTHINGLLM_IMAGE; do
   image_value=$(jq -er --arg key "$image_key" '.image_variables[$key]' "$MANIFEST")
   env_set "${DEPLOY_DIR}/.env" "$image_key" "$image_value"
 done
+image_value=$(jq -r '.image_variables.CADDY_IMAGE // "caddy:2.10.2-alpine"' "$MANIFEST")
+env_set "${DEPLOY_DIR}/.env" CADDY_IMAGE "$image_value"
 
 ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml)
 ROOT_EXECUTABLES=(install.sh manage.sh update.sh uninstall.sh)
-CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example)
-SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh analytics.sh snapshot.sh rollback.sh)
+CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
+SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
 OPTIONAL_DOC_FILES=(RELEASE.md)
 

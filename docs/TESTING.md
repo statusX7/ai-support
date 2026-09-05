@@ -1,5 +1,13 @@
 # 测试说明
 
+结果必须按以下层级分别记录，不能用一个总数掩盖关键跳过：
+
+- `STATIC`：Bash 语法、ShellCheck、Compose/JSON、版本与密钥扫描；
+- `UNIT-STUB`：受控包管理器、Docker、Provider/Crisp 协议分支及十项 PTY 向导；
+- `REAL-BOOTSTRAP`：初始无 Docker/Compose 的独立 systemd Linux，从发布包运行生产安装入口；
+- `REAL-LOCAL-INTEGRATION`：真实 PostgreSQL、AnythingLLM、n8n、workflow、知识索引、持久化、更新和卸载；
+- `EXTERNAL-E2E`：真实 Crisp、真实第三方 Provider、DNS/公网投递和 conversation 回写。
+
 ## 测试分层
 
 测试结果必须按以下三层记录，不能用低层结果代替高层验收：
@@ -17,6 +25,8 @@
 ```
 
 开发环境缺少 ShellCheck、Docker Compose、Node.js 或真实部署目录时，对应项目会明确显示“跳过”。日常模式允许跳过，但报告必须逐项列出，不能写成全部通过。
+
+`tests/test_bootstrap.sh` 和 `tests/test_wizard.sh` 属于 `UNIT-STUB`，用于穷举失败分支，但不能冒充空机安装。`tests/test_release_package.sh` 只接受干净 Git 提交，并验证归档每个条目都来自固定、已跟踪清单；发布资产须在独立目录解压后再次验收。
 
 自动测试使用项目目录内的临时运行目录，结束后清理。桩凭据只用于测试，不得使用真实 Token、Secret 或用户数据。
 
@@ -61,13 +71,17 @@ Website Hook 和 Plugin Hook 必须在各自配置下分别完整执行一次发
 
 只在隔离的 Crisp 测试 Website、测试 Provider 和虚构知识文件中执行。报告只记录时间、版本、匿名测试会话标识、测试事实标识及 PASS/FAIL；禁止记录 Token、Secret、完整消息正文或真实用户数据。
 
-### 1. 全新安装与两阶段状态
+### 1. 全新安装、自动依赖与分层状态
 
-在干净部署目录运行 `./install.sh`。确认安装自动创建或验证 AnythingLLM Developer API Key、创建工作区、同步 Prompt、发布 workflow，并仅在完整健康检查通过后写入 `state=ready`。
+使用支持嵌套容器能力的独立 VM 或真实服务器；记录镜像来源与校验、发行版、架构、PID 1、完整初始包清单、命令可用状态、容器和部署目录。至少一套环境必须在启动前真实缺少 Docker 与 Compose，且不能挂载宿主 Docker socket。
+
+从最终发布归档解压后，通过 PTY 驱动生产 `bash install.sh` 的十项提示；不得预写 `.env`、直接调用内部函数或用环境变量绕过向导。记录十次输入、进入安装后的额外必答次数、退出码和脱敏转录。确认脚本安装 Engine/CLI/containerd/Compose、启用并启动 daemon、运行测试容器，再自动创建 AnythingLLM Developer API Key、工作区、Prompt、知识索引和已发布 workflow。
+
+第三方凭据不足时允许使用明确标记的本地协议服务验证安装接线；这只能计入 `REAL-LOCAL-INTEGRATION`，不能写成真实模型或 Crisp 验收。本地服务完成而 Crisp 外部检查失败时应是 `state=local-ready`，并保留服务和数据；有效 Crisp REST 凭据通过后才提升为 `ready`。
 
 再分别验证：
 
-- Provider、Crisp 或 AnythingLLM 故障时安装返回非零，状态不是 `ready`。
+- Provider 或 AnythingLLM 故障时安装失败；Crisp 外部故障时返回 2 并保留 `local-ready`。
 - 对同一未完成部署重新运行安装可安全续跑。
 - `--skip-start` 的新部署处于 `staged`，不能运行管理或更新；不带该参数重跑后成为 `ready`。
 - 对 `ready` 部署重复安装不改写现有密钥或自定义配置。

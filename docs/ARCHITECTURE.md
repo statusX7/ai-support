@@ -7,6 +7,7 @@
 - AnythingLLM 负责知识库、文档解析、自动分块、检索和模型调用。
 - OpenAI Compatible API 提供文本或视觉模型能力。
 - PostgreSQL 保存 n8n 配置、凭据和工作流状态。
+- 可选 Caddy 只负责受管 HTTPS 的生产 Webhook 入口。
 
 项目不自行实现 RAG、向量数据库、文档解析或模型管理。
 
@@ -30,9 +31,13 @@ Website Hook 本身不提供签名，因此必须在 Webhook URL 中携带独立
 
 ## 部署边界
 
+安装入口分为两级：`scripts/bootstrap.sh` 先以 Bash 与发行版包管理器补齐最小运行工具，`scripts/wizard.sh` 再采集十项配置；只有用户确认后才安装或复用 Docker、启动 daemon 并进入应用初始化。两模块被 source 时不执行依赖检查或系统变更，因而 `--help`、`--version` 和参数错误不依赖 Docker/jq。
+
 所有持久化数据都位于部署目录，默认是 `/opt/crisp-ai`。PostgreSQL、n8n、AnythingLLM 和匿名统计分别使用部署目录内的持久化路径；n8n 与 AnythingLLM 数据目录由容器 UID/GID `1000:1000` 持有。容器端口默认绑定到 `127.0.0.1`，数据库不对宿主机暴露端口。
 
-安装标记经历 `installing` 或 `staged`，只有完整验收成功后才成为 `ready`。所有变更性维护操作通过同一文件锁串行执行。
+安装标记经历 `collecting`、`installing` 或 `staged`。Docker、本地容器、Provider、AnythingLLM、Prompt/知识和已发布 workflow 通过后，可进入 `local-ready`；Crisp REST 凭据通过后进入 `ready`。依赖、本地服务、应用配置、Provider、Crisp API、Webhook 和真实 conversation 分别记录 fact，避免把容器启动与客户链路混为一谈。所有变更性维护操作通过同一文件锁串行执行。
+
+n8n 与 AnythingLLM 始终绑定回环地址；PostgreSQL 仅在后端网络。选择受管 HTTPS 时，Compose 的 `managed-https` profile 启动 Caddy并公开 80/443，但 Caddyfile 只转发 `/webhook/crisp-webhook`。选择已有反向代理时不启用该 profile；模式切换只清理本项目 Caddy 容器。
 
 默认卸载是可恢复的生命周期状态：容器、网络和程序文件被移除，安装标记变为 `uninstalled-data-kept`，但权限受限的 `.env`、业务配置、知识文件、数据库、AnythingLLM 数据、备份和日志保留在部署目录。必须从新的可信源码副本重新运行 `install.sh` 才能恢复服务。完整清理属于独立的破坏性流程，需要普通确认和精确输入 `PURGE` 两次确认；其迁移备份始终写到部署目录同级。
 

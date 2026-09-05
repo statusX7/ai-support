@@ -4,6 +4,7 @@
 !.env.example
 config/provider.yaml
 config/prompt.md
+config/Caddyfile
 config/keyword.yaml
 config/menu.yaml
 config/handoff.yaml
@@ -29,6 +30,9 @@ tmp/
 .test-runtime.*
 .test-tools/
 .external-e2e.*
+.work/
+dist/
+.release-package.*
 
 # 导入导出产物
 backup.tar.gz

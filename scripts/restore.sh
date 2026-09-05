@@ -74,7 +74,7 @@ is_allowed_archive_path() {
     VERSION|manifest.json|checksums.sha256|n8n|n8n/workflow.json|data|data/knowledge-manifest.json|config|knowledge)
       return 0
       ;;
-    config/app.yaml|config/provider.yaml|config/provider.yaml.example|config/prompt.md|config/prompt.md.example|config/keyword.yaml|config/keyword.yaml.example|config/menu.yaml|config/menu.yaml.example|config/handoff.yaml|config/handoff.yaml.example|config/tags.yaml|config/tags.yaml.example|config/feedback.yaml|config/feedback.yaml.example)
+    config/app.yaml|config/provider.yaml|config/provider.yaml.example|config/prompt.md|config/prompt.md.example|config/keyword.yaml|config/keyword.yaml.example|config/menu.yaml|config/menu.yaml.example|config/handoff.yaml|config/handoff.yaml.example|config/tags.yaml|config/tags.yaml.example|config/feedback.yaml|config/feedback.yaml.example|config/Caddyfile|config/Caddyfile.example)
       return 0
       ;;
     knowledge/*)
@@ -164,7 +164,7 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   fi
 fi
 
-for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example; do
+for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example; do
   if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
     install -m 0640 -- "${STAGING}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
   fi

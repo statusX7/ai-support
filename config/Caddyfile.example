@@ -1,0 +1,9 @@
+{
+  admin off
+}
+
+{$WEBHOOK_DOMAIN} {
+  @crisp_webhook path /webhook/crisp-webhook
+  reverse_proxy @crisp_webhook n8n:5678
+  respond 404
+}

@@ -2,27 +2,61 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/bootstrap.sh
+source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
+# shellcheck source=scripts/wizard.sh
+source "${SCRIPT_DIR}/scripts/wizard.sh"
 
 DEPLOY_REQUEST=""
-if (( $# > 0 )); then
-  if [[ "$1" == "--deploy-dir" && $# -eq 2 ]]; then
-    DEPLOY_REQUEST=$2
-  else
-    die "用法：./manage.sh [--deploy-dir PATH]"
+ORIGINAL_ARGS=("$@")
+
+manage_usage() {
+  cat <<'EOF'
+用法：./manage.sh [--deploy-dir PATH] [--help] [--version]
+
+未安装时可选择“快速初始化”；已安装时可查看状态、修改配置、修复依赖或卸载。
+EOF
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --deploy-dir)
+      (( $# >= 2 )) || die "--deploy-dir 缺少参数"
+      DEPLOY_REQUEST=$2
+      shift 2
+      ;;
+    --help|-h)
+      manage_usage
+      exit 0
+      ;;
+    --version)
+      printf '%s\n' "$(<"${SCRIPT_DIR}/VERSION")"
+      exit 0
+      ;;
+    *) die "未知选项：$1" ;;
+  esac
+done
+if [[ $EUID -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo bash "$SCRIPT_DIR/manage.sh" "${ORIGINAL_ARGS[@]}"
   fi
+  die "管理操作需要 root 权限；请使用 sudo bash ./manage.sh"
 fi
+bootstrap_prepare_minimal_dependencies \
+  || die "管理工具所需基础依赖自动安装失败"
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 
 require_installation() {
+  bootstrap_prepare_minimal_dependencies
   assert_installation "$DEPLOY_DIR"
   acquire_maintenance_lock "$DEPLOY_DIR"
 }
 
 pause_screen() {
   printf '\n按 Enter 返回菜单...'
-  IFS= read -r _
+  IFS= read -r _ || true
 }
 
 recreate_ai_services() {
@@ -35,9 +69,9 @@ recreate_ai_services() {
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR" 30 2
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
-  import_and_publish_workflow "$DEPLOY_DIR"
+  import_and_publish_workflow "$DEPLOY_DIR" || die "n8n workflow 发布失败"
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR"
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application
 }
 
 configure_anythingllm() {
@@ -58,7 +92,7 @@ configure_anythingllm() {
 
 configure_crisp() {
   local website tier hook_mode identifier token_key current current_identifier current_token_key
-  local secret_choice signing_secret existing_signing_secret auth
+  local secret_choice signing_secret existing_signing_secret auth marker_source
   current=$(env_get "${DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)
   printf 'Crisp Website ID [%s]：' "$current"
   IFS= read -r website
@@ -117,19 +151,27 @@ configure_crisp() {
   require_docker_runtime
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  import_and_publish_workflow "$DEPLOY_DIR"
+  import_and_publish_workflow "$DEPLOY_DIR" || die "n8n workflow 发布失败"
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR"
-  info "Crisp 配置已更新；Website Hook 与 Plugin Hook 的 Secret 不可混用"
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application
+  marker_source=$(sed -n 's/^source=//p' "${DEPLOY_DIR}/${INSTALL_MARKER}" | head -n 1)
+  if crisp_api_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" crisp_api ready
+    write_installation_marker "$DEPLOY_DIR" "$marker_source" "$(<"${DEPLOY_DIR}/VERSION")" ready
+    info "Crisp 配置已更新并通过 REST API 检查；Website Hook 与 Plugin Hook 的 Secret 不可混用"
+  else
+    set_installation_fact "$DEPLOY_DIR" crisp_api failed
+    write_installation_marker "$DEPLOY_DIR" "$marker_source" "$(<"${DEPLOY_DIR}/VERSION")" local-ready
+    warn "Crisp 配置已保存，但 REST API 检查失败（HTTP ${CRISP_API_STATUS:-000}）；本地服务保持运行"
+  fi
 }
 
 ai_config_menu() {
   local choice
   while true; do
     printf '\n1. 重新检测 AI Provider\n'
-    printf '2. 配置 AnythingLLM API 与工作区\n'
-    printf '3. 修改 Crisp 配置\n'
-    printf '4. 重新导入并发布 n8n workflow\n'
+    printf '2. 高级：配置 AnythingLLM API 与工作区\n'
+    printf '3. 重新导入并发布 n8n workflow\n'
     printf '0. 返回\n请选择：'
     IFS= read -r choice
     case "$choice" in
@@ -138,8 +180,7 @@ ai_config_menu() {
         recreate_ai_services
         ;;
       2) configure_anythingllm ;;
-      3) configure_crisp ;;
-      4) import_and_publish_workflow "$DEPLOY_DIR" ;;
+      3) import_and_publish_workflow "$DEPLOY_DIR" ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -341,7 +382,7 @@ statistics_menu() {
 uninstall_menu() {
   local choice
   printf '\n1. 安全卸载（保留配置、知识库和运行数据）\n'
-  printf '2. 完整清理（永久删除部署数据，必须输入 PURGE）\n'
+  printf '2. 完整清理（永久删除部署数据，需要两次数字确认）\n'
   printf '0. 返回\n请选择：'
   IFS= read -r choice
   case "$choice" in
@@ -350,7 +391,7 @@ uninstall_menu() {
       exit 0
       ;;
     2)
-      "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --purge
+      "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --purge --numeric-confirm
       exit 0
       ;;
     0) return ;;
@@ -358,68 +399,243 @@ uninstall_menu() {
   esac
 }
 
+show_installation_facts() {
+  local fact value
+  printf '安装状态：%s\n' "$(installation_state "$DEPLOY_DIR")"
+  for fact in dependencies local_services app_config provider crisp_api webhook conversation; do
+    value=$(installation_fact "$DEPLOY_DIR" "$fact" 2>/dev/null || true)
+    printf '  %-15s %s\n' "$fact" "${value:-未记录}"
+  done
+}
+
+quick_initialization() {
+  local choice
+  local -a args=(--deploy-dir "$DEPLOY_DIR")
+  if [[ -f "${DEPLOY_DIR}/${INSTALL_MARKER}" ]] \
+    && [[ "$(installation_state "$DEPLOY_DIR")" == ready || "$(installation_state "$DEPLOY_DIR")" == local-ready ]]; then
+    printf '\n1. 使用现有配置继续检查或修复安装\n'
+    printf '2. 重新运行十项快速初始化（保留数据）\n'
+    printf '0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) ;;
+      2) args+=(--reconfigure) ;;
+      0) return 0 ;;
+      *) warn "无效选项"; return 0 ;;
+    esac
+  fi
+  "${SCRIPT_DIR}/install.sh" "${args[@]}"
+}
+
+configure_webhook_menu() {
+  local current requested
+  current=$(env_get "${DEPLOY_DIR}/.env" WEBHOOK_PRODUCTION_URL 2>/dev/null || true)
+  printf '当前生产 Webhook：%s\n' "${current:-未配置}"
+  printf '请输入域名或现有 HTTPS 完整 Webhook 地址：'
+  IFS= read -r requested || return 0
+  [[ -n "$requested" ]] || { warn "未修改"; return 0; }
+  if ! wizard_parse_webhook_input "$requested"; then
+    warn "地址无效，或域名自动 HTTPS 所需的 80/443 已被占用"
+    return 0
+  fi
+  configure_webhook_access "$DEPLOY_DIR" "$WIZARD_WEBHOOK_MODE" \
+    "$WIZARD_WEBHOOK_BASE" "$WIZARD_WEBHOOK_URL" "$WIZARD_URL_HOST"
+  env_set "${DEPLOY_DIR}/.env" N8N_HOST "$WIZARD_URL_HOST"
+  env_set "${DEPLOY_DIR}/.env" N8N_PROTOCOL https
+  env_set "${DEPLOY_DIR}/.env" N8N_SECURE_COOKIE true
+  require_docker_runtime
+  docker_compose "$DEPLOY_DIR" up -d --remove-orphans
+  docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  import_and_publish_workflow "$DEPLOY_DIR"
+  if webhook_access_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" webhook ready
+    info "Webhook 的 DNS、TLS、反向代理及生产路由已可达；请在 Crisp 后台核对登记地址"
+  else
+    set_installation_fact "$DEPLOY_DIR" webhook pending
+    warn "Webhook 运行配置已更新，但公网路由待验证（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）"
+  fi
+}
+
+edit_json_configuration() {
+  local name=$1
+  local target="${DEPLOY_DIR}/config/${name}"
+  local temporary
+  [[ -f "$target" && ! -L "$target" ]] || die "配置文件缺失或不安全：$name"
+  temporary=$(mktemp "${DEPLOY_DIR}/tmp/${name}.edit.XXXXXX")
+  install -m 0600 -- "$target" "$temporary"
+  choose_editor "$temporary"
+  if ! jq empty "$temporary" >/dev/null 2>&1; then
+    rm -f -- "$temporary"
+    warn "配置格式无效，原文件未改变"
+    return 0
+  fi
+  install -m 0640 -- "$temporary" "$target"
+  rm -f -- "$temporary"
+  chown root:1000 "$target" 2>/dev/null || true
+  info "配置已原子更新：$name"
+}
+
+prompt_knowledge_menu() {
+  local choice
+  while true; do
+    printf '\n1. 客服提示词\n2. 知识库\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) prompt_menu ;;
+      2) knowledge_menu ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+rules_menu() {
+  local choice
+  while true; do
+    printf '\n1. Crisp 凭据与 Hook 类型\n2. 公网 Webhook 接入\n'
+    printf '3. 关键词回复\n4. 欢迎语与多级菜单\n5. 人工接管\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) configure_crisp ;;
+      2) configure_webhook_menu ;;
+      3) edit_json_configuration keyword.yaml ;;
+      4) edit_json_configuration menu.yaml ;;
+      5) edit_json_configuration handoff.yaml ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+analysis_menu() {
+  local choice
+  while true; do
+    printf '\n1. 查看知识命中与反馈统计\n2. 编辑标签配置\n3. 编辑反馈配置\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) statistics_menu ;;
+      2) edit_json_configuration tags.yaml ;;
+      3) edit_json_configuration feedback.yaml ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+diagnostics_menu() {
+  local choice
+  while true; do
+    printf '\n1. 查看最近日志\n2. 完整健康检查\n3. 环境检查\n4. 自动修复依赖\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1)
+        require_docker_runtime
+        warn "日志可能包含会话内容，请勿公开分享"
+        docker_compose "$DEPLOY_DIR" logs --tail 200
+        ;;
+      2) "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" || true ;;
+      3) "${DEPLOY_DIR}/scripts/bootstrap.sh" --check || true ;;
+      4)
+        if [[ $EUID -eq 0 ]]; then
+          "${DEPLOY_DIR}/scripts/bootstrap.sh" --all
+        elif command -v sudo >/dev/null 2>&1; then
+          sudo bash "${DEPLOY_DIR}/scripts/bootstrap.sh" --all
+        else
+          warn "自动修复依赖需要 root 或 sudo 权限"
+        fi
+        ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+backup_restore_menu() {
+  local choice
+  while true; do
+    printf '\n1. 创建备份\n2. 恢复备份\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) run_backup ;;
+      2) run_restore ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+update_rollback_menu() {
+  local choice
+  while true; do
+    printf '\n1. 更新系统\n2. 回滚版本\n3. 查看历史版本\n0. 返回\n请选择：'
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) "${DEPLOY_DIR}/update.sh" --deploy-dir "$DEPLOY_DIR" ;;
+      2) run_rollback ;;
+      3) "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list ;;
+      0) return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
 while true; do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
   printf '\n%s\n' '================================'
   printf ' AI客服管理系统 %s\n' "$CURRENT_VERSION"
   printf '%s\n\n' '================================'
-  printf '1. 查看状态\n'
-  printf '2. 修改AI配置\n'
-  printf '3. 修改Prompt\n'
-  printf '4. 管理知识库\n'
-  printf '5. 查看统计\n'
-  printf '6. 查看日志\n'
-  printf '7. 备份\n'
-  printf '8. 恢复\n'
-  printf '9. 更新\n'
-  printf '10. 回滚\n'
-  printf '11. 卸载系统\n'
+  printf '1. 快速初始化 / 继续未完成安装\n'
+  printf '2. 查看运行与接入状态\n'
+  printf '3. AI 接口和模型设置\n'
+  printf '4. 客服提示词与知识库\n'
+  printf '5. 关键词、欢迎菜单及人工接管设置\n'
+  printf '6. 标签、统计与反馈\n'
+  printf '7. 日志、环境检查与依赖修复\n'
+  printf '8. 备份与恢复\n'
+  printf '9. 更新与回滚\n'
+  printf '10. 卸载系统\n'
   printf '0. 退出\n\n请选择：'
-  IFS= read -r CHOICE
+  if ! IFS= read -r CHOICE; then
+    printf '\n输入结束，未执行任何操作。\n'
+    exit 0
+  fi
   case "$CHOICE" in
-    1)
-      require_installation
-      status_menu
-      ;;
+    1) quick_initialization ;;
     2)
       require_installation
-      ai_config_menu
+      show_installation_facts
+      status_menu
       ;;
     3)
       require_installation
-      prompt_menu
+      ai_config_menu
       ;;
     4)
       require_installation
-      knowledge_menu
+      prompt_knowledge_menu
       ;;
     5)
       require_installation
-      statistics_menu
+      rules_menu
       ;;
     6)
       require_installation
-      require_docker_runtime
-      warn "日志可能包含会话内容，请勿公开分享"
-      docker_compose "$DEPLOY_DIR" logs --tail 200
+      analysis_menu
       ;;
     7)
       require_installation
-      run_backup
+      diagnostics_menu
       ;;
     8)
       require_installation
-      run_restore
+      backup_restore_menu
       ;;
     9)
       require_installation
-      "${DEPLOY_DIR}/update.sh" --deploy-dir "$DEPLOY_DIR"
+      update_rollback_menu
       ;;
     10)
-      require_installation
-      run_rollback
-      ;;
-    11)
       require_installation
       uninstall_menu
       ;;

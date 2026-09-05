@@ -5,6 +5,23 @@ if [[ -n "${MOCK_DOCKER_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 fi
 
+if [[ "${1:-}" == context ]]; then
+  case "${2:-}" in
+    show) printf 'default\n'; exit 0 ;;
+    inspect) printf 'unix:///var/run/docker.sock\n'; exit 0 ;;
+    *) printf 'docker context 测试桩不支持命令：%s\n' "$*" >&2; exit 2 ;;
+  esac
+fi
+
+if [[ "${1:-}" == version ]]; then
+  if [[ "$*" == *'{{.Server.Version}}'* ]]; then
+    printf '24.0.0\n'
+  else
+    printf 'Docker version 24.0.0-test\n'
+  fi
+  exit 0
+fi
+
 if [[ "${1:-}" == image ]]; then
   shift
   case "${1:-}" in
@@ -27,8 +44,21 @@ if [[ "${1:-}" == info ]]; then
     printf '无法连接测试 Docker daemon\n' >&2
     exit 1
   fi
-  printf 'Docker daemon 测试桩可用\n'
+  if [[ "$*" == *'{{.Architecture}}'* ]]; then
+    case "$(uname -m)" in
+      x86_64|amd64) printf 'amd64\n' ;;
+      aarch64|arm64) printf 'arm64\n' ;;
+      *) printf '%s\n' "$(uname -m)" ;;
+    esac
+  else
+    printf 'Docker daemon 测试桩可用\n'
+  fi
   exit 0
+fi
+
+if [[ "${1:-}" == run ]]; then
+  [[ "${MOCK_DOCKER_FAIL_RUN:-0}" != 1 ]]
+  exit
 fi
 
 if [[ "${1:-}" == container && "${2:-}" == ls ]]; then
@@ -50,6 +80,11 @@ fi
   exit 2
 }
 shift
+
+if [[ "${1:-}" == --help ]]; then
+  printf '%s\n' 'Usage: docker compose [--project-directory PATH] [--env-file FILE] COMMAND'
+  exit 0
+fi
 
 if [[ "${1:-}" == version ]]; then
   printf 'Docker Compose version v2.99.0-test\n'

@@ -96,9 +96,9 @@ SNAPSHOT_MIN_FREE_MB_VALUE=$((10#$SNAPSHOT_MIN_FREE_MB_VALUE))
 SNAPSHOT_RETENTION_COUNT_VALUE=$((10#$SNAPSHOT_RETENTION_COUNT_VALUE))
 
 ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml install.sh manage.sh update.sh uninstall.sh)
-CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example)
+CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
-OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh)
+OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
 OPTIONAL_DOC_FILES=(RELEASE.md)
 SNAPSHOT_SOURCE_PATHS=()
@@ -244,6 +244,7 @@ IMAGES='[]'
 N8N_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" N8N_IMAGE 2>/dev/null || printf 'docker.n8n.io/n8nio/n8n:2.33.0')
 POSTGRES_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" POSTGRES_IMAGE 2>/dev/null || printf 'postgres:16.10-alpine')
 ANYTHINGLLM_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_IMAGE 2>/dev/null || printf 'mintplexlabs/anythingllm:1.16.1')
+CADDY_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" CADDY_IMAGE 2>/dev/null || printf 'caddy:2.10.2-alpine')
 mapfile -t IMAGE_REFERENCES < <(docker_compose "$DEPLOY_DIR" config --images | sort -u)
 (( ${#IMAGE_REFERENCES[@]} > 0 )) || die "Compose 未返回镜像列表"
 for image_ref in "${IMAGE_REFERENCES[@]}"; do
@@ -273,7 +274,8 @@ jq -n \
   --arg n8n_image "$N8N_IMAGE_VALUE" \
   --arg postgres_image "$POSTGRES_IMAGE_VALUE" \
   --arg anythingllm_image "$ANYTHINGLLM_IMAGE_VALUE" \
-  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_database_dump:true,contains_env:false,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images,image_variables:{N8N_IMAGE:$n8n_image,POSTGRES_IMAGE:$postgres_image,ANYTHINGLLM_IMAGE:$anythingllm_image}}' \
+  --arg caddy_image "$CADDY_IMAGE_VALUE" \
+  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_database_dump:true,contains_env:false,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images,image_variables:{N8N_IMAGE:$n8n_image,POSTGRES_IMAGE:$postgres_image,ANYTHINGLLM_IMAGE:$anythingllm_image,CADDY_IMAGE:$caddy_image}}' \
   > "${TARGET_TEMP}/manifest.json"
 chmod 600 "${TARGET_TEMP}/manifest.json"
 mv -- "$TARGET_TEMP" "$TARGET_DIR"

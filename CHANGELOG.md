@@ -1,5 +1,23 @@
 # 更新日志
 
+## v1.0.1
+
+日期：2026-09-05
+
+修改：
+
+- 修复首次安装入口在自动引导前因缺少 Docker、Compose、jq 等命令直接退出的问题；新增 Debian 12/13、Ubuntu 22.04/24.04 的两级依赖引导、Docker 官方软件源安装、daemon 启动和真实测试容器验证。
+- 新增由 `install.sh` 直接调用的十项中文快速初始化，覆盖 Provider 模型发现与实际能力探测、Crisp 凭据、公网 Webhook、Prompt、知识文件以及脱敏确认，并支持 0600 状态断点续跑。
+- 自动创建或复用 AnythingLLM Developer API Key 与工作区，同步 Prompt 和知识索引，导入并验证已发布的 n8n 生产 workflow；本地应用完成与 Crisp 外部接入状态分层记录。
+- 增加可选受管 Caddy HTTPS 入口和已有反向代理分流，切换模式时只清理本 Compose 项目的 Caddy；Provider loopback 地址自动映射到容器宿主网关。
+- 重组十项中文管理菜单，接通快速初始化、依赖修复、配置、知识、统计、备份恢复、更新回滚与数字双确认卸载。
+- 加固 `.env` 特殊字符序列化、请求凭据传递、向导临时凭据清理、升级自举兼容和仅从干净已跟踪固定清单构建的可复现 Release 归档。
+
+影响：
+
+- 在受支持的新服务器上，普通路径只需运行 `sudo bash ./install.sh` 并完成十项输入；缺少的普通运行依赖与 Docker Engine/Compose 由脚本自动补齐，无需手工配置数据库、AnythingLLM 或 n8n。
+- 本地服务与应用初始化成功但 Crisp 账户、DNS 或后台 Hook 尚未就绪时，部署保留为 `local-ready` 并明确列出最小外部动作，不再误报已开始接待客户。
+
 ## v1.0.0
 
 日期：2026-09-05

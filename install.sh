@@ -2,9 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/bootstrap.sh
+source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
+# shellcheck source=scripts/wizard.sh
+source "${SCRIPT_DIR}/scripts/wizard.sh"
 
+ORIGINAL_ARGS=("$@")
 DEPLOY_REQUEST=""
 NON_INTERACTIVE=0
 SKIP_START=0
@@ -203,6 +208,7 @@ usage() {
   --non-interactive   从环境变量读取配置，不进行交互
   --skip-start        只安装文件，不启动 Docker 服务
   --reconfigure       重复安装时重新配置 Provider 与 Crisp
+  --version           显示版本
   --help              显示帮助
 EOF
 }
@@ -230,43 +236,32 @@ while (( $# > 0 )); do
       usage
       exit 0
       ;;
+    --version)
+      printf '%s\n' "$(<"${SCRIPT_DIR}/VERSION")"
+      exit 0
+      ;;
     *)
       die "未知选项：$1"
       ;;
   esac
 done
 
+if [[ $EUID -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo --preserve-env=AI_API_BASE_URL,AI_API_KEY,AI_MODEL,DEFAULT_AI_MODEL,CRISP_WEBSITE_ID,CRISP_TOKEN_TIER,CRISP_TOKEN_IDENTIFIER,CRISP_TOKEN_KEY,CRISP_HOOK_MODE,CRISP_PLUGIN_SIGNING_SECRET,PUBLIC_WEBHOOK_URL,WEBHOOK_PRODUCTION_URL,WEBHOOK_ACCESS_MODE,N8N_HOST,TIMEZONE,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,ANYTHINGLLM_CHAT_MODE,BIND_ADDRESS,N8N_PORT,ANYTHINGLLM_PORT,N8N_IMAGE,POSTGRES_IMAGE,ANYTHINGLLM_IMAGE,CADDY_IMAGE,AI_MODEL_TOKEN_LIMIT,AI_MAX_OUTPUT_TOKENS,SNAPSHOT_MIN_FREE_MB,SNAPSHOT_RETENTION_COUNT \
+      bash "$SCRIPT_DIR/install.sh" "${ORIGINAL_ARGS[@]}"
+  fi
+  die "安装需要 root 权限；请使用 sudo bash ./install.sh，或由 root 直接运行"
+fi
+
 VERSION=$(<"${SCRIPT_DIR}/VERSION")
 printf '%s\n' '================================'
 printf ' AI客服管理系统 %s\n' "$VERSION"
 printf '%s\n\n' '================================'
 
-if [[ -z "$DEPLOY_REQUEST" && $NON_INTERACTIVE -eq 0 ]]; then
-  printf '部署目录 [%s]：' "$DEFAULT_DEPLOY_DIR"
-  IFS= read -r DEPLOY_REQUEST
-  DEPLOY_REQUEST=${DEPLOY_REQUEST:-$DEFAULT_DEPLOY_DIR}
-fi
+bootstrap_prepare_minimal_dependencies \
+  || die "基础依赖自动安装失败；修复网络或软件包管理器后重新运行，已完成进度会保留"
 DEPLOY_DIR=$(resolve_deploy_dir "${DEPLOY_REQUEST:-$DEFAULT_DEPLOY_DIR}")
-
-require_command install
-require_command mktemp
-require_command curl
-require_command jq
-require_command openssl
-require_command base64
-require_command sha256sum
-require_command tar
-require_command df
-require_command du
-require_command stat
-
-if [[ $EUID -ne 0 ]]; then
-  die "安装需要 root 权限，以便设置容器数据目录权限"
-fi
-
-if (( SKIP_START == 0 )); then
-  require_docker_runtime
-fi
 
 EXISTING=0
 REUSE_PRESERVED_CONFIG=0
@@ -278,7 +273,10 @@ if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -
     PREVIOUS_STATE=$(installation_state "$DEPLOY_DIR")
     [[ ! -f "${DEPLOY_DIR}/VERSION" ]] || PREVIOUS_VERSION=$(<"${DEPLOY_DIR}/VERSION")
     case "$PREVIOUS_STATE" in
-      ready) EXISTING=1 ;;
+      ready|local-ready) EXISTING=1 ;;
+      collecting)
+        warn "检测到未完成的快速初始化，本次将从保存的步骤继续"
+        ;;
       uninstalled-data-kept)
         if (( RECONFIGURE )); then
           warn "检测到安全卸载后的保留数据，本次将按 --reconfigure 重新配置"
@@ -306,7 +304,37 @@ fi
 if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
   die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
 fi
+
+WIZARD_RESULT="${DEPLOY_DIR}/tmp/quick-init.json"
+if (( NON_INTERACTIVE == 0 && (EXISTING == 0 || RECONFIGURE == 1) )); then
+  RESTORE_STATE=$PREVIOUS_STATE
+  case "$RESTORE_STATE" in ready|local-ready) ;; *) RESTORE_STATE=collecting ;; esac
+  write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" collecting
+  if quick_init_wizard "$WIZARD_RESULT"; then
+    :
+  else
+    WIZARD_STATUS_CODE=$?
+    if (( WIZARD_STATUS_CODE == 2 )); then
+      if [[ "$RESTORE_STATE" == ready || "$RESTORE_STATE" == local-ready ]]; then
+        write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" "$RESTORE_STATE"
+      fi
+      die "快速初始化已取消或输入结束；重新运行同一命令可继续"
+    fi
+    die "快速初始化未完成；修正提示的问题后重新运行同一命令"
+  fi
+fi
+
+if (( SKIP_START == 0 )); then
+  bootstrap_prepare_docker_runtime \
+    || die "Docker 自动安装或真实运行验证失败；修复提示的问题后重新运行，配置进度不会丢失"
+fi
+
 write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" installing
+if (( SKIP_START == 0 )); then
+  set_installation_fact "$DEPLOY_DIR" dependencies ready
+else
+  set_installation_fact "$DEPLOY_DIR" dependencies pending
+fi
 copy_project_files "$SCRIPT_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
 migrate_config_files "$DEPLOY_DIR"
@@ -321,12 +349,14 @@ env_set "$ENV_FILE" DEPLOY_DIR "$DEPLOY_DIR"
 EXISTING_N8N_IMAGE=$(env_get "$ENV_FILE" N8N_IMAGE 2>/dev/null || true)
 EXISTING_POSTGRES_IMAGE=$(env_get "$ENV_FILE" POSTGRES_IMAGE 2>/dev/null || true)
 EXISTING_ANYTHING_IMAGE=$(env_get "$ENV_FILE" ANYTHINGLLM_IMAGE 2>/dev/null || true)
+EXISTING_CADDY_IMAGE=$(env_get "$ENV_FILE" CADDY_IMAGE 2>/dev/null || true)
 [[ -n "$EXISTING_N8N_IMAGE" && "$EXISTING_N8N_IMAGE" != "docker.n8n.io/n8nio/n8n:2" ]] \
   || EXISTING_N8N_IMAGE=docker.n8n.io/n8nio/n8n:2.33.0
 [[ -n "$EXISTING_POSTGRES_IMAGE" && "$EXISTING_POSTGRES_IMAGE" != "postgres:16-alpine" ]] \
   || EXISTING_POSTGRES_IMAGE=postgres:16.10-alpine
 [[ -n "$EXISTING_ANYTHING_IMAGE" && "$EXISTING_ANYTHING_IMAGE" != "mintplexlabs/anythingllm:latest" ]] \
   || EXISTING_ANYTHING_IMAGE=mintplexlabs/anythingllm:1.16.1
+[[ -n "$EXISTING_CADDY_IMAGE" ]] || EXISTING_CADDY_IMAGE=caddy:2.10.2-alpine
 BIND_ADDRESS_VALUE=${BIND_ADDRESS:-$(env_get "$ENV_FILE" BIND_ADDRESS 2>/dev/null || printf '127.0.0.1')}
 N8N_PORT_VALUE=${N8N_PORT:-$(env_get "$ENV_FILE" N8N_PORT 2>/dev/null || printf '5678')}
 ANYTHINGLLM_PORT_VALUE=${ANYTHINGLLM_PORT:-$(env_get "$ENV_FILE" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')}
@@ -352,6 +382,7 @@ env_set "$ENV_FILE" ANYTHINGLLM_PORT "$ANYTHINGLLM_PORT_VALUE"
 env_set "$ENV_FILE" N8N_IMAGE "${N8N_IMAGE:-$EXISTING_N8N_IMAGE}"
 env_set "$ENV_FILE" POSTGRES_IMAGE "${POSTGRES_IMAGE:-$EXISTING_POSTGRES_IMAGE}"
 env_set "$ENV_FILE" ANYTHINGLLM_IMAGE "${ANYTHINGLLM_IMAGE:-$EXISTING_ANYTHING_IMAGE}"
+env_set "$ENV_FILE" CADDY_IMAGE "${CADDY_IMAGE:-$EXISTING_CADDY_IMAGE}"
 env_set "$ENV_FILE" AI_MODEL_TOKEN_LIMIT "$AI_MODEL_TOKEN_LIMIT_VALUE"
 env_set "$ENV_FILE" AI_MAX_OUTPUT_TOKENS "$AI_MAX_OUTPUT_TOKENS_VALUE"
 env_set "$ENV_FILE" ANYTHINGLLM_WORKSPACE "${ANYTHINGLLM_WORKSPACE:-$(env_get "$ENV_FILE" ANYTHINGLLM_WORKSPACE 2>/dev/null || printf 'crisp-support')}"
@@ -391,6 +422,8 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
   if (( NON_INTERACTIVE )); then
     N8N_HOST_VALUE=${N8N_HOST:-localhost}
     PUBLIC_URL_VALUE=${PUBLIC_WEBHOOK_URL:-https://${N8N_HOST_VALUE}/}
+    WEBHOOK_PRODUCTION_VALUE=${WEBHOOK_PRODUCTION_URL:-${PUBLIC_URL_VALUE}webhook/crisp-webhook}
+    WEBHOOK_MODE_VALUE=${WEBHOOK_ACCESS_MODE:-external_proxy}
     TIMEZONE_VALUE=${TIMEZONE:-UTC}
     CRISP_WEBSITE_VALUE=${CRISP_WEBSITE_ID:-}
     CRISP_TIER_VALUE=${CRISP_TOKEN_TIER:-website}
@@ -400,41 +433,32 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     CRISP_KEY_VALUE=${CRISP_TOKEN_KEY:-}
     ANYTHING_KEY_VALUE=${ANYTHINGLLM_API_KEY:-pending-anythingllm-api-key}
   else
-    printf 'n8n 公网域名（不含协议）：'
-    IFS= read -r N8N_HOST_VALUE
-    N8N_HOST_VALUE=${N8N_HOST_VALUE:-localhost}
-    printf 'Webhook 公网地址 [https://%s/]：' "$N8N_HOST_VALUE"
-    IFS= read -r PUBLIC_URL_VALUE
-    PUBLIC_URL_VALUE=${PUBLIC_URL_VALUE:-https://${N8N_HOST_VALUE}/}
-    printf '时区 [UTC]：'
-    IFS= read -r TIMEZONE_VALUE
+    [[ -f "$WIZARD_RESULT" && ! -L "$WIZARD_RESULT" ]] \
+      || die "快速初始化结果缺失或不安全；请重新运行安装"
+    AI_API_BASE_URL=$(jq -er '.provider.base_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    AI_API_KEY=$(jq -er '.provider.api_key | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    AI_MODEL=$(jq -er '.provider.model | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    PUBLIC_URL_VALUE=$(jq -er '.webhook.public_base_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    WEBHOOK_PRODUCTION_VALUE=$(jq -er '.webhook.production_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    WEBHOOK_MODE_VALUE=$(jq -er '.webhook.mode | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    wizard_parse_http_url "$PUBLIC_URL_VALUE" 1 || die "快速初始化保存的 Webhook 地址无效"
+    N8N_HOST_VALUE=$WIZARD_URL_HOST
+    TIMEZONE_VALUE=${TIMEZONE:-$(sed -n '1p' /etc/timezone 2>/dev/null || printf UTC)}
     TIMEZONE_VALUE=${TIMEZONE_VALUE:-UTC}
-    printf 'Crisp Website ID：'
-    IFS= read -r CRISP_WEBSITE_VALUE
-    printf 'Crisp Token tier（website/plugin）[website]：'
-    IFS= read -r CRISP_TIER_VALUE
-    CRISP_TIER_VALUE=${CRISP_TIER_VALUE:-website}
-    printf 'Crisp Token Identifier：'
-    IFS= read -r CRISP_IDENTIFIER_VALUE
-    printf 'Crisp Token Key（输入内容不会显示）：'
-    IFS= read -r -s CRISP_KEY_VALUE
-    printf '\nCrisp Hook 模式（website/plugin）[website]：'
-    IFS= read -r CRISP_HOOK_MODE_VALUE
-    CRISP_HOOK_MODE_VALUE=${CRISP_HOOK_MODE_VALUE:-website}
+    CRISP_WEBSITE_VALUE=$(jq -er '.crisp.website_id | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    CRISP_TIER_VALUE=website
+    CRISP_IDENTIFIER_VALUE=$(jq -er '.crisp.token_identifier | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    CRISP_KEY_VALUE=$(jq -er '.crisp.token_key | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    CRISP_HOOK_MODE_VALUE=website
     CRISP_PLUGIN_SECRET_VALUE=""
-    if [[ "$CRISP_HOOK_MODE_VALUE" == plugin ]]; then
-      printf 'Crisp Plugin Hook Signing Secret（输入内容不会显示）：'
-      IFS= read -r -s CRISP_PLUGIN_SECRET_VALUE
-    fi
-    printf '\nAnythingLLM Developer API Key（可留空，启动后自动创建）：'
-    IFS= read -r -s ANYTHING_KEY_VALUE
-    printf '\n'
-    ANYTHING_KEY_VALUE=${ANYTHING_KEY_VALUE:-pending-anythingllm-api-key}
+    ANYTHING_KEY_VALUE=pending-anythingllm-api-key
   fi
 
   validate_hostname "$N8N_HOST_VALUE" || die "n8n 域名无效；只填写主机名，不含协议、端口或路径"
   validate_public_url "$PUBLIC_URL_VALUE" \
     || die "Webhook 公网地址必须是不含认证信息、查询参数或路径穿越且以 / 结尾的 HTTP(S) 地址"
+  [[ "$WEBHOOK_PRODUCTION_VALUE" == https://*'/webhook/crisp-webhook' ]] \
+    || die "生产 Webhook 地址必须使用 HTTPS 并以 /webhook/crisp-webhook 结尾"
   validate_env_value "$TIMEZONE_VALUE" || die "时区无效"
   [[ "$CRISP_WEBSITE_VALUE" =~ ^[A-Za-z0-9-]{8,128}$ ]] || die "Crisp Website ID 格式无效"
   [[ "$CRISP_TIER_VALUE" == website || "$CRISP_TIER_VALUE" == plugin ]] || die "Crisp Token tier 只能是 website 或 plugin"
@@ -450,7 +474,8 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
 
   CRISP_AUTH_VALUE=$(printf '%s' "${CRISP_IDENTIFIER_VALUE}:${CRISP_KEY_VALUE}" | base64 | tr -d '\n')
   env_set "$ENV_FILE" N8N_HOST "$N8N_HOST_VALUE"
-  env_set "$ENV_FILE" PUBLIC_WEBHOOK_URL "$PUBLIC_URL_VALUE"
+  configure_webhook_access "$DEPLOY_DIR" "$WEBHOOK_MODE_VALUE" "$PUBLIC_URL_VALUE" \
+    "$WEBHOOK_PRODUCTION_VALUE" "$N8N_HOST_VALUE"
   env_set "$ENV_FILE" N8N_PROTOCOL "$( [[ "$PUBLIC_URL_VALUE" == https://* ]] && printf https || printf http )"
   env_set "$ENV_FILE" N8N_SECURE_COOKIE "$( [[ "$PUBLIC_URL_VALUE" == https://* ]] && printf true || printf false )"
   env_set "$ENV_FILE" TIMEZONE "$TIMEZONE_VALUE"
@@ -464,7 +489,30 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     env_set "$ENV_FILE" CRISP_PLUGIN_SIGNING_SECRET "$CRISP_PLUGIN_SECRET_VALUE"
   fi
   env_set "$ENV_FILE" ANYTHINGLLM_API_KEY "$ANYTHING_KEY_VALUE"
-  configure_provider "$DEPLOY_DIR" "$NON_INTERACTIVE"
+  if (( NON_INTERACTIVE )); then
+    configure_provider "$DEPLOY_DIR" 1
+  else
+    configure_provider "$DEPLOY_DIR" 1
+    PROMPT_MODE_VALUE=$(jq -r '.prompt.mode // "default"' "$WIZARD_RESULT")
+    case "$PROMPT_MODE_VALUE" in
+      default) ;;
+      file)
+        import_prompt_source "$DEPLOY_DIR" "$(jq -er '.prompt.source | select(type == "string" and length > 0)' "$WIZARD_RESULT")"
+        ;;
+      inline)
+        PROMPT_TEMP=$(mktemp "${DEPLOY_DIR}/config/prompt.md.tmp.XXXXXX")
+        jq -j '.prompt.content' "$WIZARD_RESULT" > "$PROMPT_TEMP"
+        [[ -s "$PROMPT_TEMP" ]] || { rm -f -- "$PROMPT_TEMP"; die "自定义 Prompt 不能为空"; }
+        chmod 0640 "$PROMPT_TEMP"
+        mv -f -- "$PROMPT_TEMP" "${DEPLOY_DIR}/config/prompt.md"
+        ;;
+      *) die "快速初始化 Prompt 模式无效" ;;
+    esac
+    KNOWLEDGE_SOURCE_VALUE=$(jq -r '.knowledge.source // ""' "$WIZARD_RESULT")
+    KNOWLEDGE_IMPORTED=$(import_knowledge_source "$DEPLOY_DIR" "$KNOWLEDGE_SOURCE_VALUE")
+    info "已复制 ${KNOWLEDGE_IMPORTED} 个知识文件到受管目录"
+  fi
+  set_installation_fact "$DEPLOY_DIR" provider ready
 else
   info '检测到已有配置；本次重复安装将保留 .env 和实际配置文件'
 fi
@@ -482,23 +530,53 @@ secure_permissions "$DEPLOY_DIR"
 
 if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
-  docker_compose "$DEPLOY_DIR" up -d
+  docker_compose "$DEPLOY_DIR" up -d --remove-orphans
   wait_for_local_health "$DEPLOY_DIR" 45 2
+  set_installation_fact "$DEPLOY_DIR" local_services ready
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  sync_prompt_to_anythingllm "$DEPLOY_DIR"
-  import_and_publish_workflow "$DEPLOY_DIR"
+  sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"
+  knowledge_sync "$DEPLOY_DIR" || die "知识库同步未完全成功；保留安装进度供重试"
+  import_and_publish_workflow "$DEPLOY_DIR" || die "n8n 工作流导入或发布失败；保留安装进度供重试"
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --installation-in-progress
-  write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" ready
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
+    --application --installation-in-progress
+  set_installation_fact "$DEPLOY_DIR" app_config ready
+  set_installation_fact "$DEPLOY_DIR" provider ready
+  set_installation_fact "$DEPLOY_DIR" crisp_api pending
+  set_installation_fact "$DEPLOY_DIR" webhook pending
+  set_installation_fact "$DEPLOY_DIR" conversation pending
+  write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
+  INITIAL_BACKUP="${DEPLOY_DIR}/backups/initial-${VERSION}.tar.gz"
+  if [[ ! -f "$INITIAL_BACKUP" ]]; then
+    "${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$INITIAL_BACKUP" \
+      >/dev/null || die "首次迁移备份失败；本地服务保持 local-ready，可修复后重试"
+    info "首次迁移备份已创建：$INITIAL_BACKUP（不含密钥）"
+  fi
+  if webhook_access_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" webhook ready
+  else
+    set_installation_fact "$DEPLOY_DIR" webhook pending
+    warn "公网 Webhook 尚未通过 DNS/TLS/路由检查（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）；本地服务保持可用"
+  fi
+  if crisp_api_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" crisp_api ready
+    write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" ready
+  else
+    set_installation_fact "$DEPLOY_DIR" crisp_api failed
+    write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
+  fi
+  # 确认结果含外部凭据；配置与本地应用初始化成功后删除第二份明文副本。
+  rm -f -- "$WIZARD_RESULT"
 else
   if [[ "$PREVIOUS_STATE" == ready && "$PREVIOUS_VERSION" == "$VERSION" && $RECONFIGURE -eq 0 ]]; then
     write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" ready
   else
     write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" staged
   fi
+  rm -f -- "$WIZARD_RESULT"
 fi
 
 printf '部署目录：%s\n' "$DEPLOY_DIR"
@@ -507,11 +585,21 @@ if (( SKIP_START )) && [[ "$(installation_state "$DEPLOY_DIR")" == staged ]]; th
 elif (( SKIP_START )); then
   printf '重复安装检查完成；现有 ready 状态未降级。\n'
 else
-  printf '\n安装、工作流发布与健康检查完成。\n'
+  printf '\n本地服务、AnythingLLM 工作区、知识索引和生产 workflow 已完成初始化。\n'
   if [[ "$(env_get "$ENV_FILE" CRISP_HOOK_MODE)" == website ]]; then
-    printf 'Webhook：%swebhook/crisp-webhook?key=<CRISP_WEBSITE_HOOK_SECRET>\n' "$(env_get "$ENV_FILE" PUBLIC_WEBHOOK_URL)"
+    printf 'Webhook（消息回调地址）：%s?key=<CRISP_WEBSITE_HOOK_SECRET>\n' \
+      "$(env_get "$ENV_FILE" WEBHOOK_PRODUCTION_URL)"
   else
-    printf 'Plugin Webhook：%swebhook/crisp-webhook（必须由 Crisp 签名）\n' "$(env_get "$ENV_FILE" PUBLIC_WEBHOOK_URL)"
+    printf 'Plugin Webhook：%s（必须由 Crisp 签名）\n' \
+      "$(env_get "$ENV_FILE" WEBHOOK_PRODUCTION_URL)"
   fi
   printf '请在 Crisp 同时订阅 message:send 与 message:received。\n'
+  if [[ "$(installation_state "$DEPLOY_DIR")" == ready ]]; then
+    printf 'Crisp REST API 凭据已验证；Webhook 登记与首条真实会话仍需在 Crisp 后台完成。\n'
+  else
+    printf '本地安装已完成，但 Crisp REST API 尚未通过（HTTP %s）；服务和数据已保留。\n' \
+      "${CRISP_API_STATUS:-000}"
+    printf '修正 Crisp 凭据后运行：%s/manage.sh\n' "$DEPLOY_DIR"
+    exit 2
+  fi
 fi

@@ -8,14 +8,16 @@ source "${SCRIPT_DIR}/common.sh"
 DEPLOY_REQUEST=""
 OFFLINE=0
 LOCAL_ONLY=0
+APPLICATION_ONLY=0
 INSTALLATION_IN_PROGRESS=0
 
 usage() {
   cat <<'EOF'
-用法：healthcheck.sh [--deploy-dir PATH] [--offline] [--local]
+用法：healthcheck.sh [--deploy-dir PATH] [--offline] [--local] [--application]
 
 --offline 只检查文件、权限和配置格式，不访问 Docker 或外部 API。
 --local 检查文件、容器与本地健康接口，不访问外部 Provider 或 Crisp API。
+--application 检查本地应用、Provider 与 AnythingLLM，不访问 Crisp API。
 --installation-in-progress 仅供 install.sh/update.sh 在提交 ready 状态前使用。
 EOF
 }
@@ -33,6 +35,10 @@ while (( $# > 0 )); do
       ;;
     --local)
       LOCAL_ONLY=1
+      shift
+      ;;
+    --application)
+      APPLICATION_ONLY=1
       shift
       ;;
     --installation-in-progress)
@@ -55,6 +61,7 @@ if (( INSTALLATION_IN_PROGRESS )); then
 else
   assert_installation "$DEPLOY_DIR"
 fi
+repair_runtime_modules_from_source "$DEPLOY_DIR"
 FAILURES=0
 WARNINGS=0
 
@@ -79,6 +86,7 @@ REQUIRED_FILES=(
   config/app.yaml config/provider.yaml config/prompt.md
   config/keyword.yaml config/menu.yaml config/handoff.yaml
   config/tags.yaml config/feedback.yaml data/analytics/events.jsonl
+  scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh config/Caddyfile.example
 )
 for relative in "${REQUIRED_FILES[@]}"; do
   if [[ -f "${DEPLOY_DIR}/${relative}" && ! -L "${DEPLOY_DIR}/${relative}" ]]; then
@@ -238,7 +246,11 @@ else
   fi
 
   RUNNING=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=running 2>/dev/null || true)
-  for service in postgres anythingllm n8n; do
+  REQUIRED_SERVICES=(postgres anythingllm n8n)
+  if [[ "$(env_get "${DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)" == managed_https ]]; then
+    REQUIRED_SERVICES+=(caddy)
+  fi
+  for service in "${REQUIRED_SERVICES[@]}"; do
     if grep -Fxq "$service" <<< "$RUNNING"; then
       pass "容器运行：$service"
     else
@@ -275,7 +287,8 @@ else
   if (( LOCAL_ONLY )); then
     health_warn "本地模式未检查外部 Provider、Crisp API 与 AnythingLLM Developer API 鉴权"
   else
-    API_BASE=$(env_get "${DEPLOY_DIR}/.env" AI_API_BASE_URL 2>/dev/null || true)
+    API_BASE=$(env_get "${DEPLOY_DIR}/.env" AI_API_PROBE_BASE_URL 2>/dev/null \
+      || env_get "${DEPLOY_DIR}/.env" AI_API_BASE_URL 2>/dev/null || true)
     API_KEY=$(env_get "${DEPLOY_DIR}/.env" AI_API_KEY 2>/dev/null || true)
     AI_MODEL_VALUE=$(env_get "${DEPLOY_DIR}/.env" AI_MODEL 2>/dev/null || true)
     PROVIDER_PAYLOAD=$(jq -cn --arg model "$AI_MODEL_VALUE" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
@@ -285,21 +298,19 @@ else
       fail "Provider Chat Completions 或所选模型不可用"
     fi
 
-    CRISP_ID=$(env_get "${DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)
-    CRISP_TIER=$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_TIER 2>/dev/null || printf 'website')
-    CRISP_AUTH=$(env_get "${DEPLOY_DIR}/.env" CRISP_AUTH_B64 2>/dev/null || true)
-    CRISP_CONFIG=$(mktemp "${DEPLOY_DIR}/tmp/crisp-health-curl.XXXXXX")
-    chmod 600 "$CRISP_CONFIG"
-    printf 'header = "Authorization: Basic %s"\nheader = "X-Crisp-Tier: %s"\n' "$CRISP_AUTH" "$CRISP_TIER" > "$CRISP_CONFIG"
-    CRISP_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 20 \
-      --config "$CRISP_CONFIG" \
-      "https://api.crisp.chat/v1/website/${CRISP_ID}" 2>/dev/null || true)
-    rm -f -- "$CRISP_CONFIG"
-    if [[ "$CRISP_STATUS" == 2?? ]]; then
+    if (( APPLICATION_ONLY )); then
+      health_warn "应用模式未检查 Crisp REST API、Webhook 登记和真实会话"
+    elif crisp_api_check "$DEPLOY_DIR"; then
       pass "Crisp REST API 可用"
     else
-      fail "Crisp REST API 检查失败（HTTP ${CRISP_STATUS:-000}）"
+      fail "Crisp REST API 检查失败（HTTP ${CRISP_API_STATUS:-000}）"
+    fi
+    if (( APPLICATION_ONLY == 0 )); then
+      if webhook_access_check "$DEPLOY_DIR"; then
+        pass "生产 Webhook 的 DNS、TLS 与路由可达"
+      else
+        fail "生产 Webhook 尚不可达（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）"
+      fi
     fi
 
     ANYTHING_KEY_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)

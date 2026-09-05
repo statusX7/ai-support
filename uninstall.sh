@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/bootstrap.sh
+source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
 
@@ -9,6 +11,7 @@ DEPLOY_REQUEST=""
 MODE="safe"
 MODE_SELECTED=0
 ASSUME_YES=0
+NUMERIC_CONFIRM=0
 
 usage() {
   cat <<'EOF'
@@ -20,7 +23,8 @@ usage() {
 选项：
   --deploy-dir PATH  指定部署目录
   --keep-data        显式选择安全卸载（默认行为，兼容旧命令）
-  --purge            完整清理部署目录；始终需要两次人工确认并输入 PURGE
+  --purge            完整清理部署目录；直接调用时仍兼容两次确认并输入 PURGE
+  --numeric-confirm  配合 --purge 使用两次数字确认（供中文管理菜单调用）
   --yes              仅跳过安全卸载的普通确认，不能跳过完整清理确认
   --help              显示帮助
 EOF
@@ -49,6 +53,10 @@ while (( $# > 0 )); do
       ASSUME_YES=1
       shift
       ;;
+    --numeric-confirm)
+      NUMERIC_CONFIRM=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -57,8 +65,12 @@ while (( $# > 0 )); do
   esac
 done
 
-DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
+(( NUMERIC_CONFIRM == 0 || MODE == "purge" )) || die "--numeric-confirm 只能与 --purge 一起使用"
+
 [[ $EUID -eq 0 ]] || die "卸载需要 root 权限"
+bootstrap_prepare_minimal_dependencies \
+  || die "卸载所需基础依赖自动安装失败；部署未改变"
+DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
 acquire_maintenance_lock "$DEPLOY_DIR"
 
@@ -71,15 +83,24 @@ done
 
 if [[ "$MODE" == purge ]]; then
   printf '%s\n' '完整清理会永久删除运行数据、知识库、历史备份、日志和密钥。'
-  printf '第一次确认：确定进入完整清理模式？[y/N] '
-  IFS= read -r confirmation || confirmation=""
-  case "$confirmation" in
-    y|Y|yes|YES) ;;
-    *) die "已取消完整清理，部署保持不变" ;;
-  esac
-  printf '第二次确认：请输入 PURGE：'
-  IFS= read -r confirmation || confirmation=""
-  [[ "$confirmation" == "PURGE" ]] || die "未输入 PURGE，已取消完整清理"
+  if (( NUMERIC_CONFIRM )); then
+    printf '第一次确认：1 确认完整清理 / 0 返回：'
+    IFS= read -r confirmation || confirmation=""
+    [[ "$confirmation" == 1 ]] || die "已取消完整清理，部署保持不变"
+    printf '第二次确认：再次输入 1 永久删除 / 0 返回：'
+    IFS= read -r confirmation || confirmation=""
+    [[ "$confirmation" == 1 ]] || die "已取消完整清理，部署保持不变"
+  else
+    printf '第一次确认：确定进入完整清理模式？[y/N] '
+    IFS= read -r confirmation || confirmation=""
+    case "$confirmation" in
+      y|Y|yes|YES) ;;
+      *) die "已取消完整清理，部署保持不变" ;;
+    esac
+    printf '第二次确认：请输入 PURGE：'
+    IFS= read -r confirmation || confirmation=""
+    [[ "$confirmation" == "PURGE" ]] || die "未输入 PURGE，已取消完整清理"
+  fi
 elif (( ASSUME_YES == 0 )); then
   printf '确认安全卸载并保留配置、知识库和运行数据？[y/N] '
   IFS= read -r confirmation || confirmation=""
@@ -107,6 +128,8 @@ info "卸载前创建不含密钥的自动备份"
 [[ -f "$BACKUP_FILE" && ! -L "$BACKUP_FILE" ]] || die "自动备份没有生成有效文件"
 
 # 容器或网络未能完整移除时必须中止，禁止在仍有进程占用数据时继续删除文件。
+bootstrap_prepare_docker_runtime \
+  || die "Docker 自动修复失败；未删除容器、数据或程序文件，自动备份位于：$BACKUP_FILE"
 require_docker_runtime
 require_command jq
 COMPOSE_PROJECT_NAME_VALUE=$(

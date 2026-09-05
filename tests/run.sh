@@ -83,10 +83,11 @@ assert_file() {
 SHELL_FILES=(
   install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
-  scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
+  scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
+  scripts/wizard.sh scripts/package-release.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
-  tests/test_external_e2e.sh
+  tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
 )
 for file in "${SHELL_FILES[@]}"; do
@@ -103,6 +104,32 @@ if command -v shellcheck >/dev/null 2>&1; then
   pass "shellcheck"
 else
   critical_skip "系统未安装 shellcheck"
+fi
+
+TEST_LAYER=STUB
+"${SCRIPT_DIR}/test_bootstrap.sh"
+pass "依赖与 Docker 自动引导专项"
+
+if command -v python3 >/dev/null 2>&1 && command -v shellcheck >/dev/null 2>&1; then
+  "${SCRIPT_DIR}/test_wizard.sh"
+  pass "十项快速初始化向导专项"
+else
+  critical_skip "缺少 Python 3 或 shellcheck，未执行 PTY 快速初始化向导专项"
+fi
+
+TEST_LAYER=STATIC
+if ! command -v git >/dev/null 2>&1; then
+  critical_skip "缺少 Git，未执行正式源码发布包专项"
+elif [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all)" ]]; then
+  if (( RELEASE_MODE )); then
+    fail "发布模式要求先形成干净提交，再执行正式源码发布包专项"
+  fi
+  skip "当前为集成中的脏工作树；形成首个干净提交后执行正式源码发布包专项"
+elif command -v shellcheck >/dev/null 2>&1; then
+  "${SCRIPT_DIR}/test_release_package.sh"
+  pass "正式源码发布包、入口与密钥边界专项"
+else
+  critical_skip "缺少 shellcheck，未执行正式源码发布包专项"
 fi
 
 jq empty \
@@ -132,7 +159,7 @@ grep -Fxq 'ANYTHINGLLM_IMAGE=mintplexlabs/anythingllm:1.16.1' "${PROJECT_ROOT}/.
 pass "Docker Compose 静态安全契约"
 
 "${SCRIPT_DIR}/test_manage_contract.sh"
-pass "管理菜单 1..11 映射"
+pass "管理菜单 1..10、子菜单与未安装边界"
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   docker compose \
@@ -187,6 +214,15 @@ TEST_LAYER=STUB
 export PATH="${MOCK_DIR}:${ORIGINAL_PATH}"
 export MOCK_DOCKER_LOG="${TEST_ROOT}/docker.log"
 export MOCK_ANYTHING_STATE="${TEST_ROOT}/anythingllm-state.json"
+STUB_HOST_FIXTURE="${TEST_ROOT}/host-fixture"
+mkdir -p -- "${STUB_HOST_FIXTURE}/etc/ssl/certs"
+printf '%s\n' 'ID=debian' 'VERSION_ID="12"' 'VERSION_CODENAME=bookworm' \
+  > "${STUB_HOST_FIXTURE}/os-release"
+printf '%s\n' 'test CA bundle' > "${STUB_HOST_FIXTURE}/etc/ssl/certs/ca-certificates.crt"
+export CRISP_AI_BOOTSTRAP_TEST_MODE=1
+export CRISP_AI_BOOTSTRAP_OS_RELEASE="${STUB_HOST_FIXTURE}/os-release"
+export CRISP_AI_BOOTSTRAP_ETC_ROOT="${STUB_HOST_FIXTURE}/etc"
+export CRISP_AI_BOOTSTRAP_INIT=unsupported
 : > "$MOCK_DOCKER_LOG"
 printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
 
@@ -197,6 +233,7 @@ DOCKER_FAILURE_DEPLOY_DIR="${TEST_ROOT}/docker-failure"
 CHAT_MODE_FAILURE_DEPLOY_DIR="${TEST_ROOT}/chat-mode-failure"
 PARTIAL_DEPLOY_DIR="${TEST_ROOT}/partial-install"
 PLUGIN_DEPLOY_DIR="${TEST_ROOT}/plugin-install"
+CRISP_EXTERNAL_FAILURE_DEPLOY_DIR="${TEST_ROOT}/crisp-external-failure"
 INSTALL_LOG="${TEST_ROOT}/install.log"
 TEST_PROVIDER_KEY='test-only-provider-key'
 TEST_CRISP_KEY='test-only-crisp-key'
@@ -210,6 +247,8 @@ printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" "$TEST
   'test-only-plugin-anything-key' \
   'test-only-soft-provider-key' 'test-only-soft-crisp-key' \
   'test-only-soft-anything-key' \
+  'test-only-crisp-layer-provider-key' 'test-only-crisp-layer-token-key' \
+  'test-only-crisp-layer-anything-key' \
   > "$MOCK_FORBIDDEN_ARG_FILE"
 
 env \
@@ -254,18 +293,83 @@ for secret_value in "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY";
 done
 grep -Fq 'publish:workflow' "$MOCK_DOCKER_LOG" || fail "安装未发布 n8n workflow"
 grep -Fq 'info' "$MOCK_DOCKER_LOG" || fail "安装未检查 Docker daemon"
-grep -Fq '安装、工作流发布与健康检查完成' "$INSTALL_LOG" || fail "安装未完成最终健康检查"
+grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Crisp REST API 成功后安装未提交 ready 状态"
+grep -Fq '本地服务、AnythingLLM 工作区、知识索引和生产 workflow 已完成初始化' \
+  "$INSTALL_LOG" || fail "安装未完成新版分层初始化"
+grep -Fq 'Crisp REST API 凭据已验证' "$INSTALL_LOG" \
+  || fail "安装未明确区分 Crisp 凭据验证与真实会话验收"
 pass "安装与 Provider 自动检测"
+
+: > "$MOCK_DOCKER_LOG"
+if env \
+  MOCK_CRISP_FAIL=1 \
+  AI_API_BASE_URL=https://provider.invalid \
+  AI_API_KEY=test-only-crisp-layer-provider-key \
+  AI_MODEL=gpt-vision-test \
+  AI_SUPPORTS_VISION=false \
+  CRISP_WEBSITE_ID=66666666-6666-6666-6666-666666666666 \
+  CRISP_TOKEN_TIER=website \
+  CRISP_TOKEN_IDENTIFIER=test-only-crisp-layer-identifier \
+  CRISP_TOKEN_KEY=test-only-crisp-layer-token-key \
+  ANYTHINGLLM_API_KEY=test-only-crisp-layer-anything-key \
+  N8N_HOST=crisp-layer.example.invalid \
+  PUBLIC_WEBHOOK_URL=https://crisp-layer.example.invalid/ \
+  TIMEZONE=UTC \
+  "${PROJECT_ROOT}/install.sh" \
+    --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --non-interactive \
+    > "${TEST_ROOT}/crisp-layer-failure.log" 2>&1; then
+  CRISP_LAYER_STATUS=0
+else
+  CRISP_LAYER_STATUS=$?
+fi
+(( CRISP_LAYER_STATUS == 2 )) \
+  || fail "Crisp 外部 API 失败应以 local-ready 分层状态退出 2，实际为 ${CRISP_LAYER_STATUS}"
+grep -Fxq 'state=local-ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Crisp 外部 API 失败未提交 local-ready"
+for expected_fact in \
+  fact_dependencies=ready \
+  fact_local_services=ready \
+  fact_app_config=ready \
+  fact_provider=ready \
+  fact_crisp_api=failed; do
+  grep -Fxq "$expected_fact" "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
+    || fail "local-ready 安装事实缺少：$expected_fact"
+done
+grep -Fq '本地安装已完成，但 Crisp REST API 尚未通过' \
+  "${TEST_ROOT}/crisp-layer-failure.log" \
+  || fail "Crisp 外部失败没有明确区分本地安装完成状态"
+grep -Fq 'publish:workflow' "$MOCK_DOCKER_LOG" \
+  || fail "Crisp 外部失败前本地生产 workflow 未完成发布"
+for secret_value in \
+  test-only-crisp-layer-provider-key \
+  test-only-crisp-layer-token-key \
+  test-only-crisp-layer-anything-key; do
+  if grep -Fq "$secret_value" "${TEST_ROOT}/crisp-layer-failure.log"; then
+    fail "Crisp 外部分层失败日志泄露 API Key 或 Token"
+  fi
+done
+CRISP_LAYER_ENV_HASH=$(sha256sum "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.env" | awk '{print $1}')
+"${PROJECT_ROOT}/install.sh" \
+  --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --non-interactive \
+  > "${TEST_ROOT}/crisp-layer-retry.log" 2>&1
+grep -Fxq 'state=ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Crisp API 恢复后 local-ready 未提升为 ready"
+[[ "$(sha256sum "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.env" | awk '{print $1}')" == "$CRISP_LAYER_ENV_HASH" ]] \
+  || fail "local-ready 重试改写了既有密钥配置"
+pass "Crisp 外部失败 local-ready 分层、脱敏与幂等恢复"
 
 if env MOCK_DOCKER_DAEMON_FAIL=1 "${PROJECT_ROOT}/install.sh" \
   --deploy-dir "$DOCKER_FAILURE_DEPLOY_DIR" --non-interactive \
   > "${TEST_ROOT}/docker-daemon-failure.log" 2>&1; then
   fail "Docker daemon 不可连接时安装被错误报告为成功"
 fi
-grep -Fq '无法连接 Docker daemon' "${TEST_ROOT}/docker-daemon-failure.log" \
+grep -Eq 'Docker daemon|Docker 自动安装或真实运行验证失败' \
+  "${TEST_ROOT}/docker-daemon-failure.log" \
   || fail "Docker daemon 失败没有清晰提示"
-[[ ! -e "$DOCKER_FAILURE_DEPLOY_DIR" ]] || fail "Docker 预检失败后仍创建了部署目录"
-pass "Docker daemon 安装前预检失败路径"
+[[ ! -e "${DOCKER_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" ]] \
+  || fail "Docker 引导失败后错误提交了安装状态"
+pass "Docker daemon 自动引导失败时不提交安装状态"
 
 bash -c '
   set -euo pipefail

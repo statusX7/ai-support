@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/bootstrap.sh
+source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
 
@@ -24,6 +26,7 @@ usage() {
   --source-dir PATH   使用已下载的 ai-support 源码目录
   --no-pull           不执行 git pull，仅使用当前源码
   --skip-start        已禁用；更新必须完成快照、重启与健康检查
+  --version           显示版本
 EOF
 }
 
@@ -51,14 +54,20 @@ while (( $# > 0 )); do
       usage
       exit 0
       ;;
+    --version)
+      printf '%s\n' "$(<"${SCRIPT_DIR}/VERSION")"
+      exit 0
+      ;;
     *) die "未知选项：$1" ;;
   esac
 done
 
+[[ $EUID -eq 0 ]] || die "更新需要 root 权限"
+bootstrap_prepare_minimal_dependencies \
+  || die "更新所需基础依赖自动安装失败；现有部署未改变"
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
 acquire_maintenance_lock "$DEPLOY_DIR"
-[[ $EUID -eq 0 ]] || die "更新需要 root 权限"
 require_command realpath
 (( SKIP_START == 0 )) || die "为保证 n8n 数据库与 AnythingLLM 数据一致，更新不再支持 --skip-start"
 
@@ -134,6 +143,8 @@ rollback_on_failure() {
 }
 trap rollback_on_failure EXIT
 
+bootstrap_prepare_docker_runtime \
+  || die "Docker 自动修复失败；现有部署未改变"
 require_docker_runtime
 docker_compose "$DEPLOY_DIR" config --quiet
 
@@ -171,10 +182,30 @@ if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR" 30 2
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
-  import_and_publish_workflow "$DEPLOY_DIR"
+  knowledge_sync "$DEPLOY_DIR" || die "更新后知识库同步失败"
+  import_and_publish_workflow "$DEPLOY_DIR" || die "更新后 workflow 发布失败"
   wait_for_local_health "$DEPLOY_DIR" 30 2
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --installation-in-progress
-  write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" ready
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
+    --application --installation-in-progress
+  set_installation_fact "$DEPLOY_DIR" dependencies ready
+  set_installation_fact "$DEPLOY_DIR" local_services ready
+  set_installation_fact "$DEPLOY_DIR" app_config ready
+  set_installation_fact "$DEPLOY_DIR" provider ready
+  if webhook_access_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" webhook ready
+  else
+    set_installation_fact "$DEPLOY_DIR" webhook pending
+    warn "更新后公网 Webhook 尚未通过 DNS/TLS/路由检查（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）"
+  fi
+  set_installation_fact "$DEPLOY_DIR" conversation pending
+  if crisp_api_check "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" crisp_api ready
+    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" ready
+  else
+    set_installation_fact "$DEPLOY_DIR" crisp_api failed
+    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" local-ready
+    warn "更新完成且本地应用已通过检查，但 Crisp API 待修正（HTTP ${CRISP_API_STATUS:-000}）"
+  fi
   SERVICES_STOPPED=0
 fi
 

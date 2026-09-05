@@ -7,6 +7,7 @@
 - `config/prompt.md` 保存客服系统提示词。
 - `config/keyword.yaml`、`config/menu.yaml`、`config/handoff.yaml`、`config/tags.yaml` 和 `config/feedback.yaml` 保存业务规则。
 - 带 `.example` 后缀的文件是可公开提交的模板，不得填入真实凭据。
+- `tmp/quick-init.json` 仅在十项向导未完成或安装需恢复时存在，权限为 `0600`；配置与本地应用成功落盘后自动删除。
 
 ## AI Provider
 
@@ -15,6 +16,8 @@
 选择模型后，脚本会实际请求 `/v1/chat/completions`。该接口和所选模型必须可用，否则拒绝保存配置，因为 AnythingLLM 的 `generic-openai` Provider 依赖 Chat Completions。脚本还会探测 `/v1/responses`，并使用一张无业务数据的微型图片实际检测视觉能力。检测结果写入 `config/provider.yaml`，API Key 只写入 `.env` 的 `AI_API_KEY`。
 
 AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceDB。基础地址应包含 API 的 `/v1` 前缀；脚本会自动避免重复拼接 `/v1`。
+
+`.env` 中 `AI_API_PROBE_BASE_URL` 是宿主机实际探测地址，`AI_API_BASE_URL` 是容器运行地址。用户输入 `localhost` 或 `127.0.0.1` 时，后者自动映射为 `host.docker.internal`；两者不要手工混用。非本机 Provider 必须使用 HTTPS。配置值通过受限的 dotenv 序列化保存，支持 `$`、`#`、空格、引号、反斜线和 `=`，脚本从不 `source .env`。
 
 上述业务配置使用 JSON 语法书写；JSON 本身是合法 YAML，这使 n8n 无需额外解析依赖即可安全读取。首次安装由对应 `.example` 模板生成实际配置，实际配置被 Git 忽略。修改后应运行健康检查并重新发布工作流。
 
@@ -32,6 +35,8 @@ AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceD
 - Plugin 模式使用 `CRISP_PLUGIN_SIGNING_SECRET`，地址不带查询 Secret。工作流强制验证原始请求体的 HMAC-SHA256 签名和五分钟时间窗，不会回退为 URL Secret。
 
 两种 Hook 都必须订阅 `message:send` 与 `message:received`。前者处理访客消息，后者处理公开 operator 回复。Plugin Hook 可额外订阅 `session:request:initiated` 发送会话创建欢迎语。不要使用 `session:set_opened` 作为欢迎事件，它表示 operator 查看 conversation。
+
+`WEBHOOK_ACCESS_MODE` 为 `managed_https` 时启用 Compose 中的 Caddy profile；`external_proxy` 表示复用现有 HTTPS 入口。`WEBHOOK_PRODUCTION_URL` 始终保存最终 `/webhook/crisp-webhook` 地址，`PUBLIC_WEBHOOK_URL` 保存 n8n 使用的公开 base。受管 Caddy 仅发布生产 Webhook，证书目录集中在 `data/caddy` 和 `data/caddy-config`。
 
 图片 URL 默认只接受 HTTPS 的 `crisp.chat` 子域名。确需使用其他可信图片主机时，可在 `.env` 的 `CRISP_IMAGE_HOSTS` 中填写逗号分隔的精确主机名。
 
@@ -79,6 +84,7 @@ sudo /opt/crisp-ai/scripts/analytics.sh feedback
 - n8n `2.33.0`
 - PostgreSQL `16.10-alpine`
 - AnythingLLM `1.16.1`
+- Caddy `2.10.2-alpine`（仅受管 HTTPS profile 启用）
 
 AnythingLLM 基线选择 `1.16.1`，用于包含 `1.15.0` 之后公布的相关修复；不得把正式部署降级到 `1.15.0` 或更早版本。可通过 `.env` 覆盖镜像，但覆盖后必须先核对上游安全公告，再重新执行完整测试和真实部署验收。不要在正式部署中改用 `latest` 或宽泛主版本标签。
 

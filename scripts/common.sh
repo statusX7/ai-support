@@ -26,7 +26,7 @@ require_command() {
 
 require_docker_runtime() {
   require_command docker
-  docker compose version >/dev/null 2>&1 || die "未检测到 Docker Compose v2"
+  docker compose version >/dev/null 2>&1 || die "未检测到兼容的 Docker Compose 插件"
   docker info >/dev/null 2>&1 || die "无法连接 Docker daemon，请确认 Docker Engine 已启动且当前用户有权限访问"
 }
 
@@ -82,7 +82,8 @@ assert_installation() {
   [[ -f "$marker" && ! -L "$marker" ]] || die "目录不是受管理的 ai-support 部署：$deploy_dir"
   [[ "$(sed -n '1p' "$marker")" == "ai-support" ]] || die "安装标记无效：$marker"
   case "$(installation_state "$deploy_dir")" in
-    ready) ;;
+    ready|local-ready) ;;
+    collecting) die "快速初始化尚未确认，请从源码目录重新运行 install.sh" ;;
     installing) die "安装尚未完成，请从源码目录重新运行 install.sh" ;;
     staged) die "部署文件已暂存但服务尚未验收，请重新运行 install.sh（不要使用 --skip-start）" ;;
     uninstalled-data-kept) die "程序已卸载但数据仍保留，请从源码目录重新运行 install.sh" ;;
@@ -96,7 +97,7 @@ assert_managed_installation() {
   [[ -f "$marker" && ! -L "$marker" ]] || die "目录不是受管理的 ai-support 部署：$deploy_dir"
   [[ "$(sed -n '1p' "$marker")" == "ai-support" ]] || die "安装标记无效：$marker"
   case "$(installation_state "$deploy_dir")" in
-    ready|installing|staged|uninstalled-data-kept) ;;
+    ready|local-ready|collecting|installing|staged|uninstalled-data-kept) ;;
     *) die "安装标记状态无效：$marker" ;;
   esac
 }
@@ -116,11 +117,12 @@ write_installation_marker() {
   local version=$3
   local state=$4
   local marker="${deploy_dir}/${INSTALL_MARKER}"
-  local temp
+  local temp fact value
+  local -a facts=(dependencies local_services app_config provider crisp_api webhook conversation)
 
   [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "安装标记版本无效"
   case "$state" in
-    ready|installing|staged|uninstalled-data-kept) ;;
+    ready|local-ready|collecting|installing|staged|uninstalled-data-kept) ;;
     *) die "安装标记状态无效：$state" ;;
   esac
   mkdir -p -- "$deploy_dir"
@@ -131,22 +133,70 @@ write_installation_marker() {
     printf 'state=%s\n' "$state"
     [[ -z "$source_dir" ]] || printf 'source=%s\n' "$source_dir"
     printf 'installed_version=%s\n' "$version"
+    if [[ -f "$marker" && ! -L "$marker" ]]; then
+      for fact in "${facts[@]}"; do
+        value=$(sed -n "s/^fact_${fact}=//p" "$marker" | head -n 1)
+        case "$value" in
+          pending|ready|failed|skipped) printf 'fact_%s=%s\n' "$fact" "$value" ;;
+        esac
+      done
+    fi
   } > "$temp"
   chmod 600 "$temp"
+  mv -f -- "$temp" "$marker"
+}
+
+installation_fact() {
+  local deploy_dir=$1
+  local name=$2
+  [[ "$name" =~ ^(dependencies|local_services|app_config|provider|crisp_api|webhook|conversation)$ ]] \
+    || return 1
+  sed -n "s/^fact_${name}=//p" "${deploy_dir}/${INSTALL_MARKER}" 2>/dev/null | head -n 1
+}
+
+set_installation_fact() {
+  local deploy_dir=$1
+  local name=$2
+  local value=$3
+  local marker="${deploy_dir}/${INSTALL_MARKER}"
+  local temp line replaced=0
+
+  [[ "$name" =~ ^(dependencies|local_services|app_config|provider|crisp_api|webhook|conversation)$ ]] \
+    || die "安装事实名称无效：$name"
+  [[ "$value" =~ ^(pending|ready|failed|skipped)$ ]] || die "安装事实值无效：$value"
+  [[ -f "$marker" && ! -L "$marker" ]] || die "安装标记缺失或不安全：$marker"
+  temp=$(mktemp "${marker}.tmp.XXXXXX")
+  chmod 600 "$temp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "fact_${name}="* ]]; then
+      if (( replaced == 0 )); then
+        printf 'fact_%s=%s\n' "$name" "$value" >> "$temp"
+        replaced=1
+      fi
+    else
+      printf '%s\n' "$line" >> "$temp"
+    fi
+  done < "$marker"
+  if (( replaced == 0 )); then
+    printf 'fact_%s=%s\n' "$name" "$value" >> "$temp"
+  fi
   mv -f -- "$temp" "$marker"
 }
 
 env_get() {
   local env_file=$1
   local key=$2
-  local line value
+  local line value decoded
 
   [[ -f "$env_file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" == "${key}="* ]] || continue
     value=${line#*=}
     if [[ ${#value} -ge 2 && "$value" == \"*\" && "$value" == *\" ]]; then
-      value=${value:1:${#value}-2}
+      command -v jq >/dev/null 2>&1 || return 1
+      value=${value//\$\$/\$}
+      decoded=$(printf '%s' "$value" | jq -Rer 'fromjson | select(type == "string")') || return 1
+      value=$decoded
     elif [[ ${#value} -ge 2 && "$value" == \'*\' && "$value" == *\' ]]; then
       value=${value:1:${#value}-2}
     fi
@@ -159,8 +209,8 @@ env_get() {
 validate_env_value() {
   local value=$1
   [[ -n "$value" ]] || return 1
-  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
-  [[ "$value" =~ ^[A-Za-z0-9._~:/@+,=%?\&-]+$ ]]
+  (( ${#value} <= 8192 )) || return 1
+  [[ ! "$value" =~ [[:cntrl:]] ]]
 }
 
 validate_port() {
@@ -212,14 +262,84 @@ validate_public_url() {
   validate_env_value "$value"
 }
 
+webhook_ports_available() {
+  local deploy_dir=$1
+  local current_mode running
+
+  require_command ss
+  current_mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  if [[ "$current_mode" == managed_https ]] && command -v docker >/dev/null 2>&1 \
+    && docker info >/dev/null 2>&1; then
+    running=$(docker_compose "$deploy_dir" ps --services --filter status=running 2>/dev/null || true)
+    grep -Fxq caddy <<< "$running" && return 0
+  fi
+  ! ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)(80|443)$'
+}
+
+configure_webhook_access() {
+  local deploy_dir=$1
+  local mode=$2
+  local public_base=$3
+  local production_url=$4
+  local domain=$5
+  local env_file="${deploy_dir}/.env"
+  local previous_mode
+
+  previous_mode=$(env_get "$env_file" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+
+  validate_public_url "$public_base" || die "Webhook 公网 Base URL 无效"
+  [[ "$production_url" == https://*'/webhook/crisp-webhook' ]] \
+    || die "生产 Webhook 地址必须使用 HTTPS 并以 /webhook/crisp-webhook 结尾"
+  case "$mode" in
+    domain|managed_https)
+      validate_hostname "$domain" || die "自动 HTTPS 域名无效"
+      webhook_ports_available "$deploy_dir" \
+        || die "80 或 443 端口已被其他服务占用；安装器不会停止现有网站，请重新配置并填写现有 HTTPS 完整 Webhook 地址"
+      [[ -f "${deploy_dir}/config/Caddyfile.example" \
+        && ! -L "${deploy_dir}/config/Caddyfile.example" ]] || die "受管 HTTPS 模板缺失或不安全"
+      if [[ ! -e "${deploy_dir}/config/Caddyfile" ]]; then
+        install -m 0640 -- "${deploy_dir}/config/Caddyfile.example" "${deploy_dir}/config/Caddyfile"
+      fi
+      [[ -f "${deploy_dir}/config/Caddyfile" && ! -L "${deploy_dir}/config/Caddyfile" ]] \
+        || die "受管 HTTPS 配置不安全"
+      env_set "$env_file" WEBHOOK_ACCESS_MODE managed_https
+      env_set "$env_file" WEBHOOK_DOMAIN "$domain"
+      env_set "$env_file" COMPOSE_PROFILES managed-https
+      ;;
+    existing_url|external_proxy)
+      # 关闭本实例此前托管的 HTTPS 容器，避免 profile 取消后留下 80/443 孤儿。
+      # 只按当前 Compose 项目和服务名操作，不触碰宿主机其他反向代理。
+      if [[ "$previous_mode" == managed_https ]] && command -v docker >/dev/null 2>&1 \
+        && docker info >/dev/null 2>&1; then
+        docker_compose "$deploy_dir" --profile managed-https stop caddy >/dev/null 2>&1 || true
+        docker_compose "$deploy_dir" --profile managed-https rm -f caddy >/dev/null 2>&1 || true
+      fi
+      env_set "$env_file" WEBHOOK_ACCESS_MODE external_proxy
+      env_set "$env_file" WEBHOOK_DOMAIN "$domain"
+      env_unset "$env_file" COMPOSE_PROFILES
+      ;;
+    *) die "Webhook 接入模式无效：$mode" ;;
+  esac
+  env_set "$env_file" PUBLIC_WEBHOOK_URL "$public_base"
+  env_set "$env_file" WEBHOOK_PRODUCTION_URL "$production_url"
+}
+
 env_set() {
   local env_file=$1
   local key=$2
   local value=$3
-  local temp line replaced=0
+  local temp line replaced=0 encoded
 
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "环境变量名称无效：$key"
   validate_env_value "$value" || die "${key} 包含不安全字符或为空"
+  if [[ "$value" =~ ^[A-Za-z0-9._~:/@+,=%?\&-]+$ ]]; then
+    encoded=$value
+  else
+    require_command jq
+    encoded=$(jq -Rn --arg value "$value" '$value')
+    # Compose 会展开双引号值中的 `$`；使用 `$$` 保留原始字面值。
+    encoded=${encoded//\$/\$\$}
+  fi
   mkdir -p -- "$(dirname -- "$env_file")"
   touch -- "$env_file"
   temp=$(mktemp "${env_file}.tmp.XXXXXX")
@@ -228,7 +348,7 @@ env_set() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" == "${key}="* ]]; then
       if (( replaced == 0 )); then
-        printf '%s=%s\n' "$key" "$value" >> "$temp"
+        printf '%s=%s\n' "$key" "$encoded" >> "$temp"
         replaced=1
       fi
     else
@@ -236,8 +356,24 @@ env_set() {
     fi
   done < "$env_file"
   if (( replaced == 0 )); then
-    printf '%s=%s\n' "$key" "$value" >> "$temp"
+    printf '%s=%s\n' "$key" "$encoded" >> "$temp"
   fi
+  mv -f -- "$temp" "$env_file"
+  chmod 600 "$env_file"
+}
+
+env_unset() {
+  local env_file=$1
+  local key=$2
+  local temp line
+
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "环境变量名称无效：$key"
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 0
+  temp=$(mktemp "${env_file}.tmp.XXXXXX")
+  chmod 600 "$temp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "${key}="* ]] || printf '%s\n' "$line" >> "$temp"
+  done < "$env_file"
   mv -f -- "$temp" "$env_file"
   chmod 600 "$env_file"
 }
@@ -308,7 +444,8 @@ wait_for_local_health() {
 secure_permissions() {
   local deploy_dir=$1
   chmod 700 "$deploy_dir" "${deploy_dir}/data" "${deploy_dir}/logs" "${deploy_dir}/backups" \
-    "${deploy_dir}/backups/versions" "${deploy_dir}/tmp" 2>/dev/null || true
+    "${deploy_dir}/backups/versions" "${deploy_dir}/tmp" "${deploy_dir}/data/caddy" \
+    "${deploy_dir}/data/caddy-config" 2>/dev/null || true
   chmod 750 "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" "${deploy_dir}/scripts" "${deploy_dir}/docs" 2>/dev/null || true
   chmod 770 "${deploy_dir}/data/analytics" 2>/dev/null || true
   [[ -f "${deploy_dir}/.env" ]] && chmod 600 "${deploy_dir}/.env"
@@ -329,6 +466,29 @@ set_runtime_ownership() {
   chmod 0750 "${deploy_dir}/data/n8n" "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/runtime"
 }
 
+repair_runtime_modules_from_source() {
+  local deploy_dir=$1
+  local marker="${deploy_dir}/${INSTALL_MARKER}"
+  local source_dir relative source target mode
+  local -a required=(
+    scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
+    config/Caddyfile.example
+  )
+
+  source_dir=$(sed -n 's/^source=//p' "$marker" 2>/dev/null | head -n 1)
+  [[ -n "$source_dir" && "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 0
+  for relative in "${required[@]}"; do
+    target="${deploy_dir}/${relative}"
+    [[ -f "$target" && ! -L "$target" ]] && continue
+    source="${source_dir}/${relative}"
+    [[ -f "$source" && ! -L "$source" ]] \
+      || die "升级后缺少运行模块 ${relative}，且原始源码中无法恢复；请从完整新版本发布包运行 update.sh"
+    case "$relative" in scripts/*.sh) mode=0750 ;; *) mode=0640 ;; esac
+    install -D -m "$mode" -- "$source" "$target"
+    info "已从升级源码补齐运行模块：${relative}"
+  done
+}
+
 copy_project_files() {
   local source_dir=$1
   local deploy_dir=$2
@@ -337,7 +497,7 @@ copy_project_files() {
     VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
-    config/tags.yaml.example config/feedback.yaml.example
+    config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example
     n8n/workflow.json knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
   )
@@ -345,14 +505,16 @@ copy_project_files() {
     install.sh manage.sh update.sh uninstall.sh
     scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
     scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
+    scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
     "${deploy_dir}/scripts" "${deploy_dir}/docs" "${deploy_dir}/data/n8n" "${deploy_dir}/data/postgres" \
-    "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/analytics" "${deploy_dir}/data/runtime" "${deploy_dir}/logs" \
+    "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/analytics" "${deploy_dir}/data/runtime" \
+    "${deploy_dir}/data/caddy" "${deploy_dir}/data/caddy-config" "${deploy_dir}/logs" \
     "${deploy_dir}/backups" "${deploy_dir}/backups/versions" "${deploy_dir}/tmp"
   for directory in config knowledge n8n scripts docs data data/n8n data/postgres data/anythingllm \
-    data/analytics data/runtime logs backups backups/versions tmp; do
+    data/analytics data/runtime data/caddy data/caddy-config logs backups backups/versions tmp; do
     [[ -d "${deploy_dir}/${directory}" && ! -L "${deploy_dir}/${directory}" ]] \
       || die "受管理目录缺失或是符号链接：${deploy_dir}/${directory}"
   done
@@ -465,11 +627,34 @@ migrate_runtime_env() {
       env_set "$env_file" ANYTHINGLLM_IMAGE mintplexlabs/anythingllm:1.16.1
       ;;
   esac
+  value=$(env_get "$env_file" CADDY_IMAGE 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" CADDY_IMAGE caddy:2.10.2-alpine
 
   value=$(env_get "$env_file" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
   if [[ "$value" != chat ]]; then
     env_set "$env_file" ANYTHINGLLM_CHAT_MODE chat
     warn "已将 AnythingLLM 会话模式迁移为 chat，以保持同一 Crisp conversation 的上下文"
+  fi
+
+  value=$(env_get "$env_file" AI_API_PROBE_BASE_URL 2>/dev/null || true)
+  if [[ -z "$value" ]]; then
+    value=$(env_get "$env_file" AI_API_BASE_URL 2>/dev/null || true)
+    if [[ -n "$value" ]]; then
+      env_set "$env_file" AI_API_PROBE_BASE_URL "$value"
+    fi
+  fi
+
+  value=$(env_get "$env_file" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  if [[ -z "$value" ]]; then
+    env_set "$env_file" WEBHOOK_ACCESS_MODE external_proxy
+    env_set "$env_file" WEBHOOK_DOMAIN "$(env_get "$env_file" N8N_HOST 2>/dev/null || printf localhost)"
+  elif [[ "$value" != external_proxy && "$value" != managed_https ]]; then
+    die "WEBHOOK_ACCESS_MODE 只能是 external_proxy 或 managed_https"
+  fi
+  value=$(env_get "$env_file" WEBHOOK_PRODUCTION_URL 2>/dev/null || true)
+  if [[ -z "$value" ]]; then
+    value=$(env_get "$env_file" PUBLIC_WEBHOOK_URL 2>/dev/null || true)
+    [[ -n "$value" ]] && env_set "$env_file" WEBHOOK_PRODUCTION_URL "${value}webhook/crisp-webhook"
   fi
 
   value=$(env_get "$env_file" N8N_PROTOCOL 2>/dev/null || true)
@@ -526,12 +711,45 @@ normalize_api_base() {
   port=${BASH_REMATCH[3]}
   validate_hostname "$host" || return 1
   [[ -z "$port" ]] || validate_port "$port" || return 1
+  if [[ "$base" == http://* && "$host" != localhost && "$host" != 127.* ]]; then
+    return 1
+  fi
   [[ "$base" != *".."* ]] || return 1
   if [[ "$base" != */v1 ]]; then
     base="${base}/v1"
   fi
   validate_env_value "$base" || return 1
   printf '%s\n' "$base"
+}
+
+provider_runtime_base() {
+  local base=$1
+  local scheme host port path
+
+  base=$(normalize_api_base "$base") || return 1
+  if [[ "$base" =~ ^(https?)://(localhost|127\.0\.0\.1)(:([0-9]{1,5}))?(/.*)$ ]]; then
+    scheme=${BASH_REMATCH[1]}
+    host=host.docker.internal
+    port=${BASH_REMATCH[3]}
+    path=${BASH_REMATCH[5]}
+    printf '%s://%s%s%s\n' "$scheme" "$host" "$port" "$path"
+  else
+    printf '%s\n' "$base"
+  fi
+}
+
+validate_model_identifier() {
+  local value=$1
+  (( ${#value} >= 1 && ${#value} <= 512 )) || return 1
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$ ]]
+}
+
+curl_config_escape() {
+  local value=$1
+  validate_env_value "$value" || return 1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
 }
 
 probe_api_endpoint() {
@@ -544,7 +762,12 @@ probe_api_endpoint() {
   config_file=$(mktemp "${temp_dir}/provider-curl.XXXXXX")
   response_file=$(mktemp "${temp_dir}/provider-response.XXXXXX")
   chmod 600 "$config_file" "$response_file"
-  printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$api_key" > "$config_file"
+  local escaped_api_key
+  escaped_api_key=$(curl_config_escape "$api_key") || {
+    rm -f -- "$config_file" "$response_file"
+    return 1
+  }
+  printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$escaped_api_key" > "$config_file"
   status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
     --connect-timeout 8 --max-time 30 \
     --config "$config_file" \
@@ -571,13 +794,76 @@ probe_api_endpoint() {
   [[ "$valid" == true ]]
 }
 
+crisp_api_check() {
+  local deploy_dir=$1
+  local env_file="${deploy_dir}/.env"
+  local website tier auth config_file escaped_auth escaped_tier status
+
+  website=$(env_get "$env_file" CRISP_WEBSITE_ID 2>/dev/null || true)
+  tier=$(env_get "$env_file" CRISP_TOKEN_TIER 2>/dev/null || true)
+  auth=$(env_get "$env_file" CRISP_AUTH_B64 2>/dev/null || true)
+  [[ "$website" =~ ^[A-Za-z0-9-]{8,128}$ ]] || {
+    CRISP_API_STATUS=configuration
+    return 1
+  }
+  [[ "$tier" == website || "$tier" == plugin ]] || {
+    CRISP_API_STATUS=configuration
+    return 1
+  }
+  validate_env_value "$auth" || {
+    CRISP_API_STATUS=configuration
+    return 1
+  }
+
+  escaped_auth=$(curl_config_escape "$auth") || return 1
+  escaped_tier=$(curl_config_escape "$tier") || return 1
+  config_file=$(mktemp "${deploy_dir}/tmp/crisp-api.XXXXXX")
+  chmod 600 "$config_file"
+  {
+    printf 'header = "Authorization: Basic %s"\n' "$escaped_auth"
+    printf 'header = "X-Crisp-Tier: %s"\n' "$escaped_tier"
+  } > "$config_file"
+  # 不跟随重定向，避免把 Authorization 发送到其他主机。
+  status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --retry-max-time 45 \
+    --config "$config_file" \
+    "https://api.crisp.chat/v1/website/${website}" 2>/dev/null || true)
+  rm -f -- "$config_file"
+  CRISP_API_STATUS=${status:-000}
+  [[ "$CRISP_API_STATUS" == 2?? ]]
+}
+
+webhook_access_check() {
+  local deploy_dir=$1
+  local url status response_file
+
+  url=$(env_get "${deploy_dir}/.env" WEBHOOK_PRODUCTION_URL 2>/dev/null || true)
+  [[ "$url" == https://*'/webhook/crisp-webhook' ]] || {
+    WEBHOOK_ACCESS_STATUS=configuration
+    return 1
+  }
+  response_file=$(mktemp "${deploy_dir}/tmp/webhook-access.XXXXXX")
+  chmod 600 "$response_file"
+  # 空事件只用于验证 DNS、TLS、反向代理及生产 webhook 路由；不携带 URL Secret，
+  # 正常 workflow 会拒绝或忽略它，且不会触发 AI/Crisp 外发。
+  status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
+    --connect-timeout 8 --max-time 20 \
+    --header 'Content-Type: application/json' --data '{}' "$url" 2>/dev/null || true)
+  rm -f -- "$response_file"
+  WEBHOOK_ACCESS_STATUS=${status:-000}
+  case "$WEBHOOK_ACCESS_STATUS" in
+    2??|3??|400|401|403|405|422) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 configure_provider() {
   local deploy_dir=$1
   local non_interactive=${2:-0}
   local env_file="${deploy_dir}/.env"
-  local base api_key response_file status selected_model choice manual_model models_curl_config
+  local base runtime_base api_key response_file status selected_model choice manual_model models_curl_config
   local responses=false chat=false api_mode vision_answer=false
-  local default_model=${DEFAULT_AI_MODEL:-gpt-4.1-mini}
+  local default_model=${DEFAULT_AI_MODEL:-}
   local -a models=()
 
   require_command curl
@@ -598,13 +884,14 @@ configure_provider() {
   response_file=$(mktemp "${deploy_dir}/tmp/models.XXXXXX")
   models_curl_config=$(mktemp "${deploy_dir}/tmp/models-curl.XXXXXX")
   chmod 600 "$models_curl_config"
-  printf 'header = "Authorization: Bearer %s"\n' "$api_key" > "$models_curl_config"
+  printf 'header = "Authorization: Bearer %s"\n' "$(curl_config_escape "$api_key")" > "$models_curl_config"
   status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
     --connect-timeout 8 --max-time 30 \
     --config "$models_curl_config" \
     "${base}/models" 2>/dev/null || true)
   if [[ "$status" == 2?? ]] && jq -e '.data | type == "array"' "$response_file" >/dev/null 2>&1; then
-    mapfile -t models < <(jq -r '.data[]?.id | select(type == "string")' "$response_file" | head -n 100)
+    mapfile -t models < <(jq -r '.data[]?.id | select(type == "string")' "$response_file" \
+      | LC_ALL=C sort -u | head -n 500)
   fi
   rm -f -- "$response_file" "$models_curl_config"
 
@@ -646,19 +933,27 @@ configure_provider() {
     warn "请求 /v1/models 失败或未返回模型"
     if (( non_interactive )); then
       selected_model=${AI_MODEL:-$default_model}
+      [[ -n "$selected_model" ]] \
+        || die "/v1/models 未返回可选模型；非交互安装必须明确设置 AI_MODEL"
     else
-      printf '1. 手动输入模型名称\n2. 使用默认模型（%s）\n请选择：' "$default_model"
+      printf '1. 手动输入模型名称\n'
+      if [[ -n "$default_model" ]]; then
+        printf '2. 使用管理员明确配置的默认模型（%s）\n' "$default_model"
+      fi
+      printf '请选择：'
       IFS= read -r choice
       if [[ "$choice" == "1" ]]; then
         printf '请输入模型名称：'
         IFS= read -r manual_model
         selected_model=$manual_model
-      else
+      elif [[ "$choice" == "2" && -n "$default_model" ]]; then
         selected_model=$default_model
+      else
+        die "未选择有效模型，Provider 配置未保存"
       fi
     fi
   fi
-  validate_env_value "$selected_model" || die "模型名称包含不安全字符或为空"
+  validate_model_identifier "$selected_model" || die "模型名称格式无效"
 
   local responses_payload chat_payload
   responses_payload=$(jq -cn --arg model "$selected_model" '{model:$model,input:"ping",max_output_tokens:16}')
@@ -692,7 +987,9 @@ configure_provider() {
     warn "所选模型未通过图片输入能力检测；图片消息将提示切换视觉模型"
   fi
 
-  env_set "$env_file" AI_API_BASE_URL "$base"
+  runtime_base=$(provider_runtime_base "$base") || die "无法生成容器可用的 Provider 地址"
+  env_set "$env_file" AI_API_PROBE_BASE_URL "$base"
+  env_set "$env_file" AI_API_BASE_URL "$runtime_base"
   env_set "$env_file" AI_API_KEY "$api_key"
   env_set "$env_file" AI_MODEL "$selected_model"
   env_set "$env_file" AI_API_MODE "$api_mode"
@@ -704,9 +1001,9 @@ configure_provider() {
   {
     printf 'provider:\n'
     printf '  type: openai-compatible\n'
-    printf '  base_url: "%s"\n' "$base"
+    printf '  base_url: %s\n' "$(jq -Rn --arg value "$runtime_base" '$value')"
     printf '  api_key_env: AI_API_KEY\n'
-    printf '  model: "%s"\n' "$selected_model"
+    printf '  model: %s\n' "$(jq -Rn --arg value "$selected_model" '$value')"
     printf '  api_mode: %s\n' "$api_mode"
     printf '  capabilities:\n'
     printf '    responses: %s\n' "$responses"
@@ -719,7 +1016,11 @@ configure_provider() {
   } > "$provider_temp"
   mv -f -- "$provider_temp" "${deploy_dir}/config/provider.yaml"
   chmod 600 "${deploy_dir}/config/provider.yaml"
-  info "Provider 已配置：模型 ${selected_model}，模式 ${api_mode}"
+  if [[ "$runtime_base" != "$base" ]]; then
+    info "Provider 已配置：模型 ${selected_model}，模式 ${api_mode}；容器将通过 host.docker.internal 访问宿主服务"
+  else
+    info "Provider 已配置：模型 ${selected_model}，模式 ${api_mode}"
+  fi
 }
 
 anythingllm_api_ready() {
@@ -736,7 +1037,7 @@ anythingllm_secure_request() {
   local auth_value=${4:-}
   local payload=${5:-}
   local output_file=$6
-  local config_file payload_file status
+  local config_file payload_file status escaped_auth
 
   [[ "$method" == GET || "$method" == POST || "$method" == DELETE ]] || die "AnythingLLM 请求方法无效"
   [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]{1,5}/ ]] || die "AnythingLLM 本地 API 地址无效"
@@ -747,7 +1048,8 @@ anythingllm_secure_request() {
     printf 'header = "Accept: application/json"\n'
     if [[ -n "$auth_value" ]]; then
       validate_env_value "$auth_value" || die "AnythingLLM 认证值无效"
-      printf 'header = "Authorization: Bearer %s"\n' "$auth_value"
+      escaped_auth=$(curl_config_escape "$auth_value") || die "AnythingLLM 认证值无法安全写入请求配置"
+      printf 'header = "Authorization: Bearer %s"\n' "$escaped_auth"
     fi
     if [[ "$method" == POST || "$method" == DELETE ]]; then
       printf 'header = "Content-Type: application/json"\n'
@@ -944,6 +1246,72 @@ is_supported_knowledge_file() {
   esac
 }
 
+import_prompt_source() {
+  local deploy_dir=$1
+  local requested=${2:-}
+  local resolved target size
+
+  [[ -n "$requested" ]] || return 0
+  resolved=$(realpath -e -- "$requested") || die "Prompt 文件不存在：$requested"
+  [[ -f "$resolved" && ! -L "$resolved" ]] || die "Prompt 必须是普通文件且不能是符号链接"
+  size=$(stat -c '%s' "$resolved")
+  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size <= 0 || size > 262144 )); then
+    die "Prompt 文件必须为 1 到 262144 字节"
+  fi
+  target="${deploy_dir}/config/prompt.md"
+  if [[ "$(realpath -m -- "$resolved")" != "$(realpath -m -- "$target")" ]]; then
+    install -m 0640 -- "$resolved" "$target"
+  fi
+  chown root:1000 "$target" 2>/dev/null || true
+}
+
+import_knowledge_source() {
+  local deploy_dir=$1
+  local requested=${2:-}
+  local resolved file name staging target count=0
+  local -a files=()
+
+  [[ -n "$requested" ]] || {
+    printf '0\n'
+    return 0
+  }
+  resolved=$(realpath -e -- "$requested") || die "知识来源不存在：$requested"
+  [[ ! -L "$resolved" ]] || die "知识来源不能是符号链接"
+  if [[ -f "$resolved" ]]; then
+    is_supported_knowledge_file "$resolved" || die "知识文件只支持 Markdown、TXT、PDF 或 DOCX"
+    files+=("$resolved")
+  elif [[ -d "$resolved" ]]; then
+    while IFS= read -r -d '' file; do
+      is_supported_knowledge_file "$file" || continue
+      files+=("$file")
+    done < <(find "$resolved" -maxdepth 1 -type f ! -type l -print0 | sort -z)
+  else
+    die "知识来源必须是普通文件或目录"
+  fi
+
+  staging=$(mktemp -d "${deploy_dir}/tmp/knowledge-import.XXXXXX")
+  for file in "${files[@]}"; do
+    name=$(basename -- "$file")
+    [[ "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *\\* \
+      && "$name" != */* && "$name" != *';'* && "$name" != *','* ]] \
+      || { rm -rf -- "$staging"; die "知识文件名包含不安全字符：$name"; }
+    [[ ! -e "${staging}/${name}" ]] \
+      || { rm -rf -- "$staging"; die "知识目录存在重名文件：$name"; }
+    install -m 0640 -- "$file" "${staging}/${name}"
+  done
+  while IFS= read -r -d '' file; do
+    name=$(basename -- "$file")
+    target="${deploy_dir}/knowledge/${name}"
+    if [[ "$(realpath -m -- "$file")" != "$(realpath -m -- "$target")" ]]; then
+      install -m 0640 -- "$file" "$target"
+    fi
+    ((count += 1))
+  done < <(find "$staging" -maxdepth 1 -type f -print0 | sort -z)
+  rm -rf -- "$staging"
+  chown -R root:1000 "${deploy_dir}/knowledge" 2>/dev/null || true
+  printf '%d\n' "$count"
+}
+
 anythingllm_connection() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
@@ -1048,7 +1416,7 @@ knowledge_sync() {
   local force=${2:-0}
   local knowledge_dir="${deploy_dir}/knowledge"
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
-  local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations
+  local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations escaped_key
   local failures=0 uploaded=0 removed=0 skipped=0
   local -a files=()
 
@@ -1099,7 +1467,9 @@ knowledge_sync() {
     response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX")
     upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX")
     chmod 600 "$upload_config"
-    printf 'header = "Authorization: Bearer %s"\n' "$ANYTHING_KEY" > "$upload_config"
+    escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
+      || { rm -f -- "$upload_config" "$response_file"; die "AnythingLLM API Key 无法安全写入请求配置"; }
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"
     status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
       --connect-timeout 5 --max-time 300 \
       --config "$upload_config" \
