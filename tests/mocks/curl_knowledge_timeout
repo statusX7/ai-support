@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state_dir=${MOCK_ANYTHING_TIMEOUT_STATE:?缺少 MOCK_ANYTHING_TIMEOUT_STATE}
+output_file=""
+write_out=""
+request=GET
+url=""
+form_file=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    --output|-o)
+      output_file=$2
+      shift 2
+      ;;
+    --write-out|-w)
+      write_out=$2
+      shift 2
+      ;;
+    --request|-X)
+      request=$2
+      shift 2
+      ;;
+    --form|-F)
+      if [[ "$2" == file=@* ]]; then
+        form_file=${2#file=@}
+      fi
+      shift 2
+      ;;
+    --config|-K|--data-binary|--header|-H|--connect-timeout|--max-time)
+      shift 2
+      ;;
+    --silent|-s|--show-error|-S)
+      shift
+      ;;
+    http://*|https://*)
+      url=$1
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$url" ]] || {
+  printf 'AnythingLLM 超时测试桩未收到 URL\n' >&2
+  exit 2
+}
+
+respond() {
+  local status=$1
+  local body=$2
+
+  if [[ -n "$output_file" ]]; then
+    printf '%s\n' "$body" > "$output_file"
+  fi
+  if [[ -n "$write_out" ]]; then
+    printf '%s' "$status"
+  fi
+}
+
+mkdir -p -- "$state_dir"
+case "$url" in
+  */api/v1/document/upload)
+    [[ -n "$form_file" ]] || {
+      printf 'AnythingLLM 超时测试桩未收到上传文件\n' >&2
+      exit 2
+    }
+    printf 'upload\n' >> "${state_dir}/request.log"
+    respond 200 '{"success":true,"documents":[{"location":"custom-documents/slow.md.json"}]}'
+    ;;
+  */api/v1/workspace/*/update-embeddings)
+    printf 'update-accepted\n' >> "${state_dir}/request.log"
+    if [[ ! -e "${state_dir}/update-started" ]]; then
+      : > "${state_dir}/update-started"
+      : > "${state_dir}/server-processing"
+      (
+        sleep "${MOCK_ANYTHING_COMMIT_DELAY:-1.5}"
+        : > "${state_dir}/server-committed"
+        rm -f -- "${state_dir}/server-processing"
+        printf 'server-committed\n' >> "${state_dir}/request.log"
+      ) </dev/null >/dev/null 2>&1 &
+    fi
+    # 服务端已受理，但客户端在收到 HTTP 响应前超时。
+    [[ -z "$output_file" ]] || : > "$output_file"
+    [[ -z "$write_out" ]] || printf '000'
+    exit 28
+    ;;
+  */api/v1/workspace/*)
+    if [[ -e "${state_dir}/server-committed" ]]; then
+      printf 'workspace-read:committed\n' >> "${state_dir}/request.log"
+      respond 200 '{"workspace":{"slug":"crisp-support","documents":[{"docpath":"custom-documents/slow.md.json"}]}}'
+    else
+      printf 'workspace-read:processing\n' >> "${state_dir}/request.log"
+      respond 200 '{"workspace":{"slug":"crisp-support","documents":[]}}'
+    fi
+    ;;
+  */api/v1/system/remove-documents)
+    if [[ -e "${state_dir}/server-processing" ]]; then
+      printf 'remove-during-processing\n' >> "${state_dir}/request.log"
+    else
+      printf 'remove-after-processing\n' >> "${state_dir}/request.log"
+    fi
+    : > "${state_dir}/remove-called"
+    respond 200 '{"success":true}'
+    ;;
+  *)
+    printf 'unexpected:%s:%s\n' "$request" "$url" >> "${state_dir}/request.log"
+    respond 404 '{"error":"unexpected endpoint"}'
+    ;;
+esac

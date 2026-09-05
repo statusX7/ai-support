@@ -1042,10 +1042,14 @@ anythingllm_secure_request() {
   local auth_value=${4:-}
   local payload=${5:-}
   local output_file=$6
+  local max_time=${7:-60}
   local config_file payload_file status escaped_auth
 
   [[ "$method" == GET || "$method" == POST || "$method" == DELETE ]] || die "AnythingLLM 请求方法无效"
   [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]{1,5}/ ]] || die "AnythingLLM 本地 API 地址无效"
+  if [[ ! "$max_time" =~ ^[0-9]+$ ]] || (( max_time < 1 || max_time > 3600 )); then
+    die "AnythingLLM 请求超时参数无效"
+  fi
   config_file=$(mktemp "${deploy_dir}/tmp/curl-config.XXXXXX")
   payload_file=$(mktemp "${deploy_dir}/tmp/curl-body.XXXXXX")
   chmod 600 "$config_file" "$payload_file"
@@ -1063,12 +1067,12 @@ anythingllm_secure_request() {
   if [[ "$method" == POST || "$method" == DELETE ]]; then
     printf '%s' "$payload" > "$payload_file"
     status=$(curl --silent --output "$output_file" --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 60 --config "$config_file" \
+      --connect-timeout 5 --max-time "$max_time" --config "$config_file" \
       --request "$method" \
       --data-binary "@${payload_file}" "$url" 2>/dev/null || true)
   else
     status=$(curl --silent --output "$output_file" --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 60 --config "$config_file" "$url" 2>/dev/null || true)
+      --connect-timeout 5 --max-time "$max_time" --config "$config_file" "$url" 2>/dev/null || true)
   fi
   rm -f -- "$config_file" "$payload_file"
   printf '%s\n' "${status:-000}"
@@ -1366,23 +1370,71 @@ anythingllm_locations_have_state() {
   fi
 }
 
+anythingllm_wait_locations_state() {
+  local expected=$1
+  local should_exist=$2
+  local timeout=${3:-180}
+  local interval=${ANYTHINGLLM_EMBED_POLL_SECONDS:-2}
+  local deadline
+
+  if [[ ! "$timeout" =~ ^[0-9]+$ ]] || (( timeout < 0 || timeout > 3600 )); then
+    return 1
+  fi
+  if [[ ! "$interval" =~ ^[0-9]+$ ]] || (( interval < 1 || interval > 30 )); then
+    interval=2
+  fi
+  deadline=$((SECONDS + timeout))
+  while true; do
+    anythingllm_locations_have_state "$expected" "$should_exist" && return 0
+    (( SECONDS < deadline )) || return 1
+    sleep "$interval"
+  done
+}
+
 anythingllm_update_embeddings() {
   local payload=$1
-  local status response_file adds deletes
+  local status response_file adds deletes request_timeout state_timeout
 
+  request_timeout=${ANYTHINGLLM_EMBED_REQUEST_TIMEOUT_SECONDS:-900}
+  state_timeout=${ANYTHINGLLM_EMBED_STATE_WAIT_SECONDS:-180}
+  if [[ ! "$request_timeout" =~ ^[0-9]+$ ]] \
+    || (( request_timeout < 60 || request_timeout > 3600 )); then
+    request_timeout=900
+  fi
+  if [[ ! "$state_timeout" =~ ^[0-9]+$ ]] \
+    || (( state_timeout < 0 || state_timeout > 3600 )); then
+    state_timeout=180
+  fi
   response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/update-embeddings.XXXXXX")
   status=$(anythingllm_secure_request "$ANYTHING_DEPLOY_DIR" POST \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/update-embeddings" \
-    "$ANYTHING_KEY" "$payload" "$response_file")
-  if [[ "$status" != 2?? ]] || jq -e '.error == true' "$response_file" >/dev/null 2>&1; then
+    "$ANYTHING_KEY" "$payload" "$response_file" "$request_timeout")
+  if [[ -s "$response_file" ]] \
+    && jq -e '.error == true' "$response_file" >/dev/null 2>&1; then
     rm -f -- "$response_file"
     return 1
   fi
   rm -f -- "$response_file"
   adds=$(jq -c '.adds // []' <<< "$payload")
   deletes=$(jq -c '.deletes // []' <<< "$payload")
-  [[ "$adds" == "[]" ]] || anythingllm_locations_have_state "$adds" true || return 1
-  [[ "$deletes" == "[]" ]] || anythingllm_locations_have_state "$deletes" false || return 1
+  if [[ "$status" == 2?? ]]; then
+    [[ "$adds" == "[]" ]] \
+      || anythingllm_wait_locations_state "$adds" true "$state_timeout" || return 2
+    [[ "$deletes" == "[]" ]] \
+      || anythingllm_wait_locations_state "$deletes" false "$state_timeout" || return 2
+    return 0
+  fi
+
+  # 000、超时、限流和服务端错误都可能表示服务端已经受理但客户端尚未收到响应。
+  # 此时只对账，不删除源文档，避免与仍在执行的索引任务竞态。
+  if [[ "$status" == 000 || "$status" == 408 || "$status" == 429 || "$status" == 5?? ]]; then
+    [[ "$adds" == "[]" ]] \
+      || anythingllm_wait_locations_state "$adds" true "$state_timeout" || return 2
+    [[ "$deletes" == "[]" ]] \
+      || anythingllm_wait_locations_state "$deletes" false "$state_timeout" || return 2
+    return 0
+  fi
+  return 1
 }
 
 anythingllm_remove_documents() {
@@ -1416,12 +1468,49 @@ knowledge_record_garbage() {
   mv -f -- "$manifest_temp" "$manifest"
 }
 
+knowledge_record_pending() {
+  local manifest=$1
+  local filename=$2
+  local hash=$3
+  local locations=$4
+  local old_locations=$5
+  local manifest_temp now
+
+  now=$(date +%s)
+  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
+  jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
+    --argjson old_locations "$old_locations" --argjson started_at "$now" \
+    '.pending_files = (.pending_files // {}) |
+     .pending_files[$name] = {
+       sha256:$hash,
+       locations:$locations,
+       old_locations:$old_locations,
+       started_at:$started_at
+     }' "$manifest" > "$manifest_temp"
+  chmod 600 "$manifest_temp"
+  mv -f -- "$manifest_temp" "$manifest"
+}
+
+knowledge_clear_pending() {
+  local manifest=$1
+  local filename=$2
+  local manifest_temp
+
+  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
+  jq --arg name "$filename" \
+    '.pending_files = (.pending_files // {}) | del(.pending_files[$name])' \
+    "$manifest" > "$manifest_temp"
+  chmod 600 "$manifest_temp"
+  mv -f -- "$manifest_temp" "$manifest"
+}
+
 knowledge_sync() {
   local deploy_dir=$1
   local force=${2:-0}
   local knowledge_dir="${deploy_dir}/knowledge"
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
   local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations escaped_key
+  local pending_hash pending_locations pending_old_locations pending_started pending_age pending_retry_after update_status
   local failures=0 uploaded=0 removed=0 skipped=0
   local -a files=()
 
@@ -1430,17 +1519,20 @@ knowledge_sync() {
   require_command sha256sum
   anythingllm_connection "$deploy_dir"
   if [[ ! -f "$manifest" ]]; then
-    printf '{"version":1,"files":{},"garbage_locations":[]}\n' > "$manifest"
+    printf '{"version":1,"files":{},"pending_files":{},"garbage_locations":[]}\n' > "$manifest"
     chmod 600 "$manifest"
   fi
   jq -e '
     .version == 1 and (.files | type == "object") and
+    ((.pending_files // {}) | type == "object") and
     ((.garbage_locations // []) | type == "array" and all(type == "string"))
   ' "$manifest" >/dev/null || die "知识库清单格式无效：$manifest"
 
   garbage_locations=$(jq -c '(.garbage_locations // []) | unique' "$manifest")
   if [[ "$garbage_locations" != "[]" ]]; then
-    if anythingllm_remove_documents "$garbage_locations"; then
+    payload=$(jq -cn --argjson deletes "$garbage_locations" '{adds:[],deletes:$deletes}')
+    if anythingllm_update_embeddings "$payload" \
+      && anythingllm_remove_documents "$garbage_locations"; then
       manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
       jq '.garbage_locations = []' "$manifest" > "$manifest_temp"
       chmod 600 "$manifest_temp"
@@ -1450,6 +1542,11 @@ knowledge_sync() {
       warn "上次同步遗留的 AnythingLLM 源文档仍未清理，将在下次同步重试"
       ((failures += 1))
     fi
+  fi
+  pending_retry_after=${ANYTHINGLLM_PENDING_RETRY_AFTER_SECONDS:-1200}
+  if [[ ! "$pending_retry_after" =~ ^[0-9]+$ ]] \
+    || (( pending_retry_after < 60 || pending_retry_after > 86400 )); then
+    pending_retry_after=1200
   fi
 
   while IFS= read -r -d '' file; do
@@ -1464,62 +1561,124 @@ knowledge_sync() {
       || { warn "跳过非法文件名"; ((failures += 1)); continue; }
     hash=$(sha256sum -- "$file" | awk '{print $1}')
     old_hash=$(jq -r --arg name "$filename" '.files[$name].sha256 // ""' "$manifest")
-    if [[ "$force" != 1 && "$hash" == "$old_hash" ]]; then
-      ((skipped += 1))
-      continue
-    fi
-
-    response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX")
-    upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX")
-    chmod 600 "$upload_config"
-    escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
-      || { rm -f -- "$upload_config" "$response_file"; die "AnythingLLM API Key 无法安全写入请求配置"; }
-    printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"
-    status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 300 \
-      --config "$upload_config" \
-      --form "file=@${file}" \
-      "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null || true)
-    rm -f -- "$upload_config"
-    if [[ "$status" != 2?? ]] || ! jq -e '.success == true and (.documents | type == "array")' "$response_file" >/dev/null 2>&1; then
-      warn "知识文件同步失败：$filename（HTTP ${status:-000}）"
-      rm -f -- "$response_file"
-      ((failures += 1))
-      continue
-    fi
-    locations=$(jq -c '[.documents[]?.location | select(type == "string")]' "$response_file")
-    rm -f -- "$response_file"
-    if [[ "$locations" == "[]" ]]; then
-      warn "AnythingLLM 未返回文档位置：$filename"
-      ((failures += 1))
-      continue
-    fi
-
-    old_locations=$(jq -c --arg name "$filename" '.files[$name].locations // []' "$manifest")
-    payload=$(jq -cn --argjson adds "$locations" '{adds:$adds,deletes:[]}')
-    if ! anythingllm_update_embeddings "$payload"; then
-      warn "新索引建立或验证失败，已保留旧索引：$filename"
-      if ! anythingllm_remove_documents "$locations"; then
-        knowledge_record_garbage "$manifest" "$locations"
-        warn "本次上传的源文档清理失败，已登记供下次同步重试：$filename"
+    pending_hash=$(jq -r --arg name "$filename" '.pending_files[$name].sha256 // ""' "$manifest")
+    locations=''
+    old_locations=''
+    if [[ -n "$pending_hash" ]]; then
+      pending_locations=$(jq -c --arg name "$filename" '.pending_files[$name].locations // []' "$manifest")
+      pending_old_locations=$(jq -c --arg name "$filename" '.pending_files[$name].old_locations // []' "$manifest")
+      pending_started=$(jq -r --arg name "$filename" '.pending_files[$name].started_at // 0' "$manifest")
+      [[ "$pending_started" =~ ^[0-9]+$ ]] || pending_started=0
+      pending_age=$(( $(date +%s) - pending_started ))
+      if [[ "$hash" != "$pending_hash" || "$pending_locations" == "[]" ]]; then
+        if (( pending_age < pending_retry_after )); then
+          warn "知识文件在上次索引结果未确认时发生变化，已保留进度供稍后重试：$filename"
+          ((failures += 1))
+          continue
+        fi
+        payload=$(jq -cn --argjson deletes "$pending_locations" '{adds:[],deletes:$deletes}')
+        if [[ "$pending_locations" != "[]" ]] \
+          && { ! anythingllm_update_embeddings "$payload" \
+            || ! anythingllm_remove_documents "$pending_locations"; }; then
+          warn "无法安全清理已变更文件的上次索引进度：$filename"
+          ((failures += 1))
+          continue
+        fi
+        knowledge_clear_pending "$manifest" "$filename"
+        pending_hash=''
+        info "已清理发生变化文件的旧索引进度：$filename"
+      elif anythingllm_wait_locations_state "$pending_locations" true \
+        "${ANYTHINGLLM_EMBED_STATE_WAIT_SECONDS:-180}"; then
+        locations=$pending_locations
+        old_locations=$pending_old_locations
+        info "已从 AnythingLLM 实际状态恢复未完成的知识索引：$filename"
+      else
+        if (( pending_age < pending_retry_after )); then
+          warn "知识索引仍在服务端处理中，已保留进度供稍后重试：$filename"
+          ((failures += 1))
+          continue
+        fi
+        payload=$(jq -cn --argjson adds "$pending_locations" '{adds:$adds,deletes:[]}')
+        knowledge_record_pending "$manifest" "$filename" "$hash" \
+          "$pending_locations" "$pending_old_locations"
+        if anythingllm_update_embeddings "$payload"; then
+          locations=$pending_locations
+          old_locations=$pending_old_locations
+          info "已重试并恢复未完成的知识索引：$filename"
+        else
+          warn "知识索引结果仍无法确认，未删除服务端文档：$filename"
+          ((failures += 1))
+          continue
+        fi
       fi
-      ((failures += 1))
-      continue
+    fi
+
+    if [[ -z "$locations" ]]; then
+      if [[ "$force" != 1 && "$hash" == "$old_hash" ]]; then
+        ((skipped += 1))
+        continue
+      fi
+
+      response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX")
+      upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX")
+      chmod 600 "$upload_config"
+      escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
+        || { rm -f -- "$upload_config" "$response_file"; die "AnythingLLM API Key 无法安全写入请求配置"; }
+      printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"
+      status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 300 \
+        --config "$upload_config" \
+        --form "file=@${file}" \
+        "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null || true)
+      rm -f -- "$upload_config"
+      if [[ "$status" != 2?? ]] || ! jq -e '.success == true and (.documents | type == "array")' "$response_file" >/dev/null 2>&1; then
+        warn "知识文件同步失败：$filename（HTTP ${status:-000}）"
+        rm -f -- "$response_file"
+        ((failures += 1))
+        continue
+      fi
+      locations=$(jq -c '[.documents[]?.location | select(type == "string")]' "$response_file")
+      rm -f -- "$response_file"
+      if [[ "$locations" == "[]" ]]; then
+        warn "AnythingLLM 未返回文档位置：$filename"
+        ((failures += 1))
+        continue
+      fi
+
+      old_locations=$(jq -c --arg name "$filename" '.files[$name].locations // []' "$manifest")
+      knowledge_record_pending "$manifest" "$filename" "$hash" "$locations" "$old_locations"
+      payload=$(jq -cn --argjson adds "$locations" '{adds:$adds,deletes:[]}')
+      if anythingllm_update_embeddings "$payload"; then
+        update_status=0
+      else
+        update_status=$?
+      fi
+      if (( update_status != 0 )); then
+        if (( update_status == 2 )); then
+          warn "知识索引结果暂时未知，已保留恢复信息且不会删除服务端文档：$filename"
+        else
+          warn "知识索引被 AnythingLLM 明确拒绝，已保留旧索引：$filename"
+          if anythingllm_remove_documents "$locations"; then
+            knowledge_clear_pending "$manifest" "$filename"
+          else
+            knowledge_record_garbage "$manifest" "$locations"
+            knowledge_clear_pending "$manifest" "$filename"
+            warn "本次上传的源文档清理失败，已登记供下次同步重试：$filename"
+          fi
+        fi
+        ((failures += 1))
+        continue
+      fi
     fi
     stale_locations='[]'
     if [[ "$old_locations" != "[]" ]]; then
       stale_locations=$(jq -cn --argjson old "$old_locations" --argjson current "$locations" '$old - $current')
       payload=$(jq -cn --argjson deletes "$stale_locations" '{adds:[],deletes:$deletes}')
       if [[ "$stale_locations" != "[]" ]] && ! anythingllm_update_embeddings "$payload"; then
-        warn "旧索引清理失败，正在移除本次新索引：$filename"
-        payload=$(jq -cn --argjson deletes "$locations" '{adds:[],deletes:$deletes}')
-        anythingllm_update_embeddings "$payload" || warn "新索引回退清理失败，可能存在孤立索引：$filename"
-        if ! anythingllm_remove_documents "$locations"; then
-          knowledge_record_garbage "$manifest" "$locations"
-          warn "本次上传的源文档清理失败，已登记供下次同步重试：$filename"
-        fi
+        warn "旧索引清理结果无法确认；新索引保持可用，旧位置已登记供下次重试：$filename"
+        knowledge_record_garbage "$manifest" "$stale_locations"
         ((failures += 1))
-        continue
+        stale_locations='[]'
       fi
     fi
     garbage_locations='[]'
@@ -1532,12 +1691,38 @@ knowledge_sync() {
     jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
       --argjson garbage "$garbage_locations" \
       '.files[$name] = {sha256:$hash, locations:$locations} |
+       .pending_files = (.pending_files // {}) | del(.pending_files[$name]) |
        .garbage_locations = (((.garbage_locations // []) + $garbage) | unique)' \
       "$manifest" > "$manifest_temp"
     chmod 600 "$manifest_temp"
     mv -f -- "$manifest_temp" "$manifest"
     ((uploaded += 1))
   done
+
+  while IFS= read -r filename; do
+    [[ -n "$filename" ]] || continue
+    [[ -e "${knowledge_dir}/${filename}" ]] && continue
+    pending_locations=$(jq -c --arg name "$filename" '.pending_files[$name].locations // []' "$manifest")
+    pending_started=$(jq -r --arg name "$filename" '.pending_files[$name].started_at // 0' "$manifest")
+    [[ "$pending_started" =~ ^[0-9]+$ ]] || pending_started=0
+    pending_age=$(( $(date +%s) - pending_started ))
+    if (( pending_age < pending_retry_after )) \
+      && ! anythingllm_locations_have_state "$pending_locations" true; then
+      warn "已删除文件的旧索引仍可能在服务端处理中，已保留进度：$filename"
+      ((failures += 1))
+      continue
+    fi
+    payload=$(jq -cn --argjson deletes "$pending_locations" '{adds:[],deletes:$deletes}')
+    if [[ "$pending_locations" != "[]" ]] \
+      && { ! anythingllm_update_embeddings "$payload" \
+        || ! anythingllm_remove_documents "$pending_locations"; }; then
+      warn "无法安全清理已删除文件的未完成索引：$filename"
+      ((failures += 1))
+      continue
+    fi
+    knowledge_clear_pending "$manifest" "$filename"
+    ((removed += 1))
+  done < <(jq -r '(.pending_files // {}) | keys[]' "$manifest")
 
   while IFS= read -r filename; do
     [[ -n "$filename" ]] || continue

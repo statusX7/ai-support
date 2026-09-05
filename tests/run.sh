@@ -88,7 +88,8 @@ SHELL_FILES=(
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
-  tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
+  tests/test_knowledge_timeout.sh tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
+  tests/mocks/curl_knowledge_timeout
 )
 for file in "${SHELL_FILES[@]}"; do
   assert_file "${PROJECT_ROOT}/${file}"
@@ -109,6 +110,9 @@ fi
 TEST_LAYER=STUB
 "${SCRIPT_DIR}/test_bootstrap.sh"
 pass "依赖与 Docker 自动引导专项"
+
+"${SCRIPT_DIR}/test_knowledge_timeout.sh"
+pass "AnythingLLM 首次索引超时对账与恢复专项"
 
 if command -v python3 >/dev/null 2>&1 && command -v shellcheck >/dev/null 2>&1; then
   "${SCRIPT_DIR}/test_wizard.sh"
