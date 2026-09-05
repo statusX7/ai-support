@@ -14,6 +14,7 @@ SKIP_START=0
 SNAPSHOT_ID=""
 SNAPSHOT_SCRIPT=""
 ROLLBACK_SCRIPT=""
+BACKUP_SCRIPT=""
 UPDATE_COMPLETE=0
 SERVICES_STOPPED=0
 
@@ -107,10 +108,12 @@ if (( 10#$NEW_MAJOR < 10#$OLD_MAJOR \
 fi
 SNAPSHOT_SCRIPT="${SOURCE_DIR}/scripts/snapshot.sh"
 ROLLBACK_SCRIPT="${SOURCE_DIR}/scripts/rollback.sh"
+BACKUP_SCRIPT="${SOURCE_DIR}/scripts/backup.sh"
 if [[ ! -x "$SNAPSHOT_SCRIPT" ]]; then SNAPSHOT_SCRIPT="${DEPLOY_DIR}/scripts/snapshot.sh"; fi
 if [[ ! -x "$ROLLBACK_SCRIPT" ]]; then ROLLBACK_SCRIPT="${DEPLOY_DIR}/scripts/rollback.sh"; fi
-[[ -x "$SNAPSHOT_SCRIPT" && -x "$ROLLBACK_SCRIPT" ]] \
-  || die "当前部署和源码均缺少可执行的快照或回滚脚本"
+if [[ ! -x "$BACKUP_SCRIPT" ]]; then BACKUP_SCRIPT="${DEPLOY_DIR}/scripts/backup.sh"; fi
+[[ -x "$SNAPSHOT_SCRIPT" && -x "$ROLLBACK_SCRIPT" && -x "$BACKUP_SCRIPT" ]] \
+  || die "当前部署和源码均缺少可执行的快照、回滚或备份脚本"
 
 SNAPSHOT_MIN_FREE_MB_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_MIN_FREE_MB 2>/dev/null || true)
 SNAPSHOT_RETENTION_COUNT_VALUE=$(env_get "${DEPLOY_DIR}/.env" SNAPSHOT_RETENTION_COUNT 2>/dev/null || true)
@@ -151,7 +154,7 @@ docker_compose "$DEPLOY_DIR" config --quiet
 SNAPSHOT_ID=$("$SNAPSHOT_SCRIPT" --deploy-dir "$DEPLOY_DIR" --reason "pre-update-${OLD_VERSION}" --quiet)
 info "更新前版本快照：$SNAPSHOT_ID"
 BACKUP_FILE="${DEPLOY_DIR}/backups/pre-update-${OLD_VERSION}-$(date -u '+%Y%m%dT%H%M%SZ').tar.gz"
-"${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$BACKUP_FILE" >/dev/null
+"$BACKUP_SCRIPT" --deploy-dir "$DEPLOY_DIR" --output "$BACKUP_FILE" >/dev/null
 info "更新前迁移备份：$BACKUP_FILE"
 
 # 快照先记录旧镜像引用与镜像 ID；随后才迁移新版运行参数并拉取镜像。

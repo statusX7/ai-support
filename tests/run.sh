@@ -812,9 +812,17 @@ grep -Fq '已自动回滚到更新前版本' "${TEST_ROOT}/update-rollback.log" 
 pass "更新失败自动回滚"
 
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "legacy-backup-should-not-run\\n" >&2' \
+  'exit 97' > "${DEPLOY_DIR}/scripts/backup.sh"
+chmod 0750 "${DEPLOY_DIR}/scripts/backup.sh"
 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update.log" 2>&1
+if grep -Fq 'legacy-backup-should-not-run' "${TEST_ROOT}/update.log"; then
+  fail "升级错误调用了旧部署中的备份脚本"
+fi
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail "更新后版本错误"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
 jq -e '
