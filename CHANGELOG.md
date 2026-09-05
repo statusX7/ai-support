@@ -15,6 +15,7 @@
 - 安装依赖与拉取容器镜像默认使用无颜色、非动画的稳定输出，避免 `TERM=dumb`、日志采集或窄终端产生控制序列和超大转录。
 - 修复 AnythingLLM 首次下载本地 Embedding 模型时索引请求超时与服务端延迟提交的竞态；索引前写入可恢复清单，结果未知时有界对账且不删除在处理文档。
 - 为 n8n workflow 导入、发布状态导出增加 15 分钟执行上限和明确失败信息；恢复安装复用既有 AnythingLLM Developer API Key 时不再误报为新建。
+- 修复低速首次启动时 n8n JavaScript task runner 的 grant token 过期和任务 60 秒超时；生产 Webhook 现在能完成 Code node 校验，并为当前固定版本同时配置兼容 Webhook URL。
 
 影响：
 
