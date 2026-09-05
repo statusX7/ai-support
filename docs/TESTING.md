@@ -20,9 +20,23 @@
 
 自动测试使用项目目录内的临时运行目录，结束后清理。桩凭据只用于测试，不得使用真实 Token、Secret 或用户数据。
 
-## 发布模式自动测试
+## 源码发布模式（External Validation Pending）
 
-发布模式不允许关键自动测试跳过，并要求一个 `ready` 的真实部署，以及专用 Crisp Website、Provider、AnythingLLM 工作区和四个互不相同的空白测试 conversation。先通过 root shell 或 CI Secret Store 安全注入以下变量，不要把值写入仓库、命令行参数或 Shell 历史：
+源码发布与部署方实例验收分离。缺少 Crisp、Provider、AnythingLLM、公网 Webhook 或隔离 conversation 时，可显式运行：
+
+```bash
+AI_SUPPORT_RELEASE_TEST=1 \
+AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1 \
+./tests/run.sh
+```
+
+该模式要求 `STATIC` 与 `STUB` 无失败、无跳过，只允许 `INTEGRATION` 层把未配置的真实部署或外部 E2E 记录为 `External Validation Pending`。它不会把跳过项写成通过，也不会豁免实际执行后返回的失败。`AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1` 不能脱离 `AI_SUPPORT_RELEASE_TEST=1` 单独使用。
+
+源码发布报告必须保留外部待验证清单。部署实例获得真实凭据后，仍应运行下一节的不带豁免完整测试。
+
+## 完整部署发布模式自动测试
+
+完整部署模式不允许关键自动测试跳过，并要求一个 `ready` 的真实部署，以及专用 Crisp Website、Provider、AnythingLLM 工作区和四个互不相同的空白测试 conversation。先通过 root shell 或 CI Secret Store 安全注入以下变量，不要把值写入仓库、命令行参数或 Shell 历史：
 
 执行主机必须提供 ShellCheck、Docker Compose v2、Node.js、`curl`、`jq`、Python 3、`realpath`、`base64` 和 `sha256sum`；缺少任一关键依赖都会令发布模式失败。
 
@@ -145,4 +159,4 @@ Website Hook 和 Plugin Hook 分别执行一轮，且都订阅 `message:send` �
 
 ## 结果判定
 
-任何步骤为 FAIL、SKIP、未执行或证据不足，都必须写成“未验收”。只有 [发布说明](RELEASE.md) 中全部门禁为 PASS，才允许创建 `v1.0.0` tag 和 GitHub Release。
+任何步骤为 FAIL、SKIP、未执行或证据不足，都必须如实写成“失败”“跳过”或“未验收”。源码发布可以按 [发布说明](RELEASE.md) 使用 `External Validation Pending`，但不能把这些项目计入通过；完整部署实例只有在所有门禁均为 PASS 时才算验收完成。

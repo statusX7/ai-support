@@ -3,12 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.XXXXXX")
 MOCK_DIR="${SCRIPT_DIR}/mocks"
 ORIGINAL_PATH=$PATH
 PASSED=0
 SKIPPED=0
 RELEASE_MODE=${AI_SUPPORT_RELEASE_TEST:-0}
+EXTERNAL_PENDING_MODE=${AI_SUPPORT_EXTERNAL_VALIDATION_PENDING:-0}
 TEST_LAYER=STATIC
 declare -A LAYER_PASSED=([STATIC]=0 [STUB]=0 [INTEGRATION]=0)
 declare -A LAYER_SKIPPED=([STATIC]=0 [STUB]=0 [INTEGRATION]=0)
@@ -17,6 +17,16 @@ case "$RELEASE_MODE" in
   0|1) ;;
   *) printf '失败：[STATIC] AI_SUPPORT_RELEASE_TEST 只能是 0 或 1\n' >&2; exit 1 ;;
 esac
+case "$EXTERNAL_PENDING_MODE" in
+  0|1) ;;
+  *) printf '失败：[STATIC] AI_SUPPORT_EXTERNAL_VALIDATION_PENDING 只能是 0 或 1\n' >&2; exit 1 ;;
+esac
+if (( EXTERNAL_PENDING_MODE && RELEASE_MODE == 0 )); then
+  printf '失败：[STATIC] External Validation Pending 只能与 AI_SUPPORT_RELEASE_TEST=1 同时使用\n' >&2
+  exit 1
+fi
+
+TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.XXXXXX")
 
 cleanup() {
   if [[ "${AI_SUPPORT_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -57,6 +67,10 @@ trap 'report_unhandled_error "$LINENO"' ERR
 
 critical_skip() {
   if (( RELEASE_MODE )); then
+    if (( EXTERNAL_PENDING_MODE )) && [[ "$TEST_LAYER" == INTEGRATION ]]; then
+      skip "External Validation Pending：$1"
+      return
+    fi
     fail "发布模式禁止跳过：$1"
   fi
   skip "$1"
@@ -101,6 +115,8 @@ jq empty \
 PROJECT_VERSION=$(<"${PROJECT_ROOT}/VERSION")
 [[ "$PROJECT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "VERSION 格式无效"
 grep -Fq "version: ${PROJECT_VERSION}" "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
+grep -Fq "ai_support_version: '${PROJECT_VERSION}'" "${PROJECT_ROOT}/n8n/workflow.json" \
+  || fail "n8n workflow 回复版本未同步"
 pass "版本与 JSON/YAML 格式"
 
 grep -Fq 'no-new-privileges:true' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 缺少权限收紧"
@@ -868,3 +884,6 @@ for layer in STATIC STUB INTEGRATION; do
     "$layer" "${LAYER_PASSED[$layer]}" "${LAYER_SKIPPED[$layer]}"
 done
 printf '测试完成：通过 %d，跳过 %d，失败 0。\n' "$PASSED" "$SKIPPED"
+if (( RELEASE_MODE && EXTERNAL_PENDING_MODE )); then
+  printf '源码发布验收：通过；External Validation Pending（仅 INTEGRATION 层允许跳过）。\n'
+fi

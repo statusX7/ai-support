@@ -1,5 +1,22 @@
 # 更新日志
 
+## v1.0.0
+
+日期：2026-09-05
+
+修改：
+
+- 完成 Crisp、n8n、AnythingLLM 与 OpenAI Compatible API 组合部署框架的正式源码版本，统一安装、管理、更新、回滚、备份恢复和安全卸载入口。
+- 将源码发布与部署方外部实例验收分离；新增显式 `External Validation Pending` 发布模式，仅允许 `INTEGRATION` 层因外部资源未配置而跳过。
+- 同步应用与 n8n 出站消息版本，增加 workflow 版本一致性检查。
+- 修正 `update.sh --help` 对已禁用 `--skip-start` 的误导说明，并避免测试参数校验失败时遗留临时目录。
+- 增加正式 release notes、发布报告和无 GitHub 权限时的本地 tag/后续推送流程。
+
+影响：
+
+- 部署方可从正式源码运行 `sudo ./install.sh`，配置自己的 Crisp、Provider 和公网 Webhook 后完成实例健康检查。
+- 本版本的本地代码、真实 Docker/AnythingLLM/Provider 历史验收与安全测试结果可追溯；缺少专用 Crisp 账号的端到端项目明确标记为 `External Validation Pending`，未伪造为通过。
+
 ## v0.8.2
 
 日期：2026-09-05

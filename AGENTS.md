@@ -21,7 +21,8 @@
 - 每批修改必须同步更新 `VERSION` 和 `CHANGELOG.md`。
 - Git commit message 使用英文，并以版本号开头，例如 `v0.1.1 add ai provider detection`。
 - 日常修改只创建本地 commit，不执行 GitHub push。
-- 只有真实部署与外部端到端发布门禁全部通过的正式版本才创建 GitHub Release 并 push；候选版本只保留本地 commit。
+- 源码正式版本与部署实例验收分离：缺少用户自有 Crisp、Provider 或公网 Webhook 时，可在本地代码门禁通过后发布，但报告必须明确标记 `External Validation Pending`，不得把未执行项目写成通过。
+- 有 GitHub 权限时才 push 并创建 GitHub Release；没有权限时完成本地 commit、annotated tag、release notes 和推送说明，不得伪造远端状态。
 - 每次完成开发后创建 `docs/reports/v版本-report.md`，记录提交、变更、测试、风险与后续建议。
 
 ## 验证

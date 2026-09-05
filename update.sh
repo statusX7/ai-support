@@ -23,7 +23,7 @@ usage() {
   --deploy-dir PATH   指定部署目录
   --source-dir PATH   使用已下载的 ai-support 源码目录
   --no-pull           不执行 git pull，仅使用当前源码
-  --skip-start        更新文件但不拉取镜像或重启容器
+  --skip-start        已禁用；更新必须完成快照、重启与健康检查
 EOF
 }
 
