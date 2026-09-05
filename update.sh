@@ -156,10 +156,10 @@ info "更新前迁移备份：$BACKUP_FILE"
 
 # 快照先记录旧镜像引用与镜像 ID；随后才迁移新版运行参数并拉取镜像。
 migrate_runtime_env "$DEPLOY_DIR"
-docker compose --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
+docker_compose_command --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
   -f "${SOURCE_DIR}/docker-compose.yml" config --quiet
 # 镜像拉取在正式停机前完成；网络或 registry 失败不会影响当前运行服务。
-docker compose --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
+docker_compose_command --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
   -f "${SOURCE_DIR}/docker-compose.yml" pull
 docker_compose "$DEPLOY_DIR" stop n8n anythingllm
 SERVICES_STOPPED=1

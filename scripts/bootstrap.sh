@@ -142,6 +142,9 @@ bootstrap_apt_get() {
   local status
   local lock_timeout=${CRISP_AI_BOOTSTRAP_APT_LOCK_TIMEOUT:-180}
   local -a apt_options=(
+    -q
+    -o APT::Color=0
+    -o Dpkg::Use-Pty=0
     -o "DPkg::Lock::Timeout=${lock_timeout}"
     -o Acquire::Retries=3
     -o Acquire::http::Timeout=30

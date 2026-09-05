@@ -113,6 +113,10 @@ grep -Fq 'bootstrap_prepare_docker_runtime' "${PROJECT_ROOT}/install.sh" \
   || fail "install.sh 未在向导确认后调用 Docker 运行时引导"
 grep -Fq 'quick_init_wizard' "${PROJECT_ROOT}/install.sh" \
   || fail "install.sh 未实际调用 quick_init_wizard"
+grep -Fq 'Dpkg::Use-Pty=0' "${PROJECT_ROOT}/scripts/bootstrap.sh" \
+  || fail "apt 自动安装未关闭不可审计的 PTY 动画"
+grep -Fq "COMPOSE_PROGRESS=\"\$progress\"" "${PROJECT_ROOT}/scripts/common.sh" \
+  || fail "Compose 生产入口未在 dumb/日志终端使用稳定进度输出"
 for script_name in bootstrap.sh wizard.sh package-release.sh; do
   grep -Fq "scripts/${script_name}" "${PROJECT_ROOT}/scripts/common.sh" \
     || fail "部署复制清单未包含 ${script_name}"

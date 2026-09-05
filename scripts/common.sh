@@ -405,10 +405,15 @@ ensure_secret() {
   fi
 }
 
+docker_compose_command() {
+  local progress=${COMPOSE_PROGRESS:-plain}
+  COMPOSE_PROGRESS="$progress" docker compose "$@"
+}
+
 docker_compose() {
   local deploy_dir=$1
   shift
-  docker compose \
+  docker_compose_command \
     --project-directory "$deploy_dir" \
     --env-file "${deploy_dir}/.env" \
     -f "${deploy_dir}/docker-compose.yml" \
