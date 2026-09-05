@@ -65,7 +65,8 @@ while (( $# > 0 )); do
   esac
 done
 
-(( NUMERIC_CONFIRM == 0 || MODE == "purge" )) || die "--numeric-confirm 只能与 --purge 一起使用"
+[[ $NUMERIC_CONFIRM -eq 0 || $MODE == purge ]] \
+  || die "--numeric-confirm 只能与 --purge 一起使用"
 
 [[ $EUID -eq 0 ]] || die "卸载需要 root 权限"
 bootstrap_prepare_minimal_dependencies \

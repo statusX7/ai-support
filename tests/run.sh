@@ -947,6 +947,20 @@ fi
   || fail "--yes 的错误 PURGE 确认破坏了部署目录"
 grep -Fq 'PURGE' "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" \
   || fail "--yes 场景未要求 PURGE 二次确认"
+
+: > "$MOCK_DOCKER_LOG"
+if printf '1\n0\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge --numeric-confirm \
+  > "${TEST_ROOT}/uninstall-purge-numeric-cancel.log" 2>&1; then
+  fail "数字二次确认取消后仍执行了完整清理"
+fi
+[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" ]] \
+  || fail "数字二次确认取消破坏了部署目录"
+grep -Fq '已取消完整清理' "${TEST_ROOT}/uninstall-purge-numeric-cancel.log" \
+  || fail "数字二次确认没有安全取消或触发了 set -u 错误"
+if grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG"; then
+  fail "数字二次确认取消后仍停止了服务"
+fi
 pass "彻底卸载要求普通确认及不可绕过的 PURGE 二次确认"
 
 PURGE_ENV_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')
