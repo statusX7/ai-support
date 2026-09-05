@@ -17,6 +17,7 @@
 - 为 n8n workflow 导入、发布状态导出增加 15 分钟执行上限和明确失败信息；恢复安装复用既有 AnythingLLM Developer API Key 时不再误报为新建。
 - 修复低速首次启动时 n8n JavaScript task runner 的 grant token 过期和任务 60 秒超时；生产 Webhook 现在能完成 Code node 校验，并为当前固定版本同时配置兼容 Webhook URL。
 - 将安装、更新、恢复和回滚的本地服务健康等待改为受限且可配置的统一策略，避免慢速但受支持的虚拟机在数据已恢复后误报回滚失败。
+- 修复更新或回滚中断留下 `installing` 状态时重复要求十项输入的问题；实际配置完整且校验通过时直接复用密钥和业务数据继续安装。
 
 影响：
 

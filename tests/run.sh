@@ -457,6 +457,20 @@ ENV_HASH_AFTER=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 [[ "$ENV_HASH_BEFORE" == "$ENV_HASH_AFTER" ]] || fail "重复安装改写了现有密钥配置"
 pass "重复安装幂等性"
 
+sed -i 's/^state=.*/state=installing/' "${DEPLOY_DIR}/.crisp-ai-installation"
+rm -f -- "${DEPLOY_DIR}/tmp/quick-init.json"
+"${PROJECT_ROOT}/install.sh" \
+  --deploy-dir "$DEPLOY_DIR" --non-interactive --skip-start > "${TEST_ROOT}/incomplete-install-retry.log" 2>&1
+grep -Fxq 'state=staged' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "完整配置的未完成安装在 --skip-start 下未进入 staged"
+[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] \
+  || fail "未完成安装恢复改写了现有密钥配置"
+grep -Fq '已验证未完成部署的 .env 与实际配置' "${TEST_ROOT}/incomplete-install-retry.log" \
+  || fail "未完成安装没有明确说明已验证并复用实际配置"
+pass "未完成安装在向导临时状态缺失时复用已验证配置"
+
+sed -i 's/^state=.*/state=ready/' "${DEPLOY_DIR}/.crisp-ai-installation"
+
 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --offline \
   > "${TEST_ROOT}/health-offline.log" 2>&1
 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \

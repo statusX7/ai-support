@@ -199,6 +199,11 @@ validate_preserved_installation() {
   fi
 }
 
+installation_config_is_reusable() {
+  local deploy_dir=$1
+  (validate_preserved_installation "$deploy_dir") >/dev/null 2>&1
+}
+
 usage() {
   cat <<'EOF'
 用法：./install.sh [选项]
@@ -265,6 +270,7 @@ DEPLOY_DIR=$(resolve_deploy_dir "${DEPLOY_REQUEST:-$DEFAULT_DEPLOY_DIR}")
 
 EXISTING=0
 REUSE_PRESERVED_CONFIG=0
+REUSE_CONFIG_REASON=""
 PREVIOUS_STATE="new"
 PREVIOUS_VERSION=""
 if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
@@ -277,11 +283,22 @@ if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -
       collecting)
         warn "检测到未完成的快速初始化，本次将从保存的步骤继续"
         ;;
+      installing|failed)
+        if (( RECONFIGURE )); then
+          warn "检测到未完成的部署状态（${PREVIOUS_STATE}），本次将按 --reconfigure 重新配置"
+        elif installation_config_is_reusable "$DEPLOY_DIR"; then
+          REUSE_PRESERVED_CONFIG=1
+          REUSE_CONFIG_REASON=incomplete
+        else
+          warn "检测到未完成的部署状态（${PREVIOUS_STATE}），现有配置不完整，将返回快速初始化"
+        fi
+        ;;
       uninstalled-data-kept)
         if (( RECONFIGURE )); then
           warn "检测到安全卸载后的保留数据，本次将按 --reconfigure 重新配置"
         else
           REUSE_PRESERVED_CONFIG=1
+          REUSE_CONFIG_REASON=uninstalled
         fi
         ;;
       *)
@@ -299,7 +316,11 @@ acquire_maintenance_lock "$DEPLOY_DIR"
 if (( REUSE_PRESERVED_CONFIG )); then
   validate_preserved_installation "$DEPLOY_DIR"
   EXISTING=1
-  info '已验证安全卸载保留的 .env 与实际配置；本次将直接复用，不重新输入凭据'
+  if [[ "$REUSE_CONFIG_REASON" == incomplete ]]; then
+    info '已验证未完成部署的 .env 与实际配置；本次将直接复用并继续，不重新输入凭据'
+  else
+    info '已验证安全卸载保留的 .env 与实际配置；本次将直接复用，不重新输入凭据'
+  fi
 fi
 if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
   die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
