@@ -1,12 +1,12 @@
 {
   "handoff": {
     "keywords": ["人工", "人工客服", "转人工", "真人", "真人客服"],
+    "match_mode": "exact",
     "disable_ai": true,
     "notify_user": {
       "enabled": true
     },
     "message": "正在为您转接人工客服，请稍候。",
-    "resume_keywords": ["恢复AI", "AI恢复"],
     "resume_after_seconds": 1800,
     "while_active": "人工客服正在接管此会话，请稍候。",
     "no_answer_message": "知识库暂时没有足够信息，请换一种方式描述问题。",

@@ -21,7 +21,7 @@
 - 每批修改必须同步更新 `VERSION` 和 `CHANGELOG.md`。
 - Git commit message 使用英文，并以版本号开头，例如 `v0.1.1 add ai provider detection`。
 - 日常修改只创建本地 commit，不执行 GitHub push。
-- 只有 `v0.7.0`、`v0.8.0` 等正式版本才创建 GitHub Release 并 push。
+- 只有真实部署与外部端到端发布门禁全部通过的正式版本才创建 GitHub Release 并 push；候选版本只保留本地 commit。
 - 每次完成开发后创建 `docs/reports/v版本-report.md`，记录提交、变更、测试、风险与后续建议。
 
 ## 验证

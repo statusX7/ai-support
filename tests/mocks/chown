@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 桩测试不改变宿主机属主；真实 UID/GID 由部署集成检查验证。
+exit 0

@@ -1,8 +1,14 @@
 name: crisp-ai
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.10-alpine}
     restart: unless-stopped
     init: true
     security_opt:
@@ -23,9 +29,11 @@ services:
       start_period: 20s
     networks:
       - backend
+    logging: *default-logging
 
   anythingllm:
-    image: ${ANYTHINGLLM_IMAGE:-mintplexlabs/anythingllm:latest}
+    image: ${ANYTHINGLLM_IMAGE:-mintplexlabs/anythingllm:1.16.1}
+    user: "1000:1000"
     restart: unless-stopped
     init: true
     security_opt:
@@ -47,6 +55,7 @@ services:
       EMBEDDING_ENGINE: native
       VECTOR_DB: lancedb
       DISABLE_TELEMETRY: "true"
+      DISABLE_SWAGGER_DOCS: "true"
       WORKSPACE_DELETION_PROTECTION: enable
       TZ: ${TIMEZONE:-UTC}
     volumes:
@@ -67,9 +76,11 @@ services:
       start_period: 60s
     networks:
       - backend
+    logging: *default-logging
 
   n8n:
-    image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2}
+    image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2.33.0}
+    user: "1000:1000"
     restart: unless-stopped
     init: true
     security_opt:
@@ -88,7 +99,7 @@ services:
       DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
       N8N_HOST: ${N8N_HOST:-localhost}
       N8N_PORT: "5678"
-      N8N_PROTOCOL: https
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-https}
       N8N_EDITOR_BASE_URL: ${PUBLIC_WEBHOOK_URL:?请在 .env 中设置 PUBLIC_WEBHOOK_URL}
       WEBHOOK_URL: ${PUBLIC_WEBHOOK_URL:?请在 .env 中设置 PUBLIC_WEBHOOK_URL}
       N8N_PROXY_HOPS: "1"
@@ -109,11 +120,13 @@ services:
       CRISP_WEBSITE_ID: ${CRISP_WEBSITE_ID:?请在 .env 中设置 CRISP_WEBSITE_ID}
       CRISP_TOKEN_TIER: ${CRISP_TOKEN_TIER:-website}
       CRISP_AUTH_B64: ${CRISP_AUTH_B64:?请在 .env 中设置 CRISP_AUTH_B64}
-      CRISP_WEBHOOK_SECRET: ${CRISP_WEBHOOK_SECRET:?请在 .env 中设置 CRISP_WEBHOOK_SECRET}
+      CRISP_HOOK_MODE: ${CRISP_HOOK_MODE:-website}
+      CRISP_WEBSITE_HOOK_SECRET: ${CRISP_WEBSITE_HOOK_SECRET:-not-configured}
+      CRISP_PLUGIN_SIGNING_SECRET: ${CRISP_PLUGIN_SIGNING_SECRET:-not-configured}
       CRISP_IMAGE_HOSTS: ${CRISP_IMAGE_HOSTS:-}
       ANYTHINGLLM_API_KEY: ${ANYTHINGLLM_API_KEY:?请在 .env 中设置 ANYTHINGLLM_API_KEY}
       ANYTHINGLLM_WORKSPACE: ${ANYTHINGLLM_WORKSPACE:-crisp-support}
-      ANYTHINGLLM_CHAT_MODE: ${ANYTHINGLLM_CHAT_MODE:-query}
+      ANYTHINGLLM_CHAT_MODE: ${ANYTHINGLLM_CHAT_MODE:-chat}
       AI_API_BASE_URL: ${AI_API_BASE_URL:?请在 .env 中设置 AI_API_BASE_URL}
       AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
       AI_MODEL: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
@@ -139,6 +152,9 @@ services:
       - type: bind
         source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/analytics
         target: /opt/crisp-ai/data/analytics
+      - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/runtime
+        target: /opt/crisp-ai/data/runtime
     tmpfs:
       - /tmp:size=128m,mode=1777
     healthcheck:
@@ -153,6 +169,7 @@ services:
       start_period: 45s
     networks:
       - backend
+    logging: *default-logging
 
 networks:
   backend:

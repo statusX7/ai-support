@@ -10,4 +10,4 @@ cd ai-support
 sudo ./install.sh
 ```
 
-配置通过 `./manage.sh` 管理，详细说明见 `docs/`。
+安装完成后通过 `./manage.sh` 管理配置、知识库、备份和更新。部署前请阅读 [安装说明](docs/INSTALL.md)，正式发布条件见 [发布门禁](docs/RELEASE.md)。

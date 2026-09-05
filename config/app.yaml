@@ -1,6 +1,6 @@
 app:
   name: ai-support
-  version: v0.7.0
+  version: v0.8.0
 
 deployment:
   default_dir: /opt/crisp-ai
@@ -29,6 +29,5 @@ webhook:
   accepted_events:
     - message:send
     - message:received
-    - session:set_opened
     - session:request:initiated
   max_signature_age_seconds: 300

@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 DEPLOY_REQUEST=""
 OFFLINE=0
 LOCAL_ONLY=0
+INSTALLATION_IN_PROGRESS=0
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,7 @@ usage() {
 
 --offline 只检查文件、权限和配置格式，不访问 Docker 或外部 API。
 --local 检查文件、容器与本地健康接口，不访问外部 Provider 或 Crisp API。
+--installation-in-progress 仅供 install.sh/update.sh 在提交 ready 状态前使用。
 EOF
 }
 
@@ -33,6 +35,10 @@ while (( $# > 0 )); do
       LOCAL_ONLY=1
       shift
       ;;
+    --installation-in-progress)
+      INSTALLATION_IN_PROGRESS=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -42,7 +48,13 @@ while (( $# > 0 )); do
 done
 
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
-assert_installation "$DEPLOY_DIR"
+if (( INSTALLATION_IN_PROGRESS )); then
+  assert_managed_installation "$DEPLOY_DIR"
+  [[ "$(installation_state "$DEPLOY_DIR")" == installing ]] \
+    || die "--installation-in-progress 仅允许检查 installing 状态"
+else
+  assert_installation "$DEPLOY_DIR"
+fi
 FAILURES=0
 WARNINGS=0
 
@@ -88,7 +100,8 @@ done
 if jq -e '
   (.handoff.keywords | type == "array") and
   (.handoff.keywords | all(type == "string" and length > 0)) and
-  (.handoff.disable_ai | type == "boolean") and
+  (.handoff.match_mode == "exact" or .handoff.match_mode == "contains") and
+  (.handoff.disable_ai == true) and
   (.handoff.notify_user.enabled | type == "boolean") and
   (.handoff.resume_after_seconds | type == "number" and . >= 0)
 ' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null 2>&1; then
@@ -122,6 +135,24 @@ if (( (8#$ANALYTICS_MODE & 007) == 0 )); then
 else
   fail "匿名统计事件权限过宽：$ANALYTICS_MODE"
 fi
+for suffix in 1 2 3 4 5; do
+  ANALYTICS_ROTATED="${DEPLOY_DIR}/data/analytics/events.jsonl.${suffix}"
+  if [[ -L "$ANALYTICS_ROTATED" ]]; then
+    fail "统计轮转文件不得是符号链接：$ANALYTICS_ROTATED"
+    continue
+  fi
+  [[ ! -e "$ANALYTICS_ROTATED" ]] && continue
+  if [[ ! -f "$ANALYTICS_ROTATED" ]]; then
+    fail "统计轮转文件不是安全的普通文件：$ANALYTICS_ROTATED"
+    continue
+  fi
+  ANALYTICS_MODE=$(stat -c '%a' "$ANALYTICS_ROTATED" 2>/dev/null || printf '777')
+  if (( (8#$ANALYTICS_MODE & 007) == 0 )); then
+    pass "统计轮转文件权限有效：events.jsonl.${suffix}"
+  else
+    fail "统计轮转文件权限过宽：events.jsonl.${suffix}（${ANALYTICS_MODE}）"
+  fi
+done
 
 if provider_config_has_secret_field "${DEPLOY_DIR}/config/provider.yaml"; then
   fail "provider.yaml 不得保存密钥"
@@ -147,7 +178,19 @@ else
   fail ".env 权限过宽：$ENV_MODE"
 fi
 
-for key in N8N_ENCRYPTION_KEY POSTGRES_PASSWORD ANYTHINGLLM_AUTH_TOKEN CRISP_WEBHOOK_SECRET AI_API_KEY CRISP_AUTH_B64; do
+for runtime_dir in data/n8n data/anythingllm data/runtime; do
+  RUNTIME_OWNER=$(stat -c '%u:%g' "${DEPLOY_DIR}/${runtime_dir}" 2>/dev/null || printf 'unknown')
+  RUNTIME_MODE=$(stat -c '%a' "${DEPLOY_DIR}/${runtime_dir}" 2>/dev/null || printf '777')
+  if [[ "$RUNTIME_OWNER" == "1000:1000" ]] && (( (8#$RUNTIME_MODE & 002) == 0 )); then
+    pass "容器数据目录所有权有效：${runtime_dir}"
+  else
+    fail "容器数据目录权限无效：${runtime_dir}（${RUNTIME_OWNER} ${RUNTIME_MODE}）"
+  fi
+done
+
+for key in N8N_ENCRYPTION_KEY POSTGRES_PASSWORD ANYTHINGLLM_AUTH_TOKEN ANYTHINGLLM_JWT_SECRET \
+  ANYTHINGLLM_SIG_KEY ANYTHINGLLM_SIG_SALT ANYTHINGLLM_API_KEY AI_API_KEY \
+  CRISP_TOKEN_IDENTIFIER CRISP_TOKEN_KEY CRISP_AUTH_B64; do
   value=$(env_get "${DEPLOY_DIR}/.env" "$key" 2>/dev/null || true)
   if is_placeholder "$value"; then
     fail "敏感配置尚未完成：$key"
@@ -155,6 +198,23 @@ for key in N8N_ENCRYPTION_KEY POSTGRES_PASSWORD ANYTHINGLLM_AUTH_TOKEN CRISP_WEB
     pass "敏感配置已设置：$key"
   fi
 done
+CRISP_HOOK_MODE_VALUE=$(env_get "${DEPLOY_DIR}/.env" CRISP_HOOK_MODE 2>/dev/null || true)
+case "$CRISP_HOOK_MODE_VALUE" in
+  website) CRISP_HOOK_SECRET_KEY=CRISP_WEBSITE_HOOK_SECRET ;;
+  plugin) CRISP_HOOK_SECRET_KEY=CRISP_PLUGIN_SIGNING_SECRET ;;
+  *)
+    CRISP_HOOK_SECRET_KEY=""
+    fail "CRISP_HOOK_MODE 必须是 website 或 plugin"
+    ;;
+esac
+if [[ -n "$CRISP_HOOK_SECRET_KEY" ]]; then
+  value=$(env_get "${DEPLOY_DIR}/.env" "$CRISP_HOOK_SECRET_KEY" 2>/dev/null || true)
+  if is_placeholder "$value"; then
+    fail "Webhook 校验配置尚未完成：$CRISP_HOOK_SECRET_KEY"
+  else
+    pass "Webhook 校验配置已设置：$CRISP_HOOK_SECRET_KEY"
+  fi
+fi
 
 if (( OFFLINE )); then
   health_warn "离线模式未检查容器和 API"
@@ -185,6 +245,19 @@ else
       fail "容器未运行：$service"
     fi
   done
+  # shellcheck disable=SC2016 # $1 与 $output 必须在 n8n 容器内展开。
+  if docker_compose "$DEPLOY_DIR" exec -T n8n sh -c '
+    output=/tmp/ai-support-health-workflow.json
+    n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1 || exit 1
+    node -e '\''const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const workflow=Array.isArray(value)?value[0]:value;process.exit(workflow&&workflow.active===true?0:1)'\'' "$output"
+    status=$?
+    rm -f "$output"
+    exit "$status"
+  ' sh "$WORKFLOW_ID"; then
+    pass "n8n 工作流已发布"
+  else
+    fail "n8n 工作流未发布或无法导出"
+  fi
 
   N8N_PORT_VALUE=$(env_get "${DEPLOY_DIR}/.env" N8N_PORT 2>/dev/null || printf '5678')
   ANYTHING_PORT_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
@@ -204,23 +277,25 @@ else
   else
     API_BASE=$(env_get "${DEPLOY_DIR}/.env" AI_API_BASE_URL 2>/dev/null || true)
     API_KEY=$(env_get "${DEPLOY_DIR}/.env" AI_API_KEY 2>/dev/null || true)
-    PROVIDER_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 20 --header "Authorization: Bearer ${API_KEY}" \
-      "${API_BASE}/models" 2>/dev/null || true)
-    if [[ "$PROVIDER_STATUS" == 2?? ]]; then
-      pass "Provider /v1/models 可用"
+    AI_MODEL_VALUE=$(env_get "${DEPLOY_DIR}/.env" AI_MODEL 2>/dev/null || true)
+    PROVIDER_PAYLOAD=$(jq -cn --arg model "$AI_MODEL_VALUE" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
+    if probe_api_endpoint "${API_BASE}/chat/completions" "$API_KEY" "$PROVIDER_PAYLOAD" "${DEPLOY_DIR}/tmp"; then
+      pass "Provider Chat Completions 与所选模型可用"
     else
-      fail "Provider 检查失败（HTTP ${PROVIDER_STATUS:-000}）"
+      fail "Provider Chat Completions 或所选模型不可用"
     fi
 
     CRISP_ID=$(env_get "${DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)
     CRISP_TIER=$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_TIER 2>/dev/null || printf 'website')
     CRISP_AUTH=$(env_get "${DEPLOY_DIR}/.env" CRISP_AUTH_B64 2>/dev/null || true)
+    CRISP_CONFIG=$(mktemp "${DEPLOY_DIR}/tmp/crisp-health-curl.XXXXXX")
+    chmod 600 "$CRISP_CONFIG"
+    printf 'header = "Authorization: Basic %s"\nheader = "X-Crisp-Tier: %s"\n' "$CRISP_AUTH" "$CRISP_TIER" > "$CRISP_CONFIG"
     CRISP_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
       --connect-timeout 5 --max-time 20 \
-      --header "Authorization: Basic ${CRISP_AUTH}" \
-      --header "X-Crisp-Tier: ${CRISP_TIER}" \
+      --config "$CRISP_CONFIG" \
       "https://api.crisp.chat/v1/website/${CRISP_ID}" 2>/dev/null || true)
+    rm -f -- "$CRISP_CONFIG"
     if [[ "$CRISP_STATUS" == 2?? ]]; then
       pass "Crisp REST API 可用"
     else
@@ -228,14 +303,46 @@ else
     fi
 
     ANYTHING_KEY_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)
-    ANYTHING_AUTH_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 20 \
-      --header "Authorization: Bearer ${ANYTHING_KEY_VALUE}" \
-      "http://127.0.0.1:${ANYTHING_PORT_VALUE}/api/v1/auth" 2>/dev/null || true)
-    if [[ "$ANYTHING_AUTH_STATUS" == 2?? ]]; then
+    if anythingllm_validate_api_key "$DEPLOY_DIR" "$ANYTHING_KEY_VALUE"; then
       pass "AnythingLLM Developer API 可用"
     else
-      fail "AnythingLLM Developer API 检查失败（HTTP ${ANYTHING_AUTH_STATUS:-000}）"
+      fail "AnythingLLM Developer API Key 无效"
+    fi
+
+    ANYTHING_WORKSPACE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)
+    ANYTHING_CHAT_MODE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
+    LOCAL_PROMPT=$(<"${DEPLOY_DIR}/config/prompt.md")
+    ANYTHING_RESPONSE=$(mktemp "${DEPLOY_DIR}/tmp/anything-health.XXXXXX")
+    ANYTHING_STATUS=$(anythingllm_secure_request "$DEPLOY_DIR" GET \
+      "http://127.0.0.1:${ANYTHING_PORT_VALUE}/api/v1/workspace/${ANYTHING_WORKSPACE_VALUE}" \
+      "$ANYTHING_KEY_VALUE" "" "$ANYTHING_RESPONSE")
+    if [[ "$ANYTHING_STATUS" == 2?? ]] && jq -e --arg slug "$ANYTHING_WORKSPACE_VALUE" --arg prompt "$LOCAL_PROMPT" '
+      .workspace as $workspace |
+      (if ($workspace | type) == "array" then $workspace[0] else $workspace end) as $item |
+      $item.slug == $slug and $item.openAiPrompt == $prompt
+    ' "$ANYTHING_RESPONSE" >/dev/null 2>&1; then
+      pass "AnythingLLM 工作区与 Prompt 已生效"
+    else
+      fail "AnythingLLM 工作区缺失或 Prompt 未同步"
+    fi
+    rm -f -- "$ANYTHING_RESPONSE"
+
+    if [[ "$ANYTHING_CHAT_MODE_VALUE" == chat ]]; then
+      ANYTHING_RESPONSE=$(mktemp "${DEPLOY_DIR}/tmp/anything-chat-health.XXXXXX")
+      ANYTHING_PAYLOAD=$(jq -cn --arg mode "$ANYTHING_CHAT_MODE_VALUE" \
+        --arg session "ai-support-health-$(date -u '+%Y%m%d')" \
+        '{message:"请只回复：健康检查通过",mode:$mode,sessionId:$session}')
+      ANYTHING_STATUS=$(anythingllm_secure_request "$DEPLOY_DIR" POST \
+        "http://127.0.0.1:${ANYTHING_PORT_VALUE}/api/v1/workspace/${ANYTHING_WORKSPACE_VALUE}/chat" \
+        "$ANYTHING_KEY_VALUE" "$ANYTHING_PAYLOAD" "$ANYTHING_RESPONSE")
+      if [[ "$ANYTHING_STATUS" == 2?? ]] && jq -e '.textResponse | type == "string" and length > 0' "$ANYTHING_RESPONSE" >/dev/null 2>&1; then
+        pass "AnythingLLM 工作区 Chat 可用"
+      else
+        fail "AnythingLLM 工作区 Chat 失败（HTTP ${ANYTHING_STATUS:-000}）"
+      fi
+      rm -f -- "$ANYTHING_RESPONSE"
+    else
+      fail "ANYTHINGLLM_CHAT_MODE 必须为 chat，才能保持同一 Crisp conversation 的上下文"
     fi
   fi
 fi

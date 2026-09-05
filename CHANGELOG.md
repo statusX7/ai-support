@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.8.0
+
+日期：2026-09-05
+
+修改：
+
+- 安装流程改为两阶段状态提交，增加维护锁、输入边界、Docker daemon、AnythingLLM 自动登录、Developer API Key、工作区、Prompt 和已发布 workflow 验证。
+- Provider 检测改为实际校验 Chat Completions、Responses 与图片输入的成功响应结构，拒绝 HTTP 200 但携带错误或空结果的伪成功响应。
+- Crisp Website Hook 与 Plugin Hook 使用独立 Secret；修正事件方向、签名校验、精确转人工、operator 接管、标签并集、发送前失败关闭复核及稳定出站 fingerprint。
+- 同一 conversation 的 AI 开关、接管代次、菜单、欢迎状态和去重指纹写入受限持久化控制文件，并增加并发锁、原子更新、过期与容量清理。
+- AnythingLLM 固定使用 `chat` 会话模式；知识库同步增加新索引验证、旧索引回退、源文档清理和失败后的可重试垃圾清单。
+- 版本快照升级为包含 n8n PostgreSQL 逻辑备份、AnythingLLM 数据及本机镜像 ID 的一致性格式；更新前拉取、容量检查、历史保留和失败回滚路径得到加固。
+- 备份恢复增加完整文件集合校验、重复路径、路径穿越、链接、特殊文件与敏感 Provider 字段防护；卸载在 Docker 停止失败时默认安全中止。
+- 新增分层测试、n8n Code node 行为测试、真实部署检查、显式凭据外部 E2E 和严格 `v1.0.0` 发布门禁文档。
+
+影响：
+
+- 本地静态、工作流运行时、Compose 解析和桩集成回归均已通过；当前环境没有 Docker daemon 和专用外部凭据，真实容器与 Crisp 端到端验收仍未完成。
+- 本版本仅创建本地候选 commit，不创建 tag、不 push、不发布 GitHub Release；全部真实门禁通过后才允许提升为 `v1.0.0`。
+- 默认镜像固定为 n8n `2.33.0`、AnythingLLM `1.16.1` 和 PostgreSQL `16.10-alpine`；部署方升级前必须保留一致性快照。
+
 ## v0.7.0
 
 日期：2026-09-04

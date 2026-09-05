@@ -39,6 +39,7 @@ done
 
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
+acquire_maintenance_lock "$DEPLOY_DIR"
 require_command tar
 require_command jq
 require_command sha256sum

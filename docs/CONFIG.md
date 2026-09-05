@@ -10,9 +10,9 @@
 
 ## AI Provider
 
-配置入口只要求输入 API Base URL 和 API Key。管理脚本会规范化地址、请求 `/v1/models` 并显示检测到的模型；模型列表请求失败时才提供手动输入或默认模型选项。
+配置入口只要求输入 API Base URL 和 API Key。脚本会规范化地址、请求 `/v1/models` 并显示模型菜单；列表请求失败时才允许手动输入或使用默认模型。
 
-管理脚本还会分别探测 `/v1/responses` 与 `/v1/chat/completions`，把可用接口记录到 `config/provider.yaml`。API Key 只写入 `.env` 的 `AI_API_KEY`。
+选择模型后，脚本会实际请求 `/v1/chat/completions`。该接口和所选模型必须可用，否则拒绝保存配置，因为 AnythingLLM 的 `generic-openai` Provider 依赖 Chat Completions。脚本还会探测 `/v1/responses`，并使用一张无业务数据的微型图片实际检测视觉能力。检测结果写入 `config/provider.yaml`，API Key 只写入 `.env` 的 `AI_API_KEY`。
 
 AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceDB。基础地址应包含 API 的 `/v1` 前缀；脚本会自动避免重复拼接 `/v1`。
 
@@ -20,25 +20,28 @@ AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceD
 
 ## AnythingLLM 初始化
 
-首次启动后，在本机访问 AnythingLLM 管理页面，创建名为 `crisp-support` 的工作区，并在“Developer API”中创建独立 API Key。随后通过 `./manage.sh` 保存该 Key。不同 Crisp conversation 使用各自的 `sessionId`，避免会话历史串线。
+首次安装会自动使用本机 `ANYTHINGLLM_AUTH_TOKEN` 获取会话令牌，复用或创建名为 `ai-support` 的 Developer API Key，并检查或创建 `ANYTHINGLLM_WORKSPACE` 指定的工作区。Key 自动写入权限为 `0600` 的 `.env`，不会写入公开模板或日志。预先提供 Key 时，安装程序会先验证它。
 
-工作区默认使用 `query` 模式，以知识库为答案边界。若需要允许模型使用通用知识，可把 `.env` 中的 `ANYTHINGLLM_CHAT_MODE` 改为 `chat`，但应同步收紧 Prompt 与转人工规则。
+`ANYTHINGLLM_CHAT_MODE` 必须是 `chat`。n8n 会把同一 Crisp conversation 受长度限制的用户、AI 与人工消息加入当前请求，并使用 `sessionId` 隔离 AnythingLLM 会话；安装和升级会把旧的 `query` 或 `automatic` 值迁移为 `chat`。知识库优先与“不确定不猜测”由独立 Prompt 约束。
 
 ## Crisp
 
-单工作区部署优先使用 Website Token，`CRISP_TOKEN_TIER` 设置为 `website`；多工作区私有插件使用 Plugin Token，并设置为 `plugin`。两种 Token 都只保存在 `.env`。
+`CRISP_TOKEN_TIER` 配置 REST API Token 的 `website` 或 `plugin` 类型。`CRISP_HOOK_MODE` 独立配置 Webhook 的 `website` 或 `plugin` 校验方式。Token、URL Secret 和 Signing Secret 都只保存在 `.env`。
 
-Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/webhook/crisp-webhook?key=随机Secret`，其中 Secret 与 `.env` 的 `CRISP_WEBHOOK_SECRET` 一致。Plugin Hook 应使用不带查询 Secret 的地址，工作流会校验 `X-Crisp-Signature` 和 `X-Crisp-Request-Timestamp`。
+- Website 模式使用 `CRISP_WEBSITE_HOOK_SECRET`，地址带 `?key=<Secret>`。Website Hook 没有 Crisp 签名，工作流只验证随机查询 Secret。
+- Plugin 模式使用 `CRISP_PLUGIN_SIGNING_SECRET`，地址不带查询 Secret。工作流强制验证原始请求体的 HMAC-SHA256 签名和五分钟时间窗，不会回退为 URL Secret。
 
-至少订阅 `message:send`。若使用 Plugin Hook，还可订阅 `message:received`、`session:set_opened` 和 `session:request:initiated`，分别用于记录人工回复和在聊天窗口打开时发送欢迎语。Website Hook 无法提供 `session:set_opened`，因此欢迎语会在访客首次发言时合并发送。
+两种 Hook 都必须订阅 `message:send` 与 `message:received`。前者处理访客消息，后者处理公开 operator 回复。Plugin Hook 可额外订阅 `session:request:initiated` 发送会话创建欢迎语。不要使用 `session:set_opened` 作为欢迎事件，它表示 operator 查看 conversation。
 
 图片 URL 默认只接受 HTTPS 的 `crisp.chat` 子域名。确需使用其他可信图片主机时，可在 `.env` 的 `CRISP_IMAGE_HOSTS` 中填写逗号分隔的精确主机名。
 
 ## 人工接管
 
-`handoff.yaml` 的 `keywords` 是唯一的自动识别入口，默认包含“人工”“人工客服”“转人工”“真人”和“真人客服”。关键词列表完全来自配置，工作流不内置业务主题词。访客命中关键词或明确选择菜单中的人工选项后，工作流先按 `notify_user.enabled` 回复“正在为您转接人工客服，请稍候。”，再按 `disable_ai` 关闭当前 conversation 的 AI，并添加人工标签。
+`handoff.yaml` 的 `keywords` 是唯一的文字自动识别入口，默认包含“人工”“人工客服”“转人工”“真人”和“真人客服”。`match_mode` 默认是 `exact`：对输入做 Unicode、空白和大小写规范化后，必须与某个配置词完全相等，避免“人工智能”之类文本误触发。确需旧式包含匹配时可显式设为 `contains`。
 
-真实 operator 回复也会立即关闭当前 conversation 的 AI。接管期间访客消息仍可进入有限会话历史，但不会触发 AI 回复。`resume_after_seconds` 到期后，AI 会在下一条访客消息恢复；设为 `0` 表示只允许 operator 发送 `resume_keywords` 中的控制词恢复。
+访客精确命中关键词或选择菜单中的人工动作后，工作流先按 `notify_user.enabled` 回复“正在为您转接人工客服，请稍候。”，随后关闭当前 conversation 的 AI，并添加人工标签。`disable_ai` 必须保持为 `true`；安装、更新和恢复会把旧配置中的其他值安全迁移为 `true`。
+
+真实、公开且非自动的 operator `message:received` 文本或文件回复会立即关闭当前 conversation 的 AI；内部 note 和本系统发送的消息会被忽略。AI 生成后、发送前还会重新读取 Crisp 消息并检查接管代次，发现人工已经回复时取消本次 AI 发送。接管期间访客消息不会触发 AI 回复。`resume_after_seconds` 到期后，AI 会在下一条访客消息恢复；设为 `0` 表示不自动恢复。operator 的消息内容不会绕过接管规则。
 
 知识库未命中、低置信度、图片理解失败和 API 失败不会关闭 AI。相应提示可通过 `no_answer_message`、`low_confidence_message` 和 `failure_message` 修改。
 
@@ -46,13 +49,13 @@ Website Hook 不提供签名，Webhook 地址必须使用 `https://部署域名/
 
 `tags.yaml` 配置项目管理的四类标签，默认值分别是 `ai_resolved`、`knowledge_miss`、`low_confidence` 和 `human_required`。标签值不得包含空格或控制字符；设 `enabled` 为 `false` 可关闭自动标签。
 
-更新标签时，工作流先读取 Crisp conversation 当前 `segments`，保留所有非本项目管理的标签，再替换项目管理标签。读取失败时会跳过更新，避免误清空已有标签。Website Token 或 Plugin Token 必须具备读取和修改 conversation meta 的权限。
+更新标签时，工作流先读取 Crisp conversation 当前 `segments`，再把新标签与全部既有标签做去重并集；不会删除或替换既有项目标签。读取失败时会跳过 PATCH，正文回复不受影响。Website Token 或 Plugin Token 必须具备读取和修改 conversation meta 的权限。
 
 ## 回答反馈与统计
 
 `feedback.yaml` 控制回答后的“是否解决问题”提示、正负反馈词、致谢消息、有效期与最大文本长度。反馈只在成功生成的知识库或视觉回答后询问；菜单、欢迎语、失败提示和转人工通知不会重复询问。
 
-`data/analytics/events.jsonl` 保存追加式事件。问题数、AI 回复数、命中、未命中和转人工事件不保存消息内容。反馈事件按需求保存 `session`、`question`、`answer` 和 `feedback`，其中 session 使用 HMAC 匿名化，问题和回答会过滤常见 Token、Secret、邮箱和号码并截断。管理员仍应避免把敏感个人信息写入反馈，并按数据保留政策定期清理该文件。
+`data/analytics/events.jsonl` 保存追加式事件，活动文件达到约 10 MiB 时轮转，最多保留 `.1` 至 `.5` 五个历史文件。统计脚本按最旧轮转到活动文件汇总，存储窗口最大约 60 MiB；超出窗口的最旧轮转会被淘汰。问题数、AI 回复数、命中、未命中、发送失败和转人工事件不保存消息内容；AI 回复、命中和待反馈数据只在 Crisp 确认消息成功发送后提交。反馈事件按需求保存 `session`、`question`、`answer` 和 `feedback`，其中 session 使用 HMAC 匿名化，问题和回答在进入待反馈状态前就会过滤常见 Token、Cookie、JWT、Secret、邮箱和号码并截断。管理员仍应落实隐私告知、访问控制和保留期限。
 
 查看统计：
 
@@ -67,10 +70,22 @@ sudo /opt/crisp-ai/scripts/analytics.sh feedback
 
 `SNAPSHOT_RETENTION_COUNT` 控制有效版本快照的最大数量，默认 `10`。设为 `0` 表示不自动清理。自定义值会在重复安装时保留；升级会为旧部署补齐缺失的默认值。
 
+版本快照会短暂停止 n8n 与 AnythingLLM，保存程序、配置、知识文件、AnythingLLM 数据、n8n PostgreSQL 逻辑备份和本机镜像 ID。快照不包含 `.env`、匿名统计或日志，只用于同一主机受限回滚。
+
+## 镜像版本
+
+默认 Compose 使用已选定的版本标签：
+
+- n8n `2.33.0`
+- PostgreSQL `16.10-alpine`
+- AnythingLLM `1.16.1`
+
+AnythingLLM 基线选择 `1.16.1`，用于包含 `1.15.0` 之后公布的相关修复；不得把正式部署降级到 `1.15.0` 或更早版本。可通过 `.env` 覆盖镜像，但覆盖后必须先核对上游安全公告，再重新执行完整测试和真实部署验收。不要在正式部署中改用 `latest` 或宽泛主版本标签。
+
 ## Prompt
 
 首次安装会从 `config/prompt.md.example` 创建 `config/prompt.md`。可通过管理菜单修改、导入或导出；导入文件必须是普通文件且位于允许的路径中。
 
 ## 知识库
 
-支持 Markdown、TXT、PDF 和 DOCX。管理脚本只接受这些扩展名，并拒绝符号链接和路径穿越。AnythingLLM 负责解析、自动分块、向量化、检索和重新索引。
+支持 Markdown、TXT、PDF 和 DOCX。管理脚本只接受这些扩展名，并拒绝符号链接和路径穿越。AnythingLLM 负责解析、自动分块、向量化、检索和重新索引；文件更新或删除后，脚本同时清除旧索引与 AnythingLLM 源文档，暂时失败的源文档清理会写入本地清单并在下次同步重试。

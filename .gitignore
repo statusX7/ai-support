@@ -13,6 +13,11 @@ config/*.local.yaml
 *.pem
 *.key
 *.secret
+.crisp-ai-installation
+
+# 知识库可能包含客户或内部资料，只保留目录说明文件
+knowledge/*
+!knowledge/README.md
 
 # 运行数据与日志
 data/
@@ -23,6 +28,7 @@ tmp/
 *.pid
 .test-runtime.*
 .test-tools/
+.external-e2e.*
 
 # 导入导出产物
 backup.tar.gz

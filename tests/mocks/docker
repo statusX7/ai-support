@@ -11,6 +11,9 @@ if [[ "${1:-}" == image ]]; then
     inspect)
       if [[ "$*" == *'--format'* ]]; then
         printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+      elif [[ "${MOCK_DOCKER_MISSING_IMAGE:-0}" == 1 ]]; then
+        printf '测试桩：历史镜像不存在\n' >&2
+        exit 1
       fi
       exit 0
       ;;
@@ -58,22 +61,32 @@ fi
 case "$COMMAND" in
   config)
     if [[ "$*" == *'--images'* ]]; then
-      printf 'postgres:16-alpine\nmintplexlabs/anythingllm:latest\ndocker.n8n.io/n8nio/n8n:2\n'
+      printf 'postgres:16.10-alpine\nmintplexlabs/anythingllm:1.16.1\ndocker.n8n.io/n8nio/n8n:2.33.0\n'
     fi
     exit 0
     ;;
   pull)
     [[ "${MOCK_DOCKER_FAIL_PULL:-0}" != 1 ]]
     ;;
-  up|down|stop|restart)
+  down)
+    [[ "${MOCK_DOCKER_FAIL_DOWN:-0}" != 1 ]]
+    ;;
+  up|stop|restart)
     exit 0
     ;;
   ps)
-    printf 'postgres\nanythingllm\nn8n\n'
+    if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]]; then
+      printf 'postgres\nanythingllm\nn8n\n'
+    fi
     ;;
   exec)
     if [[ "$*" == *'n8n --version'* ]]; then
       printf '2.99.0-test\n'
+    elif [[ "$*" == *'pg_dump'* ]]; then
+      [[ "${MOCK_DOCKER_FAIL_PG_DUMP:-0}" != 1 ]] || exit 1
+      printf 'PGDMP-test-only-logical-backup\n'
+    elif [[ "$*" == *'pg_restore'* ]]; then
+      [[ "${MOCK_DOCKER_FAIL_PG_RESTORE:-0}" != 1 ]] || exit 1
     fi
     ;;
   logs)

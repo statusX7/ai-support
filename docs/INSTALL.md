@@ -3,12 +3,17 @@
 ## 前置条件
 
 - 64 位 Linux 主机与 root 权限。
-- 已启动的 Docker Engine、Docker Compose v2、`curl`、`jq`、`openssl`、`tar`、`git`、`df`、`du` 和 `sha256sum`。
-- 一个可用的 Crisp Website Token 或 Plugin Token。
-- 一个支持 OpenAI Compatible API 的服务。
-- 一个带有效 TLS 证书的公网域名，用于接收 Crisp Webhook。
+- 已启动的 Docker Engine 和 Docker Compose v2。
+- `curl`、`jq`、`openssl`、`tar`、`git`、`flock`、`realpath`、`stat`、`df`、`du`、`awk`、`base64` 和 `sha256sum`。
+- 可用的 Crisp Website Token 或 Plugin Token，以及对应 Website ID。
+- 支持 OpenAI Compatible `/v1/chat/completions` 的 Provider；`/v1/responses` 为可选能力。
+- 带有效 TLS 证书的公网域名，用于接收 Crisp Webhook。
 
-## 安装
+n8n 和 AnythingLLM 默认只绑定 `127.0.0.1`。生产环境必须通过 HTTPS 反向代理公开 Webhook，并限制 n8n、AnythingLLM 管理页面的访问来源。
+
+使用 Crisp Plugin Token 时，至少授予 `website:conversation:messages` 与 `website:conversation:sessions` 的 read、write 权限：前者用于读取上下文和发送回复，后者用于读取并合并 conversation 标签。Website Token 应直接在目标 workspace 中生成。不要为了安装扩大到无关 CRM 或坐席权限。
+
+## 一键安装
 
 ```bash
 git clone https://github.com/statusX7/ai-support.git
@@ -16,43 +21,88 @@ cd ai-support
 sudo ./install.sh
 ```
 
-默认部署到 `/opt/crisp-ai`。安装程序会依次要求 API Base URL 和 API Key，调用 `/v1/models` 后显示模型列表，再检测 `/v1/responses` 与 `/v1/chat/completions`。只有模型列表检测失败时，才会提供手动模型或默认模型选项。
+默认部署目录是 `/opt/crisp-ai`。安装程序会完成以下工作：
 
-安装程序会在写入部署目录前确认 Docker Compose 与 Docker daemon 可用。启动后会等待 PostgreSQL、AnythingLLM 和 n8n 及其本地健康接口；如果已经提供 AnythingLLM Developer API Key，还会同步 Prompt、发布 workflow，并验证 Provider、Crisp 与 AnythingLLM API。任一必需步骤失败都会以非零状态退出并给出明确错误。
+1. 检查 Docker Compose 和 Docker daemon。
+2. 创建受限目录、随机密钥和实际配置文件。
+3. 请求 Provider `/v1/models`，选择模型并实际探测 Chat Completions、Responses 和图片输入能力。
+4. 启动 PostgreSQL、AnythingLLM 和 n8n。
+5. 如果未预先提供 AnythingLLM Developer API Key，自动登录本机 AnythingLLM，创建名为 `ai-support` 的 Key。
+6. 检查或创建工作区，默认 slug 为 `crisp-support`，同步 Prompt。
+7. 导入并发布 n8n workflow，重启 n8n 后执行完整健康检查。
+8. 所有必需检查通过后，才把安装状态提交为 `ready`。
 
-指定其他目录：
+任一步失败都会返回非零状态。安装不会把 API Key、Token 或 Secret 打印到日志。
+
+指定其他部署目录：
 
 ```bash
 sudo ./install.sh --deploy-dir /srv/crisp-ai
 ```
 
-重复执行安装是安全的：程序文件会更新，`.env`、实际业务配置、知识文件和运行数据会保留。需要重新走配置流程时增加 `--reconfigure`。
+## 安装状态与重试
 
-## 首次初始化 AnythingLLM
+安装标记使用四种状态：
 
-1. 通过本机端口或受保护的反向代理打开 AnythingLLM，默认端口为 `3001`。
-2. 使用安装时生成并保存在 `.env` 中的 `ANYTHINGLLM_AUTH_TOKEN` 登录。
-3. 创建 `crisp-support` 工作区。
-4. 在 AnythingLLM 的 Developer API 页面创建独立 API Key。
-5. 运行 `sudo /opt/crisp-ai/manage.sh`，依次选择“修改AI配置”和“配置 AnythingLLM API 与工作区”。
+- `installing`：配置或验收尚未完成。
+- `staged`：使用 `--skip-start` 只暂存了文件，服务尚未启动和验收。
+- `ready`：容器、工作流和完整健康检查均已通过。
+- `uninstalled-data-kept`：程序已卸载，但配置和数据被保留。
 
-管理脚本会同步 Prompt、导入并发布 n8n workflow。发布前 Crisp Webhook 不会进入生产处理链路。
+只有 `ready` 部署可以使用管理、更新和日常健康检查。安装中断后，从源码目录重新运行同一条 `install.sh` 命令即可安全续跑。不要通过手工编辑安装标记绕过验收。
 
-## 配置 Crisp
+`--skip-start` 仅用于暂存文件，不代表安装完成。完成部署时必须不带该参数重新运行：
 
-单工作区优先使用 Website Token。进入 Crisp 工作区设置的高级配置，创建 Website Hook，至少订阅 `message:send`，并使用以下地址：
-
-```text
-https://support.example.com/webhook/crisp-webhook?key=<CRISP_WEBHOOK_SECRET>
+```bash
+sudo ./install.sh --deploy-dir /opt/crisp-ai
 ```
 
-`CRISP_WEBHOOK_SECRET` 位于部署目录的 `.env`，不要通过聊天、工单或公开日志传输。
+重复安装会保留 `.env`、实际业务配置、知识文件和运行数据。需要重新配置 Provider 或 Crisp 时使用：
 
-Plugin Hook 可以额外订阅 `message:received`、`session:set_opened` 和 `session:request:initiated`。Plugin Hook 不使用查询参数 Secret，而是由工作流验证 Crisp 提供的 HMAC-SHA256 签名。
+```bash
+sudo ./install.sh --deploy-dir /opt/crisp-ai --reconfigure
+```
+
+`install.sh` 只允许初始化或重复执行同一版本。检测到源码版本与现有 `ready` 部署不同时会拒绝直接覆盖，必须使用下文的 `update.sh`，以确保先创建数据库与 AnythingLLM 一致性快照。
+
+安装、更新、备份、恢复、快照、回滚和卸载使用同一个非阻塞维护锁；检测到另一项维护任务正在运行时会安全中止。
+
+## 配置 Crisp Hook
+
+两种 Hook 模式都必须订阅：
+
+- `message:send`：接收访客消息。
+- `message:received`：接收公开的 operator 回复，并立即关闭该 conversation 的 AI。
+
+不要订阅或使用 `session:set_opened` 触发欢迎语；该事件表示 operator 打开会话，不表示访客打开聊天窗口。
+
+### Website Hook
+
+安装时选择 `CRISP_HOOK_MODE=website`。将 URL 配置为：
+
+```text
+https://support.example.com/webhook/crisp-webhook?key=<CRISP_WEBSITE_HOOK_SECRET>
+```
+
+Website Hook 没有 Crisp 签名，工作流只接受查询参数中的随机 URL Secret。不得把该 Secret 用作 Plugin 签名 Secret。
+
+Website Hook 没有可靠的“访客打开窗口”事件，因此欢迎语会与该 conversation 的第一条访客消息一起发送。
+
+### Plugin Hook
+
+安装时选择 `CRISP_HOOK_MODE=plugin`，并输入 Crisp 为该 Plugin Hook 提供的 Signing Secret。URL 不携带查询 Secret：
+
+```text
+https://support.example.com/webhook/crisp-webhook
+```
+
+Plugin 模式强制校验原始请求体、`X-Crisp-Request-Timestamp` 和 `X-Crisp-Signature`，拒绝超过五分钟的签名，也不会降级为 Website URL Secret。若需在会话创建时主动欢迎，可额外订阅 `session:request:initiated`。
+
+`CRISP_TOKEN_TIER` 表示 REST API Token 类型，`CRISP_HOOK_MODE` 表示 Webhook 校验方式；应分别按 Crisp 中实际创建的凭据和 Hook 类型配置。
 
 ## 反向代理
 
-n8n 和 AnythingLLM 默认只监听 `127.0.0.1`。反向代理应只公开所需入口，启用 HTTPS，正确传递 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，并限制 AnythingLLM 与 n8n 管理页面的访问来源。
+反向代理应只公开 `/webhook/crisp-webhook`，启用 HTTPS，并正确传递 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`。不要把 n8n 编辑器或 AnythingLLM 管理页面直接暴露到公网。
 
 ## 日常管理
 
@@ -60,39 +110,52 @@ n8n 和 AnythingLLM 默认只监听 `127.0.0.1`。反向代理应只公开所需
 sudo /opt/crisp-ai/manage.sh
 ```
 
-完整健康检查：
+完整健康检查会验证容器、已发布 workflow、Provider 所选模型、Crisp REST API、AnythingLLM Key、工作区、Prompt 和一次工作区 Chat：
 
 ```bash
 sudo /opt/crisp-ai/scripts/healthcheck.sh
 ```
 
-不访问容器或外部 API 的静态检查：
+静态检查和本地检查：
 
 ```bash
 sudo /opt/crisp-ai/scripts/healthcheck.sh --offline
-```
-
-只检查容器与本地健康接口：
-
-```bash
 sudo /opt/crisp-ai/scripts/healthcheck.sh --local
 ```
 
+`--offline` 不访问 Docker 或 API；`--local` 不访问外部 Provider 或 Crisp。二者都不能替代完整健康检查和真实 Crisp 验收。
+
 ## 更新与回滚
 
-管理菜单中的“更新系统”会先执行快照容量预检，再停止 n8n 与 AnythingLLM 写入，创建迁移备份和本机版本快照，然后执行源码拉取、镜像拉取、重启、workflow 发布和本地健康检查。快照创建时会再次检查容量；任何关键步骤失败都会自动恢复更新前快照。
+管理菜单中的“更新系统”或 `update.sh` 会：
 
-从旧版升级时，脚本会幂等补齐 `handoff.yaml` 的新字段，并只把 `v0.6.0` 的旧默认关键词和默认提示迁移为新语义；自定义关键词、恢复时间与自定义提示会保留。
+1. 获取源码并校验新 Compose 配置。
+2. 在停机前拉取新镜像。
+3. 预检快照容量，短暂停止 n8n 与 AnythingLLM。
+4. 创建不含密钥的迁移备份，以及包含 AnythingLLM 数据和 n8n PostgreSQL 逻辑备份的一致性版本快照。
+5. 更新文件、启动服务、重新同步 Prompt、发布 workflow 并执行健康检查。
+6. 成功后提交 `ready` 状态；失败时自动回滚。
 
-版本快照包含配置、Prompt、workflow、知识文件、程序文件、AnythingLLM 数据以及可用的本地镜像 ID，不包含 `.env`、PostgreSQL、n8n 数据库、统计事件或日志。可在管理菜单查看历史并选择回滚，也可运行：
+更新不支持 `--skip-start`，因为数据库和 AnythingLLM 数据必须保持一致。
+
+查看历史和手动回滚：
 
 ```bash
 sudo /opt/crisp-ai/scripts/rollback.sh --list
 sudo /opt/crisp-ai/scripts/rollback.sh --snapshot <快照ID>
 ```
 
-回滚保留现有 `.env`、PostgreSQL、n8n 数据库、匿名统计和历史快照。如果对应历史镜像已从本机删除，脚本只能恢复文件与数据，可能仍需从镜像仓库重新取得旧镜像。
+回滚要求 Docker daemon、PostgreSQL 和快照记录的历史镜像都可用。脚本在修改当前文件前检查历史镜像；恢复时原子切换 AnythingLLM 数据、恢复 n8n 数据库、发布 workflow，并在健康检查通过后重新提交 `ready`。现有 `.env`、匿名统计和版本历史不会被快照覆盖。
 
-`.env` 中的 `SNAPSHOT_MIN_FREE_MB` 默认是 `1024`，表示创建快照后仍需保留的最低空间；`SNAPSHOT_RETENTION_COUNT` 默认是 `10`，表示最多保留的有效快照数。任一值设为 `0` 会关闭对应限制。超过数量时最旧快照会被永久删除；正在用于回滚的目标快照会受到保护。
+`.env` 中的 `SNAPSHOT_MIN_FREE_MB` 默认是 `1024`，`SNAPSHOT_RETENTION_COUNT` 默认是 `10`。任一值设为 `0` 会关闭对应限制。自动清理会永久删除超出数量上限的最旧有效快照，回滚目标在操作期间受到保护。
 
-从 `v0.6.x` 首次升级到 `v0.7.0` 时，应从独立的新源码目录运行新版 `update.sh --deploy-dir <现有部署目录> --source-dir <新源码目录> --no-pull`。这样升级前即可使用新版容量预检、快照和回滚逻辑；已安装的旧版 `update.sh` 无法在自身开始执行前获得这些保护。
+从旧部署升级时，应从独立的新源码目录执行：
+
+```bash
+sudo ./update.sh \
+  --deploy-dir /opt/crisp-ai \
+  --source-dir /path/to/new/ai-support \
+  --no-pull
+```
+
+正式升级和故障回滚必须先在隔离环境按 [测试说明](TESTING.md) 演练。

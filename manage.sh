@@ -17,6 +17,7 @@ DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 
 require_installation() {
   assert_installation "$DEPLOY_DIR"
+  acquire_maintenance_lock "$DEPLOY_DIR"
 }
 
 pause_screen() {
@@ -27,39 +28,37 @@ pause_screen() {
 recreate_ai_services() {
   require_docker_runtime
   docker_compose "$DEPLOY_DIR" config --quiet
-  docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm n8n
+  docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm
+  wait_for_local_health "$DEPLOY_DIR" 45 2
+  bootstrap_anythingllm_api_key "$DEPLOY_DIR"
+  ensure_anythingllm_workspace "$DEPLOY_DIR"
+  docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  sync_prompt_to_anythingllm "$DEPLOY_DIR"
+  import_and_publish_workflow "$DEPLOY_DIR"
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR"
 }
 
 configure_anythingllm() {
-  local key workspace port status payload
-  printf 'AnythingLLM Developer API Key（输入内容不会显示）：'
+  local key workspace
+  printf 'AnythingLLM Developer API Key（留空则保留现有值或自动创建）：'
   IFS= read -r -s key
   printf '\n工作区 slug [%s]：' "$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || printf 'crisp-support')"
   IFS= read -r workspace
   workspace=${workspace:-$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || printf 'crisp-support')}
-  validate_env_value "$key" || die "AnythingLLM API Key 无效"
-  [[ "$workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || die "工作区 slug 只能包含字母、数字、下划线或连字符"
-  env_set "${DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY "$key"
-  env_set "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE "$workspace"
-
-  port=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
-  status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    --connect-timeout 5 --max-time 20 --header "Authorization: Bearer ${key}" \
-    "http://127.0.0.1:${port}/api/v1/workspace/${workspace}" 2>/dev/null || true)
-  if [[ "$status" == "404" ]]; then
-    payload=$(jq -cn --arg name "$workspace" --arg slug "$workspace" '{name:$name,slug:$slug}')
-    status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time 30 --header "Authorization: Bearer ${key}" \
-      --header 'Content-Type: application/json' --data "$payload" \
-      "http://127.0.0.1:${port}/api/v1/workspace/new" 2>/dev/null || true)
+  if [[ -n "$key" ]]; then
+    validate_env_value "$key" || die "AnythingLLM API Key 无效"
+    env_set "${DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY "$key"
   fi
-  [[ "$status" == 2?? ]] || die "AnythingLLM API 或工作区检查失败（HTTP ${status:-000}）"
-  sync_prompt_to_anythingllm "$DEPLOY_DIR"
-  import_and_publish_workflow "$DEPLOY_DIR"
+  [[ "$workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || die "工作区 slug 只能包含字母、数字、下划线或连字符"
+  env_set "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE "$workspace"
+  recreate_ai_services
 }
 
 configure_crisp() {
-  local website tier identifier token_key current secret_choice auth
+  local website tier hook_mode identifier token_key current current_identifier current_token_key
+  local secret_choice signing_secret existing_signing_secret auth
   current=$(env_get "${DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)
   printf 'Crisp Website ID [%s]：' "$current"
   IFS= read -r website
@@ -67,16 +66,33 @@ configure_crisp() {
   printf 'Crisp Token tier（website/plugin）[%s]：' "$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_TIER 2>/dev/null || printf 'website')"
   IFS= read -r tier
   tier=${tier:-$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_TIER 2>/dev/null || printf 'website')}
-  printf 'Crisp Token Identifier：'
+  current_identifier=$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_IDENTIFIER 2>/dev/null || true)
+  current_token_key=$(env_get "${DEPLOY_DIR}/.env" CRISP_TOKEN_KEY 2>/dev/null || true)
+  printf 'Crisp Token Identifier（留空则保留现有值）：'
   IFS= read -r identifier
-  printf 'Crisp Token Key（输入内容不会显示）：'
+  identifier=${identifier:-$current_identifier}
+  printf 'Crisp Token Key（留空则保留现有值，输入内容不会显示）：'
   IFS= read -r -s token_key
-  printf '\n是否轮换 Webhook Secret？[y/N] '
-  IFS= read -r secret_choice
+  token_key=${token_key:-$current_token_key}
+  printf '\nCrisp Hook 模式（website/plugin）[%s]：' "$(env_get "${DEPLOY_DIR}/.env" CRISP_HOOK_MODE 2>/dev/null || printf 'website')"
+  IFS= read -r hook_mode
+  hook_mode=${hook_mode:-$(env_get "${DEPLOY_DIR}/.env" CRISP_HOOK_MODE 2>/dev/null || printf 'website')}
+  signing_secret=""
+  if [[ "$hook_mode" == plugin ]]; then
+    printf 'Plugin Hook Signing Secret（留空则保留现有值）：'
+    IFS= read -r -s signing_secret
+    printf '\n'
+  else
+    printf '是否轮换 Website Hook URL Secret？[y/N] '
+    IFS= read -r secret_choice
+  fi
 
   [[ "$website" =~ ^[A-Za-z0-9-]{8,128}$ ]] || die "Crisp Website ID 格式无效"
   [[ "$tier" == website || "$tier" == plugin ]] || die "Token tier 只能是 website 或 plugin"
-  validate_env_value "$identifier" || die "Token Identifier 无效"
+  [[ "$hook_mode" == website || "$hook_mode" == plugin ]] || die "Hook 模式只能是 website 或 plugin"
+  if ! validate_env_value "$identifier" || [[ "$identifier" == *:* ]]; then
+    die "Token Identifier 无效"
+  fi
   validate_env_value "$token_key" || die "Token Key 无效"
   auth=$(printf '%s' "${identifier}:${token_key}" | base64 | tr -d '\n')
   env_set "${DEPLOY_DIR}/.env" CRISP_WEBSITE_ID "$website"
@@ -84,12 +100,27 @@ configure_crisp() {
   env_set "${DEPLOY_DIR}/.env" CRISP_TOKEN_IDENTIFIER "$identifier"
   env_set "${DEPLOY_DIR}/.env" CRISP_TOKEN_KEY "$token_key"
   env_set "${DEPLOY_DIR}/.env" CRISP_AUTH_B64 "$auth"
-  case "$secret_choice" in
-    y|Y|yes|YES) env_set "${DEPLOY_DIR}/.env" CRISP_WEBHOOK_SECRET "$(random_hex 32)" ;;
-  esac
+  env_set "${DEPLOY_DIR}/.env" CRISP_HOOK_MODE "$hook_mode"
+  if [[ "$hook_mode" == plugin ]]; then
+    if [[ -n "$signing_secret" ]]; then
+      validate_env_value "$signing_secret" || die "Plugin Hook Signing Secret 无效"
+      env_set "${DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET "$signing_secret"
+    fi
+    existing_signing_secret=$(env_get "${DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+    validate_env_value "$existing_signing_secret" || die "Plugin 模式必须配置 Crisp 提供的 Signing Secret"
+  else
+    ensure_secret "${DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 32
+    case "${secret_choice:-}" in
+      y|Y|yes|YES) env_set "${DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET "$(random_hex 32)" ;;
+    esac
+  fi
   require_docker_runtime
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
-  info "Crisp 配置已更新；如已轮换 Secret，请同步修改 Crisp Webhook URL"
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  import_and_publish_workflow "$DEPLOY_DIR"
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR"
+  info "Crisp 配置已更新；Website Hook 与 Plugin Hook 的 Secret 不可混用"
 }
 
 ai_config_menu() {
@@ -142,7 +173,7 @@ prompt_menu() {
       2)
         choose_editor "${DEPLOY_DIR}/config/prompt.md"
         validate_prompt_file "${DEPLOY_DIR}/config/prompt.md"
-        sync_prompt_to_anythingllm "$DEPLOY_DIR" || true
+        sync_prompt_to_anythingllm "$DEPLOY_DIR"
         ;;
       3)
         printf '导入文件路径：'
@@ -151,7 +182,7 @@ prompt_menu() {
         validate_prompt_file "$resolved"
         install -m 0640 -- "$resolved" "${DEPLOY_DIR}/config/prompt.md"
         chown root:1000 "${DEPLOY_DIR}/config/prompt.md" 2>/dev/null || true
-        sync_prompt_to_anythingllm "$DEPLOY_DIR" || true
+        sync_prompt_to_anythingllm "$DEPLOY_DIR"
         ;;
       4)
         printf '导出文件路径：'
@@ -235,7 +266,7 @@ knowledge_menu() {
       1) list_knowledge ;;
       2) add_knowledge ;;
       3) delete_knowledge ;;
-      4) knowledge_sync "$DEPLOY_DIR" || true ;;
+      4) knowledge_sync "$DEPLOY_DIR" || warn "知识库同步未完全成功；请根据上方错误修复后重试" ;;
       5) knowledge_reindex "$DEPLOY_DIR" ;;
       0) return ;;
       *) warn "无效选项" ;;

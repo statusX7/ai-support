@@ -9,6 +9,7 @@ DEPLOY_REQUEST=""
 INPUT_REQUEST=""
 SKIP_RESTART=0
 SAFETY_BACKUP=1
+SERVICES_STOPPED=0
 
 usage() {
   cat <<'EOF'
@@ -52,6 +53,7 @@ done
 [[ -n "$INPUT_REQUEST" ]] || die "必须通过 --input 指定备份文件"
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
+acquire_maintenance_lock "$DEPLOY_DIR"
 require_command tar
 require_command jq
 require_command sha256sum
@@ -91,6 +93,9 @@ while IFS= read -r entry; do
   [[ "$clean" != /* && "$clean" != ".." && "$clean" != ../* && "$clean" != */../* && "$clean" != *\\* ]] || die "备份包含路径穿越：$entry"
   is_allowed_archive_path "$entry" || die "备份包含未授权路径：$entry"
 done < <(tar --list --gzip --file "$INPUT_FILE")
+if [[ -n "$(tar --list --gzip --file "$INPUT_FILE" | sed 's#^\./##; s#/$##' | LC_ALL=C sort | uniq -d)" ]]; then
+  die "备份包含重复归档路径"
+fi
 
 while IFS= read -r listing; do
   case "${listing:0:1}" in
@@ -101,6 +106,10 @@ done < <(tar --list --verbose --gzip --file "$INPUT_FILE")
 
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/restore-stage.XXXXXX")
 cleanup() {
+  if (( SERVICES_STOPPED == 1 )); then
+    docker_compose "$DEPLOY_DIR" up -d n8n anythingllm >/dev/null 2>&1 \
+      || warn "恢复失败后重新启动服务失败"
+  fi
   rm -rf -- "$STAGING"
 }
 trap cleanup EXIT
@@ -116,6 +125,12 @@ while IFS= read -r checksum_line; do
   checksum_path=${checksum_line#*  }
   is_allowed_archive_path "$checksum_path" || die "校验和引用了未授权路径"
 done < "${STAGING}/checksums.sha256"
+if [[ -n "$(sed -n 's/^[0-9a-f]\{64\}  //p' "${STAGING}/checksums.sha256" | sed 's#^\./##' | LC_ALL=C sort | uniq -d)" ]]; then
+  die "校验和文件包含重复路径"
+fi
+EXPECTED_FILES=$(sed -n 's/^[0-9a-f]\{64\}  //p' "${STAGING}/checksums.sha256" | sed 's#^\./##' | LC_ALL=C sort)
+ACTUAL_FILES=$(find "$STAGING" -type f ! -name 'checksums.sha256' -printf '%P\n' | LC_ALL=C sort)
+[[ "$EXPECTED_FILES" == "$ACTUAL_FILES" ]] || die "备份普通文件集合与校验和清单不一致"
 (
   cd -- "$STAGING"
   sha256sum --check --strict checksums.sha256 >/dev/null
@@ -138,6 +153,17 @@ if (( SAFETY_BACKUP )); then
   info "已创建恢复前安全备份：$SAFETY_FILE"
 fi
 
+if (( SKIP_RESTART == 0 )); then
+  require_docker_runtime
+  docker_compose "$DEPLOY_DIR" stop n8n anythingllm
+  SERVICES_STOPPED=1
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  RUNNING_SERVICES=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=running 2>/dev/null || true)
+  if grep -Eq '^(n8n|anythingllm)$' <<< "$RUNNING_SERVICES"; then
+    die "n8n 或 AnythingLLM 正在运行，不能使用 --skip-restart 执行恢复"
+  fi
+fi
+
 for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example; do
   if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
     install -m 0640 -- "${STAGING}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
@@ -156,21 +182,23 @@ while IFS= read -r -d '' file; do
   is_supported_knowledge_file "$config_name" || continue
   install -m 0640 -- "$file" "${DEPLOY_DIR}/knowledge/${config_name}"
 done < <(find "${STAGING}/knowledge" -maxdepth 1 -type f -print0 | sort -z)
-printf '{"version":1,"files":{}}\n' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
+printf '{"version":1,"files":{},"garbage_locations":[]}\n' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
 chmod 600 "${DEPLOY_DIR}/data/knowledge-manifest.json"
 
-chown -R root:1000 "${DEPLOY_DIR}/config" "${DEPLOY_DIR}/knowledge" "${DEPLOY_DIR}/n8n" 2>/dev/null || true
+set_runtime_ownership "$DEPLOY_DIR"
 secure_permissions "$DEPLOY_DIR"
 
 if (( SKIP_RESTART == 0 )); then
-  require_command docker
   docker_compose "$DEPLOY_DIR" config --quiet
-  docker_compose "$DEPLOY_DIR" restart
-  if anythingllm_api_ready "$DEPLOY_DIR"; then
-    knowledge_sync "$DEPLOY_DIR" || warn "配置已恢复，但部分知识文件同步失败"
-    sync_prompt_to_anythingllm "$DEPLOY_DIR" || warn "配置已恢复，但 Prompt 同步失败"
-    import_and_publish_workflow "$DEPLOY_DIR" || warn "配置已恢复，但工作流发布失败"
-  fi
+  docker_compose "$DEPLOY_DIR" up -d n8n anythingllm
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  bootstrap_anythingllm_api_key "$DEPLOY_DIR"
+  ensure_anythingllm_workspace "$DEPLOY_DIR"
+  knowledge_sync "$DEPLOY_DIR" || die "知识文件恢复后同步失败"
+  sync_prompt_to_anythingllm "$DEPLOY_DIR"
+  import_and_publish_workflow "$DEPLOY_DIR"
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  SERVICES_STOPPED=0
 fi
 
 trap - EXIT

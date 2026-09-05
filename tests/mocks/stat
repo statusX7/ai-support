@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == *"%u:%g"* ]] \
+  && [[ "$*" == *"/data/n8n"* || "$*" == *"/data/anythingllm"* \
+    || "$*" == *"/data/runtime"* ]]; then
+  printf '1000:1000\n'
+  exit 0
+fi
+
+exec /usr/bin/stat "$@"

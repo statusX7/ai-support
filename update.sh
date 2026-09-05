@@ -57,8 +57,10 @@ done
 
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
+acquire_maintenance_lock "$DEPLOY_DIR"
 [[ $EUID -eq 0 ]] || die "更新需要 root 权限"
 require_command realpath
+(( SKIP_START == 0 )) || die "为保证 n8n 数据库与 AnythingLLM 数据一致，更新不再支持 --skip-start"
 
 if [[ -n "$SOURCE_REQUEST" ]]; then
   SOURCE_DIR=$(realpath -e -- "$SOURCE_REQUEST")
@@ -71,16 +73,29 @@ else
 fi
 [[ -f "${SOURCE_DIR}/VERSION" && -f "${SOURCE_DIR}/install.sh" && -f "${SOURCE_DIR}/docker-compose.yml" ]] \
   || die "指定目录不是完整的 ai-support 源码"
+[[ "$(realpath -m -- "$SOURCE_DIR")" != "$(realpath -m -- "$DEPLOY_DIR")" ]] \
+  || die "源码目录不能与部署目录相同；请在独立 Git 工作区中运行 update.sh 并指定 --source-dir"
 
 if (( NO_PULL == 0 )); then
   require_command git
   [[ -d "${SOURCE_DIR}/.git" ]] || die "源码目录不是 Git 工作区；请准备新版本源码并使用 --no-pull"
   [[ -z "$(git -C "$SOURCE_DIR" status --porcelain)" ]] \
     || die "源码工作区存在未提交修改，拒绝自动更新；请先处理修改或使用 --no-pull"
+  git -C "$SOURCE_DIR" pull --ff-only
 fi
+
+NEW_VERSION=$(<"${SOURCE_DIR}/VERSION")
+[[ "$NEW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "源码 VERSION 格式无效"
 
 OLD_VERSION=$(<"${DEPLOY_DIR}/VERSION")
 [[ "$OLD_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "当前 VERSION 格式无效"
+IFS=. read -r NEW_MAJOR NEW_MINOR NEW_PATCH <<< "${NEW_VERSION#v}"
+IFS=. read -r OLD_MAJOR OLD_MINOR OLD_PATCH <<< "${OLD_VERSION#v}"
+if (( 10#$NEW_MAJOR < 10#$OLD_MAJOR \
+  || (10#$NEW_MAJOR == 10#$OLD_MAJOR && 10#$NEW_MINOR < 10#$OLD_MINOR) \
+  || (10#$NEW_MAJOR == 10#$OLD_MAJOR && 10#$NEW_MINOR == 10#$OLD_MINOR && 10#$NEW_PATCH <= 10#$OLD_PATCH) )); then
+  die "目标版本必须高于当前版本：${OLD_VERSION} -> ${NEW_VERSION}"
+fi
 SNAPSHOT_SCRIPT="${SOURCE_DIR}/scripts/snapshot.sh"
 ROLLBACK_SCRIPT="${SOURCE_DIR}/scripts/rollback.sh"
 if [[ ! -x "$SNAPSHOT_SCRIPT" ]]; then SNAPSHOT_SCRIPT="${DEPLOY_DIR}/scripts/snapshot.sh"; fi
@@ -119,12 +134,8 @@ rollback_on_failure() {
 }
 trap rollback_on_failure EXIT
 
-if (( SKIP_START == 0 )); then
-  require_docker_runtime
-  docker_compose "$DEPLOY_DIR" config --quiet
-  docker_compose "$DEPLOY_DIR" stop n8n anythingllm
-  SERVICES_STOPPED=1
-fi
+require_docker_runtime
+docker_compose "$DEPLOY_DIR" config --quiet
 
 SNAPSHOT_ID=$("$SNAPSHOT_SCRIPT" --deploy-dir "$DEPLOY_DIR" --reason "pre-update-${OLD_VERSION}" --quiet)
 info "更新前版本快照：$SNAPSHOT_ID"
@@ -132,39 +143,38 @@ BACKUP_FILE="${DEPLOY_DIR}/backups/pre-update-${OLD_VERSION}-$(date -u '+%Y%m%dT
 "${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$BACKUP_FILE" >/dev/null
 info "更新前迁移备份：$BACKUP_FILE"
 
-if (( NO_PULL == 0 )); then
-  git -C "$SOURCE_DIR" pull --ff-only
-fi
+# 快照先记录旧镜像引用与镜像 ID；随后才迁移新版运行参数并拉取镜像。
+migrate_runtime_env "$DEPLOY_DIR"
+docker compose --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
+  -f "${SOURCE_DIR}/docker-compose.yml" config --quiet
+# 镜像拉取在正式停机前完成；网络或 registry 失败不会影响当前运行服务。
+docker compose --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
+  -f "${SOURCE_DIR}/docker-compose.yml" pull
+docker_compose "$DEPLOY_DIR" stop n8n anythingllm
+SERVICES_STOPPED=1
 
-NEW_VERSION=$(<"${SOURCE_DIR}/VERSION")
-[[ "$NEW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "源码 VERSION 格式无效"
+write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$OLD_VERSION" installing
 copy_project_files "$SOURCE_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
 migrate_config_files "$DEPLOY_DIR"
-MARKER_TEMP=$(mktemp "${DEPLOY_DIR}/${INSTALL_MARKER}.tmp.XXXXXX")
-{
-  printf 'ai-support\n'
-  printf 'source=%s\n' "$SOURCE_DIR"
-  printf 'installed_version=%s\n' "$NEW_VERSION"
-} > "$MARKER_TEMP"
-chmod 600 "$MARKER_TEMP"
-mv -f -- "$MARKER_TEMP" "${DEPLOY_DIR}/${INSTALL_MARKER}"
 [[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
 touch -- "${DEPLOY_DIR}/data/analytics/events.jsonl"
-chown -R root:1000 "${DEPLOY_DIR}/config" "${DEPLOY_DIR}/knowledge" "${DEPLOY_DIR}/n8n" \
-  "${DEPLOY_DIR}/data/anythingllm" "${DEPLOY_DIR}/data/analytics" 2>/dev/null || true
+set_runtime_ownership "$DEPLOY_DIR"
 secure_permissions "$DEPLOY_DIR"
 
 if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
-  docker_compose "$DEPLOY_DIR" pull
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
   wait_for_local_health "$DEPLOY_DIR" 45 2
-  if anythingllm_api_ready "$DEPLOY_DIR"; then
-    sync_prompt_to_anythingllm "$DEPLOY_DIR"
-  fi
+  bootstrap_anythingllm_api_key "$DEPLOY_DIR"
+  ensure_anythingllm_workspace "$DEPLOY_DIR"
+  docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  sync_prompt_to_anythingllm "$DEPLOY_DIR"
   import_and_publish_workflow "$DEPLOY_DIR"
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --local
+  wait_for_local_health "$DEPLOY_DIR" 30 2
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --installation-in-progress
+  write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" ready
   SERVICES_STOPPED=0
 fi
 

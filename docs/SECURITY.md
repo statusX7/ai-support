@@ -2,16 +2,20 @@
 
 ## 密钥
 
-- API Key、Crisp Token、Webhook Secret、数据库密码和 n8n 加密密钥只保存在 `.env`。
+- API Key、Crisp Token、Website URL Secret、Plugin Signing Secret、数据库密码和 n8n 加密密钥只保存在 `.env`。
 - `config/provider.yaml` 只记录 `api_key_env: AI_API_KEY`，不得增加真实密钥字段。
 - `.env` 和本地备份权限为 `0600`；不得提交、上传或粘贴到公开工单。
 - 怀疑泄露时，应在服务端轮换对应 Token，并通过管理菜单更新本地值。
 
+Shell 发起认证请求时使用权限为 `0600` 的临时 curl 配置和请求体，避免把认证值直接放入进程命令行；请求完成后立即删除临时文件。不得用 `set -x` 运行安装、配置或健康检查。
+
 ## Webhook
 
-Website Hook 按 Crisp 的接口约束没有签名能力，因此必须使用随机 URL Secret，并始终通过 HTTPS。Plugin Hook 必须验证 `X-Crisp-Signature`，签名内容为 `[timestamp;raw_json_body]` 的 HMAC-SHA256，同时限制时间戳偏差为五分钟。
+Website Hook 按 Crisp 的接口约束没有签名能力，因此必须使用 `CRISP_WEBSITE_HOOK_SECRET` 随机 URL Secret，并始终通过 HTTPS。Plugin Hook 必须使用独立的 `CRISP_PLUGIN_SIGNING_SECRET`，验证 `X-Crisp-Signature`；签名内容为 `[timestamp;raw_json_body]` 的 HMAC-SHA256，同时限制时间戳偏差为五分钟。Plugin 模式缺少签名、时间戳或原始请求体时直接拒绝，不回退到 URL Secret。
 
-工作流还会校验 `website_id`、`session_id`、允许的事件、消息方向和事件指纹。只有 `message:send` 且 `from=user` 的消息会触发 AI；标记为自动发送或来自 operator 的消息不会触发机器人回复。
+工作流还会校验 `website_id`、`session_id`、允许的事件、消息方向和事件指纹。只有 `message:send` 且 `from=user` 的消息会触发 AI；自动消息不会形成机器人循环。只有公开、非自动、非 stealth 的 operator `message:received` 文本或文件会触发人工接管，内部 note 不会关闭 AI。
+
+AI 回复发送前会读取 conversation 消息并复核接管代次。Crisp Token 应具有消息读取权限；读取失败时，普通 AI 回复会按失败关闭策略取消，并只记录匿名投递失败事件。显式转人工的确认消息不受此检查阻断，随后仍会关闭 AI。
 
 ## n8n 权限边界
 
@@ -19,7 +23,7 @@ Website Hook 按 Crisp 的接口约束没有签名能力，因此必须使用随
 
 工作流执行成功、失败和手动执行数据默认不持久保存，减少消息内容落盘。查看实时日志时仍可能看到会话相关错误，日志不得公开分享。
 
-匿名统计文件只向 root 和 n8n 运行组开放。计数事件不含消息内容；反馈事件中的会话 ID 使用 Webhook Secret 做 HMAC 后再截断，问题与回答会过滤常见密钥、邮箱和号码并限制长度。自动过滤不能覆盖所有个人信息，启用反馈前仍需确认隐私告知、保留期限和访问权限符合部署地要求。
+匿名统计文件只向 root 和 n8n 运行组开放。计数事件不含消息内容；反馈事件中的会话 ID 使用当前 Hook 模式的 Secret 做 HMAC 后再截断，问题与回答会过滤常见密钥、Cookie、JWT、邮箱和号码并限制长度。自动过滤不能覆盖所有个人信息，启用反馈前仍需确认隐私告知、保留期限和访问权限符合部署地要求。
 
 ## 输入与文件
 
@@ -35,9 +39,25 @@ Website Hook 按 Crisp 的接口约束没有签名能力，因此必须使用随
 
 恢复会替换业务配置和知识文件，并在操作前自动创建安全备份；现有 `.env` 不会被覆盖。彻底卸载默认也会生成一份不含密钥的最终备份，除非明确使用 `--no-backup`。
 
-更新和回滚使用的 `backups/versions/` 快照与迁移备份不同：它包含 AnythingLLM 运行数据，可能间接包含知识内容或会话数据，只能保存在本机权限为 `0700` 的目录。禁止提交、上传、公开分享或跨信任边界迁移该目录。
+更新和回滚使用的 `backups/versions/` 快照与迁移备份不同：它包含 AnythingLLM 运行数据和 n8n PostgreSQL 逻辑备份，可能间接包含知识内容、工作流状态或会话数据，只能保存在本机权限为 `0700` 的目录。禁止提交、上传、公开分享或跨信任边界迁移该目录。
 
 快照保留策略会永久删除超过数量上限的最旧有效快照。默认保留 10 份；变更 `SNAPSHOT_RETENTION_COUNT` 前应确认恢复点要求，设为 `0` 可关闭自动清理。容量预检是保守估算，不能替代宿主机磁盘监控和告警。
+
+快照创建会暂停 n8n 与 AnythingLLM，并要求 PostgreSQL 正常运行，以生成一致的数据库逻辑备份。回滚会在修改文件前校验归档和历史镜像，使用暂存目录原子切换 AnythingLLM 数据；数据库恢复、workflow 发布或健康检查失败时必须按错误提示处理，不能把部署标记手工改为 `ready`。
+
+## 运行与维护边界
+
+- n8n 和 AnythingLLM 固定以 UID/GID `1000:1000` 运行，对应数据目录不得开放全局写权限。
+- Compose 默认启用 `no-new-privileges`，服务日志使用 10 MiB、3 个文件的轮转上限。
+- n8n 读取受控环境变量并只允许 Code node 导入 `crypto` 与 `fs`；能够修改 workflow 的管理员仍等同于高权限主体。
+- 安装、更新、备份、恢复、快照、回滚和卸载使用维护锁，禁止并发修改同一部署。
+- 默认镜像使用明确版本标签。更换镜像或标签后必须重新完成安全扫描、自动测试和真实验收。
+- AnythingLLM 固定为 `1.16.1`，以包含 `1.15.0` 之后的相关修复；降级或自行覆盖版本会重新引入未经本项目验收的兼容性与安全风险。
+- `data/runtime/` 只保存 AI 开关、接管代次、欢迎/菜单状态和哈希事件指纹，不保存消息正文；目录仍应按运行数据限制访问，且版本回滚不会清除现有人工接管状态。清理逻辑只在锁内处理严格命名的普通文件，保护当前会话，按 7 天和 2000/1500 数量阈值淘汰旧状态；仍应监控文件数量并确认该保留期符合业务要求。
+
+## 发布前检查
+
+正式发布前必须运行 `tests/test_static_security.sh`，检查 Git 跟踪、未忽略文件和全部 Git 历史中的常见密钥模式。扫描只是最低门槛；若曾经提交真实密钥，必须先轮换密钥并清理历史，不能仅删除当前文件。完整门禁见 [发布说明](RELEASE.md)。
 
 ## Prompt Injection
 

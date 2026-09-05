@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${MOCK_FORBIDDEN_ARG_FILE:-}" && -f "$MOCK_FORBIDDEN_ARG_FILE" ]]; then
+  while IFS= read -r forbidden || [[ -n "$forbidden" ]]; do
+    [[ -n "$forbidden" ]] || continue
+    if [[ " $* " == *"$forbidden"* ]]; then
+      printf 'curl 测试桩拒绝命令行参数中的敏感值\n' >&2
+      exit 90
+    fi
+  done < "$MOCK_FORBIDDEN_ARG_FILE"
+fi
+
 OUTPUT_FILE=""
 WRITE_OUT=""
 URL=""
 FAIL_ON_HTTP=0
 FORM_FILE=""
+CONFIG_FILE=""
+DATA_FILE=""
+REQUEST_BODY="{}"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -23,7 +36,23 @@ while (( $# > 0 )); do
       fi
       shift 2
       ;;
-    --header|-H|--data|--data-raw|--connect-timeout|--max-time|--request|-X)
+    --config|-K)
+      CONFIG_FILE=$2
+      shift 2
+      ;;
+    --data-binary)
+      if [[ "$2" == @* ]]; then
+        DATA_FILE=${2#@}
+      else
+        REQUEST_BODY=$2
+      fi
+      shift 2
+      ;;
+    --data|--data-raw)
+      REQUEST_BODY=$2
+      shift 2
+      ;;
+    --header|-H|--connect-timeout|--max-time|--request|-X)
       shift 2
       ;;
     --fail|-f)
@@ -43,6 +72,15 @@ while (( $# > 0 )); do
   esac
 done
 
+if [[ -n "$DATA_FILE" && -f "$DATA_FILE" ]]; then
+  REQUEST_BODY=$(<"$DATA_FILE")
+fi
+# 认证配置仅用于确保测试桩接受与真实 curl 相同的安全调用形式。
+if [[ -n "$CONFIG_FILE" && ! -f "$CONFIG_FILE" ]]; then
+  printf 'curl 测试桩收到无效的 --config 文件\n' >&2
+  exit 2
+fi
+
 [[ -n "$URL" ]] || {
   printf 'curl 测试桩未收到 URL\n' >&2
   exit 2
@@ -59,12 +97,24 @@ case "$URL" in
       BODY='{"data":[{"id":"gpt-vision-test"},{"id":"deepseek-test"}]}'
     fi
     ;;
-  */responses|*/chat/completions)
+  */responses)
     if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
       STATUS=503
       BODY='{"error":{"message":"测试 Provider 不可用"}}'
+    elif [[ "${MOCK_PROVIDER_SOFT_ERROR:-0}" == 1 ]]; then
+      BODY='{"error":{"message":"HTTP 200 测试错误"}}'
     else
-      BODY='{"id":"test-response"}'
+      BODY='{"id":"test-response","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}'
+    fi
+    ;;
+  */chat/completions)
+    if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
+      STATUS=503
+      BODY='{"error":{"message":"测试 Provider 不可用"}}'
+    elif [[ "${MOCK_PROVIDER_SOFT_ERROR:-0}" == 1 ]]; then
+      BODY='{"error":{"message":"HTTP 200 测试错误"}}'
+    else
+      BODY='{"id":"test-chat","choices":[{"message":{"role":"assistant","content":"OK"}}]}'
     fi
     ;;
   https://api.crisp.chat/*)
@@ -75,16 +125,81 @@ case "$URL" in
       BODY='{"error":false}'
     fi
     ;;
+  */api/request-token)
+    BODY='{"token":"test-only-anything-jwt"}'
+    ;;
+  */api/system/generate-api-key)
+    BODY='{"apiKey":{"secret":"test-only-generated-anything-key"}}'
+    ;;
+  */api/v1/auth)
+    BODY='{"authenticated":true,"success":true}'
+    ;;
+  */api/v1/system/remove-documents)
+    if [[ "${MOCK_REMOVE_DOCUMENTS_FAIL:-0}" == 1 ]]; then
+      STATUS=503
+      BODY='{"success":false,"error":"测试源文档删除失败"}'
+    else
+      if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
+        [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
+        REMOVED_DOCUMENTS=$(jq -c '.names // []' <<< "$REQUEST_BODY")
+        STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
+        jq --argjson removed "$REMOVED_DOCUMENTS" \
+          '.removed_documents = (((.removed_documents // []) + $removed) | unique)' \
+          "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
+        mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+      fi
+      BODY='{"success":true}'
+    fi
+    ;;
   */api/v1/document/upload)
     DOCUMENT_NAME=$(basename -- "${FORM_FILE:-test-knowledge}")
     BODY=$(jq -cn --arg location "custom-documents/${DOCUMENT_NAME}.json" \
       '{success:true,documents:[{location:$location}]}')
     ;;
-  */api/v1/workspace/*/update-embeddings|*/api/v1/workspace/*/update|*/api/v1/workspace/new)
+  */api/v1/workspace/*/update-embeddings)
+    if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
+      [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
+      ADDS=$(jq -c '.adds // []' <<< "$REQUEST_BODY")
+      DELETES=$(jq -c '.deletes // []' <<< "$REQUEST_BODY")
+      STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
+      jq --argjson adds "$ADDS" --argjson deletes "$DELETES" \
+        '.documents = (((.documents // []) + $adds) - $deletes | unique)' \
+        "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
+      mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+    fi
     BODY='{"success":true}'
     ;;
-  */api/v1/workspace/*|*/api/v1/auth)
-    BODY='{"success":true}'
+  */api/v1/workspace/*/update)
+    WORKSPACE_SLUG=${URL#*/api/v1/workspace/}
+    WORKSPACE_SLUG=${WORKSPACE_SLUG%%/*}
+    PROMPT=$(jq -r '.openAiPrompt // ""' <<< "$REQUEST_BODY")
+    if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
+      [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[],"prompt":""}\n' > "$MOCK_ANYTHING_STATE"
+      STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
+      jq --arg prompt "$PROMPT" '.prompt = $prompt' "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
+      mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+    fi
+    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --arg prompt "$PROMPT" \
+      '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[]}}')
+    ;;
+  */api/v1/workspace/new)
+    WORKSPACE_SLUG=$(jq -r '.name // .slug // "crisp-support"' <<< "$REQUEST_BODY")
+    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" '{workspace:{slug:$slug,documents:[]}}')
+    ;;
+  */api/v1/workspace/*/chat)
+    BODY='{"textResponse":"健康检查通过","sources":[]}'
+    ;;
+  */api/v1/workspace/*)
+    WORKSPACE_SLUG=${URL#*/api/v1/workspace/}
+    WORKSPACE_SLUG=${WORKSPACE_SLUG%%/*}
+    DOCUMENTS='[]'
+    PROMPT=''
+    if [[ -n "${MOCK_ANYTHING_STATE:-}" && -f "$MOCK_ANYTHING_STATE" ]]; then
+      DOCUMENTS=$(jq -c '[.documents[]? | {docpath:.}]' "$MOCK_ANYTHING_STATE")
+      PROMPT=$(jq -r '.prompt // ""' "$MOCK_ANYTHING_STATE")
+    fi
+    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --arg prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
+      '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:$documents}}')
     ;;
   */healthz|*/api/ping)
     BODY='{"status":"ok"}'

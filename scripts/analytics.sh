@@ -44,23 +44,25 @@ DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
 require_command jq
 EVENT_FILE="${DEPLOY_DIR}/data/analytics/events.jsonl"
-
-if [[ -L "$EVENT_FILE" ]]; then
-  die "统计事件文件不得是符号链接"
-fi
-if [[ ! -f "$EVENT_FILE" ]]; then
-  EVENT_FILE=/dev/null
-fi
+EVENT_FILES=()
+for suffix in 5 4 3 2 1 ""; do
+  candidate="${EVENT_FILE}${suffix:+.${suffix}}"
+  [[ ! -L "$candidate" ]] || die "统计事件文件不得是符号链接：$candidate"
+  [[ ! -e "$candidate" || -f "$candidate" ]] || die "统计事件路径不是普通文件：$candidate"
+  [[ ! -f "$candidate" ]] || EVENT_FILES+=("$candidate")
+done
+(( ${#EVENT_FILES[@]} > 0 )) || EVENT_FILES+=(/dev/null)
 
 SUMMARY=$(jq -nR '
   reduce inputs as $line (
     {
       total_questions: 0, ai_replies: 0, knowledge_hits: 0, knowledge_misses: 0,
       handoffs: 0, positive_feedback: 0, negative_feedback: 0,
-      negative_questions: [], failure_counts: {}
+      negative_questions: [], failure_counts: {}, invalid_lines: 0
     };
-    ($line | fromjson) as $event |
-    if ($event | type) != "object" then .
+    (try ($line | fromjson) catch null) as $event |
+    if $event == null then .invalid_lines += 1
+    elif ($event | type) != "object" then .invalid_lines += 1
     elif $event.type == "question" then .total_questions += 1
     elif $event.type == "ai_reply" then .ai_replies += 1
     elif $event.type == "knowledge_hit" then .knowledge_hits += 1
@@ -82,7 +84,12 @@ SUMMARY=$(jq -nR '
   .negative_questions |= reverse |
   .frequent_failures = (.failure_counts | to_entries | map({question: .key, count: .value}) | sort_by([-.count, .question]) | .[:10]) |
   del(.failure_counts)
-' "$EVENT_FILE") || die "统计事件文件包含无效 JSON"
+' "${EVENT_FILES[@]}") || die "统计事件读取失败"
+
+INVALID_LINES=$(jq -r '.invalid_lines' <<< "$SUMMARY")
+if (( INVALID_LINES > 0 )); then
+  warn "已跳过 ${INVALID_LINES} 行损坏的统计事件"
+fi
 
 if (( JSON_OUTPUT )); then
   jq . <<< "$SUMMARY"

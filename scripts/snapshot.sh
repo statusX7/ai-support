@@ -15,8 +15,8 @@ usage() {
   cat <<'EOF'
 用法：snapshot.sh [--deploy-dir PATH] [--reason TEXT] [--protect ID] [--check-capacity] [--quiet]
 
-创建仅用于本机版本回滚的受限快照，包含程序、配置、知识文件和 AnythingLLM 数据。
-快照不包含 .env、PostgreSQL、n8n 数据库、统计事件或日志。
+创建仅用于本机版本回滚的受限快照，包含程序、配置、知识文件、AnythingLLM 数据和 n8n 数据库逻辑备份。
+快照不包含 .env、统计事件或日志。创建期间会短暂停止 n8n 与 AnythingLLM 以保证一致性。
 
 --check-capacity 只执行容量预检，不创建快照。
 --protect ID      清理历史时保留指定快照，供回滚过程内部使用。
@@ -58,6 +58,7 @@ done
 
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
+acquire_maintenance_lock "$DEPLOY_DIR"
 [[ $EUID -eq 0 ]] || die "创建版本快照需要 root 权限"
 require_command tar
 require_command jq
@@ -76,7 +77,7 @@ VERSION_VALUE=$(<"${DEPLOY_DIR}/VERSION")
 [[ "$VERSION_VALUE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION 格式无效"
 VERSIONS_DIR="${DEPLOY_DIR}/backups/versions"
 mkdir -p -- "$VERSIONS_DIR" "${DEPLOY_DIR}/tmp"
-for directory in "$VERSIONS_DIR" "${DEPLOY_DIR}/tmp" "${DEPLOY_DIR}/data" "${DEPLOY_DIR}/data/anythingllm"; do
+for directory in "$VERSIONS_DIR" "${DEPLOY_DIR}/tmp" "${DEPLOY_DIR}/data" "${DEPLOY_DIR}/data/anythingllm" "${DEPLOY_DIR}/data/postgres"; do
   [[ -d "$directory" && ! -L "$directory" ]] || die "快照目录缺失或是符号链接：$directory"
 done
 chmod 700 "$VERSIONS_DIR"
@@ -99,6 +100,7 @@ CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.e
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
 OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
+OPTIONAL_DOC_FILES=(RELEASE.md)
 SNAPSHOT_SOURCE_PATHS=()
 for name in "${ROOT_FILES[@]}"; do
   [[ -e "${DEPLOY_DIR}/${name}" ]] && SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${name}")
@@ -106,6 +108,7 @@ done
 for directory in config knowledge n8n scripts docs data/anythingllm; do
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${directory}")
 done
+SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/postgres")
 if [[ -f "${DEPLOY_DIR}/data/knowledge-manifest.json" ]]; then
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/knowledge-manifest.json")
 fi
@@ -130,6 +133,10 @@ snapshot_capacity_check
 if (( CHECK_CAPACITY )); then
   exit 0
 fi
+if [[ -f "${DEPLOY_DIR}/config/provider.yaml" ]] \
+  && provider_config_has_secret_field "${DEPLOY_DIR}/config/provider.yaml"; then
+  die "provider.yaml 包含疑似密钥字段；请将密钥移入 .env 后再创建版本快照"
+fi
 
 SNAPSHOT_ID="$(date -u '+%Y%m%dT%H%M%SZ')-${VERSION_VALUE}-$(random_hex 4)"
 TARGET_DIR="${VERSIONS_DIR}/${SNAPSHOT_ID}"
@@ -137,13 +144,37 @@ TARGET_DIR="${VERSIONS_DIR}/${SNAPSHOT_ID}"
 
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/snapshot-stage.XXXXXX")
 TARGET_TEMP=$(mktemp -d "${VERSIONS_DIR}/.snapshot.XXXXXX")
+SERVICES_PAUSED=0
 cleanup() {
+  if (( SERVICES_PAUSED == 1 )); then
+    docker_compose "$DEPLOY_DIR" up -d n8n anythingllm >/dev/null 2>&1 \
+      || warn "快照失败后重新启动 n8n 或 AnythingLLM 失败"
+  fi
   rm -rf -- "$STAGING" "$TARGET_TEMP"
 }
 trap cleanup EXIT
 
 mkdir -p -- "$STAGING/payload/config" "$STAGING/payload/knowledge" "$STAGING/payload/n8n" \
-  "$STAGING/payload/scripts" "$STAGING/payload/docs" "$STAGING/payload/data/anythingllm"
+  "$STAGING/payload/scripts" "$STAGING/payload/docs" "$STAGING/payload/data/anythingllm" \
+  "$STAGING/payload/data/postgres"
+
+require_docker_runtime
+RUNNING_SERVICES=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=running 2>/dev/null || true)
+POSTGRES_WAS_RUNNING=0
+grep -Fxq postgres <<< "$RUNNING_SERVICES" && POSTGRES_WAS_RUNNING=1
+(( POSTGRES_WAS_RUNNING == 1 )) || die "PostgreSQL 容器未运行，无法创建一致的 n8n 数据库快照"
+if grep -Eq '^(n8n|anythingllm)$' <<< "$RUNNING_SERVICES"; then
+  docker_compose "$DEPLOY_DIR" stop n8n anythingllm >/dev/null
+  SERVICES_PAUSED=1
+fi
+
+restart_paused_services() {
+  if (( SERVICES_PAUSED == 1 )); then
+    docker_compose "$DEPLOY_DIR" up -d n8n anythingllm >/dev/null \
+      || warn "快照后重新启动 n8n 或 AnythingLLM 失败"
+    SERVICES_PAUSED=0
+  fi
+}
 
 for name in "${ROOT_FILES[@]}"; do
   [[ -f "${DEPLOY_DIR}/${name}" && ! -L "${DEPLOY_DIR}/${name}" ]] || die "快照源文件缺失或不安全：$name"
@@ -166,6 +197,11 @@ done
 for name in "${DOC_FILES[@]}"; do
   [[ -f "${DEPLOY_DIR}/docs/${name}" && ! -L "${DEPLOY_DIR}/docs/${name}" ]] || die "快照文档缺失或不安全：$name"
   install -m 0600 -- "${DEPLOY_DIR}/docs/${name}" "$STAGING/payload/docs/${name}"
+done
+for name in "${OPTIONAL_DOC_FILES[@]}"; do
+  if [[ -f "${DEPLOY_DIR}/docs/${name}" && ! -L "${DEPLOY_DIR}/docs/${name}" ]]; then
+    install -m 0600 -- "${DEPLOY_DIR}/docs/${name}" "$STAGING/payload/docs/${name}"
+  fi
 done
 install -m 0600 -- "${DEPLOY_DIR}/n8n/workflow.json" "$STAGING/payload/n8n/workflow.json"
 
@@ -191,16 +227,31 @@ while IFS= read -r -d '' item; do
 done < <(find "${DEPLOY_DIR}/data/anythingllm" -mindepth 1 -print0)
 cp -a -- "${DEPLOY_DIR}/data/anythingllm/." "$STAGING/payload/data/anythingllm/"
 
-IMAGES='[]'
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  while IFS= read -r image_ref; do
-    [[ -n "$image_ref" ]] || continue
-    [[ "$image_ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$ ]] || continue
-    image_id=$(docker image inspect --format '{{.Id}}' "$image_ref" 2>/dev/null || true)
-    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
-    IMAGES=$(jq -c --arg reference "$image_ref" --arg id "$image_id" '. + [{reference:$reference,id:$id}]' <<< "$IMAGES")
-  done < <(docker_compose "$DEPLOY_DIR" config --images 2>/dev/null | sort -u)
+# shellcheck disable=SC2016 # 变量必须在 PostgreSQL 容器内展开，避免密钥出现在宿主机 argv。
+if ! docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
+  'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --format=custom --no-owner --no-acl' \
+  > "$STAGING/payload/data/postgres/n8n.dump"; then
+  restart_paused_services
+  die "n8n PostgreSQL 逻辑备份失败"
 fi
+[[ -s "$STAGING/payload/data/postgres/n8n.dump" ]] || {
+  restart_paused_services
+  die "n8n PostgreSQL 逻辑备份为空"
+}
+chmod 600 "$STAGING/payload/data/postgres/n8n.dump"
+
+IMAGES='[]'
+N8N_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" N8N_IMAGE 2>/dev/null || printf 'docker.n8n.io/n8nio/n8n:2.33.0')
+POSTGRES_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" POSTGRES_IMAGE 2>/dev/null || printf 'postgres:16.10-alpine')
+ANYTHINGLLM_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_IMAGE 2>/dev/null || printf 'mintplexlabs/anythingllm:1.16.1')
+mapfile -t IMAGE_REFERENCES < <(docker_compose "$DEPLOY_DIR" config --images | sort -u)
+(( ${#IMAGE_REFERENCES[@]} > 0 )) || die "Compose 未返回镜像列表"
+for image_ref in "${IMAGE_REFERENCES[@]}"; do
+  [[ "$image_ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$ ]] || die "Compose 镜像引用无效"
+  image_id=$(docker image inspect --format '{{.Id}}' "$image_ref" 2>/dev/null || true)
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "无法记录本机镜像 ID：$image_ref"
+  IMAGES=$(jq -c --arg reference "$image_ref" --arg id "$image_id" '. + [{reference:$reference,id:$id}]' <<< "$IMAGES")
+done
 
 ARCHIVE_TEMP="${TARGET_TEMP}/snapshot.tar.gz"
 tar --create --gzip --file "$ARCHIVE_TEMP" --directory "$STAGING" payload
@@ -208,7 +259,7 @@ chmod 600 "$ARCHIVE_TEMP"
 ARCHIVE_SHA=$(sha256sum "$ARCHIVE_TEMP" | awk '{print $1}')
 CREATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 jq -n \
-  --arg format "ai-support-snapshot-v1" \
+  --arg format "ai-support-snapshot-v2" \
   --arg id "$SNAPSHOT_ID" \
   --arg version "$VERSION_VALUE" \
   --arg created_at "$CREATED_AT" \
@@ -219,13 +270,17 @@ jq -n \
   --argjson min_free_mb "$SNAPSHOT_MIN_FREE_MB_VALUE" \
   --argjson retention_count "$SNAPSHOT_RETENTION_COUNT_VALUE" \
   --argjson images "$IMAGES" \
-  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_env:false,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images}' \
+  --arg n8n_image "$N8N_IMAGE_VALUE" \
+  --arg postgres_image "$POSTGRES_IMAGE_VALUE" \
+  --arg anythingllm_image "$ANYTHINGLLM_IMAGE_VALUE" \
+  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_database_dump:true,contains_env:false,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images,image_variables:{N8N_IMAGE:$n8n_image,POSTGRES_IMAGE:$postgres_image,ANYTHINGLLM_IMAGE:$anythingllm_image}}' \
   > "${TARGET_TEMP}/manifest.json"
 chmod 600 "${TARGET_TEMP}/manifest.json"
 mv -- "$TARGET_TEMP" "$TARGET_DIR"
-trap - EXIT
 rm -rf -- "$STAGING"
 chmod 700 "$TARGET_DIR"
+restart_paused_services
+trap - EXIT
 
 prune_snapshot_history() {
   local manifest directory id created record candidate remaining
@@ -235,7 +290,7 @@ prune_snapshot_history() {
     directory=$(dirname -- "$manifest")
     id=$(basename -- "$directory")
     [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && -d "$directory" && ! -L "$directory" && ! -L "$manifest" ]] || continue
-    created=$(jq -er --arg id "$id" 'select(.format == "ai-support-snapshot-v1" and .id == $id) | .created_at' "$manifest" 2>/dev/null || true)
+    created=$(jq -er --arg id "$id" 'select((.format == "ai-support-snapshot-v1" or .format == "ai-support-snapshot-v2") and .id == $id) | .created_at' "$manifest" 2>/dev/null || true)
     [[ "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
     records+=("${created}"$'\t'"${id}")
   done < <(find "$VERSIONS_DIR" -mindepth 2 -maxdepth 2 -type f -name manifest.json -print0)
