@@ -15,6 +15,14 @@ NON_INTERACTIVE=0
 SKIP_START=0
 RECONFIGURE=0
 
+handle_install_interrupt() {
+  trap - INT TERM
+  printf '\n警告：安装已中断；已完成的初始化或安装步骤可在下次运行同一命令时恢复。\n' >&2
+  exit 130
+}
+
+trap handle_install_interrupt INT TERM
+
 validate_preserved_installation() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"

@@ -74,7 +74,7 @@ normalize_archive_entry() {
   printf '%s\n' "$entry"
 }
 
-for command_name in awk bash dirname env find git grep gzip jq ln mkdir mktemp rm sed sha256sum stat tar timeout tr wc; do
+for command_name in awk bash dirname env find git grep gzip jq ln mkdir mkfifo mktemp rm sed sha256sum stat tar timeout tr wc; do
   require_command "$command_name"
 done
 
@@ -406,6 +406,34 @@ fi
 assert_contains "${TEST_ROOT}/install-eof.log" '向导|初始化|输入|取消|中止|结束' \
   "无 .env 首次运行未进入可识别的中文初始化流程"
 pass "无 .env 的生产 install.sh 自动进入向导且 EOF 安全"
+
+INTERRUPT_DEPLOY="${TEST_ROOT}/interrupt-install"
+INTERRUPT_FIFO="${TEST_ROOT}/interrupt-input.fifo"
+INTERRUPT_LOG="${TEST_ROOT}/interrupt-install.log"
+mkfifo -- "$INTERRUPT_FIFO"
+exec 9<> "$INTERRUPT_FIFO"
+set +e
+timeout --preserve-status --signal=INT --kill-after=3 10 \
+  /usr/bin/env -i PATH="$PATH" LANG=C.UTF-8 TERM=dumb \
+  CRISP_AI_BOOTSTRAP_TEST_MODE=1 \
+  CRISP_AI_BOOTSTRAP_OS_RELEASE="${HOST_FIXTURE}/os-release" \
+  CRISP_AI_BOOTSTRAP_ETC_ROOT="${HOST_FIXTURE}/etc" \
+  "${PACKAGE_ROOT}/install.sh" --deploy-dir "$INTERRUPT_DEPLOY" --skip-start \
+  <&9 > "$INTERRUPT_LOG" 2>&1
+INTERRUPT_STATUS=$?
+set -e
+exec 9>&-
+(( INTERRUPT_STATUS == 130 || INTERRUPT_STATUS == 2 )) \
+  || fail "install.sh 收到 SIGINT 后退出码异常：${INTERRUPT_STATUS}"
+assert_contains "$INTERRUPT_LOG" '\[1/10\] AI API 地址' \
+  "install.sh 未进入可发送 SIGINT 的首次向导"
+assert_contains "$INTERRUPT_LOG" '安装已中断.*下次运行.*恢复' \
+  "install.sh 收到 SIGINT 后没有明确中文恢复提示"
+if [[ -f "${INTERRUPT_DEPLOY}/.crisp-ai-installation" ]] \
+  && grep -Fq 'state=ready' "${INTERRUPT_DEPLOY}/.crisp-ai-installation"; then
+  fail "install.sh 收到 SIGINT 后错误提交 ready 状态"
+fi
+pass "生产 install.sh 收到 SIGINT 后明确退出并保留恢复入口"
 
 MANAGE_DEPLOY="${TEST_ROOT}/manage-first-run"
 set +e

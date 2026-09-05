@@ -23,6 +23,7 @@
 - workflow 发布后新增生产 Webhook 运行烟雾检查，必须由 n8n task runner 返回预期 401 JSON；回滚完成状态也按真实 Crisp/Webhook 结果写入 `ready` 或 `local-ready`，不再出现 `ready` 与 `fact_crisp_api=failed` 冲突。
 - 回滚使用当前进程已完成的服务、Prompt 与 workflow 检查，不再用恢复后的旧版健康脚本解释旧配置 schema，保持跨版本回滚兼容。
 - 修复管理菜单调用完整清理时，`--numeric-confirm` 在 `set -u` 下把字符串模式当作算术变量而提前退出的问题；新增数字二次确认的生产入口回归。
+- 修复 `wizard.sh` 被安装器加载时信号处理未生效的问题；`sudo bash install.sh` 收到 Ctrl+C/TERM 现在会明确说明断点可恢复，并以非成功状态结束。
 
 影响：
 
