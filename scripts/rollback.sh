@@ -159,16 +159,23 @@ done < <(tar --list --verbose --gzip --file "$ARCHIVE")
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/rollback-stage.XXXXXX")
 cleanup() {
   local status=$?
+  local recreate_anythingllm=0
   trap - EXIT
   if (( status != 0 && ${ANYTHING_SWAPPED:-0} == 1 )) \
     && [[ -d "${ANYTHING_PREVIOUS:-}" && ! -L "${ANYTHING_PREVIOUS:-}" ]]; then
     rm -rf -- "${DEPLOY_DIR}/data/anythingllm"
-    mv -- "$ANYTHING_PREVIOUS" "${DEPLOY_DIR}/data/anythingllm" \
-      || warn "无法自动还原回滚前的 AnythingLLM 数据"
+    if mv -- "$ANYTHING_PREVIOUS" "${DEPLOY_DIR}/data/anythingllm"; then
+      recreate_anythingllm=1
+    else
+      warn "无法自动还原回滚前的 AnythingLLM 数据"
+    fi
   fi
   rm -rf -- "$STAGING"
   if (( status != 0 && SERVICES_STOPPED == 1 )); then
     warn "回滚未完成，尝试重新启动当前服务"
+    if (( recreate_anythingllm )); then
+      docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm >/dev/null 2>&1 || true
+    fi
     docker_compose "$DEPLOY_DIR" up -d --remove-orphans >/dev/null 2>&1 || true
   fi
   exit "$status"
@@ -292,6 +299,8 @@ if ! docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
 fi
 
 docker_compose "$DEPLOY_DIR" config --quiet
+# AnythingLLM 使用 bind mount。目录经 mv 交换后必须重建容器，确保 mount 绑定到恢复后的 inode。
+docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm
 docker_compose "$DEPLOY_DIR" up -d --remove-orphans
 wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"

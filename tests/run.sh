@@ -758,6 +758,8 @@ bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNA
   > "${TEST_ROOT}/rollback.log" 2>&1
 grep -Fq 'rollback-state-before' "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt" || fail "AnythingLLM 数据未回滚"
 grep -Fq 'pg_restore' "$MOCK_DOCKER_LOG" || fail "回滚未恢复 n8n PostgreSQL 逻辑备份"
+grep -Fq -- '--force-recreate anythingllm' "$MOCK_DOCKER_LOG" \
+  || fail "回滚交换 AnythingLLM bind mount 后未重建容器"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "配置未随版本快照回滚"
 SNAPSHOT_HISTORY=$("${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list)
 grep -Fq "$SNAPSHOT_ID" <<< "$SNAPSHOT_HISTORY" || fail "版本历史未列出快照"
