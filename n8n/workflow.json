@@ -379,7 +379,7 @@
         "sendBody": true,
         "contentType": "raw",
         "rawContentType": "application/json",
-        "body": "={{ JSON.stringify({ type: 'text', from: 'operator', origin: 'chat', content: $json.reply, fingerprint: Number($json.outboundFingerprint), automated: true, properties: { ai_support: true, ai_support_version: 'v0.8.0' } }) }}",
+        "body": "={{ JSON.stringify({ type: 'text', from: 'operator', origin: 'chat', content: $json.reply, fingerprint: Number($json.outboundFingerprint), automated: true, properties: { ai_support: true, ai_support_version: 'v0.8.1' } }) }}",
         "options": {
           "timeout": 30000
         }

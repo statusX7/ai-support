@@ -110,6 +110,24 @@ Plugin 模式强制校验原始请求体、`X-Crisp-Request-Timestamp` 和 `X-Cr
 sudo /opt/crisp-ai/manage.sh
 ```
 
+管理菜单集中提供以下入口：
+
+| 编号 | 功能 | 说明 |
+| --- | --- | --- |
+| 1 | 查看状态 | 查看容器状态、执行健康检查或查看历史版本。 |
+| 2 | 修改 AI 配置 | 检测 Provider、配置 AnythingLLM 或 Crisp，并重新发布 workflow。 |
+| 3 | 修改 Prompt | 查看、编辑、导入、导出并同步 Prompt。 |
+| 4 | 管理知识库 | 查看、添加、删除、同步或重新索引知识文件。 |
+| 5 | 查看统计 | 查看知识库命中分析或 AI 回答质量反馈。 |
+| 6 | 查看日志 | 显示最近容器日志；日志可能含会话内容。 |
+| 7 | 备份 | 创建不含密钥的迁移备份。 |
+| 8 | 恢复 | 从迁移备份恢复业务配置、workflow 和知识文件。 |
+| 9 | 更新 | 创建备份及一致性快照后更新。 |
+| 10 | 回滚 | 选择一致性版本快照回滚。 |
+| 11 | 卸载系统 | 选择安全卸载或需要 `PURGE` 确认的完整清理。 |
+
+菜单中的变更操作会复用维护锁；同一部署已有维护任务时不会并发执行。
+
 完整健康检查会验证容器、已发布 workflow、Provider 所选模型、Crisp REST API、AnythingLLM Key、工作区、Prompt 和一次工作区 Chat：
 
 ```bash
@@ -159,3 +177,39 @@ sudo ./update.sh \
 ```
 
 正式升级和故障回滚必须先在隔离环境按 [测试说明](TESTING.md) 演练。
+
+## 安全卸载与恢复
+
+管理菜单的“卸载”以及不带清理参数的 `uninstall.sh` 默认执行安全卸载：
+
+```bash
+sudo /opt/crisp-ai/uninstall.sh
+```
+
+脚本先在 `backups/uninstall-backup-<UTC时间>-<随机值>.tar.gz` 创建一份不含密钥的迁移备份，再停止并删除本项目容器和 Compose 网络。Docker 操作成功后，才删除 Compose 服务定义、根级程序文件、程序脚本、workflow 副本、程序文档和临时目录。以下内容保留在原部署目录：
+
+- 权限保持为 `0600` 的 `.env`，用于解密保留的 n8n 数据库并继续使用原 PostgreSQL 密码；它仍包含敏感凭据。
+- 实际业务 `config/`、`knowledge/`、`data/`、`backups/` 和 `logs/`。
+- 标记为 `uninstalled-data-kept` 的安装状态，用于阻止把已卸载目录误判为可运行服务。
+
+`--keep-data` 是默认安全模式的兼容别名；自动化环境可用 `--keep-data --yes` 跳过这一模式的普通确认，但不会改变保留范围。
+
+恢复时，从一份新的可信源码副本对原目录重新安装：
+
+```bash
+git clone https://github.com/statusX7/ai-support.git /path/to/new/ai-support
+cd /path/to/new/ai-support
+sudo ./install.sh --deploy-dir /opt/crisp-ai
+```
+
+安装程序会复用保留的密钥、业务配置和数据；健康检查全部通过后才重新进入 `ready`。如需迁移到其他主机，应先在目标主机完成安装、重新输入凭据，再通过管理菜单“恢复”导入自动生成的迁移备份。迁移备份不含 `.env`、数据库或运行时会话数据。
+
+只有确认不再需要本机数据时才执行完整清理：
+
+```bash
+sudo /opt/crisp-ai/uninstall.sh --purge
+```
+
+完整清理会先要求输入 `y` 或 `yes`，再要求精确输入 `PURGE`；`--yes` 也不能跳过这两次确认。确认后会删除 `.env`、配置、知识、数据库、AnythingLLM 数据、部署内备份和日志，以及整个部署目录。脚本始终会先在部署目录同级创建 `crisp-ai-purge-backup-<UTC时间>-<随机值>.tar.gz` 并显示路径；该迁移备份不含密钥、数据库或 AnythingLLM 运行数据。
+
+如果 Docker daemon、Compose 或 `docker compose down` 失败，脚本会返回非零并在删除程序或数据前安全中止；此前生成的迁移备份会保留。脚本不提供绕过 Docker 检查的强制离线选项。先修复 Docker 状态并确认本项目容器已停止，再重新执行；不得以手工删除目录代替这一检查。

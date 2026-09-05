@@ -134,6 +134,15 @@ Website Hook 和 Plugin Hook 分别执行一轮，且都订阅 `message:send` �
 - 删除所需历史镜像后，回滚必须在修改当前文件和停止服务前安全失败。
 - 验证容量不足拒绝、历史保留数量以及回滚目标保护策略。
 
+### 9. 安全卸载与恢复
+
+- 通过管理菜单和命令行分别执行默认安全卸载，确认卸载前在 `backups/uninstall-backup-<UTC时间>-<随机值>.tar.gz` 创建了可校验的迁移备份。
+- 确认本项目容器和 Compose 网络已删除，Compose、程序、脚本和随程序发布的服务配置已移除；`.env`、实际 `config/`、`knowledge/`、`data/`、`backups/`、`logs/` 均保留，`.env` 权限仍为 `0600`，安装状态为 `uninstalled-data-kept`。
+- 从新的可信源码目录对同一路径重新运行 `install.sh`，确认 PostgreSQL、n8n、AnythingLLM、知识索引及原配置可恢复，完整健康检查通过后状态回到 `ready`。
+- 分别模拟 Docker daemon 不可用、Compose 不可用和 `docker compose down` 失败，确认命令非零退出，程序与数据均未删除，且不存在强制离线绕过；即使已生成迁移备份，也不能把该备份误判为卸载完成。
+- 在隔离部署中验证完整清理：第一次未输入 `y`/`yes` 或第二次未精确输入 `PURGE` 时目录保持不变；即使指定 `--yes` 也必须完成两次确认。确认后整个部署目录被删除。
+- 确认完整清理前在部署目录同级生成 `crisp-ai-purge-backup-<UTC时间>-<随机值>.tar.gz`，归档校验有效且能导入新部署；确认命令不存在跳过自动备份的选项，并记录该迁移备份不能恢复 `.env`、数据库或 AnythingLLM 运行数据。
+
 ## 结果判定
 
 任何步骤为 FAIL、SKIP、未执行或证据不足，都必须写成“未验收”。只有 [发布说明](RELEASE.md) 中全部门禁为 PASS，才允许创建 `v1.0.0` tag 和 GitHub Release。

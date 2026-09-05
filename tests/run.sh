@@ -70,7 +70,7 @@ SHELL_FILES=(
   install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
-  tests/run.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
+  tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh
   tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
@@ -114,6 +114,9 @@ grep -Fq 'mintplexlabs/anythingllm:1.16.1' "${PROJECT_ROOT}/docker-compose.yml" 
 grep -Fxq 'ANYTHINGLLM_IMAGE=mintplexlabs/anythingllm:1.16.1' "${PROJECT_ROOT}/.env.example" \
   || fail ".env.example 的 AnythingLLM 镜像未同步为 1.16.1"
 pass "Docker Compose 静态安全契约"
+
+"${SCRIPT_DIR}/test_manage_contract.sh"
+pass "管理菜单 1..11 映射"
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   docker compose \
@@ -679,31 +682,154 @@ jq -e '
   || fail "更新前未创建版本快照"
 pass "更新、备份与配置保留"
 
-"${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --keep-data --yes \
-  > "${TEST_ROOT}/uninstall-keep.log" 2>&1
-[[ -f "${DEPLOY_DIR}/.env" && -f "${DEPLOY_DIR}/config/prompt.md" ]] || fail "保留卸载删除了配置"
-[[ -d "${DEPLOY_DIR}/data" && -d "${DEPLOY_DIR}/knowledge" ]] || fail "保留卸载删除了数据"
-[[ ! -e "${DEPLOY_DIR}/manage.sh" && ! -d "${DEPLOY_DIR}/scripts" ]] || fail "保留卸载未移除程序"
+mkdir -p -- "${DEPLOY_DIR}/logs"
+printf '安全卸载后应保留的日志\n' > "${DEPLOY_DIR}/logs/uninstall-preserve.log"
+printf '安全卸载后应保留的数据\n' > "${DEPLOY_DIR}/data/uninstall-preserve.txt"
+SAFE_ENV_HASH=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+SAFE_PROMPT_HASH=$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')
+SAFE_BACKUP_COUNT_BEFORE=$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f \
+  -name 'uninstall-backup-*.tar.gz' | wc -l)
+: > "$MOCK_DOCKER_LOG"
+"${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --yes \
+  > "${TEST_ROOT}/uninstall-safe.log" 2>&1
+SAFE_BACKUP_COUNT_AFTER=$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f \
+  -name 'uninstall-backup-*.tar.gz' | wc -l)
+(( SAFE_BACKUP_COUNT_AFTER == SAFE_BACKUP_COUNT_BEFORE + 1 )) \
+  || fail "默认安全卸载未自动创建唯一备份"
+SAFE_UNINSTALL_BACKUP=$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f \
+  -name 'uninstall-backup-*.tar.gz' -printf '%T@\t%p\n' | sort -n | tail -n 1 | cut -f2-)
+[[ -n "$SAFE_UNINSTALL_BACKUP" && "$(stat -c '%a' "$SAFE_UNINSTALL_BACKUP")" == 600 ]] \
+  || fail "安全卸载备份缺失或权限不是 0600"
+if tar -tzf "$SAFE_UNINSTALL_BACKUP" | grep -Eq '(^|/)\.env$'; then
+  fail "安全卸载备份包含 .env"
+fi
+tar -xOzf "$SAFE_UNINSTALL_BACKUP" > "${TEST_ROOT}/safe-uninstall-archive.bin"
+for secret_value in "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY"; do
+  if grep -Fq "$secret_value" "${TEST_ROOT}/safe-uninstall-archive.bin"; then
+    fail "安全卸载备份泄露 API Key 或 Token"
+  fi
+done
+grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" || fail "默认安全卸载未执行 Docker Compose down"
+[[ -f "${DEPLOY_DIR}/.env" && "$(stat -c '%a' "${DEPLOY_DIR}/.env")" == 600 ]] \
+  || fail "安全卸载未以 0600 保留 .env"
+[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$SAFE_ENV_HASH" ]] \
+  || fail "安全卸载改写了 .env"
+[[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$SAFE_PROMPT_HASH" ]] \
+  || fail "安全卸载改写了 Prompt 配置"
+[[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] || fail "安全卸载删除了知识文件"
+[[ -f "${DEPLOY_DIR}/logs/uninstall-preserve.log" ]] || fail "安全卸载删除了日志"
+[[ -f "${DEPLOY_DIR}/data/uninstall-preserve.txt" ]] || fail "安全卸载删除了运行数据"
+[[ -d "${DEPLOY_DIR}/config" && -d "${DEPLOY_DIR}/knowledge" \
+  && -d "${DEPLOY_DIR}/backups" && -d "${DEPLOY_DIR}/logs" && -d "${DEPLOY_DIR}/data" ]] \
+  || fail "安全卸载未保留约定目录"
+for removed_path in install.sh manage.sh update.sh uninstall.sh docker-compose.yml scripts n8n; do
+  [[ ! -e "${DEPLOY_DIR}/${removed_path}" ]] || fail "安全卸载未移除服务程序项：${removed_path}"
+done
 grep -Fq 'state=uninstalled-data-kept' "${DEPLOY_DIR}/.crisp-ai-installation" || fail "卸载状态标记错误"
-pass "保留数据卸载"
+for output_heading in 删除内容 保留内容 恢复方式; do
+  grep -Fq "$output_heading" "${TEST_ROOT}/uninstall-safe.log" \
+    || fail "安全卸载输出缺少：${output_heading}"
+done
+pass "默认安全卸载自动备份、停止服务并保留可恢复数据"
 
 : > "$MOCK_DOCKER_LOG"
-if env MOCK_DOCKER_FAIL_DOWN=1 "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
-  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge --no-backup --yes \
+env \
+  AI_API_BASE_URL=https://provider.invalid \
+  AI_API_KEY="$TEST_PROVIDER_KEY" \
+  AI_MODEL=gpt-vision-test \
+  AI_SUPPORTS_VISION=true \
+  CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111 \
+  CRISP_TOKEN_TIER=website \
+  CRISP_TOKEN_IDENTIFIER=test-only-identifier \
+  CRISP_TOKEN_KEY="$TEST_CRISP_KEY" \
+  ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" \
+  N8N_HOST=support.example.invalid \
+  PUBLIC_WEBHOOK_URL=https://support.example.invalid/ \
+  TIMEZONE=UTC \
+  "${PROJECT_ROOT}/install.sh" \
+    --deploy-dir "$DEPLOY_DIR" --non-interactive > "${TEST_ROOT}/reinstall-after-uninstall.log" 2>&1
+[[ -f "${DEPLOY_DIR}/manage.sh" && -f "${DEPLOY_DIR}/docker-compose.yml" \
+  && -f "${DEPLOY_DIR}/n8n/workflow.json" ]] || fail "安全卸载后同路径重装未恢复程序"
+grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "安全卸载后同路径重装未返回 ready 状态"
+[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$SAFE_ENV_HASH" ]] \
+  || fail "安全卸载后同路径重装改写了 .env"
+[[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$SAFE_PROMPT_HASH" ]] \
+  || fail "安全卸载后同路径重装改写了 Prompt"
+[[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" \
+  && -f "${DEPLOY_DIR}/logs/uninstall-preserve.log" \
+  && -f "${DEPLOY_DIR}/data/uninstall-preserve.txt" ]] \
+  || fail "安全卸载后同路径重装未保留数据"
+grep -Eq '(^| )up( |$)' "$MOCK_DOCKER_LOG" || fail "安全卸载后重装未重新启动服务"
+pass "安全卸载后同路径重装与数据恢复"
+
+: > "$MOCK_DOCKER_LOG"
+if printf 'y\nNOT_PURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
+  > "${TEST_ROOT}/uninstall-purge-wrong-confirmation.log" 2>&1; then
+  fail "错误 PURGE 二次确认仍执行了彻底卸载"
+fi
+[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" ]] \
+  || fail "错误 PURGE 二次确认破坏了部署目录"
+if grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG"; then
+  fail "错误 PURGE 二次确认后仍停止了服务"
+fi
+grep -Fq 'PURGE' "${TEST_ROOT}/uninstall-purge-wrong-confirmation.log" \
+  || fail "彻底卸载未明确要求输入 PURGE"
+: > "$MOCK_DOCKER_LOG"
+if printf 'y\nNOT_PURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge --yes \
+  > "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" 2>&1; then
+  fail "--yes 绕过了 PURGE 二次确认"
+fi
+[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" ]] \
+  || fail "--yes 的错误 PURGE 确认破坏了部署目录"
+grep -Fq 'PURGE' "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" \
+  || fail "--yes 场景未要求 PURGE 二次确认"
+pass "彻底卸载要求普通确认及不可绕过的 PURGE 二次确认"
+
+PURGE_ENV_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')
+PURGE_PROMPT_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')
+: > "$MOCK_DOCKER_LOG"
+if printf 'y\nPURGE\n' | env MOCK_DOCKER_FAIL_DOWN=1 "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
   > "${TEST_ROOT}/uninstall-down-failure.log" 2>&1; then
   fail "Docker Compose 停止失败时彻底卸载仍被报告为成功"
 fi
-[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/.crisp-ai-installation" ]] \
-  || fail "Docker Compose 停止失败后部署数据未保留"
+[[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  && -f "${PLUGIN_DEPLOY_DIR}/docker-compose.yml" ]] \
+  || fail "Docker Compose 停止失败后服务程序被破坏"
+[[ "$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')" == "$PURGE_ENV_HASH" ]] \
+  || fail "Docker Compose 停止失败后 .env 被改写"
+[[ "$(sha256sum "${PLUGIN_DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PURGE_PROMPT_HASH" ]] \
+  || fail "Docker Compose 停止失败后配置被改写"
+grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" || fail "Docker Compose down 失败路径未实际执行 down"
 grep -Eq '停止|Docker|容器' "${TEST_ROOT}/uninstall-down-failure.log" \
   || fail "Docker Compose 停止失败没有清晰提示"
-pass "彻底卸载在容器停止失败时安全中止"
+pass "Docker Compose down 失败时完整保留部署"
 
-"${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
-  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge --no-backup --yes \
-  > "${TEST_ROOT}/uninstall-purge.log" 2>&1
+FINAL_BACKUP_COUNT_BEFORE=$(find "$TEST_ROOT" -maxdepth 1 -type f \
+  -name 'crisp-ai-purge-backup-*.tar.gz' | wc -l)
+printf 'y\nPURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+  --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge > "${TEST_ROOT}/uninstall-purge.log" 2>&1
 [[ ! -e "$PLUGIN_DEPLOY_DIR" ]] || fail "彻底卸载未删除部署目录"
-pass "彻底卸载"
+FINAL_BACKUP_COUNT_AFTER=$(find "$TEST_ROOT" -maxdepth 1 -type f \
+  -name 'crisp-ai-purge-backup-*.tar.gz' | wc -l)
+(( FINAL_BACKUP_COUNT_AFTER == FINAL_BACKUP_COUNT_BEFORE + 1 )) \
+  || fail "彻底卸载未在部署父目录创建最终备份"
+FINAL_UNINSTALL_BACKUP=$(find "$TEST_ROOT" -maxdepth 1 -type f \
+  -name 'crisp-ai-purge-backup-*.tar.gz' -printf '%T@\t%p\n' | sort -n | tail -n 1 | cut -f2-)
+[[ -n "$FINAL_UNINSTALL_BACKUP" && "$(stat -c '%a' "$FINAL_UNINSTALL_BACKUP")" == 600 ]] \
+  || fail "彻底卸载最终备份缺失或权限不是 0600"
+if tar -xOzf "$FINAL_UNINSTALL_BACKUP" | grep -Fq "$TEST_PLUGIN_SIGNING_SECRET"; then
+  fail "彻底卸载最终备份泄露 Secret"
+fi
+grep -Fq '完整清理完成' "${TEST_ROOT}/uninstall-purge.log" || fail "彻底卸载未说明完成状态"
+for output_heading in 删除内容 保留内容 恢复方式; do
+  grep -Fq "$output_heading" "${TEST_ROOT}/uninstall-purge.log" \
+    || fail "彻底卸载输出缺少：${output_heading}"
+done
+pass "PURGE 二次确认后的完整卸载与父目录最终备份"
 
 printf '\n分层结果：\n'
 for layer in STATIC STUB INTEGRATION; do

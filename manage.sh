@@ -306,30 +306,80 @@ run_rollback() {
   esac
 }
 
+status_menu() {
+  local choice
+  while true; do
+    printf '\n1. 查看容器状态\n2. 执行健康检查\n3. 查看历史版本\n0. 返回\n请选择：'
+    IFS= read -r choice
+    case "$choice" in
+      1)
+        require_docker_runtime
+        docker_compose "$DEPLOY_DIR" ps
+        ;;
+      2) "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" || true ;;
+      3) "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+statistics_menu() {
+  local choice
+  while true; do
+    printf '\n1. 知识库命中分析\n2. AI 回答质量反馈\n0. 返回\n请选择：'
+    IFS= read -r choice
+    case "$choice" in
+      1) "${DEPLOY_DIR}/scripts/analytics.sh" knowledge --deploy-dir "$DEPLOY_DIR" ;;
+      2) "${DEPLOY_DIR}/scripts/analytics.sh" feedback --deploy-dir "$DEPLOY_DIR" ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+uninstall_menu() {
+  local choice
+  printf '\n1. 安全卸载（保留配置、知识库和运行数据）\n'
+  printf '2. 完整清理（永久删除部署数据，必须输入 PURGE）\n'
+  printf '0. 返回\n请选择：'
+  IFS= read -r choice
+  case "$choice" in
+    1)
+      "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR"
+      exit 0
+      ;;
+    2)
+      "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR" --purge
+      exit 0
+      ;;
+    0) return ;;
+    *) warn "无效选项" ;;
+  esac
+}
+
 while true; do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
   printf '\n%s\n' '================================'
   printf ' AI客服管理系统 %s\n' "$CURRENT_VERSION"
   printf '%s\n\n' '================================'
-  printf '1. 安装系统\n'
+  printf '1. 查看状态\n'
   printf '2. 修改AI配置\n'
   printf '3. 修改Prompt\n'
   printf '4. 管理知识库\n'
-  printf '5. 查看日志\n'
-  printf '6. 健康检查\n'
+  printf '5. 查看统计\n'
+  printf '6. 查看日志\n'
   printf '7. 备份\n'
   printf '8. 恢复\n'
   printf '9. 更新\n'
-  printf '10. 卸载\n'
-  printf '11. 回滚版本\n'
-  printf '12. 查看历史版本\n'
-  printf '13. 知识库分析\n'
-  printf '14. 回答质量反馈\n'
+  printf '10. 回滚\n'
+  printf '11. 卸载系统\n'
   printf '0. 退出\n\n请选择：'
   IFS= read -r CHOICE
   case "$CHOICE" in
     1)
-      "${SCRIPT_DIR}/install.sh" --deploy-dir "$DEPLOY_DIR"
+      require_installation
+      status_menu
       ;;
     2)
       require_installation
@@ -345,13 +395,13 @@ while true; do
       ;;
     5)
       require_installation
-      require_docker_runtime
-      warn "日志可能包含会话内容，请勿公开分享"
-      docker_compose "$DEPLOY_DIR" logs --tail 200
+      statistics_menu
       ;;
     6)
       require_installation
-      "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" || true
+      require_docker_runtime
+      warn "日志可能包含会话内容，请勿公开分享"
+      docker_compose "$DEPLOY_DIR" logs --tail 200
       ;;
     7)
       require_installation
@@ -367,24 +417,11 @@ while true; do
       ;;
     10)
       require_installation
-      "${DEPLOY_DIR}/uninstall.sh" --deploy-dir "$DEPLOY_DIR"
-      exit 0
+      run_rollback
       ;;
     11)
       require_installation
-      run_rollback
-      ;;
-    12)
-      require_installation
-      "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
-      ;;
-    13)
-      require_installation
-      "${DEPLOY_DIR}/scripts/analytics.sh" knowledge --deploy-dir "$DEPLOY_DIR"
-      ;;
-    14)
-      require_installation
-      "${DEPLOY_DIR}/scripts/analytics.sh" feedback --deploy-dir "$DEPLOY_DIR"
+      uninstall_menu
       ;;
     0) exit 0 ;;
     *) warn "无效选项" ;;
