@@ -306,7 +306,25 @@ wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"
 wait_for_local_health "$DEPLOY_DIR"
-write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" ready
+set_installation_fact "$DEPLOY_DIR" dependencies ready
+set_installation_fact "$DEPLOY_DIR" local_services ready
+set_installation_fact "$DEPLOY_DIR" app_config ready
+set_installation_fact "$DEPLOY_DIR" provider ready
+if webhook_access_check "$DEPLOY_DIR"; then
+  set_installation_fact "$DEPLOY_DIR" webhook ready
+else
+  set_installation_fact "$DEPLOY_DIR" webhook pending
+  warn "回滚后公网 Webhook 尚未通过 DNS/TLS/路由检查（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）"
+fi
+set_installation_fact "$DEPLOY_DIR" conversation pending
+if crisp_api_check "$DEPLOY_DIR"; then
+  set_installation_fact "$DEPLOY_DIR" crisp_api ready
+  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" ready
+else
+  set_installation_fact "$DEPLOY_DIR" crisp_api failed
+  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" local-ready
+  warn "回滚完成且本地应用已通过检查，但 Crisp API 待修正（HTTP ${CRISP_API_STATUS:-000}）"
+fi
 SERVICES_STOPPED=0
 rm -rf -- "$ANYTHING_PREVIOUS"
 ANYTHING_SWAPPED=0

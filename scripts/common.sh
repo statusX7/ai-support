@@ -660,6 +660,8 @@ migrate_runtime_env() {
   [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_TIMEOUT_SECONDS 1800
   value=$(env_get "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
   [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 5
+  value=$(env_get "$env_file" N8N_WORKFLOW_READY_TIMEOUT_SECONDS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" N8N_WORKFLOW_READY_TIMEOUT_SECONDS 300
 
   value=$(env_get "$env_file" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
   if [[ "$value" != chat ]]; then
@@ -1261,9 +1263,45 @@ sync_prompt_to_anythingllm() {
   info "Prompt 已同步到 AnythingLLM 工作区"
 }
 
+wait_for_n8n_workflow_runtime() {
+  local deploy_dir=$1
+  local timeout_seconds interval n8n_port response_file status deadline remaining
+
+  timeout_seconds=$(env_get "${deploy_dir}/.env" N8N_WORKFLOW_READY_TIMEOUT_SECONDS 2>/dev/null || true)
+  [[ "$timeout_seconds" =~ ^[0-9]+$ && $timeout_seconds -ge 1 && $timeout_seconds -le 900 ]] \
+    || timeout_seconds=300
+  interval=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
+  [[ "$interval" =~ ^[0-9]+$ && $interval -ge 1 && $interval -le 30 ]] || interval=5
+  n8n_port=$(env_get "${deploy_dir}/.env" N8N_PORT 2>/dev/null || printf '5678')
+  response_file=$(mktemp "${deploy_dir}/tmp/n8n-runtime.XXXXXX")
+  chmod 600 "$response_file"
+  deadline=$((SECONDS + timeout_seconds))
+
+  while :; do
+    status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 15 \
+      --header 'Content-Type: application/json' --data '{}' \
+      "http://127.0.0.1:${n8n_port}/webhook/crisp-webhook?key=ai-support-healthcheck-invalid" \
+      2>/dev/null || true)
+    if [[ "$status" == 401 ]] && jq -e \
+      '.accepted == false and .reason == "Webhook 校验失败"' "$response_file" >/dev/null 2>&1; then
+      rm -f -- "$response_file"
+      return 0
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    if (( interval < remaining )); then sleep "$interval"; else sleep "$remaining"; fi
+  done
+  rm -f -- "$response_file"
+  warn "n8n 生产 Webhook 未在 ${timeout_seconds} 秒内完成任务运行器校验"
+  return 1
+}
+
 import_and_publish_workflow() {
   local deploy_dir=$1
   require_command docker
+  require_command curl
+  require_command jq
   if ! docker_compose "$deploy_dir" exec -T n8n timeout 900 \
     n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null; then
     warn "n8n workflow 导入失败或超过 15 分钟"
@@ -1276,6 +1314,10 @@ import_and_publish_workflow() {
   fi
   if ! docker_compose "$deploy_dir" restart n8n >/dev/null; then
     warn "n8n workflow 已发布，但服务重启失败"
+    return 1
+  fi
+  if ! wait_for_n8n_workflow_runtime "$deploy_dir"; then
+    warn "n8n workflow 已发布，但生产 Webhook 运行检查失败"
     return 1
   fi
   info "n8n 工作流已导入并发布"

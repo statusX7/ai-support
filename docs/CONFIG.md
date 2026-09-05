@@ -77,6 +77,8 @@ sudo /opt/crisp-ai/scripts/analytics.sh feedback
 
 `LOCAL_HEALTH_TIMEOUT_SECONDS` 与 `LOCAL_HEALTH_INTERVAL_SECONDS` 控制安装、更新、恢复和回滚等待本地服务就绪的有限窗口，默认分别为总计 `1800` 秒和每轮 `5` 秒。HTTP 探测耗时也计入总时限，普通服务器就绪后会立即提前结束；仅在已确认机器冷启动较慢时调整，允许范围分别为 `1–3600` 秒和 `1–30` 秒。
 
+`N8N_WORKFLOW_READY_TIMEOUT_SECONDS` 控制 workflow 发布后等待生产 Webhook 和 JavaScript task runner 可实际执行的总时限，默认 `300` 秒，允许 `1–900` 秒。检查使用固定无效 Secret，期望得到 workflow 自身的 401 JSON，不会触发 AI 或 Crisp 外发。
+
 版本快照会短暂停止 n8n 与 AnythingLLM，保存程序、配置、知识文件、AnythingLLM 数据、n8n PostgreSQL 逻辑备份和本机镜像 ID。快照不包含 `.env`、匿名统计或日志，只用于同一主机受限回滚。
 
 ## 镜像版本

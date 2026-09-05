@@ -125,6 +125,10 @@ case "$URL" in
       BODY='{"error":false}'
     fi
     ;;
+  */webhook/crisp-webhook\?key=ai-support-healthcheck-invalid)
+    STATUS=401
+    BODY='{"accepted":false,"reason":"Webhook 校验失败"}'
+    ;;
   */api/request-token)
     BODY='{"token":"test-only-anything-jwt"}'
     ;;
