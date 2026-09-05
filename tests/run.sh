@@ -457,18 +457,31 @@ ENV_HASH_AFTER=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 [[ "$ENV_HASH_BEFORE" == "$ENV_HASH_AFTER" ]] || fail "重复安装改写了现有密钥配置"
 pass "重复安装幂等性"
 
+install -m 0600 -- "${DEPLOY_DIR}/.env" "${TEST_ROOT}/before-runtime-provider.env"
+install -m 0600 -- "${DEPLOY_DIR}/config/provider.yaml" "${TEST_ROOT}/before-runtime-provider.yaml"
+bash -c '
+  set -euo pipefail
+  source "$1/scripts/common.sh"
+  env_set "$2/.env" AI_API_PROBE_BASE_URL http://127.0.0.1:18080/proxy/v1
+  env_set "$2/.env" AI_API_BASE_URL http://host.docker.internal:18080/proxy/v1
+' -- "$PROJECT_ROOT" "$DEPLOY_DIR"
+sed -i 's#^[[:space:]]*base_url:.*#  base_url: "http://host.docker.internal:18080/proxy/v1"#' \
+  "${DEPLOY_DIR}/config/provider.yaml"
+RUNTIME_PROVIDER_ENV_HASH=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 sed -i 's/^state=.*/state=installing/' "${DEPLOY_DIR}/.crisp-ai-installation"
 rm -f -- "${DEPLOY_DIR}/tmp/quick-init.json"
 "${PROJECT_ROOT}/install.sh" \
   --deploy-dir "$DEPLOY_DIR" --non-interactive --skip-start > "${TEST_ROOT}/incomplete-install-retry.log" 2>&1
 grep -Fxq 'state=staged' "${DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "完整配置的未完成安装在 --skip-start 下未进入 staged"
-[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] \
+[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$RUNTIME_PROVIDER_ENV_HASH" ]] \
   || fail "未完成安装恢复改写了现有密钥配置"
 grep -Fq '已验证未完成部署的 .env 与实际配置' "${TEST_ROOT}/incomplete-install-retry.log" \
   || fail "未完成安装没有明确说明已验证并复用实际配置"
-pass "未完成安装在向导临时状态缺失时复用已验证配置"
+pass "未完成安装复用已验证配置及 localhost 容器映射"
 
+install -m 0600 -- "${TEST_ROOT}/before-runtime-provider.env" "${DEPLOY_DIR}/.env"
+install -m 0600 -- "${TEST_ROOT}/before-runtime-provider.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 sed -i 's/^state=.*/state=ready/' "${DEPLOY_DIR}/.crisp-ai-installation"
 
 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --offline \

@@ -19,7 +19,8 @@ validate_preserved_installation() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
   local config_file key value hook_mode expected_auth provider_base provider_model provider_mode
-  local normalized_api_base model_token_limit max_output_tokens public_url n8n_protocol
+  local provider_probe_base normalized_probe_base expected_runtime_base
+  local model_token_limit max_output_tokens public_url n8n_protocol
   local -a required_config_files=(
     provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml
   )
@@ -77,8 +78,10 @@ validate_preserved_installation() {
     public_url=$(env_get "$env_file" PUBLIC_WEBHOOK_URL 2>/dev/null || true)
     validate_public_url "$public_url" || reconfigure_reasons+=(".env:PUBLIC_WEBHOOK_URL")
     value=$(env_get "$env_file" AI_API_BASE_URL 2>/dev/null || true)
-    normalized_api_base=$(normalize_api_base "$value" 2>/dev/null || true)
-    [[ -n "$normalized_api_base" && "$normalized_api_base" == "$value" ]] \
+    provider_probe_base=$(env_get "$env_file" AI_API_PROBE_BASE_URL 2>/dev/null || true)
+    normalized_probe_base=$(normalize_api_base "${provider_probe_base:-$value}" 2>/dev/null || true)
+    expected_runtime_base=$(provider_runtime_base "$normalized_probe_base" 2>/dev/null || true)
+    [[ -n "$expected_runtime_base" && "$expected_runtime_base" == "$value" ]] \
       || reconfigure_reasons+=(".env:AI_API_BASE_URL")
     value=$(env_get "$env_file" CRISP_WEBSITE_ID 2>/dev/null || true)
     [[ "$value" =~ ^[A-Za-z0-9-]{8,128}$ ]] || reconfigure_reasons+=(".env:CRISP_WEBSITE_ID")
