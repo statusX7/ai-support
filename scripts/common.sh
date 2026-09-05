@@ -1098,6 +1098,7 @@ bootstrap_anythingllm_api_key() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
   local key auth_token port response_file payload status jwt
+  local created=0
 
   require_command curl
   require_command jq
@@ -1139,12 +1140,17 @@ bootstrap_anythingllm_api_key() {
       die "AnythingLLM Developer API Key 自动创建失败（HTTP ${status:-000}）"
     fi
     key=$(jq -er '.apiKey.secret | select(type == "string" and length > 0)' "$response_file" 2>/dev/null || true)
+    created=1
   fi
   rm -f -- "$response_file"
   validate_env_value "$key" || die "AnythingLLM 未返回有效的 Developer API Key"
   env_set "$env_file" ANYTHINGLLM_API_KEY "$key"
   anythingllm_validate_api_key "$deploy_dir" "$key" || die "新建 AnythingLLM API Key 验证失败"
-  info "AnythingLLM Developer API Key 已自动创建"
+  if (( created )); then
+    info "AnythingLLM Developer API Key 已自动创建"
+  else
+    info "AnythingLLM Developer API Key 已自动复用"
+  fi
 }
 
 ensure_anythingllm_workspace() {
@@ -1232,12 +1238,14 @@ sync_prompt_to_anythingllm() {
 import_and_publish_workflow() {
   local deploy_dir=$1
   require_command docker
-  if ! docker_compose "$deploy_dir" exec -T n8n n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null; then
-    warn "n8n workflow 导入失败"
+  if ! docker_compose "$deploy_dir" exec -T n8n timeout 900 \
+    n8n import:workflow --input=/opt/crisp-ai/n8n/workflow.json >/dev/null; then
+    warn "n8n workflow 导入失败或超过 15 分钟"
     return 1
   fi
-  if ! docker_compose "$deploy_dir" exec -T n8n n8n publish:workflow --id="$WORKFLOW_ID" >/dev/null; then
-    warn "n8n workflow 发布失败"
+  if ! docker_compose "$deploy_dir" exec -T n8n timeout 900 \
+    n8n publish:workflow --id="$WORKFLOW_ID" >/dev/null; then
+    warn "n8n workflow 发布失败或超过 15 分钟"
     return 1
   fi
   if ! docker_compose "$deploy_dir" restart n8n >/dev/null; then

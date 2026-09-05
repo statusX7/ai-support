@@ -260,7 +260,7 @@ else
   # shellcheck disable=SC2016 # $1 与 $output 必须在 n8n 容器内展开。
   if docker_compose "$DEPLOY_DIR" exec -T n8n sh -c '
     output=/tmp/ai-support-health-workflow.json
-    n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1 || exit 1
+    timeout 900 n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1 || exit 1
     node -e '\''const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const workflow=Array.isArray(value)?value[0]:value;process.exit(workflow&&workflow.active===true?0:1)'\'' "$output"
     status=$?
     rm -f "$output"
