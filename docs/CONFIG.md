@@ -75,6 +75,8 @@ sudo /opt/crisp-ai/scripts/analytics.sh feedback
 
 `SNAPSHOT_RETENTION_COUNT` 控制有效版本快照的最大数量，默认 `10`。设为 `0` 表示不自动清理。自定义值会在重复安装时保留；升级会为旧部署补齐缺失的默认值。
 
+`LOCAL_HEALTH_ATTEMPTS` 与 `LOCAL_HEALTH_INTERVAL_SECONDS` 控制安装、更新、恢复和回滚等待本地服务就绪的有限窗口，默认分别为 `180` 次和 `5` 秒。普通服务器通常会提前结束等待；仅在已确认机器冷启动较慢时调整，允许范围分别为 `6–360` 次和 `1–30` 秒。
+
 版本快照会短暂停止 n8n 与 AnythingLLM，保存程序、配置、知识文件、AnythingLLM 数据、n8n PostgreSQL 逻辑备份和本机镜像 ID。快照不包含 `.env`、匿名统计或日志，只用于同一主机受限回滚。
 
 ## 镜像版本

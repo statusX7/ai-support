@@ -293,10 +293,10 @@ fi
 
 docker_compose "$DEPLOY_DIR" config --quiet
 docker_compose "$DEPLOY_DIR" up -d --remove-orphans
-wait_for_local_health "$DEPLOY_DIR" 30 2
+wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"
-wait_for_local_health "$DEPLOY_DIR" 30 2
+wait_for_local_health "$DEPLOY_DIR"
 write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" ready
 SERVICES_STOPPED=0
 rm -rf -- "$ANYTHING_PREVIOUS"

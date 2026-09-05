@@ -531,16 +531,16 @@ secure_permissions "$DEPLOY_DIR"
 if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
-  wait_for_local_health "$DEPLOY_DIR" 45 2
+  wait_for_local_health "$DEPLOY_DIR"
   set_installation_fact "$DEPLOY_DIR" local_services ready
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"
   knowledge_sync "$DEPLOY_DIR" || die "知识库同步未完全成功；保留安装进度供重试"
   import_and_publish_workflow "$DEPLOY_DIR" || die "n8n 工作流导入或发布失败；保留安装进度供重试"
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
     --application --installation-in-progress
   set_installation_fact "$DEPLOY_DIR" app_config ready

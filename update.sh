@@ -176,15 +176,15 @@ secure_permissions "$DEPLOY_DIR"
 if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
-  wait_for_local_health "$DEPLOY_DIR" 45 2
+  wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
   knowledge_sync "$DEPLOY_DIR" || die "更新后知识库同步失败"
   import_and_publish_workflow "$DEPLOY_DIR" || die "更新后 workflow 发布失败"
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
     --application --installation-in-progress
   set_installation_fact "$DEPLOY_DIR" dependencies ready

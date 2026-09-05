@@ -191,13 +191,13 @@ secure_permissions "$DEPLOY_DIR"
 if (( SKIP_RESTART == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d n8n anythingllm
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   knowledge_sync "$DEPLOY_DIR" || die "知识文件恢复后同步失败"
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
   import_and_publish_workflow "$DEPLOY_DIR"
-  wait_for_local_health "$DEPLOY_DIR" 30 2
+  wait_for_local_health "$DEPLOY_DIR"
   SERVICES_STOPPED=0
 fi
 

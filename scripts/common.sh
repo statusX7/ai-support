@@ -422,9 +422,22 @@ docker_compose() {
 
 wait_for_local_health() {
   local deploy_dir=$1
-  local attempts=${2:-30}
-  local interval=${3:-2}
+  local attempts=${2:-}
+  local interval=${3:-}
   local n8n_port anything_port running
+
+  if [[ -z "$attempts" ]]; then
+    attempts=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_ATTEMPTS 2>/dev/null || true)
+    [[ "$attempts" =~ ^[0-9]+$ && $attempts -ge 6 && $attempts -le 360 ]] || attempts=180
+  fi
+  if [[ -z "$interval" ]]; then
+    interval=$(env_get "${deploy_dir}/.env" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
+    [[ "$interval" =~ ^[0-9]+$ && $interval -ge 1 && $interval -le 30 ]] || interval=5
+  fi
+  [[ "$attempts" =~ ^[0-9]+$ && $attempts -ge 1 && $attempts -le 360 ]] \
+    || die "本地健康检查次数必须是 1 到 360 的整数"
+  [[ "$interval" =~ ^[0-9]+$ && $interval -ge 1 && $interval -le 30 ]] \
+    || die "本地健康检查间隔必须是 1 到 30 秒的整数"
 
   require_command docker
   require_command curl
@@ -442,7 +455,7 @@ wait_for_local_health() {
     fi
     sleep "$interval"
   done
-  warn "本地服务健康检查超时"
+  warn "本地服务健康检查超时（${attempts} 次，每次间隔 ${interval} 秒）"
   return 1
 }
 
@@ -634,6 +647,11 @@ migrate_runtime_env() {
   esac
   value=$(env_get "$env_file" CADDY_IMAGE 2>/dev/null || true)
   [[ -n "$value" ]] || env_set "$env_file" CADDY_IMAGE caddy:2.10.2-alpine
+
+  value=$(env_get "$env_file" LOCAL_HEALTH_ATTEMPTS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_ATTEMPTS 180
+  value=$(env_get "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" LOCAL_HEALTH_INTERVAL_SECONDS 5
 
   value=$(env_get "$env_file" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
   if [[ "$value" != chat ]]; then
