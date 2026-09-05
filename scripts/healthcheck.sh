@@ -232,7 +232,7 @@ else
   if docker compose version >/dev/null 2>&1; then
     pass "Docker Compose 可用"
   else
-    fail "Docker Compose v2 不可用"
+    fail "Docker Compose 插件不可用或能力检查失败"
   fi
   if docker info >/dev/null 2>&1; then
     pass "Docker daemon 可连接"

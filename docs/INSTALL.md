@@ -9,7 +9,7 @@
 
 Debian 12 `amd64` 已完成从无 Docker 的 systemd 虚拟机真实安装。其他列出的系统完成了发行版与包管理分支自动测试；正式使用前仍建议在同发行版预演。RHEL-like、非 systemd 主机、容器内启动 dockerd 和远程 Docker context 不在自动安装支持范围内，脚本会在变更前说明原因。
 
-安装脚本会自动补齐 `ca-certificates`、`curl`、`jq`、`openssl`、`tar`、`gzip`、`flock`、`ss` 等实际运行工具，以及 Docker Engine、CLI、containerd、Buildx 与 Compose 插件。不会要求宿主机安装 Node.js、npm、GitHub CLI、Python 包或全局 pip 依赖，也不会执行整机升级、关闭 TLS/签名校验、清理 `/var/lib/docker` 或停止其他容器。
+安装脚本会自动补齐 `ca-certificates`、`curl`、`jq`、`openssl`、`tar`、`gzip`、`flock`、`ss` 等实际运行工具，以及 Docker Engine、CLI、containerd 与 Compose 插件。不会要求宿主机安装 Node.js、npm、GitHub CLI、Python 包或全局 pip 依赖，也不会执行整机升级、关闭 TLS/签名校验、清理 `/var/lib/docker` 或停止其他容器。
 
 使用者只需准备：
 
@@ -71,7 +71,7 @@ sudo bash ./install.sh --deploy-dir /srv/crisp-ai
 
 安装器先只依赖 Bash、基础系统命令和包管理器识别系统，然后补齐向导所需工具。用户确认后才执行：
 
-1. 幂等配置 Docker 官方 apt 软件源，安装或复用 Engine、CLI、containerd、Buildx 与 Compose。
+1. 幂等配置 Docker 官方 apt 软件源，安装或复用 Engine、CLI、containerd 与满足项目能力要求的 Compose 插件。
 2. 通过 systemd 启用并启动 daemon，等待 `docker info`，检查本地 socket/context、Engine 版本和架构，再运行 `hello-world`。
 3. 创建 `/opt/crisp-ai` 的受限目录，生成或复用内部密钥，并验证 Compose。
 4. 启动 PostgreSQL、AnythingLLM 和 n8n，等待真实健康接口。

@@ -500,7 +500,7 @@ bootstrap_install_compose_plugin() {
     # Debian 13 的 docker-compose 是 Go 实现的 v2 CLI plugin；Debian 12 同名包仍是 v1。
     bootstrap_apt_get "为 Debian 13 现有 Docker 补齐 Compose 插件" install --yes --no-install-recommends docker-compose || return $?
   else
-    bootstrap_warn "发行版没有兼容的 Compose v2 包；保留现有 Docker，改用固定官方二进制后备方案"
+    bootstrap_warn "发行版没有兼容的 Compose 插件包；保留现有 Docker，改用固定官方二进制后备方案"
     bootstrap_install_compose_binary_fallback || return $?
   fi
 }

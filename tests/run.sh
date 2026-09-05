@@ -176,7 +176,7 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
     config --quiet
   pass "docker compose config"
 else
-  critical_skip "系统未安装 Docker Compose v2，未执行实际 docker compose config"
+  critical_skip "系统未安装满足项目能力要求的 Docker Compose 插件，未执行实际 docker compose config"
 fi
 
 "${SCRIPT_DIR}/test_workflow_contract.sh"

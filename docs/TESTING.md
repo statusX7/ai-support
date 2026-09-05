@@ -48,7 +48,7 @@ AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1 \
 
 完整部署模式不允许关键自动测试跳过，并要求一个 `ready` 的真实部署，以及专用 Crisp Website、Provider、AnythingLLM 工作区和四个互不相同的空白测试 conversation。先通过 root shell 或 CI Secret Store 安全注入以下变量，不要把值写入仓库、命令行参数或 Shell 历史：
 
-执行主机必须提供 ShellCheck、Docker Compose v2、Node.js、`curl`、`jq`、Python 3、`realpath`、`base64` 和 `sha256sum`；缺少任一关键依赖都会令发布模式失败。
+执行主机必须提供 ShellCheck、满足项目能力要求的 Docker Compose 插件、Node.js、`curl`、`jq`、Python 3、`realpath`、`base64` 和 `sha256sum`；缺少任一关键依赖都会令发布模式失败。
 
 - 控制：`AI_SUPPORT_E2E_ENABLE=1`、`AI_SUPPORT_E2E_CONFIRM_DEDICATED=YES`。
 - 部署：`AI_SUPPORT_INTEGRATION_DEPLOY_DIR`、`AI_SUPPORT_E2E_DEPLOY_DIR`。

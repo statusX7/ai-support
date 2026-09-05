@@ -9,7 +9,7 @@ fi
 if ! command -v docker >/dev/null 2>&1 \
   || ! docker compose version >/dev/null 2>&1 \
   || ! docker info >/dev/null 2>&1; then
-  printf '跳过：Docker Engine 或 Docker Compose v2 不可用。\n' >&2
+  printf '跳过：Docker Engine 或满足项目能力要求的 Docker Compose 插件不可用。\n' >&2
   exit 77
 fi
 command -v realpath >/dev/null 2>&1 || {
