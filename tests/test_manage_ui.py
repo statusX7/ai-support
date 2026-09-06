@@ -21,6 +21,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+(ROOT / ".work").mkdir(mode=0o700, exist_ok=True)
 WORK = Path(tempfile.mkdtemp(prefix="menu-contract-", dir=ROOT / ".work"))
 DEPLOY = WORK / "部署 空格'quote"
 BIN = WORK / "bin"
