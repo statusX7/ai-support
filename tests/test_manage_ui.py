@@ -96,15 +96,17 @@ class Terminal:
 
 
 PROMPT = {"text": "初始虚构 Prompt。\n"}
+MODEL_LIST = {"status": 200, "calls": 0, "chat_calls": 0, "probes": [],
+              "ids": ["synthetic-menu-model"]}
 
 
 class ApplicationFixture(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def answer(self, body):
+    def answer(self, body, status=200):
         payload = json.dumps(body, ensure_ascii=False).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -116,7 +118,13 @@ class ApplicationFixture(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/v1/workspace/crisp-support":
             self.answer({"workspace": [{"slug": "crisp-support", "openAiPrompt": PROMPT["text"], "documents": []}]})
         elif self.path == "/proxy/v1/models":
-            self.answer({"data": [{"id": "synthetic-menu-model"}]})
+            MODEL_LIST["calls"] += 1
+            if MODEL_LIST["status"] == 200:
+                self.answer({"data": [{"id": name} for name in MODEL_LIST["ids"]]})
+            else:
+                self.answer({"error": {"message": "隔离模型列表临时故障"}}, MODEL_LIST["status"])
+        elif self.path in ("/healthz", "/api/ping"):
+            self.answer({"ok": True})
         else:
             self.send_error(404)
 
@@ -129,7 +137,15 @@ class ApplicationFixture(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/v1/workspace/crisp-support/update-embeddings":
             self.answer({"success": True})
         elif self.path in ("/proxy/v1/chat/completions", "/proxy/v1/responses"):
+            MODEL_LIST["chat_calls"] += 1
+            messages = body.get("messages", body.get("input", []))
+            content = messages[0].get("content", []) if messages else []
+            vision = isinstance(content, list) and any(
+                item.get("type") in ("image_url", "input_image") for item in content)
+            MODEL_LIST["probes"].append((self.path, body.get("model"), vision))
             self.answer({"choices": [{"message": {"content": "协议测试，不是真实模型。"}}], "output_text": "协议测试"})
+        elif self.path == "/webhook/crisp-webhook?key=ai-support-healthcheck-invalid":
+            self.answer({"accepted": False, "reason": "Webhook 校验失败"}, 401)
         else:
             self.send_error(404)
 
@@ -145,6 +161,109 @@ def menu_case(number, first_label):
     terminal.send("0")
     terminal.finish()
     passing(f"生产主菜单 {number} 进入真实子菜单并返回")
+
+
+def provider_retry_cases():
+    """PTY 驱动生产 models/apply；Docker 仅在本测试的明确边界内模拟。"""
+    docker = BIN / "docker"
+    original_docker = docker.read_bytes()
+    delegate = BIN / "configuration-docker-readback"
+    delegate.write_bytes(original_docker)
+    delegate.chmod(0o755)
+    operation_log = WORK / "provider-menu-docker.log"
+    docker.write_text(r'''#!/usr/bin/env bash
+set -euo pipefail
+arguments=("$@")
+if [[ "$*" == *'GENERIC_OPEN_AI_BASE_PATH'* && "$*" == *'fetch('* ]]; then
+  printf 'runtime-provider-test\n' >> "${MENU_PROVIDER_OPERATION_LOG:?}"
+  printf '{"verified":true,"environment":"unit-menu-provider-fixture"}\n'
+  exit 0
+fi
+while (( $# )); do
+  case "$1" in
+    config) exit 0 ;;
+    up) printf 'up\n' >> "${MENU_PROVIDER_OPERATION_LOG:?}"; exit 0 ;;
+    ps) printf 'postgres\nanythingllm\nn8n\n'; exit 0 ;;
+    --project-directory|--env-file|-f) shift 2 ;;
+    *) shift ;;
+  esac
+done
+exec "${BASH_SOURCE[0]%/*}/configuration-docker-readback" "${arguments[@]}"
+''', encoding="utf-8")
+    docker.chmod(0o755)
+    operation_log.touch(mode=0o600)
+    files = [DEPLOY / name for name in (".env", "config/provider.yaml", "config/runtime.yaml")]
+    retry_prompt = "模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消："
+    extra = {"MENU_PROVIDER_OPERATION_LOG": str(operation_log), "FUNCNEST": "12"}
+
+    def current_configuration():
+        return [path.read_bytes() for path in files]
+
+    def provider_history():
+        return set((DEPLOY / "backups/config-history").glob("provider.*"))
+
+    def open_models(name):
+        terminal = Terminal(name, extra=extra)
+        terminal.expect("请选择："); terminal.send("3")
+        terminal.expect("请选择："); terminal.send("4")
+        return terminal
+
+    def exit_provider(terminal):
+        terminal.expect("1. 查看脱敏配置"); terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        return terminal.finish()
+
+    try:
+        MODEL_LIST.update(status=429, calls=0, chat_calls=0, probes=[], ids=["synthetic-menu-retry-model"])
+        before = current_configuration()
+        history_before = provider_history()
+        terminal = open_models("models-transient-retry")
+        # 失败重试次数超过 FUNCNEST，递归重新进入选择函数会触发 Bash 上限。
+        for _ in range(14):
+            terminal.expect(retry_prompt)
+            assert current_configuration() == before and provider_history() == history_before
+            assert operation_log.read_text() == "" and MODEL_LIST["chat_calls"] == 0
+            terminal.send("1")
+        terminal.expect(retry_prompt)
+        MODEL_LIST["status"] = 200
+        terminal.send("1")
+        terminal.expect("1. synthetic-menu-retry-model")
+        terminal.expect("选择模型（数字"); terminal.send("1")
+        terminal.expect("unit-menu-provider-fixture")
+        output = exit_provider(terminal)
+        actual = json.loads((DEPLOY / "config/provider.yaml").read_text())["provider"]
+        runtime = json.loads((DEPLOY / "config/runtime.yaml").read_text())
+        assert actual["model"] == "synthetic-menu-retry-model"
+        assert runtime["revision"] == runtime["applied_revision"]
+        assert len(provider_history() - history_before) == 1
+        assert operation_log.read_text().splitlines() == ["up", "runtime-provider-test"]
+        assert MODEL_LIST["calls"] >= 16 and MODEL_LIST["chat_calls"] == 3, MODEL_LIST
+        assert MODEL_LIST["probes"] == [
+            ("/proxy/v1/chat/completions", "synthetic-menu-retry-model", False),
+            ("/proxy/v1/responses", "synthetic-menu-retry-model", False),
+            ("/proxy/v1/chat/completions", "synthetic-menu-retry-model", True),
+        ], MODEL_LIST["probes"]
+        assert output.count(retry_prompt) == 15
+        assert "手动模型原名" not in output and "maximum function nesting" not in output
+        passing("生产PTY模型列表429返回4、连续重试不递归，恢复后数字选择仅应用一次")
+
+        for action, label in (("0", "取消"), ("2", "返回修改接口")):
+            MODEL_LIST.update(status=503, calls=0, chat_calls=0, probes=[])
+            before = current_configuration()
+            history_before = provider_history()
+            operation_log.write_text("")
+            terminal = open_models("models-transient-" + action)
+            terminal.expect(retry_prompt); terminal.send(action)
+            output = exit_provider(terminal)
+            assert current_configuration() == before and provider_history() == history_before
+            assert operation_log.read_text() == "" and MODEL_LIST["chat_calls"] == 0
+            assert MODEL_LIST["calls"] >= 1 and output.count(retry_prompt) == 1
+            assert "手动模型原名" not in output and "unit-menu-provider-fixture" not in output
+            passing(f"生产PTY模型列表503返回4后{label}，不改配置、不推理、不apply")
+    finally:
+        MODEL_LIST.update(status=200, ids=["synthetic-menu-model"])
+        docker.write_bytes(original_docker)
+        docker.chmod(0o755)
 
 
 def main():
@@ -167,7 +286,7 @@ def main():
     threading.Thread(target=fixture.serve_forever, daemon=True).start()
     port = fixture.server_address[1]
     (DEPLOY / ".env").write_text(
-        f"DEPLOY_DIR={json.dumps(str(DEPLOY), ensure_ascii=False)}\nANYTHINGLLM_API_KEY=synthetic-menu-secret\nANYTHINGLLM_PORT={port}\nANYTHINGLLM_WORKSPACE=crisp-support\n"
+        f"DEPLOY_DIR={json.dumps(str(DEPLOY), ensure_ascii=False)}\nANYTHINGLLM_API_KEY=synthetic-menu-secret\nANYTHINGLLM_PORT={port}\nANYTHINGLLM_WORKSPACE=crisp-support\nN8N_PORT={port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=5\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=5\n"
         f"AI_API_BASE_URL=http://127.0.0.1:{port}/proxy/v1\nAI_API_PROBE_BASE_URL=http://127.0.0.1:{port}/proxy/v1\nAI_API_KEY=synthetic-menu-key\nAI_MODEL=synthetic-menu-model\nAI_API_MODE=chat_completions\n"
         "CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111\nCRISP_TOKEN_TIER=website\nCRISP_HOOK_MODE=website\nCRISP_TOKEN_IDENTIFIER=synthetic-identifier\nCRISP_TOKEN_KEY=synthetic-crisp-key\nWEBHOOK_PRODUCTION_URL=https://support.example.invalid/webhook/crisp-webhook\n",
         encoding="utf-8")
@@ -206,6 +325,7 @@ def main():
         terminal = Terminal("sigint")
         terminal.expect("请选择："); os.killpg(terminal.process.pid, signal.SIGINT); terminal.finish(130)
         passing("SIGINT 保留现有配置并有限退出")
+        provider_retry_cases()
         prompt = '## 中文 🙂 Prompt\n\n$ # = " \\ `touch should-not-execute`\n::END::\n\n'
         terminal = Terminal("prompt-paste")
         for prompt_token, answer in (("请选择：", "4"), ("请选择：", "2")):
