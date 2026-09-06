@@ -1,6 +1,6 @@
 # Crisp 接入：凭据、Hook、按钮与欢迎网页
 
-本页针对一个 Crisp workspace 的私有客服，默认 Website Token + Website Hook；不要求 Marketplace、两套 Hook 或新的聊天前端。2026-09-06 核对下列官方资料；真实账号权限、界面与消息投递以实际账户为准，源码协议测试不能替代真实 Crisp 验收。
+本页针对一个 Crisp workspace 的自部署客服，默认 Website Token + Website Hook；不要求 Marketplace、两套 Hook 或新的聊天前端。项目源码和 [新手安装教程](INSTALL.md) 已公开，下载不需 GitHub 授权；这不改变你在 Crisp 中所需的工作区管理权限，也不会公开实例凭据。2026-09-06 核对下列官方资料；真实账号权限、界面与消息投递以实际账户为准，源码协议测试不能替代真实 Crisp 验收。
 
 ## 1. 获取三项凭据
 

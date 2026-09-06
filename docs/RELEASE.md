@@ -1,6 +1,14 @@
 # 正式发布与回滚
 
-本项目源码版本、真实本地部署与用户外部接入分别验收。目标仓库保持 private：`statusX7/ai-support`。本章的发布命令只由维护者在已授权环境执行；普通服务器安装不依赖 Git 或 gh。
+本项目源码版本、真实本地部署与用户外部接入分别验收。`statusX7/ai-support` 自 2026-09-06 起保持公开（Public）：读文档、下载资产和 HTTPS clone 不需要仓库授权；提交、推送和创建 Release 仍需维护者权限。本章只供维护者使用，新手请看 [安装教程](INSTALL.md)，普通服务器运行不依赖 Git 或 gh。
+
+## 公开后的文档与发布约定
+
+- 新教程以无需认证的 Release 资产下载为主，提供浏览器上传后安装的路径；不将 gh 登录、SSH key 或访问邀请设为普通用户的安装前提。
+- 示例下载 URL 固定到同一个正式版本；更新版本时同时修改 tag、包名、解压目录和校验文件来源，不混用 `latest` 与旧文件名。
+- 只更正文档不另造软件版本，不替换已发布资产、重算旧包校验值或移动旧 tag。历史报告里的 private 表示当时事实；旧包内教程由 `main` 的最新说明补充。
+- 日常改写依照 `AGENTS.md` 先本地提交；获得文档同步授权后才推送。若同步 GitHub Release 的说明文字，仅更新教程和当前公开访问提示，保留原 tag、资产与验证结果。
+- Git 历史、Release 说明与附件、公开 Issue 都必须按公共资料审查；实例 `.env`、知识、日志、会话与备份不因仓库公开而纳入发布。
 
 ## v1.1.0 发布门禁
 
@@ -29,7 +37,7 @@ gh release list --repo statusX7/ai-support --limit 5
 git ls-remote --heads --tags origin
 ```
 
-保留现有认证、SSH remote 和 private 可见性。日志不记录认证内容；检查输出前脱敏。远端已有 v1.1.0 时先核对内容，禁止移动/删除已发布 tag；不得 force push。只有未占用目标才创建新 Release。
+保留现有维护者认证和 SSH remote，核对 `isPrivate` 为 `false`，不得擅自改回 private。公开读权限不代表推送权限。日志不记录认证内容；检查输出前脱敏。v1.1.0 已发布，下面同名命令仅作当时流程示例，不得照抄重发；正式新版本必须选择未占用 tag，禁止移动/删除历史 tag 或 force push。
 
 ## 验收及一致性
 
@@ -84,6 +92,8 @@ gh release view v1.1.0 --repo statusX7/ai-support \
 使用正式非 draft、非 prerelease。若原子 push 不被服务端支持，先验证分支再推 tag；任何远端冲突先停止核对，不能覆盖用户提交。push 成功但创建 Release 失败时，仅幂等完成尚未完成的 Release；不要重新打一个指向不同代码的同名 tag。命令语义见 [GitHub CLI 创建 Release](https://cli.github.com/manual/gh_release_create)。
 
 ## 远端回下载核验
+
+公开仓库除下述维护者 gh 检查外，还应按 [新手教程](INSTALL.md) 在不发送 GitHub 认证信息的情况下下载资产、核对 SHA256、解压并测试 `--help/--version`。匿名只读检查失败时先排查资产名称、发布状态和网络，不让新手用 Token 绕过错误下载地址。
 
 用新的项目内受限目录下载当前两个资产：
 

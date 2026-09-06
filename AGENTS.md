@@ -3,6 +3,8 @@
 ## 项目范围
 
 - 项目名称：`ai-support`。
+- 仓库 `statusX7/ai-support` 自 2026-09-06 起保持公开（Public）。新手文档以无需 GitHub 登录的 Release 下载为主，HTTPS clone 为可选路径；读取源码不要求仓库授权，提交和发布仍需要维护者权限。
+- 公开的是程序、示例和文档，不是部署数据。历史报告中的 private 是发布当时的事实，不为可见性调整改写历史 tag、覆盖旧资产或放宽密钥保护。
 - 源码、开发资料与测试产物集中于 `/root/projects/crispai`，临时资料放入已忽略的 `.work/`。
 - 安装器可管理用户指定的部署目录（默认 `/opt/crisp-ai`）、必要系统依赖、Docker 官方源和服务、项目拥有的 `/usr/local/bin/crispai`；不得修改无关站点或其他实例。
 - 运行时组合 Crisp、n8n、AnythingLLM 与 OpenAI Compatible API，不重复实现 RAG、向量数据库、文档解析或 LLM 管理。

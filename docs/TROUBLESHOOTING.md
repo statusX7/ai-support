@@ -16,6 +16,20 @@
 | 非 systemd/衍生发行版被拒绝 | 查看 [INSTALL](INSTALL.md) 支持等级；不改发行版 ID 或假装成受支持系统。 |
 | 双栏错位或终端不支持 Emoji | 使用 UTF-8；窄屏会单栏。可用 `CRISPAI_NO_EMOJI=1 crispai`；`TERM=dumb` 无控制动画。 |
 
+## 公开仓库下载与文档
+
+| 现象 | 核对与修复 |
+| --- | --- |
+| 下载时认为需要 GitHub Token | 仓库和 Release 已公开，正常浏览器/HTTPS 下载无需登录。不把 Key、Token 加进 URL，也不创建空 gh 配置。按 [新手教程](INSTALL.md) 下载两个正式资产。 |
+| Release 资产 404 | 从 [发布页面](https://github.com/statusX7/ai-support/releases) 核对 tag 与完整文件名。v1.1.0 的文件为 `ai-support-v1.1.0.tar.gz` 和 `SHA256SUMS`；不要把 `latest/download` 与旧版本文件名混搭。 |
+| `curl: command not found` | 用浏览器下载后经 SFTP 上传服务器；安装器开始运行后会补运行依赖，不能在获取包之前替你下载自己。 |
+| `gh` 提示登录 | 是该 CLI 的认证要求，不代表仓库变回私有。改用浏览器或教程中的无需认证的 curl 地址；运行客服不需要 gh。 |
+| SHA256 校验失败、提示无文件 | 两个资产必须来自同一 Release、放在同一目录并保留原名。不要使用自动生成的 Source code 包，也不要改校验值；重新下载后再校验。 |
+| 提示 `install.sh` 不存在 | 先成功解压项目完整包并进入 `ai-support-v1.1.0`；不要只下载单个脚本，运行所需模块也在完整包内。 |
+| 旧包或报告仍写 private | 这是 2026-09-06 公开之前的历史内容，不再是下载要求。旧 tag、包和校验值保持不变，最新操作看 [main 教程](https://github.com/statusX7/ai-support/blob/main/docs/INSTALL.md)。 |
+
+公开求助时不要附 `.env`、完整 Hook URL、凭据、客户正文、业务知识或备份，详见 [安全说明](SECURITY.md)。
+
 ## Provider 与 Prompt
 
 | 现象 | 核对与修复 |
