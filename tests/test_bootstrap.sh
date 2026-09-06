@@ -128,6 +128,11 @@ case "${1:-}" in
   run)
     [[ -f "${MOCK_STATE}/daemon" ]] || exit 5
     [[ "$*" == *hello-world* ]] || exit 6
+    if [[ -t 2 ]]; then printf '\033[1A\033[2K\n' >&2; fi
+    if [[ "${MOCK_DOCKER_RUN_STATUS:-0}" != 0 ]]; then
+      printf '受控镜像执行错误\n' >&2
+      exit "$MOCK_DOCKER_RUN_STATUS"
+    fi
     : > "${MOCK_STATE}/hello-world"
     ;;
   *) exit 7 ;;
@@ -503,5 +508,30 @@ fi
 assert_contains "${NO_ROOT_ROOT}/output.log" 'sudo bash ./install.sh'
 [[ ! -e "${NO_ROOT_ROOT}/state/apt.log" ]] || fail "无权限时仍执行 apt"
 pass "root、sudo 提示与无授权失败边界"
+
+python3 - "$BOOTSTRAP_SCRIPT" "$EXISTING_ROOT" <<'PY'
+import os, pty, select, signal, sys, time
+for expected in (0, 42):
+    child, master = pty.fork()
+    if child == 0:
+        os.environ.update(PATH=sys.argv[2]+'/bin', MOCK_STATE=sys.argv[2]+'/state',
+                          MOCK_DOCKER_RUN_STATUS=str(expected), TERM='dumb')
+        os.execl('/bin/bash','bash','-c','source "$1"; bootstrap_verify_docker_execution','_',sys.argv[1])
+    output=b''; deadline=time.monotonic()+15
+    while time.monotonic()<deadline:
+        if select.select([master],[],[],.1)[0]:
+            try: output+=os.read(master,65536)
+            except OSError: pass
+        waited,status=os.waitpid(child,os.WNOHANG)
+        if waited: break
+    else:
+        os.kill(child,signal.SIGTERM); raise AssertionError('Docker smoke PTY 超时')
+    os.close(master)
+    assert os.waitstatus_to_exitcode(status)==expected
+    assert b'\x1b' not in output
+    if expected:
+        assert '受控镜像执行错误'.encode() in output and '退出码 42'.encode() in output
+PY
+pass "生产 Docker 测试在 dumb PTY 不输出动画，失败保留真实退出码及诊断"
 
 printf '依赖与 Docker 引导专项测试：%d 项通过\n' "$PASSED"

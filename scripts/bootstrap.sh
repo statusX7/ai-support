@@ -612,9 +612,18 @@ bootstrap_verify_compose_capability() {
 }
 
 bootstrap_verify_docker_execution() {
+  local diagnostic status
   bootstrap_info "正在运行 Docker hello-world 容器验证 daemon 与镜像执行能力"
-  docker run --rm hello-world >/dev/null \
-    || bootstrap_die "Docker daemon 可访问，但测试容器运行失败；请检查镜像仓库网络、CPU 架构与内核能力" || return
+  # Docker 的首次拉取进度只检查 stderr 是否为 TTY，并不遵守 TERM=dumb。
+  # 捕获诊断使其使用纯文本；不依赖旧 Engine/CLI 未必提供的 --quiet 参数。
+  if diagnostic=$(docker run --rm hello-world 2>&1); then
+    return 0
+  else
+    status=$?
+    printf '%s\n' "$diagnostic" >&2
+    bootstrap_error "Docker daemon 可访问，但测试容器运行失败（退出码 ${status}）；请检查镜像仓库网络、CPU 架构与内核能力"
+    return "$status"
+  fi
 }
 
 bootstrap_prepare_docker_runtime() {
