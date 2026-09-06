@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 const project = path.resolve(__dirname, '..');
 if (!process.argv[2]) throw new Error('用法：node tests/test_web_chat_browser.js <受限协议配置JSON>；开发环境需要 chromium/node-ws/openssl');
 const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+fs.mkdirSync(path.join(project, '.work', 'v1.1.0'), { recursive: true, mode: 0o700 });
 const evidence = fs.mkdtempSync(path.join(project, '.work/v1.1.0/browser-'));
 fs.chmodSync(evidence, 0o700);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
