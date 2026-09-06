@@ -21,6 +21,7 @@ async function main() {
   fs.copyFileSync(path.join(root,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker'));
   fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
   const documents = new Map(); let locations=[], prompt='', sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
+  let modelEmpty=false, modelHang=false, modelCalls=0;
   const service=http.createServer(async(request,response)=>{
     let data=Buffer.alloc(0);for await(const chunk of request)data=Buffer.concat([data,chunk]);
     const send=(status,body)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(body));};
@@ -43,7 +44,9 @@ async function main() {
       send(200,{results:locations.map(location=>({text:'协议服务检索样本，不是真实模型',metadata:{docpath:location,title:documents.get(location)?.filename},score:0.8}))});return;
     }
     if(request.url === '/proxy/v1/models'){
-      if(modelStatus===200)send(200,{data:[{id:'synthetic-b'},{id:'synthetic-a'},{id:'synthetic-a'}]});else send(modelStatus,{error:{message:'fixture'}});return;
+      modelCalls++;
+      if(modelHang)return;
+      if(modelStatus===200)send(200,{data:modelEmpty?[]:[{id:'synthetic-b'},{id:'synthetic-a'},{id:'synthetic-a'}]});else send(modelStatus,{error:{message:'fixture'}});return;
     }
     if(request.url === '/proxy/v1/chat/completions'){lastProviderHeaders=request.headers;send(200,{choices:[{message:{content:'协议模型回答'}}]});return;}
     if(request.url === '/proxy/v1/responses'){lastProviderHeaders=request.headers;send(200,{output_text:'协议模型回答'});return;}
@@ -113,6 +116,15 @@ async function main() {
     runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.ok(runtime.revision>revision);pass('应用失败恢复旧值且revision单调防旧请求复活');
     const models=JSON.parse((await ok('provider.sh',['models'])).stdout);assert.deepEqual(models.models,['synthetic-a','synthetic-b']);pass('模型列表去重与排序');
     modelStatus=401;assert.equal((await invoke('provider.sh',['models'])).code,3);modelStatus=404;assert.equal((await invoke('provider.sh',['models'])).code,2);modelStatus=200;pass('模型鉴权失败和手填后备状态可区分');
+    modelEmpty=true;const emptyModels=await invoke('provider.sh',['models']);
+    assert.equal(emptyModels.code,2);assert.equal(emptyModels.stdout.trim(),'');modelEmpty=false;
+    pass('空模型列表进入手填后备，不编造模型');
+    modelStatus=429;let initialCalls=modelCalls;const limited=await invoke('provider.sh',['models']);
+    assert.equal(limited.code,4);assert.equal(modelCalls-initialCalls,3);assert(!limited.stdout.includes(secret));modelStatus=200;
+    pass('模型列表429使用三次有界请求并返回可重试错误');
+    modelHang=true;initialCalls=modelCalls;const started=Date.now();const timed=await invoke('provider.sh',['models']);
+    assert.equal(timed.code,4);assert(modelCalls-initialCalls<=3);assert(Date.now()-started>=29000 && Date.now()-started<110000);assert(!timed.stdout.includes(secret));modelHang=false;
+    pass('模型列表真实HTTP挂起在有限超时内失败，不伪造可用模型');
     fs.appendFileSync(path.join(deploy,'.env'),'AI_CUSTOM_HEADERS_JSON=\'{"x-original":"synthetic-original"}\'\n');
     const providerCandidate=path.join(work,'provider.json');fs.writeFileSync(providerCandidate,JSON.stringify({provider:{custom_headers:{'X-New':'synthetic-new'}}}));
     await ok('provider.sh',['probe',providerCandidate]);assert.equal(lastProviderHeaders['x-original'],'synthetic-original');assert.equal(lastProviderHeaders['x-new'],'synthetic-new');pass('新增高级Header保留未编辑的现有Header');

@@ -193,7 +193,10 @@ provider_main() {
       response=$(mktemp "${deploy_dir}/tmp/models-response.XXXXXX")
       status=$(provider_request "$deploy_dir" "$candidate" models '' "$response")
       if [[ "$status" == 401 || "$status" == 403 ]]; then rm -f -- "$candidate" "$response"; configuration_error "模型列表权限失败（HTTP ${status}），请修改凭据"; return 3; fi
-      if [[ "$status" != 2?? ]] || ! jq -M -e '.data | type == "array" and any(.[]; .id | type == "string" and length > 0)' "$response" >/dev/null 2>&1; then
+      if [[ "$status" == 000 || "$status" == 429 || "$status" == 5?? ]]; then
+        rm -f -- "$candidate" "$response"; configuration_error "模型列表暂时不可用（HTTP ${status}），有限重试已结束；可重试、修改地址或取消"; return 4
+      fi
+      if [[ "$status" != 2?? ]] || ! jq -M -e '(.error == null or .error == false) and (.data | type == "array" and any(.[]; .id | type == "string" and length > 0))' "$response" >/dev/null 2>&1; then
         rm -f -- "$candidate" "$response"; configuration_error "模型列表不可用（HTTP ${status}），可以手动填写模型"; return 2
       fi
       digest=$(sha256sum "$candidate" | awk '{print $1}')

@@ -844,6 +844,129 @@ grep -Eq '历史镜像|缺少.*镜像' "${TEST_ROOT}/rollback-missing-image.log"
   || fail "缺少历史镜像时没有清晰错误"
 pass "缺少历史镜像时回滚安全失败"
 
+assert_rollback_mutation_failure() {
+  local failure_stage=$1 failure_variable failed_command case_root case_deploy
+  local target_id target_hash previous_hash previous_prompt_hash previous_env_hash
+  local failure_status=0 safety_id safety_manifest failed_tail stage_payload
+  local service manifest forbidden_password
+  local target_password='test-only-rollback-$ # = "quoted" \\secret'
+  local current_password='test-only-current-rollback-password'
+  local -a safety_manifests=()
+  case "$failure_stage" in
+    pg_restore) failure_variable=MOCK_DOCKER_FAIL_PG_RESTORE; failed_command=pg_restore ;;
+    pg_password) failure_variable=MOCK_DOCKER_FAIL_PG_PASSWORD; failed_command=psql ;;
+    *) fail "未知回滚失败测试阶段" ;;
+  esac
+  case_root="${TEST_ROOT}/rollback-failure-${failure_stage}"
+  case_deploy="${case_root}/deploy"
+  mkdir -p -- "$case_deploy"
+  cp -a -- "${DEPLOY_DIR}/." "$case_deploy/"
+  cp -- "$MOCK_ANYTHING_STATE" "${case_root}/anythingllm-state.json"
+  local MOCK_ANYTHING_STATE="${case_root}/anythingllm-state.json"
+  local MOCK_DOCKER_LOG="${case_root}/docker.log"
+  local MOCK_DOCKER_SERVICE_STATE="${case_root}/running-services"
+  local MOCK_POSTGRES_PASSWORD_DIGEST_FILE="${case_root}/password-digest"
+  export MOCK_ANYTHING_STATE MOCK_DOCKER_LOG MOCK_DOCKER_SERVICE_STATE MOCK_POSTGRES_PASSWORD_DIGEST_FILE
+  printf 'postgres\nanythingllm\nn8n\nprovider-adapter\n' > "$MOCK_DOCKER_SERVICE_STATE"
+  : > "$MOCK_DOCKER_LOG"
+  # 每例绑定自己的部署目录与命令入口，不修改原生命周期实例或宿主状态。
+  bash -c 'set -euo pipefail; source "$1/scripts/common.sh";
+    env_set "$1/.env" DEPLOY_DIR "$1";
+    env_set "$1/.env" POSTGRES_PASSWORD "$4";
+    env_set "$1/.env" SNAPSHOT_MIN_FREE_MB 0;
+    env_set "$1/.env" SNAPSHOT_RETENTION_COUNT 10;
+    write_installation_marker "$1" "$2" "$3" local-ready' \
+    -- "$case_deploy" "$PROJECT_ROOT" "$PROJECT_VERSION" "$target_password"
+  "${case_deploy}/scripts/launcher.sh" install --deploy-dir "$case_deploy" \
+    --command-path "${case_root}/crispai" --non-interactive > "${case_root}/launcher.log" 2>&1
+  printf '目标快照的 AnythingLLM 数据：%s\n' "$failure_stage" > "${case_deploy}/data/anythingllm/rollback-failure.txt"
+  printf '目标快照的 Prompt：%s\n' "$failure_stage" > "${case_deploy}/config/prompt.md"
+  target_hash=$(sha256sum "${case_deploy}/data/anythingllm/rollback-failure.txt" | cut -d ' ' -f 1)
+  target_id=$("${case_deploy}/scripts/snapshot.sh" --deploy-dir "$case_deploy" \
+    --reason "target-${failure_stage}" --quiet)
+  printf '回滚前仍须保留的 AnythingLLM 数据：%s\n' "$failure_stage" > "${case_deploy}/data/anythingllm/rollback-failure.txt"
+  printf '回滚前仍须保留的 Prompt：%s\n' "$failure_stage" > "${case_deploy}/config/prompt.md"
+  bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" POSTGRES_PASSWORD "$2"' \
+    -- "$case_deploy" "$current_password"
+  previous_hash=$(sha256sum "${case_deploy}/data/anythingllm/rollback-failure.txt" | cut -d ' ' -f 1)
+  previous_prompt_hash=$(sha256sum "${case_deploy}/config/prompt.md" | cut -d ' ' -f 1)
+  previous_env_hash=$(sha256sum "${case_deploy}/.env" | cut -d ' ' -f 1)
+  : > "$MOCK_DOCKER_LOG"
+  env "${failure_variable}=1" "${case_deploy}/scripts/rollback.sh" --deploy-dir "$case_deploy" \
+    --snapshot "$target_id" > "${case_root}/failure.log" 2>&1 || failure_status=$?
+  (( failure_status != 0 )) || fail "${failure_stage} 失败被错误报告为回滚成功"
+  grep -Fq "$failed_command" "$MOCK_DOCKER_LOG" || fail "未实际执行 ${failure_stage} 失败分支"
+  failed_tail="${case_root}/failed-tail.log"
+  awk -v command="$failed_command" 'index($0,command) { failed=1 } failed { print }' \
+    "$MOCK_DOCKER_LOG" > "$failed_tail"
+  if grep -Eq '(^| )(up|restart)( |$)' "$failed_tail"; then
+    fail "${failure_stage} 失败之后仍重新启动应用，可能运行混合恢复状态"
+  fi
+  grep -Fxq postgres "$MOCK_DOCKER_SERVICE_STATE" || fail "${failure_stage} 错误停止了 PostgreSQL 恢复服务"
+  for service in n8n anythingllm provider-adapter; do
+    if grep -Fxq "$service" "$MOCK_DOCKER_SERVICE_STATE"; then
+      fail "${failure_stage} 失败后 ${service} 未保持停止"
+    fi
+  done
+  [[ "$(sha256sum "${case_deploy}/data/anythingllm/rollback-failure.txt" | cut -d ' ' -f 1)" == "$target_hash" ]] \
+    || fail "${failure_stage} 失败后单边退回或删除了目标 AnythingLLM 数据"
+  [[ "$(sha256sum "${case_deploy}/data/.anythingllm-previous-${target_id}/rollback-failure.txt" | cut -d ' ' -f 1)" == "$previous_hash" ]] \
+    || fail "${failure_stage} 失败后未保留回滚前 AnythingLLM 数据"
+  grep -Fxq 'fact_local_services=failed' "${case_deploy}/.crisp-ai-installation" \
+    || fail "${failure_stage} 失败后本地服务事实未标为 failed"
+  grep -Fxq 'fact_app_config=failed' "${case_deploy}/.crisp-ai-installation" \
+    || fail "${failure_stage} 失败后应用配置事实未标为 failed"
+  grep -Fxq 'state=installing' "${case_deploy}/.crisp-ai-installation" \
+    || fail "${failure_stage} 失败后错误宣称安装已完成或无法恢复"
+  mapfile -t safety_manifests < <(find "${case_deploy}/backups/versions" -mindepth 2 -maxdepth 2 \
+    -type f -name manifest.json -print0 | while IFS= read -r -d '' manifest; do
+      jq -e --arg reason "pre-rollback-${target_id}" '.reason == $reason and .contains_env == true and .contains_database_dump == true' \
+        "$manifest" >/dev/null && printf '%s\n' "$manifest"
+    done)
+  (( ${#safety_manifests[@]} == 1 )) || fail "${failure_stage} 失败后缺少唯一完整安全快照"
+  safety_manifest=${safety_manifests[0]}
+  safety_id=$(jq -er '.id' "$safety_manifest")
+  assert_file "${case_deploy}/backups/versions/${target_id}/snapshot.tar.gz"
+  assert_file "${case_deploy}/backups/versions/${safety_id}/snapshot.tar.gz"
+  [[ "$(stat -c '%a' "${case_deploy}/backups/versions/${safety_id}/snapshot.tar.gz")" == 600 ]] \
+    || fail "${failure_stage} 安全快照未受限保存"
+  [[ "$(tar -xOzf "${case_deploy}/backups/versions/${safety_id}/snapshot.tar.gz" payload/.env | sha256sum | cut -d ' ' -f 1)" == "$previous_env_hash" ]] \
+    || fail "${failure_stage} 安全快照未保留回滚前完整凭据"
+  stage_payload=$(find "${case_deploy}/tmp" -mindepth 1 -maxdepth 1 -type d -name 'rollback-stage.*' -print -quit)
+  [[ -n "$stage_payload" ]] || fail "${failure_stage} 失败后删除了恢复暂存材料"
+  assert_file "${stage_payload}/payload/data/postgres/n8n.dump"
+  if [[ "$failure_stage" == pg_password ]]; then
+    [[ "$(<"$MOCK_POSTGRES_PASSWORD_DIGEST_FILE")" == "$(printf '%s' "$target_password" | sha256sum | cut -d ' ' -f 1)" ]] \
+      || fail "密码恢复未从 stdin 原样收到目标快照密码"
+  elif grep -Fq '\password' "$MOCK_DOCKER_LOG"; then
+    fail "数据库恢复失败后仍尝试改角色密码"
+  fi
+  for forbidden_password in "$target_password" "$current_password"; do
+    if grep -Fq -- "$forbidden_password" "$MOCK_DOCKER_LOG" "${case_root}/failure.log"; then
+      fail "${failure_stage} 回滚将明文密码泄露到 argv 或输出"
+    fi
+  done
+  # 真实生产恢复入口从停机的失败事实恢复成套安全快照；不是重置夹具后宣称通过。
+  "${case_deploy}/scripts/rollback.sh" --deploy-dir "$case_deploy" --snapshot "$safety_id" \
+    --no-safety-snapshot > "${case_root}/recovery.log" 2>&1
+  [[ "$(sha256sum "${case_deploy}/data/anythingllm/rollback-failure.txt" | cut -d ' ' -f 1)" == "$previous_hash" \
+    && "$(sha256sum "${case_deploy}/config/prompt.md" | cut -d ' ' -f 1)" == "$previous_prompt_hash" \
+    && "$(sha256sum "${case_deploy}/.env" | cut -d ' ' -f 1)" == "$previous_env_hash" ]] \
+    || fail "${failure_stage} 失败后的成套安全恢复不一致"
+  [[ "$(<"$MOCK_POSTGRES_PASSWORD_DIGEST_FILE")" == "$(printf '%s' "$current_password" | sha256sum | cut -d ' ' -f 1)" ]] \
+    || fail "${failure_stage} 安全恢复未恢复正确数据库角色密码"
+  for service in postgres n8n anythingllm provider-adapter; do
+    grep -Fxq "$service" "$MOCK_DOCKER_SERVICE_STATE" || fail "安全恢复后 ${service} 未重新启动"
+  done
+  grep -Fxq 'state=local-ready' "${case_deploy}/.crisp-ai-installation" \
+    || fail "安全恢复后没有真实外部会话却错误报告 ready"
+}
+
+for rollback_failure_stage in pg_restore pg_password; do
+  assert_rollback_mutation_failure "$rollback_failure_stage"
+  pass "${rollback_failure_stage} 故障不启动混合状态、保留双份数据/安全快照且可成套恢复"
+done
+
 bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_RETENTION_COUNT 2' \
   -- "$DEPLOY_DIR"
 for reason in retention-a retention-b retention-c; do

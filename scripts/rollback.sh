@@ -11,6 +11,8 @@ LIST_ONLY=0
 SKIP_START=0
 SAFETY_SNAPSHOT=1
 SERVICES_STOPPED=0
+MUTATION_STARTED=0
+PAUSED_APP_SERVICES=()
 
 usage() {
   cat <<'EOF'
@@ -164,28 +166,30 @@ done < <(tar --list --verbose --gzip --file "$ARCHIVE")
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/rollback-stage.XXXXXX")
 cleanup() {
   local status=$?
-  local recreate_anythingllm=0
   trap - EXIT
-  if (( status != 0 && ${ANYTHING_SWAPPED:-0} == 1 )) \
-    && [[ -d "${ANYTHING_PREVIOUS:-}" && ! -L "${ANYTHING_PREVIOUS:-}" ]]; then
-    rm -rf -- "${DEPLOY_DIR}/data/anythingllm"
-    if mv -- "$ANYTHING_PREVIOUS" "${DEPLOY_DIR}/data/anythingllm"; then
-      recreate_anythingllm=1
-    else
-      warn "无法自动还原回滚前的 AnythingLLM 数据"
+  if (( status != 0 && MUTATION_STARTED == 1 )); then
+    # 数据库恢复可能已部分提交；不能单独退回一个数据目录后启动混合代际服务。
+    docker_compose "$DEPLOY_DIR" stop n8n anythingllm >/dev/null 2>&1 || true
+    if docker_compose "$DEPLOY_DIR" config --services 2>/dev/null | grep -Fxq provider-adapter; then
+      docker_compose "$DEPLOY_DIR" stop provider-adapter >/dev/null 2>&1 || true
     fi
-  fi
-  rm -rf -- "$STAGING"
-  if (( status != 0 && SERVICES_STOPPED == 1 )); then
-    warn "回滚未完成，尝试重新启动当前服务"
-    if (( recreate_anythingllm )); then
-      docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm >/dev/null 2>&1 || true
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    set_installation_fact "$DEPLOY_DIR" app_config failed || true
+    warn "回滚未完成：应用保持停止，未启动混合状态。恢复材料保留于：$STAGING"
+    [[ -z "${ANYTHING_PREVIOUS:-}" ]] || warn "回滚前 AnythingLLM 数据保留于：$ANYTHING_PREVIOUS"
+    [[ -z "${SAFETY_ID:-}" ]] || warn "可成套恢复安全快照：rollback.sh --deploy-dir $DEPLOY_DIR --snapshot $SAFETY_ID --no-safety-snapshot"
+  else
+    rm -rf -- "$STAGING"
+    if (( status != 0 && SERVICES_STOPPED == 1 )); then
+      warn "回滚尚未修改数据，重新启动原有应用服务"
+      docker_compose "$DEPLOY_DIR" up -d "${PAUSED_APP_SERVICES[@]}" >/dev/null 2>&1 || true
     fi
-    docker_compose "$DEPLOY_DIR" up -d --remove-orphans >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 tar --extract --gzip --file "$ARCHIVE" --directory "$STAGING" --no-same-owner --no-same-permissions
 PAYLOAD="${STAGING}/payload"
 [[ -f "${PAYLOAD}/VERSION" && -f "${PAYLOAD}/docker-compose.yml" && -f "${PAYLOAD}/n8n/workflow.json" ]] || die "版本快照缺少必要文件"
@@ -200,6 +204,10 @@ if [[ -f "${PAYLOAD}/config/provider.yaml" ]] && provider_config_has_secret_fiel
 fi
 if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   [[ -s "${PAYLOAD}/.env" ]] || die "完整快照缺少内部凭据文件"
+  restored_database_password=$(env_get "${PAYLOAD}/.env" POSTGRES_PASSWORD)
+  if [[ -z "$restored_database_password" ]] || ! validate_env_value "$restored_database_password"; then
+    die "快照数据库密码无效；未修改部署"
+  fi
 fi
 
 require_docker_runtime
@@ -214,7 +222,9 @@ while IFS=$'\t' read -r reference image_id; do
     || die "本机缺少回滚所需历史镜像：$reference ($image_id)"
 done < <(jq -r '.images[]? | [.reference,.id] | @tsv' "$MANIFEST")
 
-docker_compose "$DEPLOY_DIR" stop n8n anythingllm
+mapfile -t PAUSED_APP_SERVICES < <(docker_compose "$DEPLOY_DIR" config --services | grep -E '^(n8n|anythingllm|provider-adapter)$')
+(( ${#PAUSED_APP_SERVICES[@]} )) || PAUSED_APP_SERVICES=(n8n anythingllm)
+docker_compose "$DEPLOY_DIR" stop "${PAUSED_APP_SERVICES[@]}"
 SERVICES_STOPPED=1
 
 if (( SAFETY_SNAPSHOT )); then
@@ -222,6 +232,9 @@ if (( SAFETY_SNAPSHOT )); then
   info "回滚前安全快照：$SAFETY_ID"
 fi
 
+MUTATION_STARTED=1
+MARKER_SOURCE=$(sed -n 's/^source=//p' "${DEPLOY_DIR}/${INSTALL_MARKER}" | head -n 1)
+write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" installing
 if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   install -m 0600 -- "${PAYLOAD}/.env" "${DEPLOY_DIR}/.env"
 fi
@@ -302,14 +315,12 @@ fi
 
 ANYTHING_RESTORE="${DEPLOY_DIR}/data/.anythingllm-restore-${SNAPSHOT_ID}"
 ANYTHING_PREVIOUS="${DEPLOY_DIR}/data/.anythingllm-previous-${SNAPSHOT_ID}"
-ANYTHING_SWAPPED=0
 [[ ! -e "$ANYTHING_RESTORE" && ! -e "$ANYTHING_PREVIOUS" ]] || die "回滚暂存目录已存在，请先人工检查"
 mkdir -m 0700 -- "$ANYTHING_RESTORE"
 cp -a -- "${PAYLOAD}/data/anythingllm/." "$ANYTHING_RESTORE/"
 chown -R 1000:1000 "$ANYTHING_RESTORE" 2>/dev/null || die "无法设置 AnythingLLM 回滚数据权限"
 mv -- "${DEPLOY_DIR}/data/anythingllm" "$ANYTHING_PREVIOUS"
 mv -- "$ANYTHING_RESTORE" "${DEPLOY_DIR}/data/anythingllm"
-ANYTHING_SWAPPED=1
 if [[ -f "${PAYLOAD}/data/knowledge-manifest.json" ]]; then
   install -m 0600 -- "${PAYLOAD}/data/knowledge-manifest.json" "${DEPLOY_DIR}/data/knowledge-manifest.json"
 fi
@@ -329,17 +340,12 @@ done < <(jq -r '.images[]? | [.reference,.id] | @tsv' "$MANIFEST")
 if ! docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
   'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --clean --if-exists --no-owner --no-acl' \
   < "${PAYLOAD}/data/postgres/n8n.dump"; then
-  rm -rf -- "${DEPLOY_DIR}/data/anythingllm"
-  mv -- "$ANYTHING_PREVIOUS" "${DEPLOY_DIR}/data/anythingllm"
-  ANYTHING_SWAPPED=0
-  die "n8n 数据库恢复失败；AnythingLLM 数据已还原，安全快照可用于人工恢复"
+  die "n8n 数据库恢复失败；应用保持停止，请使用安全快照成套恢复"
 fi
 
 if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   # pg_dump 不包含角色密码；清理后新安装的数据库必须与快照恢复的 .env 对齐。
   # psql 的 \password 在客户端生成密码散列，明文仅走受控 stdin，不进入 argv/SQL 日志。
-  restored_database_password=$(env_get "${DEPLOY_DIR}/.env" POSTGRES_PASSWORD)
-  validate_env_value "$restored_database_password" || die "快照数据库密码无效"
   # shellcheck disable=SC2016
   if ! printf '%s\n%s\n' "$restored_database_password" "$restored_database_password" \
     | docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
@@ -372,11 +378,18 @@ fi
 set_installation_fact "$DEPLOY_DIR" conversation pending
 if crisp_api_check "$DEPLOY_DIR"; then
   set_installation_fact "$DEPLOY_DIR" crisp_api ready
-  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" ready
 else
   set_installation_fact "$DEPLOY_DIR" crisp_api failed
-  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" local-ready
   warn "回滚完成且本地应用已通过检查，但 Crisp API 待修正（HTTP ${CRISP_API_STATUS:-000}）"
+fi
+refresh_conversation_fact "$DEPLOY_DIR" || set_installation_fact "$DEPLOY_DIR" conversation pending
+if [[ "$(installation_fact "$DEPLOY_DIR" crisp_api)" == ready \
+  && "$(installation_fact "$DEPLOY_DIR" webhook)" == ready \
+  && "$(installation_fact "$DEPLOY_DIR" conversation)" == ready ]]; then
+  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" ready
+else
+  write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" local-ready
+  warn '本地回滚已完成；外部接入尚待验证，可运行 crispai doctor 继续检查'
 fi
 SERVICES_STOPPED=0
 if [[ -f "${DEPLOY_DIR}/scripts/launcher.sh" ]]; then
@@ -384,7 +397,6 @@ if [[ -f "${DEPLOY_DIR}/scripts/launcher.sh" ]]; then
     || warn "版本已恢复，但 crispai 入口存在冲突，请从 manage.sh 检查"
 fi
 rm -rf -- "$ANYTHING_PREVIOUS"
-ANYTHING_SWAPPED=0
 
 trap - EXIT
 rm -rf -- "$STAGING"

@@ -116,6 +116,12 @@ case "$COMMAND" in
   config)
     if [[ "$*" == *'--images'* ]]; then
       printf 'postgres:16.10-alpine\nmintplexlabs/anythingllm:1.16.1\ndocker.n8n.io/n8nio/n8n:2.33.0\n'
+    elif [[ "$*" == *'--services'* ]]; then
+      printf 'postgres\nanythingllm\nn8n\n'
+      if [[ -f "${MOCK_PROJECT_DIR}/docker-compose.yml" ]] \
+        && grep -Eq '^  provider-adapter:' "${MOCK_PROJECT_DIR}/docker-compose.yml"; then
+        printf 'provider-adapter\n'
+      fi
     elif [[ "$*" == *'--format json'* ]]; then
       printf '{"name":"crisp-ai-test"}\n'
     fi
@@ -128,11 +134,41 @@ case "$COMMAND" in
     [[ "${MOCK_DOCKER_FAIL_DOWN:-0}" != 1 ]]
     ;;
   up|stop|restart)
+    # 可选的独立实例运行状态，避免快照 ps 把刚停止的服务误报为仍运行。
+    if [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
+      [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
+      services=()
+      for argument in "$@"; do
+        case "$argument" in
+          postgres|anythingllm|n8n|provider-adapter) services+=("$argument") ;;
+        esac
+      done
+      (( ${#services[@]} )) || services=(postgres anythingllm n8n provider-adapter)
+      state_temporary=$(mktemp "${MOCK_DOCKER_SERVICE_STATE}.tmp.XXXXXX")
+      cp -- "$MOCK_DOCKER_SERVICE_STATE" "$state_temporary"
+      if [[ "$COMMAND" == stop ]]; then
+        for service in "${services[@]}"; do
+          next_state=$(mktemp "${MOCK_DOCKER_SERVICE_STATE}.next.XXXXXX")
+          awk -v service="$service" '$0 != service' "$state_temporary" > "$next_state"
+          mv -f -- "$next_state" "$state_temporary"
+        done
+      else
+        printf '%s\n' "${services[@]}" >> "$state_temporary"
+        sort -u -o "$state_temporary" "$state_temporary"
+      fi
+      chmod 600 "$state_temporary"
+      mv -f -- "$state_temporary" "$MOCK_DOCKER_SERVICE_STATE"
+    fi
     exit 0
     ;;
   ps)
     if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]]; then
-      printf 'postgres\nanythingllm\nn8n\n'
+      if [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
+        [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
+        sed -n 'p' "$MOCK_DOCKER_SERVICE_STATE"
+      else
+        printf 'postgres\nanythingllm\nn8n\n'
+      fi
     fi
     ;;
   exec)
@@ -146,9 +182,13 @@ case "$COMMAND" in
     elif [[ "$*" == *'psql'* && "$*" == *'\password'* ]]; then
       IFS= read -r restore_password_first
       IFS= read -r restore_password_second
-      [[ -n "$restore_password_first" && "$restore_password_first" == "$restore_password_second" \
-        && "${MOCK_DOCKER_FAIL_PG_PASSWORD:-0}" != 1 ]] || exit 1
+      [[ -n "$restore_password_first" && "$restore_password_first" == "$restore_password_second" ]] || exit 1
+      if [[ -n "${MOCK_POSTGRES_PASSWORD_DIGEST_FILE:-}" ]]; then
+        printf '%s' "$restore_password_first" | sha256sum | cut -d ' ' -f 1 > "$MOCK_POSTGRES_PASSWORD_DIGEST_FILE"
+        chmod 600 "$MOCK_POSTGRES_PASSWORD_DIGEST_FILE"
+      fi
       unset restore_password_first restore_password_second
+      [[ "${MOCK_DOCKER_FAIL_PG_PASSWORD:-0}" != 1 ]] || exit 1
     elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
       CONFIG_NAME=${!#}
       [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1

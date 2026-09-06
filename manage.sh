@@ -199,9 +199,13 @@ provider_candidate() {
 provider_model_select() {
   local candidate=$1 models_file choice query='' page=0 total start request_status
   manager_temporary || return; models_file=$MANAGE_FILE
-  if manager_tool provider models "$candidate" > "$models_file"; then :; else
-    request_status=$?
+  while true; do
+    if manager_tool provider models "$candidate" > "$models_file"; then break; else request_status=$?; fi
     if (( request_status == 3 )); then warn '模型列表鉴权失败，请先修正本次地址与 Key'; return; fi
+    if (( request_status == 4 )); then
+      menu_read choice '模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消：' || return
+      case "$choice" in 1) continue ;; *) return ;; esac
+    fi
     warn '列表不可用；可手填模型并验证实际推理，空输入取消本次修改'
     menu_read choice '手动模型原名：' || return
     [[ -n "$choice" ]] || return
@@ -209,7 +213,7 @@ provider_model_select() {
     mv -f -- "$candidate.new" "$candidate"
     if menu_confirm '使用手填模型验证并应用？'; then manager_action manager_tool provider apply "$candidate"; fi
     return
-  fi
+  done
   jq -M '[if type=="array" then .[] else (.models // .data // [])[] end | if type=="string" then . else .id end | select(type=="string")] | unique' "$models_file" > "$models_file.ids"
   while true; do
     jq -M --arg query "$query" '[.[] | select(contains($query))]' "$models_file.ids" > "$models_file.filtered"
