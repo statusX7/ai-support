@@ -102,6 +102,11 @@ async function main() {
     assert.equal(locations.length,4);pass('删除条目移走当前原文并保留受限历史恢复副本');
     const promptContent='## 中文 🙂 Prompt\n\n保留 $ # = " \\ 原样。\n\n';const promptSource=path.join(work,'新 提示.md');fs.writeFileSync(promptSource,promptContent);
     await ok('configuration.sh',['prompt-apply',promptSource]);assert.equal(prompt,promptContent);assert.equal(fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'),promptContent);pass('Prompt 特殊字符和末尾空行逐字同步');
+    const marked=await ok('configuration.sh',['mark-applied']);
+    assert.equal(marked.stdout.trim(),'');
+    const markedState=JSON.parse(fs.readFileSync(path.join(deploy,'config/runtime.yaml')));
+    assert.equal(markedState.revision,markedState.applied_revision);
+    pass('mark-applied 反向加载 knowledge 不重复派发入口或输出旧状态');
     const candidate=path.join(work,'runtime.json');fs.writeFileSync(candidate,JSON.stringify({enabled:false}));await ok('configuration.sh',['apply','runtime','--input',candidate]);
     let runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.applied_revision,runtime.revision);pass('全局配置原子提交与运行时文件读回');
     const revision=runtime.revision;fs.writeFileSync(candidate,JSON.stringify({enabled:true}));const failure=await invoke('configuration.sh',['apply','runtime','--input',candidate],{CONFIGURATION_FIXTURE_READBACK_FAIL:'1'});assert.notEqual(failure.code,0);

@@ -10,7 +10,7 @@ source "$CRISP_SETTINGS_DIR/wizard.sh"
 
 crisp_settings_get() {
   local env_file="${1}/.env"
-  jq -n --arg website "$(env_get "$env_file" CRISP_WEBSITE_ID)" \
+  jq -M -n --arg website "$(env_get "$env_file" CRISP_WEBSITE_ID)" \
     --arg tier "$(env_get "$env_file" CRISP_TOKEN_TIER)" --arg hook "$(env_get "$env_file" CRISP_HOOK_MODE)" \
     --arg url "$(env_get "$env_file" WEBHOOK_PRODUCTION_URL)" \
     '{website_id:$website,token_tier:$tier,hook_mode:$hook,webhook_url:$url,token_identifier:"已填写（隐藏）",token_key:"已填写（隐藏）",events:["message:send","message:received","message:updated"]}'
@@ -33,7 +33,7 @@ crisp_settings_test() {
       write_installation_marker "$deploy_dir" "$marker_source" "$version" local-ready
     fi
   fi
-  jq -n --argjson api "$api" --argjson webhook "$webhook" \
+  jq -M -n --argjson api "$api" --argjson webhook "$webhook" \
     --arg status "${CRISP_API_STATUS:-000}" --arg state "$(installation_state "$deploy_dir")" \
     '{crisp_api:$api,http_status:$status,public_webhook:$webhook,state:$state,events:["message:send","message:received","message:updated"],instructions:"在 Workspace Settings → Advanced configuration → Web Hooks 登记生产地址；使用私密终端的显示 Hook URL 功能获取含 Secret 的完整值。"}'
   [[ "$(installation_state "$deploy_dir")" == ready ]] || return 2
@@ -44,7 +44,7 @@ crisp_settings_apply() (
   local committed=0 completed=0 previous_caddy=0 old_access_mode
   [[ -f "$input" && ! -L "$input" && $(stat -c '%a' "$input") == 600 && $(stat -c '%s' "$input") -le 65536 ]] \
     || die 'Crisp 候选配置必须是权限 0600 的受限普通 JSON 文件'
-  jq -e 'type=="object" and all(keys[]; IN("website_id","token_tier","hook_mode","token_identifier","token_key","plugin_signing_secret","rotate_secret","webhook_input")) and all(to_entries[]; if .key=="rotate_secret" then (.value|type)=="boolean" else (.value|type)=="string" end)' "$input" >/dev/null || die 'Crisp 候选字段无效'
+  jq -M -e 'type=="object" and all(keys[]; IN("website_id","token_tier","hook_mode","token_identifier","token_key","plugin_signing_secret","rotate_secret","webhook_input")) and all(to_entries[]; if .key=="rotate_secret" then (.value|type)=="boolean" else (.value|type)=="string" end)' "$input" >/dev/null || die 'Crisp 候选字段无效'
   acquire_maintenance_lock "$deploy_dir"
   mkdir -p -- "$deploy_dir/backups/config-history"
   work=$(mktemp -d "$deploy_dir/tmp/crisp-settings.XXXXXX")
@@ -75,7 +75,7 @@ crisp_settings_apply() (
   }
   trap crisp_settings_cleanup EXIT
   for key in website_id token_tier hook_mode token_identifier token_key plugin_signing_secret; do
-    value=$(jq -r --arg key "$key" '.[$key] // ""' "$input")
+    value=$(jq -M -r --arg key "$key" '.[$key] // ""' "$input")
     [[ -n "$value" ]] || continue
     validate_env_value "$value" || die 'Crisp 配置不可包含控制字符'
     case "$key" in
@@ -96,10 +96,10 @@ crisp_settings_apply() (
   if [[ "$hook_mode" == plugin ]]; then
     value=$(env_get "$env_candidate" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
     validate_env_value "$value" || die 'Plugin Hook 必须配置有效 Signing Secret'
-  elif [[ "$(jq -r '.rotate_secret // false' "$input")" == true ]]; then
+  elif [[ "$(jq -M -r '.rotate_secret // false' "$input")" == true ]]; then
     env_set "$env_candidate" CRISP_WEBSITE_HOOK_SECRET "$(random_hex 32)"
   fi
-  value=$(jq -r '.webhook_input // ""' "$input")
+  value=$(jq -M -r '.webhook_input // ""' "$input")
   if [[ -n "$value" ]]; then
     wizard_parse_webhook_input "$value" || die '请输入域名或正确的 HTTPS 生产 Webhook 地址'
     if [[ "$WIZARD_WEBHOOK_MODE" == domain ]]; then

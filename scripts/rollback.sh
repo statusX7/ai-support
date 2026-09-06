@@ -335,6 +335,21 @@ if ! docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
   die "n8n 数据库恢复失败；AnythingLLM 数据已还原，安全快照可用于人工恢复"
 fi
 
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  # pg_dump 不包含角色密码；清理后新安装的数据库必须与快照恢复的 .env 对齐。
+  # psql 的 \password 在客户端生成密码散列，明文仅走受控 stdin，不进入 argv/SQL 日志。
+  restored_database_password=$(env_get "${DEPLOY_DIR}/.env" POSTGRES_PASSWORD)
+  validate_env_value "$restored_database_password" || die "快照数据库密码无效"
+  # shellcheck disable=SC2016
+  if ! printf '%s\n%s\n' "$restored_database_password" "$restored_database_password" \
+    | docker_compose "$DEPLOY_DIR" exec -T postgres sh -c \
+      'PGPASSWORD="$POSTGRES_PASSWORD" psql -X --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --set=ON_ERROR_STOP=1 --command="\password"' >/dev/null; then
+    unset restored_database_password
+    die "数据库角色凭据恢复失败；未宣称回滚完成，请保留安全快照继续修复"
+  fi
+  unset restored_database_password
+fi
+
 docker_compose "$DEPLOY_DIR" config --quiet
 # AnythingLLM 使用 bind mount。目录经 mv 交换后必须重建容器，确保 mount 绑定到恢复后的 inode。
 docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm

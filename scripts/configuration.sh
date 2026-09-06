@@ -22,7 +22,7 @@ configuration_runtime_init() {
   [[ ! -L "${deploy_dir}/config" && ! -L "$target" ]] || return 1
   if [[ ! -f "$target" ]]; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
-    jq -n '{schema_version:2,enabled:true,revision:1,applied_revision:0}' > "$temporary"
+    jq -M -n '{schema_version:2,enabled:true,revision:1,applied_revision:0}' > "$temporary"
     chmod 640 "$temporary"
     chown root:1000 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$target"
@@ -32,14 +32,14 @@ configuration_runtime_init() {
 configuration_validate() {
   local name=$1 input=$2
   [[ -f "$input" && ! -L "$input" && $(stat -c '%s' "$input") -le 1048576 ]] || return 1
-  jq -e 'type == "object"' "$input" >/dev/null 2>&1 || return 1
+  jq -M -e 'type == "object"' "$input" >/dev/null 2>&1 || return 1
   case "$name" in
     runtime)
-      jq -e '.enabled | type == "boolean"' "$input" >/dev/null ;;
+      jq -M -e '.enabled | type == "boolean"' "$input" >/dev/null ;;
     handoff)
-      jq -e '.handoff | type == "object" and (.resume_after_seconds | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and length <= 10000)' "$input" >/dev/null ;;
+      jq -M -e '.handoff | type == "object" and (.resume_after_seconds | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and length <= 10000)' "$input" >/dev/null ;;
     keyword)
-      jq -e '
+      jq -M -e '
         .schema_version == 2 and (.rules | type == "array" and length <= 200) and
         ([.rules[].id] | length == (unique | length)) and
         all(.rules[]; (.id | type == "string" and test("^[A-Za-z0-9_-]{1,80}$")) and
@@ -53,7 +53,7 @@ configuration_validate() {
           ([.text,.confirm_label,.cancel_label,.confirm_message,.prompt,.target] | all(. == null or (type == "string" and length <= 10000))))
       ' "$input" >/dev/null ;;
     menu)
-      jq -e '
+      jq -M -e '
         . as $root |
         def nodeok($id;$trail;$depth):
           if $depth > 10 or ($trail | index($id)) != null then false
@@ -74,8 +74,8 @@ configuration_validate() {
             (.action.type | . == "menu" or . == "reply" or . == "prompt" or . == "show_handoff_offer") and
             (if .action.type == "menu" then $root.menus[.action.target] != null else true end))) and nodeok(.root; []; 0)
       ' "$input" >/dev/null ;;
-    tags) jq -e '.tags | type == "object" and all(to_entries[]; if .key == "enabled" then (.value|type)=="boolean" else (.value|type)=="string" and (.value|length)<=100 end)' "$input" >/dev/null ;;
-    feedback) jq -e '
+    tags) jq -M -e '.tags | type == "object" and all(to_entries[]; if .key == "enabled" then (.value|type)=="boolean" else (.value|type)=="string" and (.value|length)<=100 end)' "$input" >/dev/null ;;
+    feedback) jq -M -e '
       def words: type == "array" and length <= 100 and all(type == "string" and length > 0 and length <= 200);
       .feedback | type == "object" and (.enabled | type == "boolean") and
       (.expires_after_seconds | type == "number" and floor == . and . >= 1 and . <= 604800) and
@@ -93,7 +93,7 @@ configuration_revision() {
   local deploy_dir=$1 applied=${2:-false} temporary target="${1}/config/runtime.yaml"
   configuration_runtime_init "$deploy_dir" || return 1
   temporary=$(mktemp "${target}.tmp.XXXXXX")
-  jq --argjson applied "$applied" '.schema_version = 2 | .revision = ((.revision // 0) + 1) |
+  jq -M --argjson applied "$applied" '.schema_version = 2 | .revision = ((.revision // 0) + 1) |
     if $applied then .applied_revision = .revision else . end' "$target" > "$temporary" || return 1
   chmod 640 "$temporary"
   chown root:1000 "$temporary" 2>/dev/null || true
@@ -103,7 +103,7 @@ configuration_revision() {
 configuration_mark_applied() {
   local deploy_dir=$1 temporary target="${1}/config/runtime.yaml"
   temporary=$(mktemp "${target}.tmp.XXXXXX")
-  jq '.applied_revision = .revision' "$target" > "$temporary" || return 1
+  jq -M '.applied_revision = .revision' "$target" > "$temporary" || return 1
   chmod 640 "$temporary"
   chown root:1000 "$temporary" 2>/dev/null || true
   mv -f -- "$temporary" "$target"
@@ -133,9 +133,9 @@ configuration_apply() (
   cp -p -- "${deploy_dir}/config/runtime.yaml" "$runtime_backup"
   [[ ! -f "$target" ]] || cp -p -- "$target" "${history}/previous"
   temporary=$(mktemp "${target}.tmp.XXXXXX")
-  jq '.' "$input" > "$temporary"
+  jq -M '.' "$input" > "$temporary"
   if [[ "$name" == runtime ]]; then
-    jq --slurpfile previous "$runtime_backup" '.schema_version=2 | .revision=(($previous[0].revision // 0)+1) | .applied_revision=($previous[0].applied_revision // 0)' "$input" > "$temporary"
+    jq -M --slurpfile previous "$runtime_backup" '.schema_version=2 | .revision=(($previous[0].revision // 0)+1) | .applied_revision=($previous[0].applied_revision // 0)' "$input" > "$temporary"
   fi
   chmod 640 "$temporary"
   chown root:1000 "$temporary" 2>/dev/null || true
@@ -144,7 +144,7 @@ configuration_apply() (
   if ! configuration_readback "$deploy_dir" "${name}.yaml"; then
     [[ ! -f "${history}/previous" ]] || cp -p -- "${history}/previous" "$target"
     temporary=$(mktemp "${deploy_dir}/config/runtime.yaml.tmp.XXXXXX")
-    jq --slurpfile current "${deploy_dir}/config/runtime.yaml" '.revision=(($current[0].revision // 0)+1) | .applied_revision=.revision' "$runtime_backup" > "$temporary"
+    jq -M --slurpfile current "${deploy_dir}/config/runtime.yaml" '.revision=(($current[0].revision // 0)+1) | .applied_revision=.revision' "$runtime_backup" > "$temporary"
     chmod 640 "$temporary"; chown root:1000 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "${deploy_dir}/config/runtime.yaml"
     configuration_error '运行时配置回读失败；原有效设置已恢复，请先检查服务'
@@ -152,7 +152,7 @@ configuration_apply() (
   fi
   configuration_mark_applied "$deploy_dir"
   configuration_readback "$deploy_dir" runtime.yaml || { configuration_error '配置已提交，但运行时 revision 暂未确认，请重新自检'; return 1; }
-  jq '{schema_version,enabled,revision,applied_revision}' "${deploy_dir}/config/runtime.yaml"
+  jq -M '{schema_version,enabled,revision,applied_revision}' "${deploy_dir}/config/runtime.yaml"
 )
 
 configuration_prompt_verify() {
@@ -161,7 +161,7 @@ configuration_prompt_verify() {
   response=$(mktemp "${deploy_dir}/tmp/prompt-readback.XXXXXX")
   chmod 600 "$response"
   status=$(anythingllm_secure_request "$deploy_dir" GET "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}" "$ANYTHING_KEY" '' "$response")
-  if [[ "$status" != 2?? ]] || ! jq -e --rawfile expected "${deploy_dir}/config/prompt.md" '
+  if [[ "$status" != 2?? ]] || ! jq -M -e --rawfile expected "${deploy_dir}/config/prompt.md" '
     (.workspace | if type == "array" then .[0] else . end).openAiPrompt == $expected
   ' "$response" >/dev/null; then
     rm -f -- "$response"
@@ -175,7 +175,7 @@ configuration_prompt_apply() (
   [[ -f "$input" && ! -L "$input" ]] || { configuration_error 'Prompt 来源必须是普通文件'; return 1; }
   size=$(stat -c '%s' "$input")
   (( size > 0 && size <= 262144 )) || { configuration_error 'Prompt 必须为 1～262144 字节'; return 1; }
-  jq -Rse 'length > 0 and test("[^\\s]") and ((explode | index(0)) == null)' "$input" >/dev/null || return 1
+  jq -M -Rse 'length > 0 and test("[^\\s]") and ((explode | index(0)) == null)' "$input" >/dev/null || return 1
   acquire_maintenance_lock "$deploy_dir"
   configuration_runtime_init "$deploy_dir"
   history=$(mktemp -d "${deploy_dir}/backups/config-history/prompt.XXXXXXXX")
@@ -194,7 +194,7 @@ configuration_prompt_apply() (
   fi
   install -m 600 -- "${history}/previous.md" "${deploy_dir}/backups/config-history/prompt.previous.md"
   configuration_revision "$deploy_dir" true
-  jq -n --arg hash "$(sha256sum "$target" | awk '{print $1}')" '{applied:true,sha256:$hash}'
+  jq -M -n --arg hash "$(sha256sum "$target" | awk '{print $1}')" '{applied:true,sha256:$hash}'
 )
 
 configuration_query() {
@@ -203,14 +203,14 @@ configuration_query() {
   anythingllm_connection "$deploy_dir"
   response=$(mktemp "${deploy_dir}/tmp/configuration-query.XXXXXX")
   chmod 600 "$response"
-  payload=$(jq -cn --arg message "$question" '{message:$message,mode:"chat",sessionId:"ai-support-admin-test",reset:true}')
+  payload=$(jq -M -cn --arg message "$question" '{message:$message,mode:"chat",sessionId:"ai-support-admin-test",reset:true}')
   status=$(anythingllm_secure_request "$deploy_dir" POST "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/chat" "$ANYTHING_KEY" "$payload" "$response" 120)
-  if [[ "$status" != 2?? ]] || ! jq -e '(.error == null or .error == false) and (.textResponse | type == "string" and length > 0)' "$response" >/dev/null; then
+  if [[ "$status" != 2?? ]] || ! jq -M -e '(.error == null or .error == false) and (.textResponse | type == "string" and length > 0)' "$response" >/dev/null; then
     rm -f -- "$response"
     configuration_error '测试问答失败，请检查 Provider 和知识索引'
     return 1
   fi
-  jq '{answer:.textResponse,sources:(.sources // []),verified:true}' "$response"
+  jq -M '{answer:.textResponse,sources:(.sources // []),verified:true}' "$response"
   rm -f -- "$response"
 }
 
@@ -218,7 +218,7 @@ configuration_migrate() {
   local deploy_dir=$1 target temporary
   configuration_runtime_init "$deploy_dir"
   target="${deploy_dir}/config/provider.yaml"
-  if [[ -f "$target" ]] && ! jq -e '.provider | type == "object"' "$target" >/dev/null 2>&1; then
+  if [[ -f "$target" ]] && ! jq -M -e '.provider | type == "object"' "$target" >/dev/null 2>&1; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
     chmod 600 "$temporary"
     python3 -c 'import json,sys,yaml
@@ -234,9 +234,9 @@ json.dump(value,sys.stdout,ensure_ascii=False,indent=2)
     mv -f -- "$temporary" "$target"
   fi
   target="${deploy_dir}/config/keyword.yaml"
-  if [[ -f "$target" ]] && ! jq -e '.schema_version == 2 and (.rules | type == "array")' "$target" >/dev/null 2>&1; then
+  if [[ -f "$target" ]] && ! jq -M -e '.schema_version == 2 and (.rules | type == "array")' "$target" >/dev/null 2>&1; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
-    jq --slurpfile handoff "${deploy_dir}/config/handoff.yaml" '
+    jq -M --slurpfile handoff "${deploy_dir}/config/handoff.yaml" '
       {schema_version:2,rules:([(.keywords // [])[] | {
         id:.id,name:(.name // .id),enabled:(if has("enabled") then .enabled else true end),
         match_mode:(.match_mode // "contains"),keywords:(.keywords // .match // []),
@@ -258,7 +258,7 @@ json.dump(value,sys.stdout,ensure_ascii=False,indent=2)
   target="${deploy_dir}/config/menu.yaml"
   if [[ -f "$target" ]]; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
-    jq 'walk(if type == "object" and .type? == "handoff" then .type="show_handoff_offer" else . end) |
+    jq -M 'walk(if type == "object" and .type? == "handoff" then .type="show_handoff_offer" else . end) |
       .welcome.trigger = (.welcome.trigger // "first_message") | .welcome.auto_open = (.welcome.auto_open // false) |
       . as $root | .menus |= with_entries(. as $menu | .value.options |= with_entries(
         if .value.action.type == "menu" and .value.action.target == $root.root and $menu.key != $root.root then .value.action.back = true else . end))' "$target" > "$temporary" || return 1
@@ -281,9 +281,9 @@ configuration_main() {
   deploy_dir=$(resolve_deploy_dir "$deploy_request")
   assert_managed_installation "$deploy_dir"
   case "$action" in
-    get|read) name=${1:?}; input=$(configuration_path "$deploy_dir" "$name"); jq '.' "$input" ;;
+    get|read) name=${1:?}; input=$(configuration_path "$deploy_dir" "$name"); jq -M '.' "$input" ;;
     apply) name=${1:?}; shift; [[ ${1:-} != --input ]] || shift; configuration_apply "$deploy_dir" "$name" "${1:?}" ;;
-    status) configuration_runtime_init "$deploy_dir"; jq '.' "${deploy_dir}/config/runtime.yaml" ;;
+    status) configuration_runtime_init "$deploy_dir"; jq -M '.' "${deploy_dir}/config/runtime.yaml" ;;
     mark-applied)
       for name in runtime handoff keyword menu tags feedback; do
         configuration_validate "$name" "${deploy_dir}/config/${name}.yaml" && configuration_readback "$deploy_dir" "${name}.yaml" || return 1
@@ -316,4 +316,5 @@ configuration_main() {
   esac
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then configuration_main "$@"; fi
+# knowledge.sh 会反向 source 本模块；只有最外层脚本入口可派发命令。
+if [[ ${BASH_SOURCE[0]} == "$0" && ${#BASH_SOURCE[@]} -eq 1 ]]; then configuration_main "$@"; fi

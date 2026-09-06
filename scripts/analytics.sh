@@ -53,7 +53,7 @@ for suffix in 5 4 3 2 1 ""; do
 done
 (( ${#EVENT_FILES[@]} > 0 )) || EVENT_FILES+=(/dev/null)
 
-SUMMARY=$(jq -nR '
+SUMMARY=$(jq -M -nR '
   reduce inputs as $line (
     {
       total_questions: 0, ai_replies: 0, knowledge_hits: 0, knowledge_misses: 0, knowledge_unknown: 0,
@@ -93,7 +93,7 @@ SUMMARY=$(jq -nR '
   del(.failure_counts,.feedback_answers)
 ' "${EVENT_FILES[@]}") || die "统计事件读取失败"
 
-INVALID_LINES=$(jq -r '.invalid_lines' <<< "$SUMMARY")
+INVALID_LINES=$(jq -M -r '.invalid_lines' <<< "$SUMMARY")
 if (( INVALID_LINES > 0 )); then
   warn "已跳过 ${INVALID_LINES} 行损坏的统计事件"
 fi
@@ -104,7 +104,7 @@ if (( JSON_OUTPUT )); then
 fi
 
 print_knowledge() {
-  jq -r '
+  jq -M -r '
     "总问题： \(.total_questions)",
     "AI回复： \(.ai_replies)",
     "命中： \(.knowledge_hits)",
@@ -118,7 +118,7 @@ print_knowledge() {
 }
 
 print_feedback() {
-  jq -r '
+  jq -M -r '
     "好评： \(.positive_feedback)",
     "差评： \(.negative_feedback)",
     "有效好评率： \(if .positive_rate == null then "暂无数据" else (.positive_rate|tostring)+"%" end)",

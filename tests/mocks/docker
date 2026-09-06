@@ -143,6 +143,12 @@ case "$COMMAND" in
       printf 'PGDMP-test-only-logical-backup\n'
     elif [[ "$*" == *'pg_restore'* ]]; then
       [[ "${MOCK_DOCKER_FAIL_PG_RESTORE:-0}" != 1 ]] || exit 1
+    elif [[ "$*" == *'psql'* && "$*" == *'\password'* ]]; then
+      IFS= read -r restore_password_first
+      IFS= read -r restore_password_second
+      [[ -n "$restore_password_first" && "$restore_password_first" == "$restore_password_second" \
+        && "${MOCK_DOCKER_FAIL_PG_PASSWORD:-0}" != 1 ]] || exit 1
+      unset restore_password_first restore_password_second
     elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
       CONFIG_NAME=${!#}
       [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1

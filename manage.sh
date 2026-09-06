@@ -127,12 +127,12 @@ menu_multiline() {
 
 menu_pick_json() {
   local data=$1 id_field=$2 title_field=$3 answer count
-  count=$(jq 'length' "$data")
+  count=$(jq -M 'length' "$data")
   (( count > 0 )) || { printf '暂无可选项目。\n'; return 1; }
-  jq -r --arg title "$title_field" 'to_entries[] | "\(.key+1). \(.value[$title] // .value.id // .value.key)"' "$data"
+  jq -M -r --arg title "$title_field" 'to_entries[] | "\(.key+1). \(.value[$title] // .value.id // .value.key)"' "$data"
   menu_read answer '请选择序号（0 返回）：' || return 1
   [[ "$answer" =~ ^[1-9][0-9]{0,5}$ ]] && (( 10#$answer <= count )) || return 1
-  MENU_SELECTED_ID=$(jq -r --arg field "$id_field" --argjson index "$((10#$answer-1))" '.[$index][$field]' "$data")
+  MENU_SELECTED_ID=$(jq -M -r --arg field "$id_field" --argjson index "$((10#$answer-1))" '.[$index][$field]' "$data")
 }
 
 quick_initialization() {
@@ -159,7 +159,7 @@ show_installation_facts() {
     printf '%s：%s\n' "$label" "${value:-未检测}"
   done
   if [[ -f "$DEPLOY_DIR/config/runtime.yaml" ]]; then
-    jq -Mr '"客服总开关：\(if .enabled then "启用" else "停用" end)；配置版本：\(.revision // 0) / 已应用：\(.applied_revision // 0)"' "$DEPLOY_DIR/config/runtime.yaml"
+    jq -M -Mr '"客服总开关：\(if .enabled then "启用" else "停用" end)；配置版本：\(.revision // 0) / 已应用：\(.applied_revision // 0)"' "$DEPLOY_DIR/config/runtime.yaml"
   fi
 }
 
@@ -192,7 +192,7 @@ status_menu() {
 provider_candidate() {
   manager_temporary || return 1
   manager_tool provider get > "$MANAGE_FILE" || return 1
-  jq 'if has("provider") then {provider:.provider} else {provider:del(.key_status,.custom_header_names)} end' "$MANAGE_FILE" > "$MANAGE_FILE.new"
+  jq -M 'if has("provider") then {provider:.provider} else {provider:del(.key_status,.custom_header_names)} end' "$MANAGE_FILE" > "$MANAGE_FILE.new"
   mv -f -- "$MANAGE_FILE.new" "$MANAGE_FILE"
 }
 
@@ -205,24 +205,24 @@ provider_model_select() {
     warn '列表不可用；可手填模型并验证实际推理，空输入取消本次修改'
     menu_read choice '手动模型原名：' || return
     [[ -n "$choice" ]] || return
-    jq --arg model "$choice" '.provider.model=$model' "$candidate" > "$candidate.new"
+    jq -M --arg model "$choice" '.provider.model=$model' "$candidate" > "$candidate.new"
     mv -f -- "$candidate.new" "$candidate"
     if menu_confirm '使用手填模型验证并应用？'; then manager_action manager_tool provider apply "$candidate"; fi
     return
   fi
-  jq '[if type=="array" then .[] else (.models // .data // [])[] end | if type=="string" then . else .id end | select(type=="string")] | unique' "$models_file" > "$models_file.ids"
+  jq -M '[if type=="array" then .[] else (.models // .data // [])[] end | if type=="string" then . else .id end | select(type=="string")] | unique' "$models_file" > "$models_file.ids"
   while true; do
-    jq --arg query "$query" '[.[] | select(contains($query))]' "$models_file.ids" > "$models_file.filtered"
-    total=$(jq 'length' "$models_file.filtered")
+    jq -M --arg query "$query" '[.[] | select(contains($query))]' "$models_file.ids" > "$models_file.filtered"
+    total=$(jq -M 'length' "$models_file.filtered")
     (( total > 0 )) || { warn '列表为空，请使用手动模型入口'; return; }
     start=$((page*15)); (( start < total )) || { page=0; start=0; }
-    jq -r --argjson start "$start" 'to_entries[$start:$start+15][] | "\(.key+1). \(.value)"' "$models_file.filtered"
+    jq -M -r --argjson start "$start" 'to_entries[$start:$start+15][] | "\(.key+1). \(.value)"' "$models_file.filtered"
     menu_read choice '选择模型（数字，n 下一页，p 上一页，/词 搜索，0 返回）：' || return
     case "$choice" in
       0) return ;; n) ((page+=1)) ;; p) if ((page>0)); then page=$((page-1)); fi ;; /*) query=${choice:1}; page=0 ;;
       *)
         if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( 10#$choice <= total )); then
-          jq --slurpfile models "$models_file.filtered" --argjson index "$((10#$choice-1))" '.provider.model=$models[0][$index]' "$candidate" > "$candidate.new"
+          jq -M --slurpfile models "$models_file.filtered" --argjson index "$((10#$choice-1))" '.provider.model=$models[0][$index]' "$candidate" > "$candidate.new"
           mv -f -- "$candidate.new" "$candidate"
           manager_action manager_tool provider apply "$candidate"; return
         fi
@@ -244,35 +244,35 @@ ai_config_menu() {
           2|5)
             if [[ "$choice" == 2 ]]; then field=base_url; else field=model; fi
             menu_read value "新的 $field（回车保留）：" || return; [[ -n "$value" ]] || continue
-            jq --arg field "$field" --arg value "$value" '.provider[$field]=$value' "$candidate" > "$candidate.new" ;;
+            jq -M --arg field "$field" --arg value "$value" '.provider[$field]=$value' "$candidate" > "$candidate.new" ;;
           3)
             menu_read value '新 API Key（隐藏输入，回车保留）：' 1 || return; [[ -n "$value" ]] || continue
             manager_temporary || return; secret_file=$MANAGE_FILE
             printf '%s' "$value" > "$secret_file"; unset value
-            jq --rawfile secret "$secret_file" '.api_key=$secret' "$candidate" > "$candidate.new"; rm -f -- "$secret_file" ;;
+            jq -M --rawfile secret "$secret_file" '.api_key=$secret' "$candidate" > "$candidate.new"; rm -f -- "$secret_file" ;;
           4) provider_model_select "$candidate"; continue ;;
           6)
             menu_read value '1 Chat Completions（聊天接口）/ 2 Responses（响应接口）/ 0 返回：' || return
             case "$value" in 1) value=chat_completions ;; 2) value=responses ;; *) continue ;; esac
-            jq --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new" ;;
+            jq -M --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new" ;;
           9)
             menu_read header_name '请求头名称（回车返回；不能覆盖 Host 等协议头）：' || return; [[ -n "$header_name" ]] || continue
             menu_read value '请求头值（隐藏输入；::DELETE:: 删除该项）：' 1 || return; [[ -n "$value" ]] || continue
             manager_temporary || return; secret_file=$MANAGE_FILE
             printf '%s' "$value" > "$secret_file"; unset value
-            jq --arg name "$header_name" --rawfile value "$secret_file" 'if $value=="::DELETE::" then .provider.remove_header=$name else .provider.custom_headers[$name]=$value end' "$candidate" > "$candidate.new"
+            jq -M --arg name "$header_name" --rawfile value "$secret_file" 'if $value=="::DELETE::" then .provider.remove_header=$name else .provider.custom_headers[$name]=$value end' "$candidate" > "$candidate.new"
             rm -f -- "$secret_file" ;;
           10)
             menu_read value '新 API Base URL（回车保留）：' || return
-            if [[ -n "$value" ]]; then jq --arg value "$value" '.provider.base_url=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; fi
+            if [[ -n "$value" ]]; then jq -M --arg value "$value" '.provider.base_url=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; fi
             menu_read value '新 API Key（隐藏输入，回车保留）：' 1 || return
             if [[ -n "$value" ]]; then
               manager_temporary || return; secret_file=$MANAGE_FILE; printf '%s' "$value" > "$secret_file"; unset value
-              jq --rawfile value "$secret_file" '.api_key=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; rm -f -- "$secret_file"
+              jq -M --rawfile value "$secret_file" '.api_key=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; rm -f -- "$secret_file"
             fi
             menu_read value '请求协议：1 Chat Completions / 2 Responses（回车保留）：' || return
-            case "$value" in 1) value=chat_completions ;; 2) value=responses ;; '') value=$(jq -r '.provider.api_mode' "$candidate") ;; *) continue ;; esac
-            jq --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
+            case "$value" in 1) value=chat_completions ;; 2) value=responses ;; '') value=$(jq -M -r '.provider.api_mode' "$candidate") ;; *) continue ;; esac
+            jq -M --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
             printf '将使用候选地址与 Key 读取模型列表，选定后才验证并应用完整配置。\n'
             provider_model_select "$candidate"; continue ;;
         esac
@@ -319,7 +319,7 @@ knowledge_select() {
   local listing
   manager_temporary || return 1; listing=$MANAGE_FILE
   manager_tool knowledge list > "$listing" || return 1
-  jq 'if type=="array" then . else .libraries end' "$listing" > "$listing.array"
+  jq -M 'if type=="array" then . else .libraries end' "$listing" > "$listing.array"
   menu_pick_json "$listing.array" id name || return 1
   KNOWLEDGE_SELECTED=$MENU_SELECTED_ID
 }
@@ -346,7 +346,7 @@ knowledge_menu() {
           6)
             manager_temporary || return; listing=$MANAGE_FILE
             if manager_tool knowledge entries "$selected" > "$listing"; then
-              jq 'if type=="array" then . else (.documents // .entries // []) end' "$listing" > "$listing.array"
+              jq -M 'if type=="array" then . else (.documents // .entries // []) end' "$listing" > "$listing.array"
               if menu_pick_json "$listing.array" id name; then
                 document=$MENU_SELECTED_ID
                 if menu_confirm '删除此知识条目及其索引？'; then manager_action manager_tool knowledge remove "$selected" "$document"; fi
@@ -370,49 +370,49 @@ knowledge_menu() {
 
 rule_edit() {
   local candidate=$1 rule_id=$2 name words exclusions match rule_action value text title cancel confirm seconds ttl priority field existing temp lines
-  existing=$(jq -c --arg id "$rule_id" '.rules[]? | select(.id==$id)' "$candidate")
+  existing=$(jq -M -c --arg id "$rule_id" '.rules[]? | select(.id==$id)' "$candidate")
   [[ -n "$existing" ]] || existing='{"enabled":true,"match_mode":"contains","action":"show_handoff_offer","cooldown_seconds":60,"offer_ttl_seconds":600,"priority":100,"confirm_label":"召唤人工客服","cancel_label":"继续 AI 客服","confirm_message":"已暂停本次对话的 AI 回复，您的人工协助请求已收到。"}'
-  menu_read name "规则名称 [$(jq -r '.name // "人工确认"' <<< "$existing")]：" || return
-  name=${name:-$(jq -r '.name // "人工确认"' <<< "$existing")}
+  menu_read name "规则名称 [$(jq -M -r '.name // "人工确认"' <<< "$existing")]：" || return
+  name=${name:-$(jq -M -r '.name // "人工确认"' <<< "$existing")}
   menu_read words '关键词（逗号分隔；::PASTE:: 逐行粘贴；回车保留）：' || return
   manager_temporary || return; lines=$MANAGE_FILE
   if [[ "$words" == ::PASTE:: ]]; then
-    menu_multiline "$lines" 32768 || return; words=$(jq -Rs 'split("\n") | map(select(length>0))' "$lines")
-  elif [[ -n "$words" ]]; then words=$(printf '%s' "$words" | jq -Rs 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')
-  else words=$(jq -c '.keywords // ["人工","转人工","人工客服"]' <<< "$existing"); fi
+    menu_multiline "$lines" 32768 || return; words=$(jq -M -Rs 'split("\n") | map(select(length>0))' "$lines")
+  elif [[ -n "$words" ]]; then words=$(printf '%s' "$words" | jq -M -Rs 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')
+  else words=$(jq -M -c '.keywords // ["人工","转人工","人工客服"]' <<< "$existing"); fi
   menu_read exclusions '排除词（逗号分隔；回车保留，::CLEAR:: 清空）：' || return
   case "$exclusions" in
-    '') exclusions=$(jq -c '.exclude_keywords // ["不要人工","不需要人工","不用人工","不转人工"]' <<< "$existing") ;;
-    ::CLEAR::) exclusions='[]' ;; *) exclusions=$(printf '%s' "$exclusions" | jq -Rs 'split(",") | map(select(length>0))') ;;
+    '') exclusions=$(jq -M -c '.exclude_keywords // ["不要人工","不需要人工","不用人工","不转人工"]' <<< "$existing") ;;
+    ::CLEAR::) exclusions='[]' ;; *) exclusions=$(printf '%s' "$exclusions" | jq -M -Rs 'split(",") | map(select(length>0))') ;;
   esac
   menu_read match '匹配：1 包含 / 2 完全匹配（回车保留）：' || return
-  case "$match" in 1) match=contains ;; 2) match=exact ;; '') match=$(jq -r '.match_mode // "contains"' <<< "$existing") ;; *) return ;; esac
+  case "$match" in 1) match=contains ;; 2) match=exact ;; '') match=$(jq -M -r '.match_mode // "contains"' <<< "$existing") ;; *) return ;; esac
   menu_read rule_action '动作：1 人工确认按钮 / 2 固定回复 / 3 多级菜单 / 4 知识问答（回车保留）：' || return
-  case "$rule_action" in 1) rule_action=show_handoff_offer ;; 2) rule_action=reply ;; 3) rule_action=menu ;; 4) rule_action=prompt ;; '') rule_action=$(jq -r '.action // "show_handoff_offer"' <<< "$existing") ;; *) return ;; esac
-  menu_read priority '优先级整数（越大越优先，回车保留）：' || return; priority=${priority:-$(jq -r '.priority // 100' <<< "$existing")}
-  menu_read seconds '重复展示冷却秒数（回车保留）：' || return; seconds=${seconds:-$(jq -r '.cooldown_seconds // 60' <<< "$existing")}
-  menu_read ttl '按钮有效期秒数（回车保留）：' || return; ttl=${ttl:-$(jq -r '.offer_ttl_seconds // 600' <<< "$existing")}
+  case "$rule_action" in 1) rule_action=show_handoff_offer ;; 2) rule_action=reply ;; 3) rule_action=menu ;; 4) rule_action=prompt ;; '') rule_action=$(jq -M -r '.action // "show_handoff_offer"' <<< "$existing") ;; *) return ;; esac
+  menu_read priority '优先级整数（越大越优先，回车保留）：' || return; priority=${priority:-$(jq -M -r '.priority // 100' <<< "$existing")}
+  menu_read seconds '重复展示冷却秒数（回车保留）：' || return; seconds=${seconds:-$(jq -M -r '.cooldown_seconds // 60' <<< "$existing")}
+  menu_read ttl '按钮有效期秒数（回车保留）：' || return; ttl=${ttl:-$(jq -M -r '.offer_ttl_seconds // 600' <<< "$existing")}
   for value in "$priority" "$seconds" "$ttl"; do [[ "$value" =~ ^[0-9]{1,8}$ ]] || { warn '秒数和优先级必须是整数'; return; }; done
-  menu_read text '提示或固定回复文案（回车保留）：' || return; text=${text:-$(jq -r '.text // "需要人工协助吗？请点击下方按钮确认。"' <<< "$existing")}
-  title=$(jq -r '.confirm_label // "召唤人工客服"' <<< "$existing")
-  cancel=$(jq -r '.cancel_label // "继续 AI 客服"' <<< "$existing")
-  confirm=$(jq -r '.confirm_message // "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"' <<< "$existing")
+  menu_read text '提示或固定回复文案（回车保留）：' || return; text=${text:-$(jq -M -r '.text // "需要人工协助吗？请点击下方按钮确认。"' <<< "$existing")}
+  title=$(jq -M -r '.confirm_label // "召唤人工客服"' <<< "$existing")
+  cancel=$(jq -M -r '.cancel_label // "继续 AI 客服"' <<< "$existing")
+  confirm=$(jq -M -r '.confirm_message // "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"' <<< "$existing")
   if [[ "$rule_action" == show_handoff_offer ]]; then
     menu_read value "确认按钮 [$title]：" || return; title=${value:-$title}
     menu_read value "取消按钮 [$cancel]：" || return; cancel=${value:-$cancel}
     menu_read value '点击后的确认文案（回车保留）：' || return; confirm=${value:-$confirm}
   fi
   temp="$candidate.rule"
-  jq -n --arg id "$rule_id" --arg name "$name" --arg match "$match" --arg action "$rule_action" --argjson words "$words" --argjson exclusions "$exclusions" --argjson original "$existing" \
+  jq -M -n --arg id "$rule_id" --arg name "$name" --arg match "$match" --arg action "$rule_action" --argjson words "$words" --argjson exclusions "$exclusions" --argjson original "$existing" \
     --argjson priority "$((10#$priority))" --argjson seconds "$((10#$seconds))" --argjson ttl "$((10#$ttl))" --arg text "$text" --arg title "$title" --arg cancel "$cancel" --arg confirm "$confirm" \
     '$original + {id:$id,name:$name,keywords:$words,exclude_keywords:$exclusions,match_mode:$match,action:$action,priority:$priority,cooldown_seconds:$seconds,offer_ttl_seconds:$ttl,text:$text,confirm_label:$title,cancel_label:$cancel,confirm_message:$confirm}' > "$temp"
   case "$rule_action" in
     menu|prompt)
       if [[ "$rule_action" == menu ]]; then field=target; else field=prompt; fi
       menu_read value "${field}（目标菜单 ID / 知识问答引导，回车保留）：" || return
-      if [[ -n "$value" ]]; then jq --arg field "$field" --arg value "$value" '.[$field]=$value' "$temp" > "$temp.new"; mv -f -- "$temp.new" "$temp"; fi ;;
+      if [[ -n "$value" ]]; then jq -M --arg field "$field" --arg value "$value" '.[$field]=$value' "$temp" > "$temp.new"; mv -f -- "$temp.new" "$temp"; fi ;;
   esac
-  jq --slurpfile rule "$temp" --arg id "$rule_id" '.schema_version=2 | .rules=((.rules // [] | map(select(.id!=$id))) + $rule) | del(.keywords)' "$candidate" > "$candidate.new"
+  jq -M --slurpfile rule "$temp" --arg id "$rule_id" '.schema_version=2 | .rules=((.rules // [] | map(select(.id!=$id))) + $rule) | del(.keywords)' "$candidate" > "$candidate.new"
   mv -f -- "$candidate.new" "$candidate"
   if menu_confirm '应用规则？关键词本身不会暂停 AI。'; then manager_apply keyword "$candidate"; fi
 }
@@ -428,17 +428,17 @@ rules_menu() {
         manager_candidate keyword || continue; candidate=$MANAGE_FILE
         if [[ "$choice" == 2 ]]; then rule_id="rule_$(random_hex 8)"
         else
-          jq '.rules // []' "$candidate" > "$candidate.rules"
+          jq -M '.rules // []' "$candidate" > "$candidate.rules"
           menu_pick_json "$candidate.rules" id name || continue; rule_id=$MENU_SELECTED_ID
         fi
         case "$choice" in
           2|3) rule_edit "$candidate" "$rule_id" ;;
           4|5)
             if [[ "$choice" == 4 ]]; then value=true; else value=false; fi
-            jq --arg id "$rule_id" --argjson enabled "$value" '(.rules[] | select(.id==$id)).enabled=$enabled' "$candidate" > "$candidate.new"
+            jq -M --arg id "$rule_id" --argjson enabled "$value" '(.rules[] | select(.id==$id)).enabled=$enabled' "$candidate" > "$candidate.new"
             mv -f -- "$candidate.new" "$candidate"; manager_apply keyword "$candidate" ;;
           6) if menu_confirm '删除所选规则？'; then
-              jq --arg id "$rule_id" '.rules |= map(select(.id!=$id))' "$candidate" > "$candidate.new"
+              jq -M --arg id "$rule_id" '.rules |= map(select(.id!=$id))' "$candidate" > "$candidate.new"
               mv -f -- "$candidate.new" "$candidate"; manager_apply keyword "$candidate"
             fi ;;
         esac ;;
@@ -446,7 +446,7 @@ rules_menu() {
         menu_read query '虚构客户消息（只预演，不向 Crisp 发送）：' || return
         if ! matched_rule=$(runtime_cli preview-rule "$query"); then warn '无法读取运行中规则，请先诊断服务'; continue; fi
         if [[ "$matched_rule" == null ]]; then printf '未命中关键词，将按总开关和会话模式进行普通问答。\n'
-        else jq -r '"命中：\(.name // .id)\n动作：\(.action)\n文案：\(.text // .prompt // "")\n按钮：\(.confirm_label // "无")"' <<< "$matched_rule"; printf '只有合法人工确认按钮点击才会暂停当前会话。\n'; fi ;;
+        else jq -M -r '"命中：\(.name // .id)\n动作：\(.action)\n文案：\(.text // .prompt // "")\n按钮：\(.confirm_label // "无")"' <<< "$matched_rule"; printf '只有合法人工确认按钮点击才会暂停当前会话。\n'; fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -465,13 +465,13 @@ handoff_menu() {
         menu_read seconds '新恢复秒数（0 永久人工，正整数自动恢复；回车返回）：' || return
         [[ -n "$seconds" ]] || continue; [[ "$seconds" =~ ^[0-9]{1,8}$ ]] || { warn '请输入非负整数'; continue; }
         manager_candidate handoff || continue; candidate=$MANAGE_FILE
-        jq --argjson seconds "$((10#$seconds))" '.handoff.resume_after_seconds=$seconds' "$candidate" > "$candidate.new"
+        jq -M --argjson seconds "$((10#$seconds))" '.handoff.resume_after_seconds=$seconds' "$candidate" > "$candidate.new"
         mv -f -- "$candidate.new" "$candidate"; printf '只影响后续新接管或真人回复，现有截止时间保留。\n'; manager_apply handoff "$candidate" ;;
       3) manager_action runtime_cli list ;;
       4|5)
         manager_temporary || return; listing=$MANAGE_FILE
         if ! runtime_cli list > "$listing"; then warn '无法读取会话状态'; continue; fi
-        jq 'if type=="array" then . else .sessions // .conversations // [] end | map(. + {name:(.session_id+"；原因="+(.pause_reason // "未知")+"；截止="+((.resume_at // "永久")|tostring))})' "$listing" > "$listing.array"
+        jq -M 'if type=="array" then . else .sessions // .conversations // [] end | map(. + {name:(.session_id+"；原因="+(.pause_reason // "未知")+"；截止="+((.resume_at // "永久")|tostring))})' "$listing" > "$listing.array"
         menu_pick_json "$listing.array" key name || continue; key=$MENU_SELECTED_ID
         if [[ "$choice" == 4 ]]; then
           if menu_confirm '恢复所选会话 AI？'; then manager_action runtime_cli resume "$key"; fi
@@ -488,7 +488,7 @@ handoff_menu() {
 set_global_switch() {
   local candidate
   manager_candidate runtime || return 1; candidate=$MANAGE_FILE
-  jq --argjson enabled "$1" '.enabled=$enabled' "$candidate" > "$candidate.new"
+  jq -M --argjson enabled "$1" '.enabled=$enabled' "$candidate" > "$candidate.new"
   mv -f -- "$candidate.new" "$candidate"
   manager_tool configuration apply runtime --input "$candidate"
 }
@@ -504,7 +504,7 @@ global_switch_menu() {
 
 menus_select_node() {
   local candidate=$1
-  jq '[.menus | to_entries[] | {id:.key,name:(.key+" — "+.value.title)}]' "$candidate" > "$candidate.nodes"
+  jq -M '[.menus | to_entries[] | {id:.key,name:(.key+" — "+.value.title)}]' "$candidate" > "$candidate.nodes"
   menu_pick_json "$candidate.nodes" id name
 }
 
@@ -516,11 +516,11 @@ menus_edit_option() {
   case "$action" in
     1) action=menu; menu_read value '目标菜单 ID：' || return ;; 2) action=reply; menu_read value '固定回复文案：' || return ;;
     3) action=prompt; menu_read value '知识问答引导：' || return ;; 4) action=show_handoff_offer; value='' ;;
-    5) action=menu; is_back=true; value=$(jq -r --arg node "$node_id" '.menus[$node].parent // .root' "$candidate") ;; *) return ;;
+    5) action=menu; is_back=true; value=$(jq -M -r --arg node "$node_id" '.menus[$node].parent // .root' "$candidate") ;; *) return ;;
   esac
   menu_read position '显示顺序（回车使用选项数字）：' || return; position=${position:-$number}
   [[ "$position" =~ ^[0-9]{1,4}$ ]] || { warn '排序必须为整数'; return; }
-  jq --arg node "$node_id" --arg number "$number" --arg title "$title" --arg action "$action" --arg value "$value" --argjson order "$((10#$position))" --argjson back "$is_back" \
+  jq -M --arg node "$node_id" --arg number "$number" --arg title "$title" --arg action "$action" --arg value "$value" --argjson order "$((10#$position))" --argjson back "$is_back" \
     '.menus[$node].options[$number]={label:$title,order:$order,action:({type:$action}+if $action=="menu" then {target:$value,back:$back} elif $action=="reply" then {text:$value} elif $action=="prompt" then {prompt:$value} else {} end)}' "$candidate" > "$candidate.new"
   mv -f -- "$candidate.new" "$candidate"; manager_apply menu "$candidate"
 }
@@ -536,7 +536,7 @@ multilevel_menu() {
         menu_read title '新节点标题：' || return; [[ -n "$title" ]] || continue
         manager_candidate menu || continue; candidate=$MANAGE_FILE
         printf '请选择父级菜单：\n'; menus_select_node "$candidate" || continue; parent=$MENU_SELECTED_ID; node="menu_$(random_hex 6)"
-        jq --arg node "$node" --arg title "$title" --arg parent "$parent" \
+        jq -M --arg node "$node" --arg title "$title" --arg parent "$parent" \
           '(([.menus[$parent].options | keys[] | tonumber] | max // 0)+1) as $next | .menus[$node]={title:$title,parent:$parent,options:{"0":{label:"返回上一级",action:{type:"menu",target:$parent,back:true}}}} | .menus[$parent].options[($next|tostring)]={label:$title,order:$next,action:{type:"menu",target:$node}}' "$candidate" > "$candidate.new"
         mv -f -- "$candidate.new" "$candidate"
         if manager_tool configuration apply menu --input "$candidate"; then
@@ -546,13 +546,13 @@ multilevel_menu() {
         manager_candidate menu || continue; candidate=$MANAGE_FILE; menus_select_node "$candidate" || continue; node=$MENU_SELECTED_ID
         case "$choice" in
           3) menu_read title '新标题（回车保留）：' || return; [[ -n "$title" ]] || continue
-            jq --arg node "$node" --arg title "$title" '.menus[$node].title=$title' "$candidate" > "$candidate.new" ;;
+            jq -M --arg node "$node" --arg title "$title" '.menus[$node].title=$title' "$candidate" > "$candidate.new" ;;
           4) menus_edit_option "$candidate" "$node"; continue ;;
           5) menu_read number '要删除的选项数字：' || return; [[ "$number" =~ ^[0-9]{1,2}$ ]] || continue
-            jq --arg node "$node" --arg number "$((10#$number))" 'del(.menus[$node].options[$number])' "$candidate" > "$candidate.new" ;;
+            jq -M --arg node "$node" --arg number "$((10#$number))" 'del(.menus[$node].options[$number])' "$candidate" > "$candidate.new" ;;
           6) menu_confirm '删除节点？仍被引用或包含子节点时会被拒绝。' || continue
-            jq --arg node "$node" 'del(.menus[$node])' "$candidate" > "$candidate.new" ;;
-          7) jq --arg node "$node" '.root=$node' "$candidate" > "$candidate.new" ;;
+            jq -M --arg node "$node" 'del(.menus[$node])' "$candidate" > "$candidate.new" ;;
+          7) jq -M --arg node "$node" '.root=$node' "$candidate" > "$candidate.new" ;;
         esac
         mv -f -- "$candidate.new" "$candidate"; manager_apply menu "$candidate" ;;
       0) return ;; *) warn '请输入有效数字' ;;
@@ -570,17 +570,17 @@ welcome_menu() {
       2|3|4|5|6|7)
         manager_candidate menu || continue; candidate=$MANAGE_FILE
         case "$choice" in
-          2) jq '.welcome.enabled=true' "$candidate" > "$candidate.new" ;; 3) jq '.welcome.enabled=false' "$candidate" > "$candidate.new" ;;
+          2) jq -M '.welcome.enabled=true' "$candidate" > "$candidate.new" ;; 3) jq -M '.welcome.enabled=false' "$candidate" > "$candidate.new" ;;
           4) manager_temporary || return; textfile=$MANAGE_FILE; menu_multiline "$textfile" 16384 || continue
-            jq --rawfile text "$textfile" '.welcome.text=$text' "$candidate" > "$candidate.new" ;;
+            jq -M --rawfile text "$textfile" '.welcome.text=$text' "$candidate" > "$candidate.new" ;;
           5) menu_read value '1 首条访客消息 / 2 页面加载 / 3 访客打开聊天框 / 0 返回：' || return
             case "$value" in 1) value=first_message ;; 2) value=widget_load ;; 3) value=chat_open ;; *) continue ;; esac
-            jq --arg value "$value" '.welcome.trigger=$value' "$candidate" > "$candidate.new"
+            jq -M --arg value "$value" '.welcome.trigger=$value' "$candidate" > "$candidate.new"
             [[ "$value" == first_message ]] || printf '此模式需要把无密钥 SDK 片段接入已有网站一次。\n' ;;
           6|7) menu_read value '1 启用 / 2 关闭 / 0 返回：' || return
             case "$value" in 1) value=true ;; 2) value=false ;; *) continue ;; esac
-            if [[ "$choice" == 6 ]]; then jq --argjson value "$value" '.welcome.auto_open=$value' "$candidate" > "$candidate.new"; printf '自动展开需要网页 SDK 片段，后端消息不等于浏览器已打开。\n'
-            else jq --argjson value "$value" '.welcome.show_menu=$value' "$candidate" > "$candidate.new"; fi ;;
+            if [[ "$choice" == 6 ]]; then jq -M --argjson value "$value" '.welcome.auto_open=$value' "$candidate" > "$candidate.new"; printf '自动展开需要网页 SDK 片段，后端消息不等于浏览器已打开。\n'
+            else jq -M --argjson value "$value" '.welcome.show_menu=$value' "$candidate" > "$candidate.new"; fi ;;
         esac
         mv -f -- "$candidate.new" "$candidate"; manager_apply menu "$candidate" ;;
       8) multilevel_menu ;; 9) manager_action runtime_cli snippet ;;
@@ -608,10 +608,10 @@ crisp_menu() {
           9)
             menu_read value 'Token tier：1 Website / 2 Plugin / 0 返回：' || return
             case "$value" in 1) value=website ;; 2) value=plugin ;; *) continue ;; esac
-            jq --arg value "$value" '.token_tier=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
+            jq -M --arg value "$value" '.token_tier=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
             menu_read value 'Hook 类型：1 Website / 2 Plugin（与 Token tier 独立）/ 0 返回：' || return
             case "$value" in 1) value=website ;; 2) value=plugin ;; *) continue ;; esac
-            jq --arg value "$value" '.hook_mode=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
+            jq -M --arg value "$value" '.hook_mode=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
             if [[ "$value" == plugin ]]; then field=plugin_signing_secret; menu_read value 'Plugin Signing Secret（隐藏输入，回车保留）：' 1 || return
             else field=hook_mode; fi ;;
           11)
@@ -620,7 +620,7 @@ crisp_menu() {
               else menu_read value "$field（隐藏输入，回车保留）：" 1 || return; fi
               if [[ -n "$value" ]]; then
                 manager_temporary || return; secret_file=$MANAGE_FILE; printf '%s' "$value" > "$secret_file"; unset value
-                jq --arg field "$field" --rawfile value "$secret_file" '.[$field]=$value' "$candidate" > "$candidate.new"
+                jq -M --arg field "$field" --rawfile value "$secret_file" '.[$field]=$value' "$candidate" > "$candidate.new"
                 mv -f -- "$candidate.new" "$candidate"; rm -f -- "$secret_file"
               fi
             done
@@ -630,7 +630,7 @@ crisp_menu() {
         esac
         if [[ "$choice" != 8 && -n "$value" ]]; then
           manager_temporary || return; secret_file=$MANAGE_FILE; printf '%s' "$value" > "$secret_file"; unset value
-          jq --arg field "$field" --rawfile value "$secret_file" '.[$field]=$value' "$candidate" > "$candidate.new"
+          jq -M --arg field "$field" --rawfile value "$secret_file" '.[$field]=$value' "$candidate" > "$candidate.new"
           mv -f -- "$candidate.new" "$candidate"; rm -f -- "$secret_file"
         fi
         if menu_confirm '验证并应用本次 Crisp 配置？'; then manager_action manager_tool configuration crisp-apply "$candidate"; fi ;;
@@ -658,10 +658,10 @@ statistics_menu() {
         manager_candidate tags || continue; candidate=$MANAGE_FILE
         if [[ "$field" == enabled ]]; then
           if [[ "$value" == 5 ]]; then value=true; else value=false; fi
-          jq --argjson value "$value" '.tags.enabled=$value' "$candidate" > "$candidate.new"
+          jq -M --argjson value "$value" '.tags.enabled=$value' "$candidate" > "$candidate.new"
         else
           menu_read value '新标签文案（回车保留）：' || return; [[ -n "$value" ]] || continue
-          jq --arg field "$field" --arg value "$value" '.tags[$field]=$value' "$candidate" > "$candidate.new"
+          jq -M --arg field "$field" --arg value "$value" '.tags[$field]=$value' "$candidate" > "$candidate.new"
         fi
         mv -f -- "$candidate.new" "$candidate"; manager_apply tags "$candidate" ;;
       5)
@@ -669,10 +669,10 @@ statistics_menu() {
         menu_read value '反馈：1 启用 / 2 关闭 / 3 有效期秒数 / 4 保留天数 / 0 返回：' || return
         case "$value" in
           1|2) if [[ "$value" == 1 ]]; then value=true; else value=false; fi
-            jq --argjson value "$value" '.feedback.enabled=$value' "$candidate" > "$candidate.new" ;;
+            jq -M --argjson value "$value" '.feedback.enabled=$value' "$candidate" > "$candidate.new" ;;
           3|4) if [[ "$value" == 3 ]]; then field=expires_after_seconds; else field=retention_days; fi
             menu_read value '请输入正整数：' || return; [[ "$value" =~ ^[1-9][0-9]{0,7}$ ]] || continue
-            jq --arg field "$field" --argjson value "$value" '.feedback[$field]=$value' "$candidate" > "$candidate.new" ;;
+            jq -M --arg field "$field" --argjson value "$value" '.feedback[$field]=$value' "$candidate" > "$candidate.new" ;;
           *) continue ;;
         esac
         mv -f -- "$candidate.new" "$candidate"; manager_apply feedback "$candidate" ;;
@@ -841,11 +841,11 @@ esac
 while (( MANAGE_EOF == 0 )); do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
   MENU_ENABLED=未配置 MENU_CRISP=未检测 MENU_KNOWLEDGE=0
-  if [[ -f "$DEPLOY_DIR/config/runtime.yaml" ]]; then MENU_ENABLED=$(jq -r 'if .enabled then "启用" else "停用" end' "$DEPLOY_DIR/config/runtime.yaml" 2>/dev/null || printf 未检测); fi
+  if [[ -f "$DEPLOY_DIR/config/runtime.yaml" ]]; then MENU_ENABLED=$(jq -M -r 'if .enabled then "启用" else "停用" end' "$DEPLOY_DIR/config/runtime.yaml" 2>/dev/null || printf 未检测); fi
   if [[ -f "$DEPLOY_DIR/$INSTALL_MARKER" ]]; then
     case "$(installation_fact "$DEPLOY_DIR" conversation 2>/dev/null || true)" in ready) MENU_CRISP=已验证 ;; *) MENU_CRISP=待验证 ;; esac
   fi
-  if [[ -f "$DEPLOY_DIR/knowledge/catalog.json" ]]; then MENU_KNOWLEDGE=$(jq '[.libraries[]? | select(.enabled)] | length' "$DEPLOY_DIR/knowledge/catalog.json" 2>/dev/null || printf 0); fi
+  if [[ -f "$DEPLOY_DIR/knowledge/catalog.json" ]]; then MENU_KNOWLEDGE=$(jq -M '[.libraries[]? | select(.enabled)] | length' "$DEPLOY_DIR/knowledge/catalog.json" 2>/dev/null || printf 0); fi
   menu_render "$CURRENT_VERSION" "$DEPLOY_DIR" "$MENU_ENABLED" "$MENU_CRISP" "$MENU_KNOWLEDGE"
   if ! IFS= read -r CHOICE; then printf '\n输入结束，已退出。\n'; exit 0; fi
   case "$CHOICE" in

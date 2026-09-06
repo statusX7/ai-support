@@ -9,7 +9,7 @@ const equal = (left, right) => { const first = Buffer.from(String(left || '')); 
 const reply = (response, status, body) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(body)); };
 const callback = async (body) => {
   if (!state.webhook) throw new Error('隔离测试 Webhook 尚未配置');
-  const response = await fetch(state.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(45000) });
+  const response = await fetch(state.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Connection': 'close' }, body: JSON.stringify(body), signal: AbortSignal.timeout(45000) });
   return { status: response.status, body: await response.json() };
 };
 const server = http.createServer(async (request, response) => {
@@ -72,7 +72,10 @@ const server = http.createServer(async (request, response) => {
       reply(response, 200, { error: false, reason: 'resolved', data: { segments: state.segments[session] || ['external-synthetic-label'] } }); return;
     }
     reply(response, 404, { error: true });
-  } catch (_) { if (!response.headersSent) reply(response, 500, { error: true, reason: 'fixture_failed' }); }
+  } catch (error) {
+    process.stderr.write('协议测试服务错误分类：' + error.name + '/' + (error.cause?.code || 'none') + '\n');
+    if (!response.headersSent) reply(response, 500, { error: true, reason: 'fixture_failed' });
+  }
 });
 server.listen(Number(process.env.RUNTIME_PROTOCOL_PORT || 18787), process.env.RUNTIME_PROTOCOL_BIND || '127.0.0.1', () => process.stdout.write('隔离协议测试服务已启动；并非真实 Crisp 或真实模型。\n'));
 // 主机与容器共享同一个协议状态，仅监听回环和明确指定的 Docker 网关。
