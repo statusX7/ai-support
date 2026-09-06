@@ -3,7 +3,7 @@
 }
 
 {$WEBHOOK_DOMAIN} {
-  @crisp_webhook path /webhook/crisp-webhook
+  @crisp_webhook path /webhook/crisp-webhook /webhook/crispai-public-config /webhook/crispai-web-chat
   reverse_proxy @crisp_webhook n8n:5678
   respond 404
 }

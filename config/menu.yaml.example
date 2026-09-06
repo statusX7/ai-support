@@ -2,7 +2,9 @@
   "welcome": {
     "enabled": true,
     "text": "您好，欢迎联系客服。",
-    "show_menu": true
+    "show_menu": true,
+    "trigger": "first_message",
+    "auto_open": false
   },
   "root": "main",
   "menus": {
@@ -13,7 +15,7 @@
         "2": {"label": "手机排障流程", "action": {"type": "menu", "target": "mobile"}},
         "3": {"label": "共享账号问题", "action": {"type": "prompt", "prompt": "检索共享账号相关规则后回答。"}},
         "4": {"label": "导入订阅问题", "action": {"type": "menu", "target": "subscription"}},
-        "0": {"label": "人工客服", "action": {"type": "handoff", "reason": "菜单转人工"}}
+        "0": {"label": "人工协助", "action": {"type": "show_handoff_offer", "text": "需要人工协助吗？请点击下方按钮确认。"}}
       }
     },
     "computer": {
@@ -21,7 +23,7 @@
       "options": {
         "1": {"label": "无法连接", "action": {"type": "prompt", "prompt": "按电脑无法连接排障流程回答。"}},
         "2": {"label": "客户端打不开", "action": {"type": "prompt", "prompt": "按电脑客户端无法启动流程回答。"}},
-        "0": {"label": "返回上一级", "action": {"type": "menu", "target": "main"}}
+        "0": {"label": "返回上一级", "action": {"type": "menu", "target": "main", "back": true}}
       }
     },
     "mobile": {
@@ -29,7 +31,7 @@
       "options": {
         "1": {"label": "iOS", "action": {"type": "prompt", "prompt": "按 iOS 排障流程回答。"}},
         "2": {"label": "Android", "action": {"type": "prompt", "prompt": "按 Android 排障流程回答。"}},
-        "0": {"label": "返回上一级", "action": {"type": "menu", "target": "main"}}
+        "0": {"label": "返回上一级", "action": {"type": "menu", "target": "main", "back": true}}
       }
     },
     "subscription": {
@@ -37,7 +39,7 @@
       "options": {
         "1": {"label": "导入订阅", "action": {"type": "prompt", "prompt": "按订阅导入流程回答。"}},
         "2": {"label": "充值未到账", "action": {"type": "prompt", "prompt": "检索充值未到账处理流程，说明核对步骤；不要执行账户或付款操作。"}},
-        "0": {"label": "返回主菜单", "action": {"type": "menu", "target": "main"}}
+        "0": {"label": "返回主菜单", "action": {"type": "menu", "target": "main", "back": true}}
       }
     }
   }

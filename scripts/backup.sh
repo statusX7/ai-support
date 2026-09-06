@@ -7,18 +7,21 @@ source "${SCRIPT_DIR}/common.sh"
 
 DEPLOY_REQUEST=""
 OUTPUT_REQUEST=""
+FULL_BACKUP=0
 
 usage() {
   cat <<'EOF'
-用法：backup.sh [--deploy-dir PATH] [--output FILE]
+用法：backup.sh [--deploy-dir PATH] [--output FILE] [--full]
 
 备份包含配置、Prompt、规则、n8n workflow、知识文件和知识库清单。
 备份不包含 .env、API Key、Crisp Token、Webhook Secret、日志或用户会话数据。
+--full 创建包含内部凭据、数据库、全部知识库和会话状态的本机一致性备份；仅存放于受限可信位置。
 EOF
 }
 
 while (( $# > 0 )); do
   case "$1" in
+    --full) FULL_BACKUP=1; shift ;;
     --deploy-dir)
       (( $# >= 2 )) || die "--deploy-dir 缺少参数"
       DEPLOY_REQUEST=$2
@@ -36,6 +39,12 @@ while (( $# > 0 )); do
     *) die "未知选项：$1" ;;
   esac
 done
+
+if (( FULL_BACKUP )); then
+  full_args=(create --deploy-dir "$(resolve_deploy_dir "$DEPLOY_REQUEST")")
+  [[ -z "$OUTPUT_REQUEST" ]] || full_args+=(--output "$OUTPUT_REQUEST")
+  exec bash "${SCRIPT_DIR}/full-backup.sh" "${full_args[@]}"
+fi
 
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"

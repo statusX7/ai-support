@@ -12,7 +12,7 @@ fail() {
 }
 
 pass() {
-  printf '通过：[UNIT-STUB] %s\n' "$1"
+  printf '通过：[UNIT/CONTRACT] %s\n' "$1"
 }
 
 for command_name in bash curl find install jq mktemp python3 realpath shellcheck stat; do
@@ -113,6 +113,20 @@ search_steps = normal_steps[:2] + [
 port_steps = normal_steps[:7] + [
     ("[7/10] 公网域名或现有 HTTPS Webhook 地址", "https://proxy.example.invalid/team/webhook/crisp-webhook", False),
 ] + normal_steps[7:]
+paste_steps = normal_steps[:7] + [
+    ("[8/10] 客服提示词", "::PASTE::", False),
+    ("正文需要结束符字面量时", '## 中文 🙂\n\n$ # = " \\ 保留。\n\\::END::\n\n::END::', False),
+    ("[9/10] 知识库文件或目录", "::LIBRARIES::", False),
+    ("知识库名称", "电脑排障", False),
+    ("文件/目录路径", knowledge_dir, False),
+    ("知识库名称", "手机排障", False),
+    ("文件/目录路径", prompt_file, False),
+    ("知识库名称", "订阅与账号", False),
+    ("文件/目录路径", "::PASTE::", False),
+    ("正文需要结束符字面量时", "# 虚构订阅\n\n测试事实为蓝色。\n::END::", False),
+    ("知识库名称", "0", False),
+    ("1 开始安装 / 2 返回修改 / 0 取消", "1", False),
+]
 
 if scenario == "normal" or scenario == "manual":
     argv = [wizard, "--output", output_file]
@@ -132,6 +146,9 @@ elif scenario == "search":
 elif scenario == "port_conflict":
     argv = [wizard, "--output", output_file]
     steps = port_steps
+elif scenario == "paste":
+    argv = [wizard, "--output", output_file]
+    steps = paste_steps
 else:
     raise SystemExit(f"unknown scenario: {scenario}")
 
@@ -208,7 +225,7 @@ except Exception as exc:
 with open(transcript_file, "wb") as handle:
     handle.write(transcript)
 with open(count_file, "w", encoding="ascii") as handle:
-    handle.write(str(len(steps)))
+    handle.write(str(sum(answer.count("\n") + 1 for _, answer, _ in steps)))
 raise SystemExit(os.waitstatus_to_exitcode(child_status))
 PY
 }
@@ -248,6 +265,30 @@ for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECR
   ! grep -Fq -- "$secret" "$NORMAL_TRANSCRIPT" || fail 'PTY 转录泄露隐藏凭据'
 done
 pass '十项 PTY 向导、脱敏摘要、特殊字符与结构化结果'
+
+PASTE_RESULT="${TEST_ROOT}/paste-result.json"
+PASTE_TRANSCRIPT="${TEST_ROOT}/paste-transcript.log"
+PASTE_COUNT="${TEST_ROOT}/paste-count"
+run_pty_case paste "$PASTE_RESULT" "$PASTE_TRANSCRIPT" "$PASTE_COUNT"
+jq -e --arg expected $'## 中文 🙂\n\n$ # = " \\ 保留。\n::END::\n\n' '
+  .prompt.mode == "inline" and .prompt.content == $expected and .knowledge.mode == "libraries" and
+  [.knowledge.libraries[].name] == ["电脑排障","手机排障","订阅与账号"]
+' "$PASTE_RESULT" >/dev/null || fail '多行 Prompt 或三个命名库状态保存不正确'
+PASTED_SOURCE=$(jq -r '.knowledge.libraries[2].source' "$PASTE_RESULT")
+[[ -f "$PASTED_SOURCE" && "$(stat -c '%a' "$PASTED_SOURCE")" == 600 ]] || fail '粘贴知识未受限保存'
+[[ "$(<"$PASTE_COUNT")" == 27 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
+for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET"; do
+  ! grep -Fq -- "$secret" "$PASTE_TRANSCRIPT" || fail '粘贴分支回显秘密'
+done
+pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（真实输入 27 行）'
+
+RESPONSES_RESULT="${TEST_ROOT}/responses-only-result.json"
+export MOCK_PROVIDER_RESPONSES_ONLY=1
+run_pty_case normal "$RESPONSES_RESULT" "${TEST_ROOT}/responses-only.log" "${TEST_ROOT}/responses-only.count"
+unset MOCK_PROVIDER_RESPONSES_ONLY
+jq -e '.status == "confirmed" and .provider.api_mode == "responses" and .provider.capabilities.responses == true and .provider.capabilities.chat_completions == false' "$RESPONSES_RESULT" >/dev/null \
+  || fail 'Responses-only 的真实探测结果未正确保存为 Responses 运行模式'
+pass 'Responses-only 协议探测通过，运行模式明确交给受管适配器'
 
 # 已确认配置只需要一次“复用”选择，不重新询问十项。
 REUSE_TRANSCRIPT="${TEST_ROOT}/reuse-transcript.log"

@@ -5,8 +5,10 @@
     "positive_keywords": ["👍 是", "👍", "是", "已解决", "解决了"],
     "negative_keywords": ["👎 否", "👎", "否", "未解决", "没有解决"],
     "positive_message": "感谢您的反馈。",
-    "negative_message": "感谢反馈。您可以补充更多细节，或输入“人工客服”请求转接。",
+    "negative_message": "感谢反馈。请补充尚未解决的具体情况；需要人工协助时，可输入“人工”查看确认按钮，点击后才暂停本会话的 AI。",
     "expires_after_seconds": 86400,
-    "max_text_chars": 500
+    "max_text_chars": 500,
+    "retention_days": 30,
+    "retain_text": false
   }
 }

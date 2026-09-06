@@ -279,7 +279,7 @@ while IFS= read -r entry; do
     .env|.env.*)
       [[ "$relative" == .env.example ]] || fail "发布包包含实际环境配置：$entry"
       ;;
-    config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml)
+    config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml|config/runtime.yaml)
       fail "发布包包含实际业务配置：$entry"
       ;;
     data|data/*|logs|logs/*|backups|backups/*|tmp|tmp/*|*.log|*.pid|*.tmp)
@@ -310,7 +310,11 @@ for relative in "${PRODUCTION_EXECUTABLES[@]}"; do
   require_executable_file "${PACKAGE_ROOT}/${relative}"
 done
 for relative in scripts/common.sh docker-compose.yml n8n/workflow.json \
-  config/app.yaml config/provider.yaml.example config/prompt.md.example knowledge/README.md; do
+  config/app.yaml config/provider.yaml.example config/prompt.md.example config/runtime.yaml.example knowledge/README.md \
+  scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/knowledge.sh \
+  scripts/provider.sh scripts/provider-adapter.js scripts/migration.sh scripts/full-backup.sh \
+  scripts/crisp-settings.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js \
+  docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md; do
   require_regular_file "${PACKAGE_ROOT}/${relative}"
 done
 [[ ! -e "${PACKAGE_ROOT}/.git" && ! -e "${PACKAGE_ROOT}/.work" ]] \

@@ -76,14 +76,26 @@ RELEASE_FILES=(
   docker-compose.yml install.sh manage.sh update.sh uninstall.sh
   config/app.yaml config/Caddyfile.example config/feedback.yaml.example
   config/handoff.yaml.example config/keyword.yaml.example config/menu.yaml.example
-  config/prompt.md.example config/provider.yaml.example config/tags.yaml.example
-  knowledge/README.md n8n/workflow.json
+  config/prompt.md.example config/provider.yaml.example config/tags.yaml.example config/runtime.yaml.example
+  knowledge/README.md n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
   scripts/analytics.sh scripts/backup.sh scripts/bootstrap.sh scripts/common.sh
   scripts/healthcheck.sh scripts/package-release.sh scripts/restore.sh
-  scripts/rollback.sh scripts/snapshot.sh scripts/wizard.sh
+  scripts/rollback.sh scripts/snapshot.sh scripts/wizard.sh scripts/launcher.sh scripts/menu-ui.sh
+  scripts/configuration.sh scripts/provider.sh scripts/provider-adapter.js scripts/knowledge.sh
+  scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
   docs/ARCHITECTURE.md docs/CONFIG.md docs/INSTALL.md docs/RELEASE.md
-  docs/SECURITY.md docs/TESTING.md
+  docs/SECURITY.md docs/TESTING.md docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md
+  tests/run.sh tests/test_archive_security.sh tests/test_bootstrap.sh
+  tests/test_configuration_guards.js tests/test_configuration_protocol.js
+  tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
+  tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
+  tests/test_provider_adapter.js tests/test_release_package.sh tests/test_static_security.sh tests/test_web_chat_browser.js
+  tests/test_wizard.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
+  tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
+  tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker
+  tests/mocks/curl tests/mocks/curl_knowledge_timeout tests/mocks/docker tests/mocks/stat
   "docs/releases/${VERSION_VALUE}.md"
+  "docs/reports/${VERSION_VALUE}-report.md"
 )
 for relative in "${RELEASE_FILES[@]}"; do
   [[ "$relative" != /* && "$relative" != ".." && "$relative" != ../* \
@@ -100,7 +112,9 @@ sort -z -o "$LIST_FILE" "$LIST_FILE"
 
 for required in VERSION install.sh manage.sh update.sh uninstall.sh docker-compose.yml \
   scripts/common.sh scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh \
-  n8n/workflow.json config/app.yaml config/provider.yaml.example; do
+  scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/provider-adapter.js \
+  scripts/launcher.sh scripts/migration.sh scripts/full-backup.sh scripts/archive-guard.py \
+  n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js config/app.yaml config/provider.yaml.example; do
   grep -zFxq -- "$required" "$LIST_FILE" \
     || { printf '错误：发布清单缺少必要文件：%s\n' "$required" >&2; exit 1; }
 done

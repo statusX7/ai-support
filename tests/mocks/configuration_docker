@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${CONFIGURATION_FIXTURE_READBACK_FAIL:-0} != 1 ]] || exit 1
+arguments=("$@")
+last=${arguments[${#arguments[@]}-1]}
+if [[ "$last" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ ]]; then
+  sha256sum -- "${CONFIGURATION_FIXTURE_DEPLOY:?}/config/${last}" | awk '{printf "%s",$1}'
+  exit 0
+fi
+printf '测试桩拒绝未实现的 Docker 请求\n' >&2
+exit 1

@@ -21,20 +21,8 @@ fail() {
 
 REQUIRED_ENV=(
   AI_SUPPORT_E2E_DEPLOY_DIR
-  AI_SUPPORT_E2E_PROVIDER_BASE_URL
-  AI_SUPPORT_E2E_PROVIDER_API_KEY
-  AI_SUPPORT_E2E_PROVIDER_MODEL
-  AI_SUPPORT_E2E_ANYTHINGLLM_BASE_URL
-  AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY
-  AI_SUPPORT_E2E_ANYTHINGLLM_WORKSPACE
-  AI_SUPPORT_E2E_CRISP_WEBSITE_ID
-  AI_SUPPORT_E2E_CRISP_TOKEN_TIER
-  AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER
-  AI_SUPPORT_E2E_CRISP_TOKEN_KEY
   AI_SUPPORT_E2E_TEXT_SESSION_ID
-  AI_SUPPORT_E2E_OPERATOR_SESSION_ID
   AI_SUPPORT_E2E_HANDOFF_SESSION_ID
-  AI_SUPPORT_E2E_IMAGE_SESSION_ID
   AI_SUPPORT_E2E_IMAGE_URL
   AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT
 )
@@ -46,14 +34,13 @@ if (( ${#MISSING_ENV[@]} > 0 )); then
   skip "缺少环境变量：${MISSING_ENV[*]}。"
 fi
 
-for command_name in curl jq python3 realpath base64 sha256sum; do
+for command_name in curl jq python3 realpath base64 sha256sum docker; do
   command -v "$command_name" >/dev/null 2>&1 || skip "缺少命令 ${command_name}。"
 done
 
 safe_credential() {
   local value=$1
-  [[ -n "$value" && ${#value} -le 4096 && "$value" != *$'\n'* \
-    && "$value" != *$'\r'* && "$value" != *'"'* && "$value" != *\\* ]]
+  [[ -n "$value" && ${#value} -le 4096 && "$value" != *$'\n'* && "$value" != *$'\r'* ]]
 }
 
 safe_base_url() {
@@ -66,33 +53,37 @@ DEPLOY_DIR=$(realpath -e -- "$AI_SUPPORT_E2E_DEPLOY_DIR")
 [[ -d "$DEPLOY_DIR" && ! -L "$DEPLOY_DIR" ]] || fail "部署目录无效"
 [[ -f "${DEPLOY_DIR}/.crisp-ai-installation" \
   && ! -L "${DEPLOY_DIR}/.crisp-ai-installation" ]] || fail "部署目录缺少安装标记"
-grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
-  || fail "部署尚未处于 ready 状态"
+grep -Eq '^state=(ready|local-ready)$' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "部署尚未完成本地安装"
 [[ -f "${DEPLOY_DIR}/scripts/analytics.sh" ]] || fail "部署缺少统计脚本"
+# Installed credentials are authoritative. No second set of 10+ secrets is needed.
+# shellcheck source=scripts/common.sh
+source "${PROJECT_ROOT}/scripts/common.sh"
+[[ $EUID == 0 ]] || fail "请以 root 运行隔离实例验收，不能读取其他用户的秘密配置"
+assert_installation "$DEPLOY_DIR"
+ENV_FILE="${DEPLOY_DIR}/.env"
+AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY=$(env_get "$ENV_FILE" ANYTHINGLLM_API_KEY)
+AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER=$(env_get "$ENV_FILE" CRISP_TOKEN_IDENTIFIER)
+AI_SUPPORT_E2E_CRISP_TOKEN_KEY=$(env_get "$ENV_FILE" CRISP_TOKEN_KEY)
 
-PROVIDER_BASE=${AI_SUPPORT_E2E_PROVIDER_BASE_URL%/}
-[[ "$PROVIDER_BASE" == */v1 ]] || PROVIDER_BASE="${PROVIDER_BASE}/v1"
-ANYTHING_BASE=${AI_SUPPORT_E2E_ANYTHINGLLM_BASE_URL%/}
-PROVIDER_MODEL=$AI_SUPPORT_E2E_PROVIDER_MODEL
-ANYTHING_WORKSPACE=$AI_SUPPORT_E2E_ANYTHINGLLM_WORKSPACE
-CRISP_WEBSITE_ID=$AI_SUPPORT_E2E_CRISP_WEBSITE_ID
-CRISP_TIER=$AI_SUPPORT_E2E_CRISP_TOKEN_TIER
+ANYTHING_BASE="http://127.0.0.1:$(env_get "$ENV_FILE" ANYTHINGLLM_PORT)"
+ANYTHING_WORKSPACE=$(env_get "$ENV_FILE" ANYTHINGLLM_WORKSPACE)
+CRISP_WEBSITE_ID=$(env_get "$ENV_FILE" CRISP_WEBSITE_ID)
+CRISP_TIER=$(env_get "$ENV_FILE" CRISP_TOKEN_TIER)
 TEXT_SESSION=$AI_SUPPORT_E2E_TEXT_SESSION_ID
-OPERATOR_SESSION=$AI_SUPPORT_E2E_OPERATOR_SESSION_ID
+OPERATOR_SESSION=${AI_SUPPORT_E2E_OPERATOR_SESSION_ID:-$TEXT_SESSION}
 HANDOFF_SESSION=$AI_SUPPORT_E2E_HANDOFF_SESSION_ID
-IMAGE_SESSION=$AI_SUPPORT_E2E_IMAGE_SESSION_ID
+IMAGE_SESSION=${AI_SUPPORT_E2E_IMAGE_SESSION_ID:-$HANDOFF_SESSION}
 IMAGE_URL=$AI_SUPPORT_E2E_IMAGE_URL
 IMAGE_EXPECTED_FACT=$AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT
 TIMEOUT_SECONDS=${AI_SUPPORT_E2E_TIMEOUT_SECONDS:-180}
 SETTLE_SECONDS=${AI_SUPPORT_E2E_SETTLE_SECONDS:-20}
 
-safe_base_url "$PROVIDER_BASE" || fail "Provider Base URL 格式无效"
 safe_base_url "$ANYTHING_BASE" || fail "AnythingLLM Base URL 格式无效"
 [[ "$IMAGE_URL" =~ ^https://[^/?#@]+/.+ ]] || fail "图片 URL 必须是 HTTPS"
 [[ "$IMAGE_EXPECTED_FACT" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$ ]] \
   || fail "图片预期事实标识必须是 6 到 128 位安全字符"
 # 隔离测试图片必须清晰展示该唯一标识；脚本只比较标识，不输出图片或回复正文。
-[[ "$PROVIDER_MODEL" =~ ^[A-Za-z0-9._:/-]{1,256}$ ]] || fail "Provider 模型名称无效"
 [[ "$ANYTHING_WORKSPACE" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || fail "AnythingLLM 工作区无效"
 [[ "$CRISP_WEBSITE_ID" =~ ^[A-Za-z0-9-]{8,128}$ ]] || fail "Crisp Website ID 无效"
 [[ "$CRISP_TIER" == website || "$CRISP_TIER" == plugin ]] || fail "Crisp Token tier 无效"
@@ -101,7 +92,6 @@ safe_base_url "$ANYTHING_BASE" || fail "AnythingLLM Base URL 格式无效"
 (( TIMEOUT_SECONDS >= 30 && TIMEOUT_SECONDS <= 900 )) || fail "超时时间必须为 30 到 900 秒"
 (( SETTLE_SECONDS >= 5 && SETTLE_SECONDS <= 120 )) || fail "稳定观察时间必须为 5 到 120 秒"
 for credential in \
-  "$AI_SUPPORT_E2E_PROVIDER_API_KEY" \
   "$AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY" \
   "$AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER" \
   "$AI_SUPPORT_E2E_CRISP_TOKEN_KEY"; do
@@ -112,23 +102,20 @@ SESSIONS=("$TEXT_SESSION" "$OPERATOR_SESSION" "$HANDOFF_SESSION" "$IMAGE_SESSION
 for session_id in "${SESSIONS[@]}"; do
   [[ "$session_id" =~ ^session_[A-Za-z0-9-]{8,128}$ ]] || fail "Crisp 测试 session_id 格式无效"
 done
-[[ "$(printf '%s\n' "${SESSIONS[@]}" | LC_ALL=C sort -u | wc -l)" == 4 ]] \
-  || fail "四个 Crisp 测试 session_id 必须互不相同"
+[[ "$TEXT_SESSION" != "$HANDOFF_SESSION" ]] || fail "A/B 两个隔离测试会话必须不同"
 
 umask 077
-TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.external-e2e.XXXXXX")
-PROVIDER_CONFIG="${TEST_ROOT}/provider.curl"
+mkdir -p "${PROJECT_ROOT}/.work"
+TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.work/external-e2e.XXXXXX")
 ANYTHING_CONFIG="${TEST_ROOT}/anythingllm.curl"
 CRISP_CONFIG="${TEST_ROOT}/crisp.curl"
 CRISP_AUTH=$(printf '%s' "${AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER}:${AI_SUPPORT_E2E_CRISP_TOKEN_KEY}" \
   | base64 | tr -d '\n')
-printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' \
-  "$AI_SUPPORT_E2E_PROVIDER_API_KEY" > "$PROVIDER_CONFIG"
-printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' \
-  "$AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY" > "$ANYTHING_CONFIG"
+printf 'Authorization: Bearer %s' "$AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY" \
+  | jq -Rs '"header = " + tojson' -r > "$ANYTHING_CONFIG"
 printf 'header = "Authorization: Basic %s"\nheader = "X-Crisp-Tier: %s"\nheader = "Content-Type: application/json"\n' \
   "$CRISP_AUTH" "$CRISP_TIER" > "$CRISP_CONFIG"
-chmod 600 "$PROVIDER_CONFIG" "$ANYTHING_CONFIG" "$CRISP_CONFIG"
+chmod 600 "$ANYTHING_CONFIG" "$CRISP_CONFIG"
 unset CRISP_AUTH
 
 HTTP_STATUS=000
@@ -136,6 +123,23 @@ HTTP_BODY=''
 ORIGINAL_HANDOFF_SEGMENTS=''
 RESTORE_HANDOFF_SEGMENTS=0
 EMBEDDED_LOCATIONS=()
+RESTORE_TEST_CONFIGURATION=0
+
+runtime_command() {
+  docker_compose "$DEPLOY_DIR" exec -T n8n node /opt/crisp-ai/n8n/runtime-cli.js "$@"
+}
+
+session_mode() {
+  runtime_command list | jq -r --arg website "$CRISP_WEBSITE_ID" --arg session "$1" \
+    'map(select(.website_id == $website and .session_id == $session)) | first | .mode // "ai"'
+}
+
+resume_test_session() {
+  local key
+  key=$(runtime_command list | jq -r --arg website "$CRISP_WEBSITE_ID" --arg session "$1" \
+    'map(select(.website_id == $website and .session_id == $session)) | first | .key // empty')
+  [[ -z "$key" ]] || runtime_command resume "$key" >/dev/null
+}
 
 http_request() {
   local config_file=$1
@@ -155,7 +159,7 @@ http_request() {
   elif [[ -n "$payload" ]]; then
     if ! raw=$(printf '%s' "$payload" | curl --silent --connect-timeout 10 \
       --max-time "$TIMEOUT_SECONDS" --config "$config_file" --request "$method" \
-      --data-binary @- --write-out $'\n%{http_code}' "$url"); then
+      --header 'Content-Type: application/json' --data-binary @- --write-out $'\n%{http_code}' "$url"); then
       HTTP_STATUS=000
       HTTP_BODY=''
       return 1
@@ -336,12 +340,12 @@ set_crisp_segments() {
 wait_for_segments() {
   local session_id=$1
   local preserved=$2
-  local required=$3
+  local required_tag=$3
   local started=$SECONDS
   local segments
   while (( SECONDS - started < TIMEOUT_SECONDS )); do
     segments=$(crisp_segments "$session_id")
-    if jq -e --arg preserved "$preserved" --arg required "$required" \
+    if jq -e --arg preserved "$preserved" --arg required "$required_tag" \
       'index($preserved) != null and index($required) != null' <<< "$segments" >/dev/null; then
       return 0
     fi
@@ -378,35 +382,37 @@ cleanup() {
       | jq -Rsc '{names:(split("\n") | map(select(length > 0)))}')
     anything_request DELETE '/api/v1/system/remove-documents' "$cleanup_payload" >/dev/null 2>&1
   fi
+  if (( RESTORE_TEST_CONFIGURATION )); then
+    for name in menu handoff; do
+      bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" \
+        apply "$name" --input "${TEST_ROOT}/${name}.original.json" >/dev/null 2>&1
+    done
+    for session_id in "${SESSIONS[@]}"; do resume_test_session "$session_id" >/dev/null 2>&1; done
+  fi
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
 printf '外部 E2E：开始校验 Provider 与 AnythingLLM（不会输出响应正文或凭据）。\n'
-http_request "$PROVIDER_CONFIG" GET "${PROVIDER_BASE}/models" \
-  || fail "Provider /models 请求失败"
-expect_success "Provider /models"
-jq -e --arg model "$PROVIDER_MODEL" 'any(.data[]?; .id == $model)' <<< "$HTTP_BODY" >/dev/null \
-  || fail "Provider /models 未返回配置模型"
-unset HTTP_BODY
-PROVIDER_PAYLOAD=$(jq -cn --arg model "$PROVIDER_MODEL" \
-  '{model:$model,messages:[{role:"user",content:"Reply only OK."}],max_tokens:8}')
-http_request "$PROVIDER_CONFIG" POST "${PROVIDER_BASE}/chat/completions" "$PROVIDER_PAYLOAD" \
-  || fail "Provider Chat Completions 请求失败"
-expect_success "Provider Chat Completions"
-jq -e '(.error | not) and ((.choices | type) == "array")' <<< "$HTTP_BODY" >/dev/null \
-  || fail "Provider Chat Completions 响应无效"
-unset HTTP_BODY PROVIDER_PAYLOAD
-if [[ "${AI_SUPPORT_E2E_PROVIDER_API_MODE:-chat_completions}" == responses ]]; then
-  PROVIDER_PAYLOAD=$(jq -cn --arg model "$PROVIDER_MODEL" \
-    '{model:$model,input:"Reply only OK.",max_output_tokens:8}')
-  http_request "$PROVIDER_CONFIG" POST "${PROVIDER_BASE}/responses" "$PROVIDER_PAYLOAD" \
-    || fail "Provider Responses 请求失败"
-  expect_success "Provider Responses"
-  jq -e '(.error | not) and ((.id // "") != "")' <<< "$HTTP_BODY" >/dev/null \
-    || fail "Provider Responses 响应无效"
-  unset HTTP_BODY PROVIDER_PAYLOAD
-fi
+bash "${DEPLOY_DIR}/scripts/provider.sh" --deploy-dir "$DEPLOY_DIR" test >/dev/null \
+  || fail "当前配置的 Provider 协议及应用容器调用失败"
+jq -e '.enabled == true' "${DEPLOY_DIR}/config/runtime.yaml" >/dev/null \
+  || fail "隔离实例的客服总开关未启用"
+for session_id in "${SESSIONS[@]}"; do
+  [[ "$(session_mode "$session_id")" == ai ]] || fail "隔离会话已处于人工模式，请先显式恢复后测试"
+done
+for name in menu handoff; do
+  cp -- "${DEPLOY_DIR}/config/${name}.yaml" "${TEST_ROOT}/${name}.original.json"
+done
+RESTORE_TEST_CONFIGURATION=1
+jq '.welcome.enabled = false' "${TEST_ROOT}/menu.original.json" > "${TEST_ROOT}/menu.test.json"
+jq '.handoff.resume_after_seconds = 0' "${TEST_ROOT}/handoff.original.json" > "${TEST_ROOT}/handoff.test.json"
+for name in menu handoff; do
+  bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" \
+    apply "$name" --input "${TEST_ROOT}/${name}.test.json" >/dev/null \
+    || fail "隔离配置应用失败"
+done
+printf '外部 E2E：复用已安装凭据，临时关闭欢迎并设置不自动恢复，结束时恢复配置及测试会话。\n'
 
 anything_request GET '/api/v1/auth' || fail "AnythingLLM API 鉴权请求失败"
 expect_success "AnythingLLM API 鉴权"
@@ -588,10 +594,11 @@ printf '外部 E2E：operator 即使回复恢复关键词也关闭 AI 通过。\
 
 HUMAN_TAG=$(jq -er '.tags.human_required | select(type == "string" and length > 0)' \
   "${DEPLOY_DIR}/config/tags.yaml") || fail "人工标签配置无效"
-EXACT_HANDOFF=$(jq -er '.handoff.keywords[0] | select(type == "string" and length > 0)' \
-  "${DEPLOY_DIR}/config/handoff.yaml") || fail "转人工关键词配置无效"
-HANDOFF_MESSAGE=$(jq -er '.handoff.message | select(type == "string" and length > 0)' \
-  "${DEPLOY_DIR}/config/handoff.yaml") || fail "转人工提示配置无效"
+HANDOFF_RULE=$(jq -ce '[.rules[] | select(.enabled != false and .action == "show_handoff_offer")] | first // error("rule")' \
+  "${DEPLOY_DIR}/config/keyword.yaml") || fail "请在隔离实例启用一条人工按钮规则"
+HANDOFF_KEYWORD=$(jq -er '.keywords[0] | select(type == "string" and length > 0)' <<< "$HANDOFF_RULE")
+HANDOFF_MESSAGE=$(jq -nr --argjson rule "$HANDOFF_RULE" --slurpfile control "${DEPLOY_DIR}/config/handoff.yaml" \
+  '$rule.confirm_message // $control[0].handoff.message')
 ORIGINAL_HANDOFF_SEGMENTS=$(crisp_segments "$HANDOFF_SESSION")
 RESTORE_HANDOFF_SEGMENTS=1
 PRESERVED_TAG="e2e-preserved-${NONCE}"
@@ -600,23 +607,55 @@ SEEDED_SEGMENTS=$(jq -cn --argjson existing "$ORIGINAL_HANDOFF_SEGMENTS" \
   '($existing | map(select(. != $human))) + [$preserved] | unique')
 set_crisp_segments "$HANDOFF_SESSION" "$SEEDED_SEGMENTS"
 HANDOFF_BASELINE=$(ai_reply_count "$HANDOFF_SESSION")
-crisp_send_text "$HANDOFF_SESSION" user "请${EXACT_HANDOFF}，谢谢" \
+crisp_send_text "$HANDOFF_SESSION" user "$HANDOFF_KEYWORD" \
   "$((CONTEXT_FINGERPRINT + 200))"
 wait_for_ai_count "$HANDOFF_SESSION" "$((HANDOFF_BASELINE + 1))"
+[[ "$(session_mode "$HANDOFF_SESSION")" == ai ]] || fail "仅命中关键词就错误暂停 AI"
+crisp_message_snapshot "$HANDOFF_SESSION"
+OFFER_MESSAGE=$(jq -ce --arg label "$(jq -r '.confirm_label // "召唤人工客服"' <<< "$HANDOFF_RULE")" '
+  [.data[] | select(.type == "picker" and .from == "operator" and
+    ((.automated == true) or (.properties.ai_support == true)) and
+    any(.content.choices[]?; .label == $label))] | sort_by(.timestamp) | last // error("picker")
+' <<< "$HTTP_BODY") || fail "未收到本项目原生 picker"
+unset HTTP_BODY
+jq -e '.content.required != true' <<< "$OFFER_MESSAGE" >/dev/null || fail "卡片不应阻止普通聊天"
 CURRENT_SEGMENTS=$(crisp_segments "$HANDOFF_SESSION")
 jq -e --arg human "$HUMAN_TAG" 'index($human) == null' <<< "$CURRENT_SEGMENTS" >/dev/null \
-  || fail "非精确短语错误触发了转人工"
-crisp_send_text "$HANDOFF_SESSION" user "$EXACT_HANDOFF" "$((CONTEXT_FINGERPRINT + 201))"
+  || fail "尚未点击按钮就添加了人工标签"
+crisp_send_text "$HANDOFF_SESSION" user \
+  "What is the answer for ${TXT_MARKER}? Reply with the exact answer token." \
+  "$((CONTEXT_FINGERPRINT + 201))"
 wait_for_ai_count "$HANDOFF_SESSION" "$((HANDOFF_BASELINE + 2))"
-wait_for_latest_ai_content "$HANDOFF_SESSION" "$HANDOFF_MESSAGE" "$((HANDOFF_BASELINE + 2))"
+wait_for_latest_ai_content "$HANDOFF_SESSION" "$TXT_ANSWER" "$((HANDOFF_BASELINE + 2))"
+[[ "$(session_mode "$HANDOFF_SESSION")" == ai ]] || fail "不点击继续提问时 AI 被暂停"
+[[ "$(session_mode "$OPERATOR_SESSION")" == human ]] || fail "B 的正常问题改变了 A 的人工状态"
+OFFER_FINGERPRINT=$(jq -r '.fingerprint' <<< "$OFFER_MESSAGE")
+[[ "$OFFER_FINGERPRINT" =~ ^[0-9]+$ ]] || fail "卡片 fingerprint 无效"
+CHOICE_PAYLOAD=$(jq -c '{content:(.content | .choices |= (to_entries | map(.value + {selected:(.key == 0)})))}' <<< "$OFFER_MESSAGE")
+crisp_request PATCH "/conversation/${HANDOFF_SESSION}/message/${OFFER_FINGERPRINT}" "$CHOICE_PAYLOAD" \
+  || fail "原生 picker 选择更新请求失败"
+expect_success "picker 选择更新"
+wait_for_ai_count "$HANDOFF_SESSION" "$((HANDOFF_BASELINE + 3))"
+wait_for_latest_ai_content "$HANDOFF_SESSION" "$HANDOFF_MESSAGE" "$((HANDOFF_BASELINE + 3))"
+[[ "$(session_mode "$HANDOFF_SESSION")" == human ]] || fail "有效按钮未暂停当前会话"
+crisp_request PATCH "/conversation/${HANDOFF_SESSION}/message/${OFFER_FINGERPRINT}" "$CHOICE_PAYLOAD" \
+  || fail "重复选择测试请求失败"
+expect_success "重复选择更新"
 wait_for_segments "$HANDOFF_SESSION" "$PRESERVED_TAG" "$HUMAN_TAG"
-crisp_send_text "$HANDOFF_SESSION" user "AI must stay silent after exact handoff ${NONCE}" \
+crisp_send_text "$HANDOFF_SESSION" user "AI must stay silent after confirmed handoff ${NONCE}" \
   "$((CONTEXT_FINGERPRINT + 202))"
 sleep "$SETTLE_SECONDS"
-[[ "$(ai_reply_count "$HANDOFF_SESSION")" == "$((HANDOFF_BASELINE + 2))" ]] \
-  || fail "精确转人工后 AI 仍然自动回复"
-printf '外部 E2E：精确转人工、AI 停止与 Crisp 标签合并通过。\n'
+[[ "$(ai_reply_count "$HANDOFF_SESSION")" == "$((HANDOFF_BASELINE + 3))" ]] \
+  || fail "重复按钮确认或人工暂停期间仍有自动回复"
+resume_test_session "$TEXT_SESSION"
+RESUMED_BASELINE=$(ai_reply_count "$TEXT_SESSION")
+crisp_send_text "$TEXT_SESSION" user "What is the answer for ${MD_MARKER}? Reply with the exact answer token." \
+  "$((CONTEXT_FINGERPRINT + 203))"
+wait_for_latest_ai_content "$TEXT_SESSION" "$MD_ANSWER" "$((RESUMED_BASELINE + 1))"
+[[ "$(session_mode "$HANDOFF_SESSION")" == human ]] || fail "另一会话恢复影响了按钮人工会话"
+printf '外部 E2E：关键词仅展示、真实选择更新、一次确认、两会话隔离与标签合并通过。\n'
 
+resume_test_session "$IMAGE_SESSION"
 IMAGE_BASELINE=$(ai_reply_count "$IMAGE_SESSION")
 IMAGE_FAILURE_MESSAGE=$(jq -r '.handoff.failure_message // ""' \
   "${DEPLOY_DIR}/config/handoff.yaml") || fail "读取视觉失败提示配置失败"
@@ -633,16 +672,18 @@ while (( SECONDS - stats_wait_started < TIMEOUT_SECONDS )); do
   STATS_AFTER=$(stats_snapshot)
   read -r QUESTIONS_AFTER REPLIES_AFTER HITS_AFTER MISSES_AFTER HANDOFFS_AFTER \
     < <(jq -r '@tsv' <<< "$STATS_AFTER")
-  if (( QUESTIONS_AFTER >= QUESTIONS_BEFORE + 7 \
-    && REPLIES_AFTER >= REPLIES_BEFORE + 5 \
+  if (( QUESTIONS_AFTER >= QUESTIONS_BEFORE + 6 \
+    && REPLIES_AFTER >= REPLIES_BEFORE + 6 \
     && HITS_AFTER > HITS_BEFORE \
     && HANDOFFS_AFTER >= HANDOFFS_BEFORE + 2 )); then
     break
   fi
   sleep 3
 done
-(( QUESTIONS_AFTER >= QUESTIONS_BEFORE + 7 )) || fail "总问题统计未增加"
-(( REPLIES_AFTER >= REPLIES_BEFORE + 5 )) || fail "AI 回复统计未增加"
+# Six actual inference questions: initial/context/operator/before-click/resumed/image.
+# Keyword cards, clicks and human-paused questions are deliberately excluded.
+(( QUESTIONS_AFTER >= QUESTIONS_BEFORE + 6 )) || fail "六个实际模型问题未进入统计"
+(( REPLIES_AFTER >= REPLIES_BEFORE + 6 )) || fail "六个实际 AI 回复未进入统计"
 (( HITS_AFTER > HITS_BEFORE )) || fail "知识库命中统计未增加"
 (( HANDOFFS_AFTER >= HANDOFFS_BEFORE + 2 )) || fail "转人工统计未增加"
 (( MISSES_AFTER >= MISSES_BEFORE )) || fail "知识库未命中统计发生倒退"

@@ -1,101 +1,81 @@
-# 配置说明
+# 配置、应用与迁移契约
 
-## 配置分层
+正常操作使用 [18 项 Shell 菜单](MENU.md)，不直接编辑 YAML 或登录应用网页补配置。以下描述真实存储与运行消费者，方便审计、故障定位和迁移；示例只含虚构内容。
 
-- `.env` 保存部署路径、端口和密钥，仅允许部署账户读取，不得提交到 Git。
-- `config/provider.yaml` 保存 Provider 类型、地址、模型和能力检测结果，不保存 API Key。
-- `config/prompt.md` 保存客服系统提示词。
-- `config/keyword.yaml`、`config/menu.yaml`、`config/handoff.yaml`、`config/tags.yaml` 和 `config/feedback.yaml` 保存业务规则。
-- 带 `.example` 后缀的文件是可公开提交的模板，不得填入真实凭据。
-- `tmp/quick-init.json` 仅在十项向导未完成或安装需恢复时存在，权限为 `0600`；配置与本地应用成功落盘后自动删除。
+## 1. 权威源和生效机制
 
-## AI Provider
+业务 `.yaml` 使用 JSON 语法（也是合法 YAML），因此 n8n 可安全读取而不执行用户文字。`.env` 使用严格解析和序列化，不 `source`、不 `eval`，特殊字符 `$ # = 引号 反斜线` 不再被 Compose 意外插值。公开 `.example` 只用于首次生成，升级不覆盖合法自定义配置。
 
-配置入口只要求输入 API Base URL 和 API Key。脚本会规范化地址、请求 `/v1/models` 并显示模型菜单；列表请求失败时才允许手动输入或使用默认模型。
+| 菜单 | 落盘位置（相对部署目录） | 消费者/生效与验证 |
+| --- | --- | --- |
+| 3 AI | `.env`、`config/provider.yaml` | 宿主探测 + 适配器/AnythingLLM/n8n；实际容器调用后提交代次，失败恢复旧值 |
+| 4 Prompt | `config/prompt.md` | workspace openAiPrompt + n8n 图片请求；API 与容器文件回读，后续新问题使用新正文 |
+| 5 知识 | `knowledge/catalog.json`、`kb_*/sources`、`data/knowledge-manifest.json` | 全部启用库投影到一个 workspace；实际文档/索引回读与来源映射 |
+| 6 规则 | `config/keyword.yaml` | runtime 每事件读取；schema、边界、容器文件回读，无需全栈重启 |
+| 7 人工 | `config/handoff.yaml`、`data/runtime/session-*.json` | 默认秒数供新接管使用；单会话 CLI 使用同一事务状态 |
+| 8 总开关 | `config/runtime.yaml` | 事件处理和每次发送前读取，代次使旧任务失效，不停止服务 |
+| 9 欢迎/菜单 | `config/menu.yaml` | runtime 与白名单公开配置路由；网页只读允许的 UI 字段 |
+| 10 Crisp | `.env`、受管反代片段 | n8n 重载与 REST/Hook/收件事实复核，不重生 workspace |
+| 11 标签/反馈 | `config/tags.yaml`、`config/feedback.yaml` | runtime 与 `data/analytics`，正文发送与可选标签分离 |
+| 12 业务迁移 | 用户选择的受限 `.tar.gz` | schema/checksum/预览→备份→同步→回读，保留本机秘密 |
+| 13/14 本机恢复 | `backups/versions`、完整备份包 | 数据库、应用文件与镜像身份一致性恢复 |
 
-选择模型后，脚本会实际请求 `/v1/chat/completions`。该接口和所选模型必须可用，否则拒绝保存配置，因为 AnythingLLM 的 `generic-openai` Provider 依赖 Chat Completions。脚本还会探测 `/v1/responses`，并使用一张无业务数据的微型图片实际检测视觉能力。检测结果写入 `config/provider.yaml`，API Key 只写入 `.env` 的 `AI_API_KEY`。
+`runtime.yaml` 使用 `schema_version: 2`、布尔 `enabled`、单调 `revision`、`applied_revision`。候选受限暂存、校验、旧值备份、原子提交后，实际组件回读成功才标已应用。失败要恢复旧值或明确 pending，不能只输出“文件已保存”。总开关/控制事件不等待付费模型探测；Prompt/Provider/知识操作会使旧任务代次失效。
 
-AnythingLLM 使用 `generic-openai` Provider、原生 Embedding 与内置 LanceDB。基础地址应包含 API 的 `/v1` 前缀；脚本会自动避免重复拼接 `/v1`。
+配置历史保存于受限 `backups/config-history`；它可能包含旧秘密、Prompt 或知识，不能上传。维护操作共用实例锁；空闲菜单不长期持锁。会话控制使用独立短临界区，不能锁着等 LLM 请求。直接在第三方 Web UI 改动可能造成偏离，选 `16 → 6` 重新应用受管配置。
 
-`.env` 中 `AI_API_PROBE_BASE_URL` 是宿主机实际探测地址，`AI_API_BASE_URL` 是容器运行地址。用户输入 `localhost` 或 `127.0.0.1` 时，后者自动映射为 `host.docker.internal`；两者不要手工混用。非本机 Provider 必须使用 HTTPS。配置值通过受限的 dotenv 序列化保存，支持 `$`、`#`、空格、引号、反斜线和 `=`，脚本从不 `source .env`。
+## 2. Provider、协议与网络
 
-上述业务配置使用 JSON 语法书写；JSON 本身是合法 YAML，这使 n8n 无需额外解析依赖即可安全读取。首次安装由对应 `.example` 模板生成实际配置，实际配置被 Git 忽略。修改后应运行健康检查并重新发布工作流。
+`AI_API_PROBE_BASE_URL` 是宿主探测地址，`AI_API_BASE_URL` 是容器可达供应商地址；本机地址映射为 `host.docker.internal`，合法代理路径保留，不重复追加 `/v1`。`AI_API_KEY` 与 `AI_CUSTOM_HEADERS_JSON` 只在 `.env`；后者允许有限安全请求头，不能覆盖 Authorization/Host/Content-Length 等管理字段。
 
-## AnythingLLM 初始化
+`provider.yaml` 记录 `schema_version: 2` 与 `provider.base_url/model/api_mode/capabilities/api_key_env` 等非秘密元数据，模型列表缓存与当前候选凭据摘要绑定，不保存明文 Key。管理员选择 `chat_completions` 或 `responses` 后必须得到有效正文；HTTP 200、模型 ID 或列表成功不能代替能力测试。
 
-首次安装会自动使用本机 `ANYTHINGLLM_AUTH_TOKEN` 获取会话令牌，复用或创建名为 `ai-support` 的 Developer API Key，并检查或创建 `ANYTHINGLLM_WORKSPACE` 指定的工作区。Key 自动写入权限为 `0600` 的 `.env`，不会写入公开模板或日志。预先提供 Key 时，安装程序会先验证它。
+AnythingLLM 固定使用 `generic-openai`，内部 Base 为 `AI_ANYTHINGLLM_BASE_URL=http://provider-adapter:8787/v1`。适配器复用固定镜像中的 Node，仅提供项目所需 Chat→Responses 转换或 Chat 转发，不是另一套 RAG。容器内部接口仍鉴权，不公开端口；生成请求有输出/内容上限、超时与取消。实际调用必须与 `api_mode` 一致。
 
-`ANYTHINGLLM_CHAT_MODE` 必须是 `chat`。n8n 会把同一 Crisp conversation 受长度限制的用户、AI 与人工消息加入当前请求，并使用 `sessionId` 隔离 AnythingLLM 会话；安装和升级会把旧的 `query` 或 `automatic` 值迁移为 `chat`。知识库优先与“不确定不猜测”由独立 Prompt 约束。
+图片走同一 Provider 的已验证文本/图片协议，带当前 Prompt 与同会话公开历史；不能支持时安全请求文字补充，不转人工。图片 URL 下载保护见 [SECURITY](SECURITY.md)。默认本地 Embedder由 AnythingLLM 管理，不需要另外的 API Key，不把聊天模型当 Embedding。升级已有模型设置须考虑全索引重建，不能只改显示名称。
 
-## Crisp
+## 3. Prompt
 
-`CRISP_TOKEN_TIER` 配置 REST API Token 的 `website` 或 `plugin` 类型。`CRISP_HOOK_MODE` 独立配置 Webhook 的 `website` 或 `plugin` 校验方式。Token、URL Secret 和 Signing Secret 都只保存在 `.env`。
+`config/prompt.md` 保留原文，不加入内部版本号或 hash。文件/多行粘贴上限 256 KiB；空或仅空白拒绝覆盖。修改自动更新 workspace，并检查回读精确一致；n8n 同时读取最新正文。当前 conversation 的新问题使用新 Prompt，公开历史仅作背景，不能覆盖当前知识与系统护栏。
 
-- Website 模式使用 `CRISP_WEBSITE_HOOK_SECRET`，地址带 `?key=<Secret>`。Website Hook 没有 Crisp 签名，工作流只验证随机查询 Secret。
-- Plugin 模式使用 `CRISP_PLUGIN_SIGNING_SECRET`，地址不带查询 Secret。工作流强制验证原始请求体的 HMAC-SHA256 签名和五分钟时间窗，不会回退为 URL Secret。
+默认规则要求知识优先、不编造、不泄露内部配置、不声称执行未做操作、必要时追问、图片结合上下文。Prompt 不能修改鉴权、总开关、按钮授权和人工状态，不因为模型不确定自动接管。
 
-两种 Hook 都必须订阅 `message:send` 与 `message:received`。前者处理访客消息，后者处理公开 operator 回复。Plugin Hook 可额外订阅 `session:request:initiated` 发送会话创建欢迎语。不要使用 `session:set_opened` 作为欢迎事件，它表示 operator 查看 conversation。
+## 4. 多知识库及真实索引
 
-`WEBHOOK_ACCESS_MODE` 为 `managed_https` 时启用 Compose 中的 Caddy profile；`external_proxy` 表示复用现有 HTTPS 入口。`WEBHOOK_PRODUCTION_URL` 始终保存最终 `/webhook/crisp-webhook` 地址，`PUBLIC_WEBHOOK_URL` 保存 n8n 使用的公开 base。受管 Caddy 仅发布生产 Webhook，证书目录集中在 `data/caddy` 和 `data/caddy-config`。
+`knowledge/catalog.json` 的 `schema_version=2`，每库有稳定 `kb_*` ID、中文名称、enabled、revision、documents、status、last_sync、error。文档有稳定 `doc_*` ID、原名、source、projection、sha256；sources 为原文，投影名包含归属避免跨库同名覆盖。
 
-图片 URL 默认只接受 HTTPS 的 `crisp.chat` 子域名。确需使用其他可信图片主机时，可在 `.env` 的 `CRISP_IMAGE_HOSTS` 中填写逗号分隔的精确主机名。
+所有启用库共同用于一个 `ANYTHINGLLM_WORKSPACE`（默认 `crisp-support`）；停用库保留原文但移出新检索，删除指定库/条目不改其他库。相同库同名文件更新原条目；跨库相同内容保持独立引用与所有权。每库最多 10000 条、最多 100 库、单文档 50 MiB 是实际校验边界，不承诺无限资源。
 
-## 人工接管
+`data/knowledge-manifest.json` 保存 hash、远端文档位置和 pending/garbage 对账；`data/runtime/knowledge-map.json` 仅将已启用的有效位置映射回库/文档。上传、workspace 加入和索引回读分开处理。超时但服务端继续索引时保留 pending，重跑同步有限对账，不立即删远端工作。
 
-`handoff.yaml` 的 `keywords` 是唯一的文字自动识别入口，默认包含“人工”“人工客服”“转人工”“真人”和“真人客服”。`match_mode` 默认是 `exact`：对输入做 Unicode、空白和大小写规范化后，必须与某个配置词完全相等，避免“人工智能”之类文本误触发。确需旧式包含匹配时可显式设为 `contains`。
+默认目录升级幂等迁移为 `kb_default`，保留原映射，避免重装重复 N 份。删索引不会擦除旧聊天中已经出现的知识；事实变更以当前库优先，冲突时应澄清，不拼接矛盾政策。检索预览应看中文问题结果与来源，不凭模拟 Provider 的固定回答判断检索质量。
 
-访客精确命中关键词或选择菜单中的人工动作后，工作流先按 `notify_user.enabled` 回复“正在为您转接人工客服，请稍候。”，随后关闭当前 conversation 的 AI，并添加人工标签。`disable_ai` 必须保持为 `true`；安装、更新和恢复会把旧配置中的其他值安全迁移为 `true`。
+## 5. 关键词、菜单与人工控制
 
-真实、公开且非自动的 operator `message:received` 文本或文件回复会立即关闭当前 conversation 的 AI；内部 note 和本系统发送的消息会被忽略。AI 生成后、发送前还会重新读取 Crisp 消息并检查接管代次，发现人工已经回复时取消本次 AI 发送。接管期间访客消息不会触发 AI 回复。`resume_after_seconds` 到期后，AI 会在下一条访客消息恢复；设为 `0` 表示不自动恢复。operator 的消息内容不会绕过接管规则。
+`keyword.yaml` 使用 `schema_version=2` 和 `rules[]`。字段为 id/name/enabled、keywords、exclude_keywords、match_mode（contains/exact）、priority、cooldown_seconds、offer_ttl_seconds、action、正文和按钮文案。人工动作只有 `show_handoff_offer`，不能配置关键词直接暂停。新装人工按钮模板启用，排除明确否定，默认冷却 60 秒、TTL 600 秒。
 
-知识库未命中、低置信度、图片理解失败和 API 失败不会关闭 AI。相应提示可通过 `no_answer_message`、`low_confidence_message` 和 `failure_message` 修改。
+每张卡片保存随机 offer、网站+会话、fingerprint、允许 choices、配置/会话代次、有效期与消费状态。关键词本条仅展示 picker，不附普通 AI 答案；未来普通问题继续 AI。合法点击原子消费并先暂停再确认；取消、未知、跨会话、过期、重复和纯文本冒充都不能暂停。`message:updated` 使用事件类型+选择摘要去重，不因同 fingerprint 已见而丢弃。
 
-## Conversation 标签
+只有有效确认按钮或真实人工公开回复自动进入 human。控制状态 key 为网站+session 的 hash，保存 mode、generation、last_human_at、resume_at、pause_reason 及控制水位；全局 enabled 不写成共享会话模式。`handoff.resume_after_seconds` 新装 1800，0 永久；真人新公开回复重计、访客/机器人/重复旧事件不重计。到期递增代次并只处理新消息，5 秒持久扫描加惰性校验，不发恢复通知。
 
-`tags.yaml` 配置项目管理的四类标签，默认值分别是 `ai_resolved`、`knowledge_miss`、`low_confidence` 和 `human_required`。标签值不得包含空格或控制字符；设 `enabled` 为 `false` 可关闭自动标签。
+普通任务在模型前记录 revision/generation，模型后与发送前复核；可信人工控制先落盘，不等待长请求。尚未 POST 的旧结果作废，不能保证撤回远端已经接收的 POST。人工状态不按普通缓存期限淘汰。
 
-更新标签时，工作流先读取 Crisp conversation 当前 `segments`，再把新标签与全部既有标签做去重并集；不会删除或替换既有项目标签。读取失败时会跳过 PATCH，正文回复不受影响。Website Token 或 Plugin Token 必须具备读取和修改 conversation meta 的权限。
+## 6. 欢迎、反馈、标签
 
-## 回答反馈与统计
+`menu.yaml` 的 welcome 默认 `enabled=true/trigger=first_message/auto_open=false/show_menu=true`。另支持 widget_load/chat_open，需无密钥 SDK + `session:sync:events`。菜单树用 root/menus/options，动作 reply/prompt/menu/show_handoff_offer；返回父级用受限 back 标记，普通下级禁止环，深度最多十层。
 
-`feedback.yaml` 控制回答后的“是否解决问题”提示、正负反馈词、致谢消息、有效期与最大文本长度。反馈只在成功生成的知识库或视觉回答后询问；菜单、欢迎语、失败提示和转人工通知不会重复询问。
+`feedback.yaml` 定义启停、提示、正负文案、有效期及保留；反馈绑定已发送回答并防重复，“否”只有存在有效反馈上下文时才消费。负反馈不接管。`retention_days` 默认 30，允许 1～3650；调度检测保留期变化后执行清理，平时每小时检查，范围仅统计活动文件及五份轮转，不删除人工状态。默认 `retain_text=false`，不留明文问题，仅保留限长指纹/脱敏摘要。
 
-`data/analytics/events.jsonl` 保存追加式事件，活动文件达到约 10 MiB 时轮转，最多保留 `.1` 至 `.5` 五个历史文件。统计脚本按最旧轮转到活动文件汇总，存储窗口最大约 60 MiB；超出窗口的最旧轮转会被淘汰。问题数、AI 回复数、命中、未命中、发送失败和转人工事件不保存消息内容；AI 回复、命中和待反馈数据只在 Crisp 确认消息成功发送后提交。反馈事件按需求保存 `session`、`question`、`answer` 和 `feedback`，其中 session 使用 HMAC 匿名化，问题和回答在进入待反馈状态前就会过滤常见 Token、Cookie、JWT、Secret、邮箱和号码并截断。管理员仍应落实隐私告知、访问控制和保留期限。
+`tags.yaml` 的 `ai_replied` 表示已回复，不自动 resolved。标签读取现有 segments 后并集写回，失败跳过，不中断正文。知识命中使用实际 sources；可观察查询才参与命中分母，未知单列，按库来源归属但每问题总数只计一次。
 
-查看统计：
+## 7. Crisp 与安装事实
 
-```bash
-sudo /opt/crisp-ai/scripts/analytics.sh knowledge
-sudo /opt/crisp-ai/scripts/analytics.sh feedback
-```
+Token tier 与 Hook mode 分开；Website URL Secret、Plugin Signing Secret、Crisp API Key互不替用。`.env` 中 PUBLIC_WEBHOOK_URL 为 base，WEBHOOK_PRODUCTION_URL 为最终生产路由。受管 HTTPS/已有反代仅公开 Hook 与无秘密 SDK/UI 配置，详见 [CRISP](CRISP.md)。
 
-## 版本快照
+安装 marker 保存单一分层 facts；runtime 收件/往返观察绑定当前凭据与 Hook，不能拿旧账户记录或协议模拟端点变成真实 Crisp 通过。菜单 10→12 读取观察，doctor 合并实际结果。收到 Hook、REST 可用、公网可达、真实回答成功是不同检查。
 
-`.env` 中的 `SNAPSHOT_MIN_FREE_MB` 控制快照完成后必须保留的空间，默认 `1024` MiB。容量预检按待复制数据的两倍加预留空间保守估算，以覆盖临时副本和压缩归档同时存在的阶段。
+## 8. 导出、升级和恢复
 
-`SNAPSHOT_RETENTION_COUNT` 控制有效版本快照的最大数量，默认 `10`。设为 `0` 表示不自动清理。自定义值会在重复安装时保留；升级会为旧部署补齐缺失的默认值。
+业务包 `ai-support-business-v2` 包含非敏感 Provider、所有业务配置、Prompt、多库原文、workflow模板、版本和 SHA 清单；排除 `.env`、秘密 Header 和会话。导入前完整校验与数字确认，保留本机秘密，自动应用后回读；失败恢复旧配置。包上限压缩 128 MiB/展开 512 MiB，不能在导入时执行其中的代码。
 
-`LOCAL_HEALTH_TIMEOUT_SECONDS` 与 `LOCAL_HEALTH_INTERVAL_SECONDS` 控制安装、更新、恢复和回滚等待本地服务就绪的有限窗口，默认分别为总计 `1800` 秒和每轮 `5` 秒。HTTP 探测耗时也计入总时限，普通服务器就绪后会立即提前结束；仅在已确认机器冷启动较慢时调整，允许范围分别为 `1–3600` 秒和 `1–30` 秒。
-
-`N8N_WORKFLOW_READY_TIMEOUT_SECONDS` 控制 workflow 发布后等待生产 Webhook 和 JavaScript task runner 可实际执行的总时限，默认 `300` 秒，允许 `1–900` 秒。检查使用固定无效 Secret，期望得到 workflow 自身的 401 JSON，不会触发 AI 或 Crisp 外发。
-
-版本快照会短暂停止 n8n 与 AnythingLLM，保存程序、配置、知识文件、AnythingLLM 数据、n8n PostgreSQL 逻辑备份和本机镜像 ID。快照不包含 `.env`、匿名统计或日志，只用于同一主机受限回滚。
-
-## 镜像版本
-
-默认 Compose 使用已选定的版本标签：
-
-- n8n `2.33.0`
-- PostgreSQL `16.10-alpine`
-- AnythingLLM `1.16.1`
-- Caddy `2.10.2-alpine`（仅受管 HTTPS profile 启用）
-
-AnythingLLM 基线选择 `1.16.1`，用于包含 `1.15.0` 之后公布的相关修复；不得把正式部署降级到 `1.15.0` 或更早版本。可通过 `.env` 覆盖镜像，但覆盖后必须先核对上游安全公告，再重新执行完整测试和真实部署验收。不要在正式部署中改用 `latest` 或宽泛主版本标签。
-
-## Prompt
-
-首次安装会从 `config/prompt.md.example` 创建 `config/prompt.md`。可通过管理菜单修改、导入或导出；导入文件必须是普通文件且位于允许的路径中。
-
-## 知识库
-
-支持 Markdown、TXT、PDF 和 DOCX。管理脚本只接受这些扩展名，并拒绝符号链接和路径穿越。AnythingLLM 负责解析、自动分块、向量化、检索和重新索引；文件更新或删除后，脚本同时清除旧索引与 AnythingLLM 源文档，暂时失败的源文档清理会写入本地清单并在下次同步重试。
+本机快照 `ai-support-snapshot-v3` 与完整备份包含 `.env`、PostgreSQL dump、AnythingLLM/n8n/runtime、程序配置和历史镜像身份；用于可信本机一致性恢复。旧 v2 快照按原边界兼容，不假称其含后来新增的秘密和状态。升级保留旧自定义设置，将 handoff 动作迁移成按钮、单知识迁移默认库；不统一重置人工。密钥和数据恢复保护见 [SECURITY](SECURITY.md)。

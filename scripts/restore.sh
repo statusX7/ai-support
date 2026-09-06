@@ -10,6 +10,7 @@ INPUT_REQUEST=""
 SKIP_RESTART=0
 SAFETY_BACKUP=1
 SERVICES_STOPPED=0
+FULL_BACKUP=0
 
 usage() {
   cat <<'EOF'
@@ -19,11 +20,13 @@ usage() {
   --deploy-dir PATH    指定部署目录
   --skip-restart       恢复后不重启容器
   --no-safety-backup   不创建恢复前安全备份
+  --full              恢复可信的本机完整备份（包含密钥、数据库及会话）
 EOF
 }
 
 while (( $# > 0 )); do
   case "$1" in
+    --full) FULL_BACKUP=1; shift ;;
     --deploy-dir)
       (( $# >= 2 )) || die "--deploy-dir 缺少参数"
       DEPLOY_REQUEST=$2
@@ -51,6 +54,12 @@ while (( $# > 0 )); do
 done
 
 [[ -n "$INPUT_REQUEST" ]] || die "必须通过 --input 指定备份文件"
+if (( FULL_BACKUP )); then
+  (( SKIP_RESTART == 0 )) || die "完整数据库恢复不能跳过服务操作"
+  full_args=(restore --deploy-dir "$(resolve_deploy_dir "$DEPLOY_REQUEST")" --input "$INPUT_REQUEST")
+  (( SAFETY_BACKUP )) || full_args+=(--no-safety-backup)
+  exec bash "${SCRIPT_DIR}/full-backup.sh" "${full_args[@]}"
+fi
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
 assert_installation "$DEPLOY_DIR"
 acquire_maintenance_lock "$DEPLOY_DIR"

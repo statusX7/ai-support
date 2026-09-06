@@ -1,92 +1,112 @@
-# 发布说明
+# 正式发布与回滚
 
-## 结果分层
+本项目源码版本、真实本地部署与用户外部接入分别验收。目标仓库保持 private：`statusX7/ai-support`。本章的发布命令只由维护者在已授权环境执行；普通服务器安装不依赖 Git 或 gh。
 
-源码发布、真实本地安装和用户外部实例验收分别记录：
+## v1.1.0 发布门禁
 
-- `STATIC` 与 `UNIT-STUB` 必须无失败；
-- `REAL-BOOTSTRAP` 必须至少在一套初始无 Docker/Compose 的受支持 systemd Linux 上通过；
-- `REAL-LOCAL-INTEGRATION` 必须使用真实 PostgreSQL、AnythingLLM、n8n 和生产 workflow；
-- 缺少用户自有 Crisp/Provider/DNS 时，`EXTERNAL-E2E` 可标记 `External Validation Pending`，不得写成通过。
+- 18 项生产管理菜单实际可达，`crispai` 指向持久实例；十项快速初始化和缺依赖自动安装没有退化。
+- 关键词仅展示原生 picker，真实有效选择才暂停该会话；真人立即暂停、0/N 秒恢复、全局开关及迟到答案复核有实际运行证据。
+- Provider Chat/Responses 最终协议、Prompt 直接粘贴、多库索引/启停和完整业务迁移实际生效。
+- STATIC、UNIT/CONTRACT 与 REAL-LOCAL 核心测试无失败或关键跳过；至少一套初始无 Docker/Compose 的隔离系统从最终包完成生产安装。
+- v1.0.1 升级、人工状态保留、故障回滚、卸载/重装及受管入口生命周期经验证。
+- 版本、schema、workflow、CHANGELOG、文档和资产一致；当前文件、diff、完整 Git 历史、归档、转录无真实秘密。
+- 只缺真正的 Crisp/Provider/DNS/站点权限时，可将 EXTERNAL-E2E 标记 `External Validation Pending`，不豁免本地代码、应用初始化或部署失败。
 
-外部账号不能阻塞源码修复发布，但依赖自动安装、Docker daemon、本地容器和内部应用初始化不能豁免。详细定义见 [测试说明](TESTING.md)。
+准确层级、命令和 T01～T50 矩阵见 [测试说明](TESTING.md)。对应发布实际结果写入 [完整报告](reports/v1.1.0-report.md) 和 [发布说明](releases/v1.1.0.md)。
 
-## v1.0.1 发布门禁
+## 检查基线与权限
 
-- `VERSION`、`config/app.yaml`、n8n 出站版本、CHANGELOG、release notes 与报告一致；
-- `install.sh` 实际按“最小依赖 → 十项向导 → Docker → 配置 → 应用初始化 → 分层检查”运行；
-- Bash 语法、ShellCheck、配置解析、Bootstrap/Wizard/管理/业务回归通过；
-- Debian 12 干净 VM 从无 Docker 到本地应用完成的真实证据可追溯；
-- 从 v1.0.0 更新、重复安装、重启持久化、故障回滚、安全卸载和同路径恢复经过隔离验收；
-- 发布包从干净提交的固定已跟踪清单生成，不包含 `.git`、`.env`、实际配置、知识数据、备份、日志、测试缓存或开发工具；
-- 当前树、Git diff、Git 历史、发布包和脱敏转录未命中真实密钥；
-- `docs/reports/v1.0.1-report.md` 如实列出每个测试层及外部待验证项。
-
-自动回归：
+复用默认 GitHub CLI 登录，不新建空 `GH_CONFIG_DIR`，不根据 `GH_TOKEN` 是否设置推断登录，不把 Token 放进 URL：
 
 ```bash
-./tests/run.sh
-./tests/test_release_package.sh
-```
-
-缺少外部账户时，既有源码测试的显式分层模式仍可使用：
-
-```bash
-AI_SUPPORT_RELEASE_TEST=1 \
-AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1 \
-./tests/run.sh
-```
-
-该变量不会把真实失败改写为跳过，也不能代替独立 VM 验收。
-
-## 一致性检查
-
-```bash
-test "$(< VERSION)" = v1.0.1
-grep -Fq 'version: v1.0.1' config/app.yaml
-grep -Fq "ai_support_version: 'v1.0.1'" n8n/workflow.json
-grep -Fq '## v1.0.1' CHANGELOG.md
-test -f docs/reports/v1.0.1-report.md
-test -f docs/releases/v1.0.1.md
-git diff --check
-./tests/test_static_security.sh
-```
-
-## 构建正式资产
-
-打包器要求工作树和 index 无修改，只收录显式清单中的已跟踪文件：
-
-```bash
-./scripts/package-release.sh --output-dir dist
-cd dist
-sha256sum --check SHA256SUMS
-```
-
-必须在另一目录解压资产并再次运行 `--help`、版本检查、静态/配置检查和可执行安装入口。发布后还要从远端下载同一资产，核对 SHA-256、顶层目录、关键模块与版本。
-
-## GitHub 发布
-
-目标为 private repository `statusX7/ai-support`。使用 GitHub CLI 默认登录状态；不要创建空 `GH_CONFIG_DIR`，也不要仅根据 `GH_TOKEN` 是否为空判断权限：
-
-```bash
-gh auth status
-test "$(gh api user --jq .login)" = statusX7
-test "$(gh repo view statusX7/ai-support --json visibility --jq .visibility)" = PRIVATE
+git status --short
+git remote -v
+git log -5 --oneline
+git tag --list
+gh auth status --hostname github.com
+gh repo view statusX7/ai-support --json nameWithOwner,isPrivate,defaultBranchRef
+gh release list --repo statusX7/ai-support --limit 5
 git ls-remote --heads --tags origin
 ```
 
-保留 v1.0.0，不 force push。完成报告和最终提交后：
+保留现有认证、SSH remote 和 private 可见性。日志不记录认证内容；检查输出前脱敏。远端已有 v1.1.0 时先核对内容，禁止移动/删除已发布 tag；不得 force push。只有未占用目标才创建新 Release。
+
+## 验收及一致性
+
+在已经安装的隔离真实实例上运行，不得使用正式客服：
 
 ```bash
-git tag -a v1.0.1 -m "v1.0.1"
-git push --atomic origin main v1.0.1
-gh release create v1.0.1 \
-  dist/ai-support-v1.0.1.tar.gz \
-  dist/SHA256SUMS \
-  --repo statusX7/ai-support \
-  --verify-tag \
-  --title "v1.0.1" \
-  --notes-file docs/releases/v1.0.1.md
+AI_SUPPORT_INTEGRATION_DEPLOY_DIR=/绝对路径/隔离验收实例 \
+AI_SUPPORT_RELEASE_TEST=1 \
+AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1 \
+bash tests/run.sh
+git diff --check
+bash tests/test_static_security.sh
 ```
 
-发布后核对 Release 非 draft/prerelease、资产大小和摘要；若 push 已成功而 Release 创建失败，只重试创建 Release，不移动远端 tag。
+有全部外部测试资源时，配置受限测试环境后去掉外部 pending 参数。无论哪种模式，独立干净系统引导、最终归档实装、生产菜单、旧版本升级和回滚证据都应另行对账。
+
+确认 `VERSION`、`config/app.yaml`、生成工作流中的版本、CHANGELOG、`docs/releases/v1.1.0.md` 和 `docs/reports/v1.1.0-report.md` 一致。工作流通过 `node n8n/build-workflow.js` 从受管源码生成，禁止只改生成 JSON 留下不一致源码。
+
+先保留可解析的“验收代码 commit”，再写最终报告和发布提交。报告不要试图包含自身最终 hash；用 `git rev-parse v1.1.0^{commit}` 核对发布 tag。远端下载回执可作为 Release 附件或独立脱敏交付记录，不能因此移动 tag。
+
+## 确定归档
+
+打包器要求已修改/暂存文件全部提交，仅收录固定的已跟踪生产清单：
+
+```bash
+bash scripts/package-release.sh --output-dir dist
+(cd dist && sha256sum --check SHA256SUMS)
+bash tests/test_release_package.sh
+```
+
+产物为 `dist/ai-support-v1.1.0.tar.gz` 和仅含当前包的 `dist/SHA256SUMS`。生产模块、模板、workflow、页面脚本和文档必须完整；不包含 `.git`、`.work`、`.env`、实际业务配置/知识、运行数据、备份、日志或测试模型。
+
+在项目忽略目录下新建隔离解压目录，检查安全条目、版本、`--help/--version` 后执行正式安装入口。不是在工作树测试完成就默认归档也成功。最终打包后的内容发生任何变动都必须重新生成 hash 并复验。
+
+## 推送及真正创建 Release
+
+以下假设已核实默认分支为 `main`、v1.1.0 不存在且工作树干净。提交前先审查待提交清单，不将受限测试资料添加进 Git。
+
+```bash
+git tag -a v1.1.0 -m "v1.1.0: complete Shell management and conversation control"
+git push --atomic origin main v1.1.0
+gh release create v1.1.0 \
+  dist/ai-support-v1.1.0.tar.gz dist/SHA256SUMS \
+  --repo statusX7/ai-support \
+  --verify-tag \
+  --title "v1.1.0" \
+  --notes-file docs/releases/v1.1.0.md
+gh release view v1.1.0 --repo statusX7/ai-support \
+  --json url,isDraft,isPrerelease,tagName,assets
+```
+
+使用正式非 draft、非 prerelease。若原子 push 不被服务端支持，先验证分支再推 tag；任何远端冲突先停止核对，不能覆盖用户提交。push 成功但创建 Release 失败时，仅幂等完成尚未完成的 Release；不要重新打一个指向不同代码的同名 tag。命令语义见 [GitHub CLI 创建 Release](https://cli.github.com/manual/gh_release_create)。
+
+## 远端回下载核验
+
+用新的项目内受限目录下载当前两个资产：
+
+```bash
+release_receipt_dir=$(mktemp -d /root/projects/crispai/.work/release-receipt.XXXXXX)
+gh release download v1.1.0 --repo statusX7/ai-support \
+  --pattern ai-support-v1.1.0.tar.gz --pattern SHA256SUMS \
+  --dir "$release_receipt_dir"
+(cd "$release_receipt_dir" && sha256sum --check SHA256SUMS)
+tar -tzf "$release_receipt_dir/ai-support-v1.1.0.tar.gz"
+tar -xzf "$release_receipt_dir/ai-support-v1.1.0.tar.gz" -C "$release_receipt_dir"
+bash "$release_receipt_dir/ai-support-v1.1.0/install.sh" --help
+bash "$release_receipt_dir/ai-support-v1.1.0/manage.sh" --version
+git rev-parse 'v1.1.0^{commit}'
+git ls-remote origin 'refs/tags/v1.1.0*'
+```
+
+维护目录不在上述路径时，改为自己的项目内忽略目录；不得指向已有部署。先检查条目及 SHA256 再解压，不把未校验的陌生包当脚本执行。记录真实 URL、资产名/大小/SHA256、远端 tag commit 和入口结果。[GitHub CLI 下载资产](https://cli.github.com/manual/gh_release_download)
+
+## 部署升级及回滚
+
+管理员使用 `crispai → 14 更新与回滚`，选择可信离线包；v1.0.1 也可用其已有更新入口。升级前创建一致性快照、核对容量与镜像，成功后读回配置及应用，重建正确数据挂载并修复快捷命令。
+
+故障时使用同菜单的历史回滚，或按 [部署文档](INSTALL.md) 的恢复命令。完整本机 v3 备份包含内部秘密和数据库，必须 0600 保存，不上传 Release。业务迁移包不含秘密，不等价于完整灾难恢复快照；旧 v2 备份的恢复要求见 [配置与迁移](CONFIG.md)。
+
+发布地址只有远端实际成功后才能报告。认证真的过期或权限被撤销时，保留本地成果和明确失败命令，说明需要账户持有人恢复哪项授权，不能虚构 Release 链接。

@@ -69,7 +69,7 @@ list_snapshots() {
   printf '%-43s %-10s %-20s %s\n' '快照 ID' '版本' '创建时间' '原因'
   if [[ -d "$VERSIONS_DIR" ]]; then
     while IFS= read -r -d '' manifest; do
-      if jq -e '.format == "ai-support-snapshot-v1" or .format == "ai-support-snapshot-v2"' "$manifest" >/dev/null 2>&1; then
+      if jq -e '.format == "ai-support-snapshot-v1" or .format == "ai-support-snapshot-v2" or .format == "ai-support-snapshot-v3"' "$manifest" >/dev/null 2>&1; then
         jq -r '[.id,.version,.created_at,.reason] | @tsv' "$manifest" | \
           while IFS=$'\t' read -r id version created reason; do
             printf '%-43s %-10s %-20s %s\n' "$id" "$version" "$created" "$reason"
@@ -97,8 +97,9 @@ MANIFEST="${SNAPSHOT_DIR}/manifest.json"
 ARCHIVE="${SNAPSHOT_DIR}/snapshot.tar.gz"
 [[ -d "$SNAPSHOT_DIR" && ! -L "$SNAPSHOT_DIR" ]] || die "版本快照不存在：$SNAPSHOT_ID"
 [[ -f "$MANIFEST" && ! -L "$MANIFEST" && -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || die "版本快照不完整"
-jq -e --arg id "$SNAPSHOT_ID" '.format == "ai-support-snapshot-v2" and .id == $id and .contains_env == false and .contains_database_dump == true' "$MANIFEST" >/dev/null \
+jq -e --arg id "$SNAPSHOT_ID" '((.format == "ai-support-snapshot-v2" and .contains_env == false) or (.format == "ai-support-snapshot-v3" and .contains_env == true)) and .id == $id and .contains_database_dump == true' "$MANIFEST" >/dev/null \
   || die "版本快照清单无效"
+SNAPSHOT_FORMAT=$(jq -r '.format' "$MANIFEST")
 (( SKIP_START == 0 )) || die "包含数据库的版本回滚必须操作 Docker，不能使用 --skip-start"
 EXPECTED_SHA=$(jq -er '.archive_sha256' "$MANIFEST")
 ACTUAL_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
@@ -143,11 +144,15 @@ is_allowed_snapshot_path() {
   esac
 }
 
+require_command python3
+python3 "${SCRIPT_DIR}/archive-guard.py" "$ARCHIVE" --kind snapshot || die "版本快照安全校验失败"
 while IFS= read -r entry; do
   clean=${entry#./}
   [[ "$clean" != /* && "$clean" != ".." && "$clean" != ../* && "$clean" != */../* && "$clean" != *\\* ]] \
     || die "版本快照包含路径穿越：$entry"
-  is_allowed_snapshot_path "$entry" || die "版本快照包含未授权路径：$entry"
+  if [[ "$SNAPSHOT_FORMAT" != ai-support-snapshot-v3 ]]; then
+    is_allowed_snapshot_path "$entry" || die "版本快照包含未授权路径：$entry"
+  fi
 done < <(tar --list --gzip --file "$ARCHIVE")
 while IFS= read -r listing; do
   case "${listing:0:1}" in
@@ -193,6 +198,9 @@ done
 if [[ -f "${PAYLOAD}/config/provider.yaml" ]] && provider_config_has_secret_field "${PAYLOAD}/config/provider.yaml"; then
   die "快照 provider.yaml 包含疑似密钥字段"
 fi
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  [[ -s "${PAYLOAD}/.env" ]] || die "完整快照缺少内部凭据文件"
+fi
 
 require_docker_runtime
 docker_compose "$DEPLOY_DIR" config --quiet
@@ -210,8 +218,12 @@ docker_compose "$DEPLOY_DIR" stop n8n anythingllm
 SERVICES_STOPPED=1
 
 if (( SAFETY_SNAPSHOT )); then
-  SAFETY_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "pre-rollback-${SNAPSHOT_ID}" --protect "$SNAPSHOT_ID" --quiet)
+  SAFETY_ID=$("${SCRIPT_DIR}/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "pre-rollback-${SNAPSHOT_ID}" --protect "$SNAPSHOT_ID" --quiet)
   info "回滚前安全快照：$SAFETY_ID"
+fi
+
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  install -m 0600 -- "${PAYLOAD}/.env" "${DEPLOY_DIR}/.env"
 fi
 
 for image_key in N8N_IMAGE POSTGRES_IMAGE ANYTHINGLLM_IMAGE; do
@@ -256,12 +268,37 @@ for name in "${OPTIONAL_DOC_FILES[@]}"; do
 done
 install -m 0640 -- "${PAYLOAD}/n8n/workflow.json" "${DEPLOY_DIR}/n8n/workflow.json"
 
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  # 源文件已经由归档校验器验证为普通文件；补齐新版本的生产模块和文档。
+  for directory in config n8n scripts docs; do
+    cp -a -- "${PAYLOAD}/${directory}/." "${DEPLOY_DIR}/${directory}/"
+  done
+  find "${DEPLOY_DIR}/scripts" -type f -name '*.sh' -exec chmod 0750 {} +
+fi
+
 find "${DEPLOY_DIR}/knowledge" -maxdepth 1 -type f ! -name 'README.md' \
   \( -iname '*.md' -o -iname '*.txt' -o -iname '*.pdf' -o -iname '*.docx' \) -delete
 while IFS= read -r -d '' file; do
   name=$(basename -- "$file")
   install -m 0640 -- "$file" "${DEPLOY_DIR}/knowledge/${name}"
 done < <(find "${PAYLOAD}/knowledge" -maxdepth 1 -type f ! -name 'README.md' -print0 | sort -z)
+
+restore_snapshot_tree() {
+  local relative=$1 destination="${DEPLOY_DIR}/$1" source="${PAYLOAD}/$1"
+  [[ -d "$source" && ! -L "$source" && -d "$destination" && ! -L "$destination" ]] \
+    || die "恢复目录不安全：$relative"
+  # 数据目录本身保留 inode；删除范围严格限定于受管实例的这一个已核验子目录。
+  find "$destination" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  cp -a -- "$source/." "$destination/"
+}
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  restore_snapshot_tree config
+  restore_snapshot_tree knowledge
+  for directory in data/runtime data/n8n; do
+    mkdir -p -- "${DEPLOY_DIR}/${directory}"
+    [[ ! -d "${PAYLOAD}/${directory}" ]] || restore_snapshot_tree "$directory"
+  done
+fi
 
 ANYTHING_RESTORE="${DEPLOY_DIR}/data/.anythingllm-restore-${SNAPSHOT_ID}"
 ANYTHING_PREVIOUS="${DEPLOY_DIR}/data/.anythingllm-previous-${SNAPSHOT_ID}"
@@ -301,6 +338,7 @@ fi
 docker_compose "$DEPLOY_DIR" config --quiet
 # AnythingLLM 使用 bind mount。目录经 mv 交换后必须重建容器，确保 mount 绑定到恢复后的 inode。
 docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm
+docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
 docker_compose "$DEPLOY_DIR" up -d --remove-orphans
 wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
@@ -326,10 +364,18 @@ else
   warn "回滚完成且本地应用已通过检查，但 Crisp API 待修正（HTTP ${CRISP_API_STATUS:-000}）"
 fi
 SERVICES_STOPPED=0
+if [[ -f "${DEPLOY_DIR}/scripts/launcher.sh" ]]; then
+  bash "${DEPLOY_DIR}/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" --non-interactive \
+    || warn "版本已恢复，但 crispai 入口存在冲突，请从 manage.sh 检查"
+fi
 rm -rf -- "$ANYTHING_PREVIOUS"
 ANYTHING_SWAPPED=0
 
 trap - EXIT
 rm -rf -- "$STAGING"
 info "版本回滚完成：${SNAPSHOT_ID} -> $(<"${DEPLOY_DIR}/VERSION")"
-warn "已保留 .env、匿名统计与版本历史；n8n 数据库和 AnythingLLM 数据已恢复到快照状态"
+if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
+  warn "内部凭据、全部知识库、会话状态、n8n 与 AnythingLLM 已恢复；匿名统计和版本历史保留"
+else
+  warn "旧版 v2 快照不含内部凭据与会话控制数据，已保留当前 .env 和会话状态；数据库与 AnythingLLM 已恢复"
+fi

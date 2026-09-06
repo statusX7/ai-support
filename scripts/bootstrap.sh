@@ -167,6 +167,8 @@ bootstrap_command_package() {
   case "$1" in
     curl) printf '%s\n' curl ;;
     jq) printf '%s\n' jq ;;
+    python3) printf '%s\n' python3 ;;
+    cmp) printf '%s\n' diffutils ;;
     openssl) printf '%s\n' openssl ;;
     tar) printf '%s\n' tar ;;
     gzip) printf '%s\n' gzip ;;
@@ -185,7 +187,7 @@ bootstrap_collect_missing_runtime_packages() {
   local -a commands=(
     curl jq openssl tar gzip base64 sha256sum realpath stat df du install
     cat dirname basename mkdir rmdir mktemp chmod chown cp mv rm touch date sort head tail tr cut
-    paste wc find grep sed awk xargs flock ss sleep
+    paste wc find grep sed awk xargs flock ss sleep python3 cmp
   )
   local -a packages=()
 
@@ -200,6 +202,9 @@ bootstrap_collect_missing_runtime_packages() {
       *) packages+=("$package") ;;
     esac
   done
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    packages+=(python3-yaml)
+  fi
   # printf 在没有参数时仍会输出一个空行；显式跳过，避免 mapfile 将其
   # 解释为一个空包名并让幂等重跑再次调用 apt。
   (( ${#packages[@]} == 0 )) || printf '%s\n' "${packages[@]}"
@@ -210,12 +215,14 @@ bootstrap_verify_runtime_commands() {
   local -a commands=(
     curl jq openssl tar gzip base64 sha256sum realpath stat df du install
     cat dirname basename mkdir rmdir mktemp chmod chown cp mv rm touch date sort head tail tr cut
-    paste wc find grep sed awk xargs flock ss sleep
+    paste wc find grep sed awk xargs flock ss sleep python3 cmp
   )
   for command_name in "${commands[@]}"; do
     command -v "$command_name" >/dev/null 2>&1 \
       || bootstrap_die "依赖安装后仍缺少命令：${command_name}" || return
   done
+  python3 -c 'import yaml' >/dev/null 2>&1 \
+    || bootstrap_die 'Python 3 的 YAML 库仍不可用；请检查自定义 PATH 是否遮蔽发行版 Python' || return
 }
 
 bootstrap_verify_ca_bundle() {

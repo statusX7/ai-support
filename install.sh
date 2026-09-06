@@ -8,12 +8,15 @@ source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 source "${SCRIPT_DIR}/scripts/common.sh"
 # shellcheck source=scripts/wizard.sh
 source "${SCRIPT_DIR}/scripts/wizard.sh"
+# shellcheck source=scripts/launcher.sh
+source "${SCRIPT_DIR}/scripts/launcher.sh"
 
 ORIGINAL_ARGS=("$@")
 DEPLOY_REQUEST=""
 NON_INTERACTIVE=0
 SKIP_START=0
 RECONFIGURE=0
+COMMAND_PATH=""
 
 handle_install_interrupt() {
   trap - INT TERM
@@ -168,7 +171,7 @@ validate_preserved_installation() {
   for config_file in "${json_config_files[@]}"; do
     [[ -s "${deploy_dir}/config/${config_file}" ]] || continue
     case "$config_file" in
-      keyword.yaml) jq -e '.keywords | type == "array"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
+      keyword.yaml) jq -e '(.keywords | type == "array") or (.schema_version==2 and (.rules | type == "array"))' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
       menu.yaml) jq -e '.menus | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
       handoff.yaml) jq -e '.handoff | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
       tags.yaml) jq -e '.tags | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
@@ -176,7 +179,17 @@ validate_preserved_installation() {
     esac || invalid_config+=("config/${config_file}")
   done
   if [[ -s "${deploy_dir}/config/provider.yaml" ]]; then
-    if provider_config_has_secret_field "${deploy_dir}/config/provider.yaml" \
+    if jq -e '.provider | type=="object" and (.base_url|type=="string") and (.model|type=="string") and (.api_mode=="responses" or .api_mode=="chat_completions") and (.api_key_env=="AI_API_KEY")' "${deploy_dir}/config/provider.yaml" >/dev/null 2>&1; then
+      provider_base=$(jq -r '.provider.base_url' "${deploy_dir}/config/provider.yaml")
+      provider_model=$(jq -r '.provider.model' "${deploy_dir}/config/provider.yaml")
+      provider_mode=$(jq -r '.provider.api_mode' "${deploy_dir}/config/provider.yaml")
+      [[ "$provider_base" == "$(env_get "$env_file" AI_API_BASE_URL 2>/dev/null || true)" \
+        && "$provider_model" == "$(env_get "$env_file" AI_MODEL 2>/dev/null || true)" \
+        && "$provider_mode" == "$(env_get "$env_file" AI_API_MODE 2>/dev/null || true)" ]] \
+        || invalid_config+=(config/provider.yaml)
+      jq -e '[.. | objects | keys[] | ascii_downcase] | all(. != "api_key" and . != "token" and . != "secret" and . != "custom_headers")' "${deploy_dir}/config/provider.yaml" >/dev/null \
+        || invalid_config+=(config/provider.yaml)
+    elif provider_config_has_secret_field "${deploy_dir}/config/provider.yaml" \
       || ! grep -Eq '^[[:space:]]*type:[[:space:]]*openai-compatible[[:space:]]*$' \
         "${deploy_dir}/config/provider.yaml" \
       || ! grep -Eq '^[[:space:]]*base_url:[[:space:]]*"?https?://[^"[:space:]]+"?[[:space:]]*$' \
@@ -221,6 +234,7 @@ usage() {
 
 选项：
   --deploy-dir PATH   指定部署目录，默认 /opt/crisp-ai
+  --command-path PATH 高级：管理入口的绝对路径，默认 /usr/local/bin/crispai
   --non-interactive   从环境变量读取配置，不进行交互
   --skip-start        只安装文件，不启动 Docker 服务
   --reconfigure       重复安装时重新配置 Provider 与 Crisp
@@ -239,6 +253,11 @@ while (( $# > 0 )); do
     --non-interactive)
       NON_INTERACTIVE=1
       shift
+      ;;
+    --command-path)
+      (( $# >= 2 )) || die '--command-path 缺少参数'
+      COMMAND_PATH=$2
+      shift 2
       ;;
     --skip-start)
       SKIP_START=1
@@ -370,6 +389,7 @@ fi
 copy_project_files "$SCRIPT_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
 migrate_config_files "$DEPLOY_DIR"
+bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate
 
 ENV_FILE="${DEPLOY_DIR}/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -540,9 +560,25 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
         ;;
       *) die "快速初始化 Prompt 模式无效" ;;
     esac
-    KNOWLEDGE_SOURCE_VALUE=$(jq -r '.knowledge.source // ""' "$WIZARD_RESULT")
-    KNOWLEDGE_IMPORTED=$(import_knowledge_source "$DEPLOY_DIR" "$KNOWLEDGE_SOURCE_VALUE")
-    info "已复制 ${KNOWLEDGE_IMPORTED} 个知识文件到受管目录"
+    if [[ "$(jq -r '.knowledge.mode // "empty"' "$WIZARD_RESULT")" == libraries ]]; then
+      while IFS= read -r KNOWLEDGE_ENTRY; do
+        KNOWLEDGE_LIBRARY_NAME=$(jq -r '.name' <<< "$KNOWLEDGE_ENTRY")
+        KNOWLEDGE_SOURCE_VALUE=$(jq -r '.source' <<< "$KNOWLEDGE_ENTRY")
+        bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" \
+          bootstrap-source "$KNOWLEDGE_LIBRARY_NAME" "$KNOWLEDGE_SOURCE_VALUE" >/dev/null
+      done < <(jq -c '.knowledge.libraries[]' "$WIZARD_RESULT")
+      info '命名知识库原文已导入，将在应用启动后同步并核对索引'
+    else
+      KNOWLEDGE_SOURCE_VALUE=$(jq -r '.knowledge.source // ""' "$WIZARD_RESULT")
+      if [[ -n "$KNOWLEDGE_SOURCE_VALUE" && -f "$DEPLOY_DIR/knowledge/catalog.json" ]]; then
+        bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" \
+          bootstrap-source 默认知识库 "$KNOWLEDGE_SOURCE_VALUE" >/dev/null
+        info '知识来源已加入默认知识库，将在应用启动后同步并核对索引'
+      else
+        KNOWLEDGE_IMPORTED=$(import_knowledge_source "$DEPLOY_DIR" "$KNOWLEDGE_SOURCE_VALUE")
+        info "已复制 ${KNOWLEDGE_IMPORTED} 个知识文件到受管目录"
+      fi
+    fi
   fi
   set_installation_fact "$DEPLOY_DIR" provider ready
 else
@@ -575,12 +611,16 @@ if (( SKIP_START == 0 )); then
   wait_for_local_health "$DEPLOY_DIR"
   "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
     --application --installation-in-progress
+  bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
+    || die '配置或知识的运行时回读失败，安装进度已保留'
   set_installation_fact "$DEPLOY_DIR" app_config ready
   set_installation_fact "$DEPLOY_DIR" provider ready
   set_installation_fact "$DEPLOY_DIR" crisp_api pending
   set_installation_fact "$DEPLOY_DIR" webhook pending
   set_installation_fact "$DEPLOY_DIR" conversation pending
   write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
+  install_crispai_launcher "$DEPLOY_DIR" "$NON_INTERACTIVE" "$COMMAND_PATH" \
+    || die '本地服务已完成，但 crispai 管理入口安装失败；处理命令冲突后可重跑安装恢复'
   INITIAL_BACKUP="${DEPLOY_DIR}/backups/initial-${VERSION}.tar.gz"
   if [[ ! -f "$INITIAL_BACKUP" ]]; then
     "${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$INITIAL_BACKUP" \
@@ -595,9 +635,15 @@ if (( SKIP_START == 0 )); then
   fi
   if crisp_api_check "$DEPLOY_DIR"; then
     set_installation_fact "$DEPLOY_DIR" crisp_api ready
-    write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" ready
   else
     set_installation_fact "$DEPLOY_DIR" crisp_api failed
+  fi
+  refresh_conversation_fact "$DEPLOY_DIR" || set_installation_fact "$DEPLOY_DIR" conversation pending
+  if [[ "$(installation_fact "$DEPLOY_DIR" crisp_api)" == ready \
+    && "$(installation_fact "$DEPLOY_DIR" webhook)" == ready \
+    && "$(installation_fact "$DEPLOY_DIR" conversation)" == ready ]]; then
+    write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" ready
+  else
     write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
   fi
   # 确认结果含外部凭据；配置与本地应用初始化成功后删除第二份明文副本。
@@ -625,13 +671,17 @@ else
     printf 'Plugin Webhook：%s（必须由 Crisp 签名）\n' \
       "$(env_get "$ENV_FILE" WEBHOOK_PRODUCTION_URL)"
   fi
-  printf '请在 Crisp 同时订阅 message:send 与 message:received。\n'
+  printf '请在 Crisp 的 Workspace Settings → Advanced configuration → Web Hooks 登记生产地址。\n'
+  printf '订阅 message:send、message:received、message:updated；页面欢迎模式另需 session:sync:events。\n'
+  printf '管理入口：crispai；继续接入验证：crispai doctor；日志：%s/logs\n' "$DEPLOY_DIR"
+  printf '含 Secret 的真实 Hook 地址只在 crispai → 10 → 7 的私密终端显示。\n'
   if [[ "$(installation_state "$DEPLOY_DIR")" == ready ]]; then
-    printf 'Crisp REST API 凭据已验证；Webhook 登记与首条真实会话仍需在 Crisp 后台完成。\n'
+    printf 'Crisp REST、公网端点与已观察真实会话均已验证；客服按总开关及逐会话模式运行。\n'
   else
-    printf '本地安装已完成，但 Crisp REST API 尚未通过（HTTP %s）；服务和数据已保留。\n' \
-      "${CRISP_API_STATUS:-000}"
-    printf '修正 Crisp 凭据后运行：%s/manage.sh\n' "$DEPLOY_DIR"
+    printf '本地已就绪，尚未确认真实接待：Crisp API=%s（HTTP %s），公网=%s，真实会话=%s。\n' \
+      "$(installation_fact "$DEPLOY_DIR" crisp_api)" "${CRISP_API_STATUS:-000}" \
+      "$(installation_fact "$DEPLOY_DIR" webhook)" "$(installation_fact "$DEPLOY_DIR" conversation)"
+    printf '无需重新初始化。仅修复待接入项，完成 Hook 登记/真实测试后运行 crispai doctor。\n'
     exit 2
   fi
 fi

@@ -2,6 +2,7 @@
   "tags": {
     "enabled": true,
     "ai_resolved": "ai_resolved",
+    "ai_replied": "ai_replied",
     "knowledge_miss": "knowledge_miss",
     "low_confidence": "low_confidence",
     "human_required": "human_required"

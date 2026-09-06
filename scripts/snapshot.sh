@@ -16,7 +16,7 @@ usage() {
 用法：snapshot.sh [--deploy-dir PATH] [--reason TEXT] [--protect ID] [--check-capacity] [--quiet]
 
 创建仅用于本机版本回滚的受限快照，包含程序、配置、知识文件、AnythingLLM 数据和 n8n 数据库逻辑备份。
-快照不包含 .env、统计事件或日志。创建期间会短暂停止 n8n 与 AnythingLLM 以保证一致性。
+快照包含 .env、人工会话状态和内部凭据，必须按敏感数据保存，禁止上传。创建期间短暂停止 n8n 与 AnythingLLM 以保证一致性。
 
 --check-capacity 只执行容量预检，不创建快照。
 --protect ID      清理历史时保留指定快照，供回滚过程内部使用。
@@ -95,7 +95,7 @@ fi
 SNAPSHOT_MIN_FREE_MB_VALUE=$((10#$SNAPSHOT_MIN_FREE_MB_VALUE))
 SNAPSHOT_RETENTION_COUNT_VALUE=$((10#$SNAPSHOT_RETENTION_COUNT_VALUE))
 
-ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml install.sh manage.sh update.sh uninstall.sh)
+ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env .env.example docker-compose.yml install.sh manage.sh update.sh uninstall.sh)
 CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
 OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
@@ -105,7 +105,8 @@ SNAPSHOT_SOURCE_PATHS=()
 for name in "${ROOT_FILES[@]}"; do
   [[ -e "${DEPLOY_DIR}/${name}" ]] && SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${name}")
 done
-for directory in config knowledge n8n scripts docs data/anythingllm; do
+for directory in config knowledge n8n scripts docs data/anythingllm data/n8n data/runtime; do
+  [[ -d "${DEPLOY_DIR}/${directory}" ]] || continue
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${directory}")
 done
 SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/postgres")
@@ -145,9 +146,10 @@ TARGET_DIR="${VERSIONS_DIR}/${SNAPSHOT_ID}"
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/snapshot-stage.XXXXXX")
 TARGET_TEMP=$(mktemp -d "${VERSIONS_DIR}/.snapshot.XXXXXX")
 SERVICES_PAUSED=0
+PAUSED_SERVICES=()
 cleanup() {
   if (( SERVICES_PAUSED == 1 )); then
-    docker_compose "$DEPLOY_DIR" up -d n8n anythingllm >/dev/null 2>&1 \
+    docker_compose "$DEPLOY_DIR" up -d "${PAUSED_SERVICES[@]}" >/dev/null 2>&1 \
       || warn "快照失败后重新启动 n8n 或 AnythingLLM 失败"
   fi
   rm -rf -- "$STAGING" "$TARGET_TEMP"
@@ -163,14 +165,15 @@ RUNNING_SERVICES=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=ru
 POSTGRES_WAS_RUNNING=0
 grep -Fxq postgres <<< "$RUNNING_SERVICES" && POSTGRES_WAS_RUNNING=1
 (( POSTGRES_WAS_RUNNING == 1 )) || die "PostgreSQL 容器未运行，无法创建一致的 n8n 数据库快照"
-if grep -Eq '^(n8n|anythingllm)$' <<< "$RUNNING_SERVICES"; then
-  docker_compose "$DEPLOY_DIR" stop n8n anythingllm >/dev/null
+mapfile -t PAUSED_SERVICES < <(printf '%s\n' "$RUNNING_SERVICES" | grep -E '^(n8n|anythingllm)$' || true)
+if (( ${#PAUSED_SERVICES[@]} )); then
+  docker_compose "$DEPLOY_DIR" stop "${PAUSED_SERVICES[@]}" >/dev/null
   SERVICES_PAUSED=1
 fi
 
 restart_paused_services() {
   if (( SERVICES_PAUSED == 1 )); then
-    docker_compose "$DEPLOY_DIR" up -d n8n anythingllm >/dev/null \
+    docker_compose "$DEPLOY_DIR" up -d "${PAUSED_SERVICES[@]}" >/dev/null \
       || warn "快照后重新启动 n8n 或 AnythingLLM 失败"
     SERVICES_PAUSED=0
   fi
@@ -204,6 +207,27 @@ for name in "${OPTIONAL_DOC_FILES[@]}"; do
   fi
 done
 install -m 0600 -- "${DEPLOY_DIR}/n8n/workflow.json" "$STAGING/payload/n8n/workflow.json"
+
+copy_snapshot_tree() {
+  local relative=$1 item name source="${DEPLOY_DIR}/$1" target="$STAGING/payload/$1"
+  [[ -d "$source" && ! -L "$source" ]] || die "快照源目录不安全：$relative"
+  while IFS= read -r -d '' item; do
+    name=${item#"$source"/}
+    [[ "$name" != *\\* && "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] \
+      || die "快照源包含不安全文件名：$relative"
+    [[ ! -L "$item" && ( -f "$item" || -d "$item" ) ]] || die "快照源包含链接或特殊文件：$relative"
+  done < <(find "$source" -mindepth 1 -print0)
+  mkdir -p -- "$target"
+  cp -a -- "$source/." "$target/"
+}
+
+# 新模块、所有命名知识库及其映射均属于本机恢复范围，不再只备份根目录文档。
+for directory in config knowledge n8n scripts docs; do
+  copy_snapshot_tree "$directory"
+done
+for directory in data/n8n data/runtime; do
+  [[ ! -d "${DEPLOY_DIR}/${directory}" ]] || copy_snapshot_tree "$directory"
+done
 
 while IFS= read -r -d '' file; do
   name=$(basename -- "$file")
@@ -260,7 +284,7 @@ chmod 600 "$ARCHIVE_TEMP"
 ARCHIVE_SHA=$(sha256sum "$ARCHIVE_TEMP" | awk '{print $1}')
 CREATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 jq -n \
-  --arg format "ai-support-snapshot-v2" \
+  --arg format "ai-support-snapshot-v3" \
   --arg id "$SNAPSHOT_ID" \
   --arg version "$VERSION_VALUE" \
   --arg created_at "$CREATED_AT" \
@@ -275,7 +299,7 @@ jq -n \
   --arg postgres_image "$POSTGRES_IMAGE_VALUE" \
   --arg anythingllm_image "$ANYTHINGLLM_IMAGE_VALUE" \
   --arg caddy_image "$CADDY_IMAGE_VALUE" \
-  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_database_dump:true,contains_env:false,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images,image_variables:{N8N_IMAGE:$n8n_image,POSTGRES_IMAGE:$postgres_image,ANYTHINGLLM_IMAGE:$anythingllm_image,CADDY_IMAGE:$caddy_image}}' \
+  '{format:$format,id:$id,version:$version,created_at:$created_at,reason:$reason,archive_sha256:$archive_sha256,contains_runtime_data:true,contains_database_dump:true,contains_env:true,capacity:{estimated_source_kib:$estimated_source_kib,free_before_kib:$free_before_kib,min_free_mb:$min_free_mb},retention_count:$retention_count,images:$images,image_variables:{N8N_IMAGE:$n8n_image,POSTGRES_IMAGE:$postgres_image,ANYTHINGLLM_IMAGE:$anythingllm_image,CADDY_IMAGE:$caddy_image}}' \
   > "${TARGET_TEMP}/manifest.json"
 chmod 600 "${TARGET_TEMP}/manifest.json"
 mv -- "$TARGET_TEMP" "$TARGET_DIR"
@@ -292,7 +316,7 @@ prune_snapshot_history() {
     directory=$(dirname -- "$manifest")
     id=$(basename -- "$directory")
     [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && -d "$directory" && ! -L "$directory" && ! -L "$manifest" ]] || continue
-    created=$(jq -er --arg id "$id" 'select((.format == "ai-support-snapshot-v1" or .format == "ai-support-snapshot-v2") and .id == $id) | .created_at' "$manifest" 2>/dev/null || true)
+    created=$(jq -er --arg id "$id" 'select((.format == "ai-support-snapshot-v1" or .format == "ai-support-snapshot-v2" or .format == "ai-support-snapshot-v3") and .id == $id) | .created_at' "$manifest" 2>/dev/null || true)
     [[ "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
     records+=("${created}"$'\t'"${id}")
   done < <(find "$VERSIONS_DIR" -mindepth 2 -maxdepth 2 -type f -name manifest.json -print0)
@@ -322,5 +346,5 @@ if (( QUIET )); then
   printf '%s\n' "$SNAPSHOT_ID"
 else
   info "版本快照已创建：$SNAPSHOT_ID"
-  warn "快照含 AnythingLLM 运行数据，仅可保存在本机受限目录，禁止上传或作为迁移备份"
+  warn "快照包含密钥、知识与会话状态，仅可保存在受限目录，禁止作为无密钥业务迁移包上传"
 fi

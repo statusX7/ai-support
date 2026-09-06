@@ -91,9 +91,14 @@ if [[ "${1:-}" == version ]]; then
   exit 0
 fi
 
+MOCK_PROJECT_DIR=''
 while (( $# > 0 )); do
   case "$1" in
-    --project-directory|--env-file|-f)
+    --project-directory)
+      MOCK_PROJECT_DIR=$2
+      shift 2
+      ;;
+    --env-file|-f|--profile)
       shift 2
       ;;
     *)
@@ -138,6 +143,27 @@ case "$COMMAND" in
       printf 'PGDMP-test-only-logical-backup\n'
     elif [[ "$*" == *'pg_restore'* ]]; then
       [[ "${MOCK_DOCKER_FAIL_PG_RESTORE:-0}" != 1 ]] || exit 1
+    elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
+      CONFIG_NAME=${!#}
+      [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1
+      [[ "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      sha256sum -- "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" | cut -d ' ' -f 1
+    elif [[ "$*" == *'GENERIC_OPEN_AI_BASE_PATH'* && "$*" == *'fetch('* ]]; then
+      [[ -f "${MOCK_PROJECT_DIR}/.env" && "${MOCK_PROVIDER_FAIL:-0}" != 1 && "${MOCK_PROVIDER_SOFT_ERROR:-0}" != 1 ]] || exit 1
+      jq -e '.provider | (.api_mode == "chat_completions" or .api_mode == "responses") and (.model | length > 0)' "${MOCK_PROJECT_DIR}/config/provider.yaml" >/dev/null || exit 1
+      printf '{"verified":true,"environment":"unit-docker-stub","path":"/chat/completions"}\n'
+    elif [[ "$*" == *'import:workflow'* ]]; then
+      [[ -f "${MOCK_PROJECT_DIR}/n8n/workflow.json" ]] || exit 1
+      jq -e '.nodes | length > 0' "${MOCK_PROJECT_DIR}/n8n/workflow.json" >/dev/null || exit 1
+      : > "${MOCK_PROJECT_DIR}/tmp/mock-workflow-imported"
+    elif [[ "$*" == *'publish:workflow'* ]]; then
+      [[ -f "${MOCK_PROJECT_DIR}/tmp/mock-workflow-imported" ]] || exit 1
+      : > "${MOCK_PROJECT_DIR}/tmp/mock-workflow-active"
+    elif [[ "$*" == *'export:workflow'* ]]; then
+      [[ -f "${MOCK_PROJECT_DIR}/tmp/mock-workflow-active" ]] || exit 1
+    else
+      printf 'docker compose exec 测试桩未实现该调用，不返回假成功。\n' >&2
+      exit 2
     fi
     ;;
   logs)

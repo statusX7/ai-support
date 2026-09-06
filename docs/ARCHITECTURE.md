@@ -1,44 +1,66 @@
-# 架构说明
+# 架构与运行契约
 
-## 组件边界
+## 组件职责
 
-- Crisp 负责访客会话、消息收发和人工客服界面。
-- n8n 负责校验 Webhook、编排规则、维护会话映射并调用外部 API。
-- AnythingLLM 负责知识库、文档解析、自动分块、检索和模型调用。
-- OpenAI Compatible API 提供文本或视觉模型能力。
-- PostgreSQL 保存 n8n 配置、凭据和工作流状态。
-- 可选 Caddy 只负责受管 HTTPS 的生产 Webhook 入口。
+| 组件 | 职责 |
+| --- | --- |
+| Crisp | 访客聊天框、公开消息、真人界面与事件 |
+| n8n | 已鉴权持久接收、短事务控制、规则/欢迎、发送与恢复扫描 |
+| AnythingLLM | 文档解析、Embedding、workspace 向量检索和聊天编排 |
+| Provider 适配器 | 同一项目的 Chat 转发或 Chat→Responses 最小兼容，不自建 RAG |
+| 第三方 AI | 实际文本与可选视觉推理 |
+| PostgreSQL | n8n 配置、工作流与其必要数据库 |
+| 可选 Caddy | 受管 HTTPS，仅开放指定 Hook/SDK/UI 路由 |
+| Shell 管理器 | 单一配置权威、应用/回读、安装维护与全局 crispai |
 
-项目不自行实现 RAG、向量数据库、文档解析或模型管理。
+不增加 CRM、多租户、坐席调度、Redis/Kafka、另一套向量库或管理网站。
 
-## 数据流
+## 安装链路
 
-1. Crisp 将 `message:send`、`message:received` 或 Plugin 的 `session:request:initiated` 发送到 n8n Webhook。
-2. n8n 按配置的 Website URL Secret 或 Plugin HMAC 签名验证请求，只接受目标 Website 的受支持事件。
-3. 配置化转人工关键词、普通关键词和菜单规则优先执行；其余消息发送到 AnythingLLM。
-4. n8n 注入同一 conversation 的受限近期历史，并用 Crisp `session_id` 隔离 AnythingLLM 会话；AnythingLLM 检索知识库并调用已配置模型。
-5. 回复发送前，n8n 重新读取 Crisp 消息并复核 AI 开关，避免 operator 已接管时仍发送在途回答。
-6. Crisp 确认回复成功后，n8n 才提交 AI 回复、知识命中和待反馈统计。
-7. n8n 读取 Crisp conversation 现有 `segments`，与新标签取并集后写回；读取或写入失败不会阻断正文回复。
+```text
+install.sh 参数/帮助 → root/sudo → 最小工具自动补齐
+→ 识别首次/续装/已部署 → 十项向导 → 用户确认
+→ Docker/Compose/daemon/实际容器能力
+→ 受管目录和内部密钥 → 固定镜像与服务
+→ AnythingLLM Key/workspace/Prompt/多库索引
+→ n8n import/publish/生产节点 → 配置回读与代次
+→ crispai 入口 → 本地/Provider/Crisp/公网/会话分层事实
+```
 
-AI 默认优先回复，不查询人工是否在线。只有真实 operator 回复，或访客命中 `handoff.yaml` 中的明确转人工关键词或菜单动作，才关闭该 conversation 的 AI。知识库未命中、低置信度、图片理解失败或 Provider 失败只返回安全提示并添加对应标签，不会进入人工模式。人工接管只按配置的等待时间自动解除；operator 的任意公开回复始终优先关闭 AI。
+所有持久数据在选择的部署目录，默认 `/opt/crisp-ai`；程序来源解压目录可删除。系统包、Docker服务及 `/usr/local/bin/crispai` 是明确受控的系统位置例外。帮助/版本不要求完整配置或外部探测。
 
-n8n 使用工作流持久状态保存有限长度的待反馈回答以及用户、AI 和人工历史。AI 开关、接管代次、菜单位置、欢迎状态和哈希后的事件指纹还会按哈希 session 键写入 `data/runtime/`，使用会话级锁和原子替换抵抗并发执行并跨容器重启保持状态；这些控制文件不保存消息正文。文本请求最多注入最近 12 条受长度限制的本地历史，图片请求最多使用最近 20 条；AnythingLLM 同时使用 Crisp `session_id` 作为 `sessionId` 隔离会话。工作流内的历史、指纹和活动会话数量都有上限。控制文件会在低频、加锁的清理中删除超过 7 天的记录；文件数超过 2000 时只保留最近更新的 1500 个，并始终保护当前会话。清理只处理严格匹配名称的普通文件。本版本只支持单客服场景，不包含坐席、权限或多客服账号管理。
+## 事件、控制与发送
 
-Website Hook 本身不提供签名，因此必须在 Webhook URL 中携带独立随机 Secret。Plugin Hook 使用另一份 Crisp Signing Secret，强制验证 `X-Crisp-Signature`、原始请求体和请求时间，绝不降级为 URL Secret。两种模式都会校验 `website_id`、事件类型、消息方向和重复指纹，并为出站回复生成稳定数值 fingerprint。
+```text
+Crisp Webhook
+  → Secret/签名、website/session、大小与事件去重
+  → 持久保存任务；人工/合法按钮控制短事务优先提交
+  → HTTP 确认
+  → 持久任务处理：总开关 → 会话模式/到期 → 反馈/菜单/关键词
+  → 公开上下文 + AnythingLLM 检索/模型（或已验证视觉路径）
+  → 全局 revision + 会话 generation + 当前人工状态再次检查
+  → 统一 automated sender / 预登记 fingerprint
+  → 发送确认后统计、可选标签；超时未知先对账
+```
 
-欢迎语不使用 `session:set_opened`。Plugin 模式可由 `session:request:initiated` 触发；Website 模式在 conversation 第一条访客消息中合并欢迎语。
+另有 n8n 5 秒 Schedule 恢复未完成任务与到期状态。`runtime.js` 为唯一生产实现，由 `build-workflow.js` 内联进工作流，并由容器 CLI 复用；生成校验防止 JSON 模板与逻辑分叉。
 
-## 部署边界
+控制状态 `data/runtime/session-SHA256(website+NUL+session).json` 使用短 mkdir 锁、fsync/原子写。每会话普通消息队列有序，不在长 LLM 请求期间持锁，不同会话独立。全局开关是 config/runtime.yaml 的 enabled，不是共享人工状态。无限人工不受已完成任务缓存淘汰影响。
 
-安装入口分为两级：`scripts/bootstrap.sh` 先以 Bash 与发行版包管理器补齐最小运行工具，`scripts/wizard.sh` 再采集十项配置；只有用户确认后才安装或复用 Docker、启动 daemon 并进入应用初始化。两模块被 source 时不执行依赖检查或系统变更，因而 `--help`、`--version` 和参数错误不依赖 Docker/jq。
+关键词只发 offer，仍处 AI；有效点击先暂停再确认，真人公开回复无需按钮立即暂停。倒计时从最近有效真人/首次确认开始，0 永久，用户消息不延长；到期只允许新问题，不补历史、不发恢复提示。自己的 automated operator、note、在线、输入和后台 opened 均不当真人。
 
-所有持久化数据都位于部署目录，默认是 `/opt/crisp-ai`。PostgreSQL、n8n、AnythingLLM 和匿名统计分别使用部署目录内的持久化路径；n8n 与 AnythingLLM 数据目录由容器 UID/GID `1000:1000` 持有。容器端口默认绑定到 `127.0.0.1`，数据库不对宿主机暴露端口。
+## Prompt、知识与上下文
 
-安装标记经历 `collecting`、`installing` 或 `staged`。Docker、本地容器、Provider、AnythingLLM、Prompt/知识和已发布 workflow 通过后，可进入 `local-ready`；Crisp REST 凭据通过后进入 `ready`。依赖、本地服务、应用配置、Provider、Crisp API、Webhook 和真实 conversation 分别记录 fact，避免把容器启动与客户链路混为一谈。所有变更性维护操作通过同一文件锁串行执行。
+各命名库用 catalog/document ID/hash 管理，全部启用库汇入一个 workspace。原文、投影、远端位置与 runtime 来源映射分离；停用库真实移除检索关系但保留原文，删除或更新不误操作其他库。pending 对账承接服务端索引超时，不能只看 HTTP 上传成功。
 
-n8n 与 AnythingLLM 始终绑定回环地址；PostgreSQL 仅在后端网络。选择受管 HTTPS 时，Compose 的 `managed-https` profile 启动 Caddy 并公开 80/443，但 Caddyfile 只转发 `/webhook/crisp-webhook`。选择已有反向代理时不启用该 profile；模式切换只清理本项目 Caddy 容器。
+公开 Crisp 历史是上下文来源，按当前会话限定与截断；人工回复显式加入，内部 note 和控件不当业务问题。AnythingLLM stable sessionId + reset 避免重复内部聊天记录。当前 Prompt 写入 workspace且图片请求读取同一受管正文。Provider协议和容器访问地址必须通过实际调用；第三方缺失时协议服务只能证明格式接线，不证明真实模型语义。
 
-默认卸载是可恢复的生命周期状态：容器、网络和程序文件被移除，安装标记变为 `uninstalled-data-kept`，但权限受限的 `.env`、业务配置、知识文件、数据库、AnythingLLM 数据、备份和日志保留在部署目录。必须从新的可信源码副本重新运行 `install.sh` 才能恢复服务。完整清理属于独立的破坏性流程，需要普通确认和精确输入 `PURGE` 两次确认；其迁移备份始终写到部署目录同级。
+## 欢迎网页边界
 
-迁移备份不含密钥和运行时用户数据。版本快照额外包含 AnythingLLM 数据、n8n PostgreSQL 逻辑备份和本机镜像 ID；创建时暂停 n8n 与 AnythingLLM，回滚时原子切换 AnythingLLM 数据并恢复数据库。当前 `data/runtime/` 控制状态和匿名统计不由版本快照回退，避免软件回滚意外解除现有人工接管。版本快照只用于同一主机故障恢复，目录权限为仅管理员可访问，不得上传或当作迁移包分发。
+first_message 无需网页变更。widget_load/chat_open 模式用一次性无密钥 SDK：session:loaded/chat:opened → session:event → Crisp session:sync:events Hook → 后端受控欢迎。chat:open 独立控制展开；公开配置仅白名单字段并结合会话人工状态，不能匿名接管或向别的会话发送。
+
+## 配置和维护
+
+JSON语法业务 YAML、Prompt 与多库 catalog 是权威源，秘密单独 .env。菜单候选校验、备份、原子应用、组件回读后提交 applied_revision；失败保留旧值或明确待同步。维护串行锁与会话控制锁分开。完整本机快照包含秘密与运行状态；业务迁移仅带配置和知识原文。旧关键词迁移为按钮确认，旧哈希人工记录惰性迁移不清空。
+
+安全卸载移除项目容器/网络/程序与所属全局命令，保留数据；完整清理先外部完整备份再数字双确认。回滚重建数据目录绑定容器，保留历史镜像身份。任何容器、库、网络、Key 或账户缺失不能靠改状态标志变成成功；外部验收分层见 [TESTING](TESTING.md)。

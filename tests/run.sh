@@ -10,8 +10,16 @@ SKIPPED=0
 RELEASE_MODE=${AI_SUPPORT_RELEASE_TEST:-0}
 EXTERNAL_PENDING_MODE=${AI_SUPPORT_EXTERNAL_VALIDATION_PENDING:-0}
 TEST_LAYER=STATIC
-declare -A LAYER_PASSED=([STATIC]=0 [STUB]=0 [INTEGRATION]=0)
-declare -A LAYER_SKIPPED=([STATIC]=0 [STUB]=0 [INTEGRATION]=0)
+TEST_SELECTION=all
+if (( $# )); then
+  [[ $# -eq 1 && $1 == --lifecycle-only && $RELEASE_MODE == 0 ]] || {
+    printf '用法：tests/run.sh [--lifecycle-only（仅非发布调试）]\n' >&2; exit 1;
+  }
+  TEST_SELECTION=lifecycle
+  printf '测试选择：仅执行隔离生命周期 UNIT/CONTRACT；不代表全量或发布验收。\n'
+fi
+declare -A LAYER_PASSED=([STATIC]=0 [UNIT/CONTRACT]=0 [REAL-LOCAL]=0 [EXTERNAL-E2E]=0)
+declare -A LAYER_SKIPPED=([STATIC]=0 [UNIT/CONTRACT]=0 [REAL-LOCAL]=0 [EXTERNAL-E2E]=0)
 
 case "$RELEASE_MODE" in
   0|1) ;;
@@ -67,7 +75,7 @@ trap 'report_unhandled_error "$LINENO"' ERR
 
 critical_skip() {
   if (( RELEASE_MODE )); then
-    if (( EXTERNAL_PENDING_MODE )) && [[ "$TEST_LAYER" == INTEGRATION ]]; then
+    if (( EXTERNAL_PENDING_MODE )) && [[ "$TEST_LAYER" == EXTERNAL-E2E ]]; then
       skip "External Validation Pending：$1"
       return
     fi
@@ -80,11 +88,20 @@ assert_file() {
   [[ -f "$1" && ! -L "$1" ]] || fail "缺少安全的普通文件：$1"
 }
 
+expect_local_ready_install() {
+  local status=0
+  "$@" || status=$?
+  (( status == 2 )) || fail "隔离测试无真实会话，安装应返回 local-ready 状态 2，实际 ${status}"
+}
+
+if [[ "$TEST_SELECTION" == all ]]; then
 SHELL_FILES=(
   install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
   scripts/wizard.sh scripts/package-release.sh
+  scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
+  scripts/launcher.sh scripts/menu-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
@@ -93,8 +110,8 @@ SHELL_FILES=(
 )
 for file in "${SHELL_FILES[@]}"; do
   assert_file "${PROJECT_ROOT}/${file}"
+  bash -n "${PROJECT_ROOT}/${file}"
 done
-bash -n "${SHELL_FILES[@]/#/${PROJECT_ROOT}/}"
 pass "全部 Bash 脚本语法"
 
 "${SCRIPT_DIR}/test_static_security.sh"
@@ -107,7 +124,7 @@ else
   critical_skip "系统未安装 shellcheck"
 fi
 
-TEST_LAYER=STUB
+TEST_LAYER=UNIT/CONTRACT
 "${SCRIPT_DIR}/test_bootstrap.sh"
 pass "依赖与 Docker 自动引导专项"
 
@@ -165,9 +182,11 @@ grep -Fxq 'ANYTHINGLLM_IMAGE=mintplexlabs/anythingllm:1.16.1' "${PROJECT_ROOT}/.
   || fail ".env.example 的 AnythingLLM 镜像未同步为 1.16.1"
 pass "Docker Compose 静态安全契约"
 
+TEST_LAYER=UNIT/CONTRACT
 "${SCRIPT_DIR}/test_manage_contract.sh"
-pass "管理菜单 1..10、子菜单与未安装边界"
+pass "管理菜单 1..18、子菜单与未安装边界"
 
+TEST_LAYER=STATIC
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   docker compose \
     --project-directory "$PROJECT_ROOT" \
@@ -182,7 +201,7 @@ fi
 "${SCRIPT_DIR}/test_workflow_contract.sh"
 pass "Webhook、图片、关键词、菜单、上下文与人工接管契约"
 
-TEST_LAYER=STUB
+TEST_LAYER=UNIT/CONTRACT
 if "${SCRIPT_DIR}/test_workflow_runtime.sh"; then
   pass "n8n Code node 行为"
 else
@@ -194,7 +213,18 @@ else
   fi
 fi
 
-TEST_LAYER=INTEGRATION
+if command -v node >/dev/null 2>&1; then
+  node "${SCRIPT_DIR}/test_configuration_guards.js"
+  pass "配置秘密边界、维护锁和 Crisp 响应护栏（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_provider_adapter.js"
+  pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_configuration_protocol.js"
+  pass "配置与多知识库生产 CLI 协议专项（内部子项单列，不重复计入总数）"
+else
+  critical_skip "系统未安装开发测试依赖 Node.js，未执行配置护栏和 Provider/配置协议专项"
+fi
+
+TEST_LAYER=REAL-LOCAL
 if "${SCRIPT_DIR}/test_deployment_integration.sh"; then
   pass "真实部署本地集成检查"
 else
@@ -206,6 +236,7 @@ else
   fi
 fi
 
+TEST_LAYER=EXTERNAL-E2E
 if "${SCRIPT_DIR}/test_external_e2e.sh"; then
   pass "Crisp、AnythingLLM 与 Provider 外部端到端验收"
 else
@@ -217,7 +248,9 @@ else
   fi
 fi
 
-TEST_LAYER=STUB
+fi
+PROJECT_VERSION=$(<"${PROJECT_ROOT}/VERSION")
+TEST_LAYER=UNIT/CONTRACT
 export PATH="${MOCK_DIR}:${ORIGINAL_PATH}"
 export MOCK_DOCKER_LOG="${TEST_ROOT}/docker.log"
 export MOCK_ANYTHING_STATE="${TEST_ROOT}/anythingllm-state.json"
@@ -234,8 +267,10 @@ export CRISP_AI_BOOTSTRAP_INIT=unsupported
 printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
 
 DEPLOY_DIR="${TEST_ROOT}/deploy"
+mkdir -p -- "${TEST_ROOT}/bin"
 FAILURE_DEPLOY_DIR="${TEST_ROOT}/provider-failure"
 SOFT_FAILURE_DEPLOY_DIR="${TEST_ROOT}/provider-soft-failure"
+RESPONSES_DEPLOY_DIR="${TEST_ROOT}/responses-only"
 DOCKER_FAILURE_DEPLOY_DIR="${TEST_ROOT}/docker-failure"
 CHAT_MODE_FAILURE_DEPLOY_DIR="${TEST_ROOT}/chat-mode-failure"
 PARTIAL_DEPLOY_DIR="${TEST_ROOT}/partial-install"
@@ -258,7 +293,7 @@ printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" "$TEST
   'test-only-crisp-layer-anything-key' \
   > "$MOCK_FORBIDDEN_ARG_FILE"
 
-env \
+expect_local_ready_install env \
   AI_API_BASE_URL=https://provider.invalid \
   AI_API_KEY="$TEST_PROVIDER_KEY" \
   AI_MODEL=gpt-vision-test \
@@ -272,9 +307,11 @@ env \
   PUBLIC_WEBHOOK_URL=https://support.example.invalid/ \
   TIMEZONE=UTC \
   "${PROJECT_ROOT}/install.sh" \
-    --deploy-dir "$DEPLOY_DIR" --non-interactive > "$INSTALL_LOG" 2>&1
+    --deploy-dir "$DEPLOY_DIR" --command-path "${TEST_ROOT}/bin/crispai" --non-interactive > "$INSTALL_LOG" 2>&1
 
 assert_file "${DEPLOY_DIR}/.crisp-ai-installation"
+assert_file "${TEST_ROOT}/bin/crispai"
+[[ "$(cd / && "${TEST_ROOT}/bin/crispai" --version)" == "$PROJECT_VERSION" ]] || fail "陌生工作目录无法使用受管命令版本入口"
 assert_file "${DEPLOY_DIR}/config/provider.yaml"
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail "安装版本错误"
 assert_file "${DEPLOY_DIR}/config/tags.yaml"
@@ -287,10 +324,7 @@ grep -Fxq 'ANYTHINGLLM_CHAT_MODE=chat' "${DEPLOY_DIR}/.env" \
 WEBSITE_HOOK_SECRET_VALUE=$(sed -n 's/^CRISP_WEBSITE_HOOK_SECRET=//p' "${DEPLOY_DIR}/.env" | head -n 1)
 [[ -n "$WEBSITE_HOOK_SECRET_VALUE" && "$WEBSITE_HOOK_SECRET_VALUE" != replace-with-* ]] \
   || fail "Website Hook URL Secret 未生成"
-grep -Fq 'model: "gpt-vision-test"' "${DEPLOY_DIR}/config/provider.yaml" || fail "未选择检测到的模型"
-grep -Fq 'responses: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "未检测 Responses API"
-grep -Fq 'chat_completions: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "未检测 Chat Completions API"
-grep -Fq 'vision: true' "${DEPLOY_DIR}/config/provider.yaml" || fail "视觉能力未保存"
+jq -e '.provider.model == "gpt-vision-test" and .provider.capabilities.responses == true and .provider.capabilities.chat_completions == true and .provider.capabilities.vision == true' "${DEPLOY_DIR}/config/provider.yaml" >/dev/null || fail "Provider 模型与实测能力未准确保存"
 [[ "$(sed -n 's/^SNAPSHOT_MIN_FREE_MB=//p' "${DEPLOY_DIR}/.env")" == 1024 ]] || fail "快照预留空间默认值错误"
 [[ "$(sed -n 's/^SNAPSHOT_RETENTION_COUNT=//p' "${DEPLOY_DIR}/.env")" == 10 ]] || fail "快照保留数量默认值错误"
 for secret_value in "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY"; do
@@ -300,11 +334,13 @@ for secret_value in "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY";
 done
 grep -Fq 'publish:workflow' "$MOCK_DOCKER_LOG" || fail "安装未发布 n8n workflow"
 grep -Fq 'info' "$MOCK_DOCKER_LOG" || fail "安装未检查 Docker daemon"
-grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
-  || fail "Crisp REST API 成功后安装未提交 ready 状态"
+grep -Fxq 'state=local-ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "没有真实会话证据时安装不能宣称已开始接待客户"
 grep -Fq '本地服务、AnythingLLM 工作区、知识索引和生产 workflow 已完成初始化' \
   "$INSTALL_LOG" || fail "安装未完成新版分层初始化"
-grep -Fq 'Crisp REST API 凭据已验证' "$INSTALL_LOG" \
+grep -Fxq 'fact_crisp_api=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Crisp API 测试成功未独立记录事实"
+grep -Fxq 'fact_conversation=pending' "${DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "安装未明确区分 Crisp 凭据验证与真实会话验收"
 pass "安装与 Provider 自动检测"
 
@@ -324,7 +360,7 @@ if env \
   PUBLIC_WEBHOOK_URL=https://crisp-layer.example.invalid/ \
   TIMEZONE=UTC \
   "${PROJECT_ROOT}/install.sh" \
-    --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --non-interactive \
+    --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --command-path "${TEST_ROOT}/bin/crispai-crisp-failure" --non-interactive \
     > "${TEST_ROOT}/crisp-layer-failure.log" 2>&1; then
   CRISP_LAYER_STATUS=0
 else
@@ -343,7 +379,7 @@ for expected_fact in \
   grep -Fxq "$expected_fact" "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
     || fail "local-ready 安装事实缺少：$expected_fact"
 done
-grep -Fq '本地安装已完成，但 Crisp REST API 尚未通过' \
+grep -Fq '本地已就绪，尚未确认真实接待' \
   "${TEST_ROOT}/crisp-layer-failure.log" \
   || fail "Crisp 外部失败没有明确区分本地安装完成状态"
 grep -Fq 'publish:workflow' "$MOCK_DOCKER_LOG" \
@@ -357,11 +393,13 @@ for secret_value in \
   fi
 done
 CRISP_LAYER_ENV_HASH=$(sha256sum "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.env" | awk '{print $1}')
-"${PROJECT_ROOT}/install.sh" \
+expect_local_ready_install "${PROJECT_ROOT}/install.sh" \
   --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --non-interactive \
   > "${TEST_ROOT}/crisp-layer-retry.log" 2>&1
-grep -Fxq 'state=ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
-  || fail "Crisp API 恢复后 local-ready 未提升为 ready"
+grep -Fxq 'state=local-ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "仅 Crisp API 恢复不能伪造真实会话 ready"
+grep -Fxq 'fact_crisp_api=ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Crisp API 恢复后对应 fact 未更新"
 [[ "$(sha256sum "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.env" | awk '{print $1}')" == "$CRISP_LAYER_ENV_HASH" ]] \
   || fail "local-ready 重试改写了既有密钥配置"
 pass "Crisp 外部失败 local-ready 分层、脱敏与幂等恢复"
@@ -465,8 +503,8 @@ bash -c '
   env_set "$2/.env" AI_API_PROBE_BASE_URL http://127.0.0.1:18080/proxy/v1
   env_set "$2/.env" AI_API_BASE_URL http://host.docker.internal:18080/proxy/v1
 ' -- "$PROJECT_ROOT" "$DEPLOY_DIR"
-sed -i 's#^[[:space:]]*base_url:.*#  base_url: "http://host.docker.internal:18080/proxy/v1"#' \
-  "${DEPLOY_DIR}/config/provider.yaml"
+jq '.provider.base_url="http://host.docker.internal:18080/proxy/v1"' "${DEPLOY_DIR}/config/provider.yaml" > "${TEST_ROOT}/runtime-provider.yaml"
+install -m 0640 -- "${TEST_ROOT}/runtime-provider.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 RUNTIME_PROVIDER_ENV_HASH=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 sed -i 's/^state=.*/state=installing/' "${DEPLOY_DIR}/.crisp-ai-installation"
 rm -f -- "${DEPLOY_DIR}/tmp/quick-init.json"
@@ -522,8 +560,8 @@ fi
 assert_file "${FAILURE_DEPLOY_DIR}/.crisp-ai-installation"
 grep -Fxq 'state=installing' "${FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "Provider 失败后安装 marker 未保持 installing"
-grep -Fq '未通过 /v1/chat/completions 实际请求' "${TEST_ROOT}/provider-failure.log" \
-  || fail "Provider 失败没有清晰说明实际 Chat 请求不可用"
+grep -Fq '所选模型未通过 Chat Completions 或 Responses 的有效正文验证' "${TEST_ROOT}/provider-failure.log" \
+  || fail "Provider 失败没有清晰说明实际请求不可用"
 for secret_value in \
   test-only-failing-provider-key \
   test-only-failing-crisp-key \
@@ -566,8 +604,25 @@ for secret_value in \
 done
 pass "AI Provider 拒绝 HTTP 200 error JSON"
 
+expect_local_ready_install env MOCK_PROVIDER_RESPONSES_ONLY=1 AI_API_MODE=responses \
+  AI_API_BASE_URL=https://provider.invalid AI_API_KEY="$TEST_PROVIDER_KEY" AI_MODEL=gpt-vision-test \
+  CRISP_WEBSITE_ID=77777777-7777-7777-7777-777777777777 CRISP_TOKEN_TIER=website \
+  CRISP_TOKEN_IDENTIFIER=test-only-identifier CRISP_TOKEN_KEY="$TEST_CRISP_KEY" \
+  ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" N8N_HOST=responses.example.invalid \
+  PUBLIC_WEBHOOK_URL=https://responses.example.invalid/ TIMEZONE=UTC \
+  "${PROJECT_ROOT}/install.sh" --deploy-dir "$RESPONSES_DEPLOY_DIR" \
+    --command-path "${TEST_ROOT}/bin/crispai-responses" --non-interactive \
+    > "${TEST_ROOT}/responses-only.log" 2>&1
+jq -e '.provider.api_mode == "responses" and .provider.capabilities.responses == true and .provider.capabilities.chat_completions == false' \
+  "${RESPONSES_DEPLOY_DIR}/config/provider.yaml" >/dev/null || fail "Responses-only 未保存正确真实协议能力"
+grep -Fxq 'AI_ANYTHINGLLM_BASE_URL=http://provider-adapter:8787/v1' "${RESPONSES_DEPLOY_DIR}/.env" \
+  || fail "Responses-only 未接入内部兼容层"
+grep -Fxq 'state=local-ready' "${RESPONSES_DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "Responses-only 协议安装未完成应用初始化"
+pass "Responses-only 经受管桥接完成安装链路（模拟 Provider 与 Docker）"
+
 TEST_PLUGIN_SIGNING_SECRET='test-only-plugin-signing-secret'
-env \
+expect_local_ready_install env \
   AI_API_BASE_URL=https://provider.invalid \
   AI_API_KEY=test-only-plugin-provider-key \
   AI_MODEL=gpt-vision-test \
@@ -583,9 +638,9 @@ env \
   PUBLIC_WEBHOOK_URL=https://plugin.example.invalid/ \
   TIMEZONE=UTC \
   "${PROJECT_ROOT}/install.sh" \
-    --deploy-dir "$PLUGIN_DEPLOY_DIR" --non-interactive \
+    --deploy-dir "$PLUGIN_DEPLOY_DIR" --command-path "${TEST_ROOT}/bin/crispai-plugin" --non-interactive \
     > "${TEST_ROOT}/plugin-install.log" 2>&1
-grep -Fxq 'state=ready' "${PLUGIN_DEPLOY_DIR}/.crisp-ai-installation" \
+grep -Fxq 'state=local-ready' "${PLUGIN_DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "Plugin Hook 安装未完成服务验收"
 grep -Fxq 'CRISP_HOOK_MODE=plugin' "${PLUGIN_DEPLOY_DIR}/.env" || fail "Plugin Hook 模式未保存"
 grep -Fxq "CRISP_PLUGIN_SIGNING_SECRET=${TEST_PLUGIN_SIGNING_SECRET}" "${PLUGIN_DEPLOY_DIR}/.env" \
@@ -599,7 +654,7 @@ install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/t
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt"
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.pdf"
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
-bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync \"\$1\"; knowledge_reindex \"\$1\"" \
+bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"; knowledge_sync_legacy \"\$1\" 1" \
   -- "$DEPLOY_DIR" > "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.files["test-knowledge.md"].locations | length > 0' \
   "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "知识文件未写入同步清单"
@@ -612,7 +667,7 @@ EXPECTED_SOURCE_LOCATIONS=$(jq -c '[.files[].locations[]] | unique' \
 rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt" \
   "${DEPLOY_DIR}/knowledge/test-knowledge.pdf" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
 if env MOCK_REMOVE_DOCUMENTS_FAIL=1 bash -c \
-  "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync \"\$1\"" \
+  "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"" \
   -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1; then
   fail "AnythingLLM 源文档删除失败时知识同步被错误报告为成功"
 fi
@@ -620,7 +675,7 @@ jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/
 jq -e --argjson expected "$EXPECTED_SOURCE_LOCATIONS" \
   '(.garbage_locations | sort) == ($expected | sort)' \
   "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "源文档删除失败后未登记孤立位置"
-bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync \"\$1\"" \
+bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"" \
   -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.garbage_locations == []' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
   || fail "后续知识同步未重试清理孤立源文档"
@@ -628,7 +683,15 @@ jq -e --argjson expected "$EXPECTED_SOURCE_LOCATIONS" \
   '((.removed_documents // []) | sort) == ($expected | sort)' "$MOCK_ANYTHING_STATE" >/dev/null \
   || fail "AnythingLLM remove-documents 未清理已删除知识源文档"
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
-pass "知识库四种扩展名的桩同步、源文档删除重试与重新索引（不验证真实解析）"
+# 上面独立回归仍在生产中使用的 v1.0.1 pending/garbage 算法；以下再从真实旧单库布局走新迁移。
+jq -e '.libraries | length == 0' "${DEPLOY_DIR}/knowledge/catalog.json" >/dev/null \
+  || fail "旧单库迁移夹具必须从空 catalog 开始，不能删除用户式已有库"
+rm -f -- "${DEPLOY_DIR}/knowledge/catalog.json"
+bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" sync \
+  >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
+jq -e '.libraries[0].id == "kb_default" and .libraries[0].documents[0].projection == "test-knowledge.md"' \
+  "${DEPLOY_DIR}/knowledge/catalog.json" >/dev/null || fail "旧单库没有迁入命名知识库"
+pass "知识旧算法四种扩展名、删除重试与命名库迁移（不验证真实解析）"
 
 printf '%s\n' \
   '{"type":"question","at":"2026-09-04T00:00:00Z"}' \
@@ -740,14 +803,12 @@ pass "版本快照容量预检"
 
 SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason test-manual --quiet)
 SNAPSHOT_LIST=$(tar -tzf "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/snapshot.tar.gz")
-if grep -Eq '(^|/)\.env$|data/analytics' <<< "$SNAPSHOT_LIST"; then
-  fail "版本快照包含 .env 或匿名统计"
-fi
+grep -Eq '(^|/)\.env$' <<< "$SNAPSHOT_LIST" || fail "本机版本快照缺少内部凭据，无法一致性恢复"
 grep -Fq 'payload/data/anythingllm/rollback-state.txt' <<< "$SNAPSHOT_LIST" || fail "版本快照未包含 AnythingLLM 数据"
 grep -Fq 'payload/data/postgres/n8n.dump' <<< "$SNAPSHOT_LIST" || fail "版本快照未包含 n8n PostgreSQL 逻辑备份"
 jq -e '
   .capacity.min_free_mb == 0 and .capacity.estimated_source_kib > 0 and
-  .retention_count == 10 and .contains_database_dump == true
+  .retention_count == 10 and .contains_database_dump == true and .contains_env == true
 ' \
   "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/manifest.json" >/dev/null || fail "快照清单未记录容量与保留策略"
 printf 'rollback-state-after\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
@@ -864,15 +925,11 @@ SAFE_UNINSTALL_BACKUP=$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f \
   -name 'uninstall-backup-*.tar.gz' -printf '%T@\t%p\n' | sort -n | tail -n 1 | cut -f2-)
 [[ -n "$SAFE_UNINSTALL_BACKUP" && "$(stat -c '%a' "$SAFE_UNINSTALL_BACKUP")" == 600 ]] \
   || fail "安全卸载备份缺失或权限不是 0600"
-if tar -tzf "$SAFE_UNINSTALL_BACKUP" | grep -Eq '(^|/)\.env$'; then
-  fail "安全卸载备份包含 .env"
-fi
-tar -xOzf "$SAFE_UNINSTALL_BACKUP" > "${TEST_ROOT}/safe-uninstall-archive.bin"
-for secret_value in "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY"; do
-  if grep -Fq "$secret_value" "${TEST_ROOT}/safe-uninstall-archive.bin"; then
-    fail "安全卸载备份泄露 API Key 或 Token"
-  fi
-done
+tar -xOzf "$SAFE_UNINSTALL_BACKUP" manifest.json | jq -e '.contains_env == true and .contains_database_dump == true' >/dev/null \
+  || fail "安全卸载没有生成包含凭据与数据库的完整本机备份"
+tar -xOzf "$SAFE_UNINSTALL_BACKUP" snapshot.tar.gz > "${TEST_ROOT}/safe-uninstall-snapshot.tar.gz"
+BACKUP_ENV_HASH=$(tar -xOzf "${TEST_ROOT}/safe-uninstall-snapshot.tar.gz" payload/.env | sha256sum | cut -d ' ' -f 1)
+[[ "$BACKUP_ENV_HASH" == "$SAFE_ENV_HASH" ]] || fail "安全卸载完整备份没有准确保留内部凭据"
 grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" || fail "默认安全卸载未执行 Docker Compose down"
 [[ -f "${DEPLOY_DIR}/.env" && "$(stat -c '%a' "${DEPLOY_DIR}/.env")" == 600 ]] \
   || fail "安全卸载未以 0600 保留 .env"
@@ -889,6 +946,8 @@ grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" || fail "默认安全卸载未执�
 for removed_path in install.sh manage.sh update.sh uninstall.sh docker-compose.yml scripts n8n; do
   [[ ! -e "${DEPLOY_DIR}/${removed_path}" ]] || fail "安全卸载未移除服务程序项：${removed_path}"
 done
+[[ ! -e "${TEST_ROOT}/bin/crispai" ]] || fail "安全卸载留下指向已移除程序的本实例管理命令"
+assert_file "${TEST_ROOT}/bin/crispai-plugin"
 grep -Fq 'state=uninstalled-data-kept' "${DEPLOY_DIR}/.crisp-ai-installation" || fail "卸载状态标记错误"
 for output_heading in 删除内容 保留内容 恢复方式; do
   grep -Fq "$output_heading" "${TEST_ROOT}/uninstall-safe.log" \
@@ -912,12 +971,13 @@ install -m 0600 -- "${TEST_ROOT}/preserved-env" "${DEPLOY_DIR}/.env"
 pass "安全卸载保留配置缺失或占位时要求重新配置"
 
 : > "$MOCK_DOCKER_LOG"
-"${PROJECT_ROOT}/install.sh" --deploy-dir "$DEPLOY_DIR" --non-interactive \
+expect_local_ready_install "${PROJECT_ROOT}/install.sh" --deploy-dir "$DEPLOY_DIR" --non-interactive \
   > "${TEST_ROOT}/reinstall-after-uninstall.log" 2>&1
 [[ -f "${DEPLOY_DIR}/manage.sh" && -f "${DEPLOY_DIR}/docker-compose.yml" \
   && -f "${DEPLOY_DIR}/n8n/workflow.json" ]] || fail "安全卸载后同路径重装未恢复程序"
-grep -Fxq 'state=ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
-  || fail "安全卸载后同路径重装未返回 ready 状态"
+[[ "$(cd / && "${TEST_ROOT}/bin/crispai" --version)" == "$PROJECT_VERSION" ]] || fail "同路径重装没有恢复本实例 crispai 命令"
+grep -Fxq 'state=local-ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "安全卸载后同路径重装未返回如实的 local-ready 状态"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$SAFE_ENV_HASH" ]] \
   || fail "安全卸载后同路径重装改写了 .env"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$SAFE_PROMPT_HASH" ]] \
@@ -933,28 +993,28 @@ grep -Fq '已验证安全卸载保留的 .env 与实际配置' \
 pass "安全卸载后同路径重装与数据恢复"
 
 : > "$MOCK_DOCKER_LOG"
-if printf 'y\nNOT_PURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+if printf '1\n9\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
   --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
   > "${TEST_ROOT}/uninstall-purge-wrong-confirmation.log" 2>&1; then
-  fail "错误 PURGE 二次确认仍执行了彻底卸载"
+  fail "错误数字二次确认仍执行了彻底卸载"
 fi
 [[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" ]] \
-  || fail "错误 PURGE 二次确认破坏了部署目录"
+  || fail "错误数字二次确认破坏了部署目录"
 if grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG"; then
-  fail "错误 PURGE 二次确认后仍停止了服务"
+  fail "错误数字二次确认后仍停止了服务"
 fi
-grep -Fq 'PURGE' "${TEST_ROOT}/uninstall-purge-wrong-confirmation.log" \
-  || fail "彻底卸载未明确要求输入 PURGE"
+grep -Fq '第二次确认' "${TEST_ROOT}/uninstall-purge-wrong-confirmation.log" \
+  || fail "完整清理未明确要求第二次数字确认"
 : > "$MOCK_DOCKER_LOG"
-if printf 'y\nNOT_PURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+if printf '1\n9\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
   --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge --yes \
   > "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" 2>&1; then
-  fail "--yes 绕过了 PURGE 二次确认"
+  fail "--yes 绕过了数字二次确认"
 fi
 [[ -d "$PLUGIN_DEPLOY_DIR" && -f "${PLUGIN_DEPLOY_DIR}/uninstall.sh" ]] \
-  || fail "--yes 的错误 PURGE 确认破坏了部署目录"
-grep -Fq 'PURGE' "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" \
-  || fail "--yes 场景未要求 PURGE 二次确认"
+  || fail "--yes 的错误数字确认破坏了部署目录"
+grep -Fq '第二次确认' "${TEST_ROOT}/uninstall-purge-yes-confirmation.log" \
+  || fail "--yes 场景未要求数字二次确认"
 
 : > "$MOCK_DOCKER_LOG"
 if printf '1\n0\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
@@ -969,12 +1029,12 @@ grep -Fq '已取消完整清理' "${TEST_ROOT}/uninstall-purge-numeric-cancel.lo
 if grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG"; then
   fail "数字二次确认取消后仍停止了服务"
 fi
-pass "彻底卸载要求普通确认及不可绕过的 PURGE 二次确认"
+pass "完整清理要求普通确认及不可绕过的数字二次确认"
 
 PURGE_ENV_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/.env" | awk '{print $1}')
 PURGE_PROMPT_HASH=$(sha256sum "${PLUGIN_DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')
 : > "$MOCK_DOCKER_LOG"
-if printf 'y\nPURGE\n' | env MOCK_DOCKER_REMAINING_NETWORKS=1 \
+if printf '1\n1\n' | env MOCK_DOCKER_REMAINING_NETWORKS=1 \
   "${PLUGIN_DEPLOY_DIR}/uninstall.sh" --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
   > "${TEST_ROOT}/uninstall-network-residual.log" 2>&1; then
   fail "Docker Compose down 返回 0 但网络残留时完整清理被错误报告为成功"
@@ -1000,7 +1060,7 @@ grep -Fq '自动备份位于' "${TEST_ROOT}/uninstall-network-residual.log" \
 pass "Compose down 返回 0 但项目网络残留时安全中止"
 
 : > "$MOCK_DOCKER_LOG"
-if printf 'y\nPURGE\n' | env MOCK_DOCKER_FAIL_DOWN=1 "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+if printf '1\n1\n' | env MOCK_DOCKER_FAIL_DOWN=1 "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
   --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge \
   > "${TEST_ROOT}/uninstall-down-failure.log" 2>&1; then
   fail "Docker Compose 停止失败时彻底卸载仍被报告为成功"
@@ -1019,9 +1079,11 @@ pass "Docker Compose down 失败时完整保留部署"
 
 FINAL_BACKUP_COUNT_BEFORE=$(find "$TEST_ROOT" -maxdepth 1 -type f \
   -name 'crisp-ai-purge-backup-*.tar.gz' | wc -l)
-printf 'y\nPURGE\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
+printf '1\n1\n' | "${PLUGIN_DEPLOY_DIR}/uninstall.sh" \
   --deploy-dir "$PLUGIN_DEPLOY_DIR" --purge > "${TEST_ROOT}/uninstall-purge.log" 2>&1
 [[ ! -e "$PLUGIN_DEPLOY_DIR" ]] || fail "彻底卸载未删除部署目录"
+[[ ! -e "${TEST_ROOT}/bin/crispai-plugin" ]] || fail "完整清理留下本实例管理命令"
+assert_file "${TEST_ROOT}/bin/crispai"
 FINAL_BACKUP_COUNT_AFTER=$(find "$TEST_ROOT" -maxdepth 1 -type f \
   -name 'crisp-ai-purge-backup-*.tar.gz' | wc -l)
 (( FINAL_BACKUP_COUNT_AFTER == FINAL_BACKUP_COUNT_BEFORE + 1 )) \
@@ -1030,22 +1092,25 @@ FINAL_UNINSTALL_BACKUP=$(find "$TEST_ROOT" -maxdepth 1 -type f \
   -name 'crisp-ai-purge-backup-*.tar.gz' -printf '%T@\t%p\n' | sort -n | tail -n 1 | cut -f2-)
 [[ -n "$FINAL_UNINSTALL_BACKUP" && "$(stat -c '%a' "$FINAL_UNINSTALL_BACKUP")" == 600 ]] \
   || fail "彻底卸载最终备份缺失或权限不是 0600"
-if tar -xOzf "$FINAL_UNINSTALL_BACKUP" | grep -Fq "$TEST_PLUGIN_SIGNING_SECRET"; then
-  fail "彻底卸载最终备份泄露 Secret"
-fi
+tar -xOzf "$FINAL_UNINSTALL_BACKUP" manifest.json | jq -e '.contains_env == true and .contains_database_dump == true' >/dev/null \
+  || fail "完整清理外部备份不是可恢复的完整本机备份"
+tar -xOzf "$FINAL_UNINSTALL_BACKUP" snapshot.tar.gz > "${TEST_ROOT}/purge-snapshot.tar.gz"
+BACKUP_ENV_HASH=$(tar -xOzf "${TEST_ROOT}/purge-snapshot.tar.gz" payload/.env | sha256sum | cut -d ' ' -f 1)
+[[ "$BACKUP_ENV_HASH" == "$PURGE_ENV_HASH" ]] || fail "完整清理外部备份未准确保留凭据"
 grep -Fq '完整清理完成' "${TEST_ROOT}/uninstall-purge.log" || fail "彻底卸载未说明完成状态"
 for output_heading in 删除内容 保留内容 恢复方式; do
   grep -Fq "$output_heading" "${TEST_ROOT}/uninstall-purge.log" \
     || fail "彻底卸载输出缺少：${output_heading}"
 done
-pass "PURGE 二次确认后的完整卸载与父目录最终备份"
+pass "数字二次确认后的完整卸载与父目录受限完整备份"
 
 printf '\n分层结果：\n'
-for layer in STATIC STUB INTEGRATION; do
+for layer in STATIC UNIT/CONTRACT REAL-LOCAL EXTERNAL-E2E; do
   printf -- '- %s：通过 %d，跳过 %d\n' \
     "$layer" "${LAYER_PASSED[$layer]}" "${LAYER_SKIPPED[$layer]}"
 done
 printf '测试完成：通过 %d，跳过 %d，失败 0。\n' "$PASSED" "$SKIPPED"
+[[ "$TEST_SELECTION" == all ]] || printf '上述仅为生命周期选定子集；最终发布必须无 --lifecycle-only 重新执行全量测试。\n'
 if (( RELEASE_MODE && EXTERNAL_PENDING_MODE )); then
-  printf '源码发布验收：通过；External Validation Pending（仅 INTEGRATION 层允许跳过）。\n'
+  printf '源码发布验收：通过；External Validation Pending（仅 EXTERNAL-E2E 层允许跳过）。\n'
 fi

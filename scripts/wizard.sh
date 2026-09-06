@@ -200,6 +200,7 @@ wizard_init_values() {
   WIZARD_KNOWLEDGE_MODE=empty
   WIZARD_KNOWLEDGE_SOURCE=''
   WIZARD_KNOWLEDGE_FILES=0
+  WIZARD_KNOWLEDGE_LIBRARIES='[]'
 }
 
 wizard_load_state() {
@@ -251,10 +252,12 @@ wizard_load_state() {
   WIZARD_WEBHOOK_PRODUCTION_URL=$(jq -r '.webhook.production_url // ""' "$state_file")
   WIZARD_PROMPT_MODE=$(jq -r '.prompt.mode // "default"' "$state_file")
   WIZARD_PROMPT_SOURCE=$(jq -r '.prompt.source // ""' "$state_file")
-  WIZARD_PROMPT_CONTENT=$(jq -r '.prompt.content // ""' "$state_file")
+  WIZARD_PROMPT_CONTENT=$(jq -j '.prompt.content // ""' "$state_file"; printf '.')
+  WIZARD_PROMPT_CONTENT=${WIZARD_PROMPT_CONTENT%.}
   WIZARD_KNOWLEDGE_MODE=$(jq -r '.knowledge.mode // "empty"' "$state_file")
   WIZARD_KNOWLEDGE_SOURCE=$(jq -r '.knowledge.source // ""' "$state_file")
   WIZARD_KNOWLEDGE_FILES=$(jq -r '.knowledge.supported_files // 0' "$state_file")
+  WIZARD_KNOWLEDGE_LIBRARIES=$(jq -c '.knowledge.libraries // []' "$state_file")
 }
 
 wizard_write_value_file() {
@@ -273,7 +276,7 @@ wizard_write_state() {
   local -a value_names=(
     created_at base_url api_key model model_discovery models_http_status api_mode
     website_id token_identifier token_key webhook_input webhook_mode webhook_base webhook_url
-    prompt_mode prompt_source prompt_content knowledge_mode knowledge_source
+    prompt_mode prompt_source prompt_content knowledge_mode knowledge_source knowledge_libraries
   )
   local -a value_values=(
     "$WIZARD_CREATED_AT" "$WIZARD_BASE_URL" "$WIZARD_API_KEY" "$WIZARD_MODEL"
@@ -281,7 +284,7 @@ wizard_write_state() {
     "$WIZARD_CRISP_WEBSITE_ID" "$WIZARD_CRISP_IDENTIFIER" "$WIZARD_CRISP_TOKEN_KEY"
     "$WIZARD_WEBHOOK_INPUT" "$WIZARD_WEBHOOK_MODE" "$WIZARD_WEBHOOK_BASE_URL"
     "$WIZARD_WEBHOOK_PRODUCTION_URL" "$WIZARD_PROMPT_MODE" "$WIZARD_PROMPT_SOURCE"
-    "$WIZARD_PROMPT_CONTENT" "$WIZARD_KNOWLEDGE_MODE" "$WIZARD_KNOWLEDGE_SOURCE"
+    "$WIZARD_PROMPT_CONTENT" "$WIZARD_KNOWLEDGE_MODE" "$WIZARD_KNOWLEDGE_SOURCE" "$WIZARD_KNOWLEDGE_LIBRARIES"
   )
 
   [[ "$status" == collecting || "$status" == confirmed ]] || return 1
@@ -337,6 +340,7 @@ wizard_write_state() {
     --rawfile prompt_content "${temp_dir}/prompt_content" \
     --rawfile knowledge_mode "${temp_dir}/knowledge_mode" \
     --rawfile knowledge_source "${temp_dir}/knowledge_source" \
+    --slurpfile knowledge_libraries "${temp_dir}/knowledge_libraries" \
     --argjson knowledge_files "$WIZARD_KNOWLEDGE_FILES" '
       {
         schema_version: $schema,
@@ -379,6 +383,7 @@ wizard_write_state() {
         knowledge: {
           mode: $knowledge_mode,
           source: $knowledge_source,
+          libraries: $knowledge_libraries[0],
           supported_files: $knowledge_files
         }
       }
@@ -598,33 +603,55 @@ wizard_probe_selected_model() {
 
   chat_payload=$(jq -cn --arg model "$WIZARD_MODEL" \
     '{model:$model,messages:[{role:"user",content:"Reply only OK."}],max_tokens:16}')
-  if ! wizard_probe_json_endpoint "$work_dir" chat/completions "$chat_payload" \
-    '((has("error") | not) or .error == null or .error == false) and (.choices | type == "array" and length > 0)'; then
+  if wizard_probe_json_endpoint "$work_dir" chat/completions "$chat_payload" \
+    '((has("error") | not) or .error == null or .error == false) and (.choices[0].message.content | type == "string" and length > 0)'; then
+    WIZARD_CHAT_CAPABILITY=true
+  else
     WIZARD_CHAT_CAPABILITY=false
-    return 1
   fi
-  WIZARD_CHAT_CAPABILITY=true
 
   responses_payload=$(jq -cn --arg model "$WIZARD_MODEL" \
     '{model:$model,input:"Reply only OK.",max_output_tokens:16}')
   if wizard_probe_json_endpoint "$work_dir" responses "$responses_payload" \
-    '((has("error") | not) or .error == null or .error == false) and ((.id | type == "string" and length > 0) or (.output | type == "array") or (.output_text | type == "string"))'; then
+    '((has("error") | not) or .error == null or .error == false) and (((.output_text // "") | length > 0) or any(.output[]?.content[]?; .type=="output_text" and (.text | type=="string" and length>0)))'; then
     WIZARD_RESPONSES_CAPABILITY=true
     WIZARD_API_MODE=responses
   else
     WIZARD_RESPONSES_CAPABILITY=false
     WIZARD_API_MODE=chat_completions
   fi
+  [[ "$WIZARD_CHAT_CAPABILITY" == true || "$WIZARD_RESPONSES_CAPABILITY" == true ]] || return 1
 
   tiny_image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
-  vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
-    '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}],max_tokens:16}')
-  if wizard_probe_json_endpoint "$work_dir" chat/completions "$vision_payload" \
-    '((has("error") | not) or .error == null or .error == false) and (.choices | type == "array" and length > 0)'; then
-    WIZARD_VISION_CAPABILITY=true
+  if [[ "$WIZARD_API_MODE" == responses ]]; then
+    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
+      '{model:$model,input:[{role:"user",content:[{type:"input_text",text:"Reply only OK."},{type:"input_image",image_url:$image}]}],max_output_tokens:16}')
+    if wizard_probe_json_endpoint "$work_dir" responses "$vision_payload" \
+      '((has("error") | not) or .error == null or .error == false) and (((.output_text // "") | length > 0) or any(.output[]?.content[]?; .type=="output_text" and (.text | type=="string" and length>0)))'; then
+      WIZARD_VISION_CAPABILITY=true
+    else WIZARD_VISION_CAPABILITY=false; fi
   else
-    WIZARD_VISION_CAPABILITY=false
+    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
+      '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}],max_tokens:16}')
+    if wizard_probe_json_endpoint "$work_dir" chat/completions "$vision_payload" \
+      '((has("error") | not) or .error == null or .error == false) and (.choices[0].message.content | type == "string" and length > 0)'; then
+      WIZARD_VISION_CAPABILITY=true
+    else WIZARD_VISION_CAPABILITY=false; fi
   fi
+}
+
+wizard_read_multiline() {
+  local target=$1 max_length=${2:-262144} line collected=''
+  printf '请粘贴多行正文。单独一行 ::END:: 保存，::CANCEL:: 取消。\n'
+  printf '正文需要结束符字面量时，在前面加反斜线，例如 \\::END::。\n'
+  while true; do
+    if ! IFS= read -r line; then wizard_warn '输入结束，当前正文未保存，可重跑此步骤'; return 2; fi
+    case "$line" in ::END::) break ;; ::CANCEL::) return 3 ;; '\::END::'|'\::CANCEL::') line=${line:1} ;; esac
+    collected+="$line"$'\n'
+    (( ${#collected} <= max_length )) || { wizard_warn '正文超过本步骤输入上限'; return 3; }
+  done
+  [[ -n "$collected" ]] || { wizard_warn '空正文不会覆盖现有内容'; return 3; }
+  printf -v "$target" '%s' "$collected"
 }
 
 wizard_provider_is_loopback() {
@@ -636,7 +663,7 @@ wizard_collect_step() {
   local step=$1
   local output_file=$2
   local work_dir=$3
-  local value normalized resolved count auth_attempt
+  local value normalized resolved count auth_attempt multiline_status library_name library_path library_temp
 
   case "$step" in
     1)
@@ -706,7 +733,7 @@ wizard_collect_step() {
         wizard_select_model_manually || return $?
       fi
       if ! wizard_probe_selected_model "$work_dir"; then
-        wizard_error '所选模型未通过 /v1/chat/completions 实际请求；当前 AnythingLLM 无法使用该配置'
+        wizard_error '所选模型的 Chat Completions 与 Responses 请求均未取得有效回答；请修正模型或凭据'
         WIZARD_MODEL=''
         wizard_write_state "$output_file" collecting 3
         return 1
@@ -787,12 +814,22 @@ wizard_collect_step() {
     8)
       while true; do
         wizard_read_value value \
-          '[8/10] 客服提示词（回车使用安全默认；可填文件路径或粘贴单行内容）：' || return $?
+          '[8/10] 客服提示词（回车使用安全默认；文件路径、单行内容或 ::PASTE:: 多行粘贴）：' || return $?
         if [[ -z "$value" ]]; then
           WIZARD_PROMPT_MODE=default
           WIZARD_PROMPT_SOURCE=''
           WIZARD_PROMPT_CONTENT=''
           break
+        elif [[ "$value" == ::PASTE:: ]]; then
+          if wizard_read_multiline WIZARD_PROMPT_CONTENT; then
+            WIZARD_PROMPT_MODE=inline
+            WIZARD_PROMPT_SOURCE=''
+            break
+          else
+            multiline_status=$?
+            (( multiline_status != 2 )) || return 2
+            continue
+          fi
         elif [[ -e "$value" ]]; then
           [[ -f "$value" && ! -L "$value" && -r "$value" ]] || {
             wizard_warn 'Prompt 路径必须是可读普通文件且不能是符号链接'
@@ -823,12 +860,44 @@ wizard_collect_step() {
       ;;
     9)
       while true; do
-        wizard_read_value value '[9/10] 知识库文件或目录（回车暂不导入）：' || return $?
+        wizard_read_value value '[9/10] 知识库文件或目录（回车跳过，::PASTE:: 粘贴，::LIBRARIES:: 多库）：' || return $?
         if [[ -z "$value" ]]; then
           WIZARD_KNOWLEDGE_MODE=empty
           WIZARD_KNOWLEDGE_SOURCE=''
           WIZARD_KNOWLEDGE_FILES=0
+          WIZARD_KNOWLEDGE_LIBRARIES='[]'
           wizard_info '尚未配置业务知识；安装后 AI 不应编造业务规则'
+          break
+        fi
+        if [[ "$value" == ::PASTE:: || "$value" == ::LIBRARIES:: ]]; then
+          WIZARD_KNOWLEDGE_LIBRARIES='[]'
+          WIZARD_KNOWLEDGE_MODE=libraries
+          WIZARD_KNOWLEDGE_SOURCE=''
+          WIZARD_KNOWLEDGE_FILES=0
+          while true; do
+            wizard_read_value library_name '知识库名称（回车使用默认知识库，0 完成添加）：' || return $?
+            [[ "$library_name" != 0 ]] || break
+            library_name=${library_name:-默认知识库}
+            if [[ "$value" == ::PASTE:: ]]; then library_path=::PASTE::
+            else wizard_read_value library_path '文件/目录路径，或 ::PASTE:: 粘贴正文（0 完成添加）：' || return $?; fi
+            [[ "$library_path" != 0 ]] || break
+            if [[ "$library_path" == ::PASTE:: ]]; then
+              if wizard_read_multiline library_temp 8388608; then
+                library_path=$(mktemp "$work_dir/wizard-knowledge.XXXXXX.md") || return 1
+                printf '%s' "$library_temp" > "$library_path"; chmod 0600 "$library_path"
+              else
+                multiline_status=$?
+                (( multiline_status != 2 )) || return 2
+                continue
+              fi
+            fi
+            [[ -e "$library_path" && ! -L "$library_path" && -r "$library_path" ]] || { wizard_warn '知识来源不是可读的普通文件或目录'; continue; }
+            library_path=$(realpath -e -- "$library_path") || return 1
+            WIZARD_KNOWLEDGE_LIBRARIES=$(jq -cn --argjson libraries "$WIZARD_KNOWLEDGE_LIBRARIES" --arg name "$library_name" --arg source "$library_path" '$libraries+[{name:$name,source:$source}]')
+            ((WIZARD_KNOWLEDGE_FILES+=1))
+            wizard_write_state "$output_file" collecting 9
+            [[ "$value" != ::PASTE:: ]] || break
+          done
           break
         fi
         [[ -e "$value" && ! -L "$value" && -r "$value" ]] || {
@@ -890,9 +959,13 @@ wizard_show_summary() {
   esac
   if [[ "$WIZARD_KNOWLEDGE_MODE" == empty ]]; then
     printf '  知识库：尚未配置业务知识\n'
+  elif [[ "$WIZARD_KNOWLEDGE_MODE" == libraries ]]; then
+    printf '  知识库：已选择 %s 个命名知识来源；解析和索引数量将在安装后对账。\n' "$WIZARD_KNOWLEDGE_FILES"
   else
     printf '  知识库：已选择 %s 个支持文件\n' "$WIZARD_KNOWLEDGE_FILES"
   fi
+  printf '  新实例默认：客服启用；关键词展示确认按钮；人工恢复 1800 秒；欢迎启用；自动展开关闭。\n'
+  printf '  已有实例：保留合法的自定义启停、欢迎和恢复设置。\n'
 }
 
 wizard_confirm() {

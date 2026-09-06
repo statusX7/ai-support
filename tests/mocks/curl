@@ -108,7 +108,10 @@ case "$URL" in
     fi
     ;;
   */chat/completions)
-    if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
+    if [[ "${MOCK_PROVIDER_RESPONSES_ONLY:-0}" == 1 ]]; then
+      STATUS=404
+      BODY='{"error":{"message":"测试服务仅支持 Responses"}}'
+    elif [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
       STATUS=503
       BODY='{"error":{"message":"测试 Provider 不可用"}}'
     elif [[ "${MOCK_PROVIDER_SOFT_ERROR:-0}" == 1 ]]; then
@@ -121,11 +124,15 @@ case "$URL" in
     if [[ "${MOCK_CRISP_FAIL:-0}" == 1 ]]; then
       STATUS=503
       BODY='{"error":"测试 Crisp 不可用"}'
+    elif [[ "${MOCK_CRISP_SOFT_ERROR:-0}" == 1 ]]; then
+      BODY=$(jq -nc --arg website "${URL##*/}" '{error:true,data:{website_id:$website}}')
+    elif [[ "${MOCK_CRISP_WRONG_WEBSITE:-0}" == 1 ]]; then
+      BODY='{"error":false,"data":{"website_id":"22222222-2222-4222-8222-222222222222"}}'
     else
-      BODY='{"error":false}'
+      BODY=$(jq -nc --arg website "${URL##*/}" '{error:false,data:{website_id:$website}}')
     fi
     ;;
-  */webhook/crisp-webhook\?key=ai-support-healthcheck-invalid)
+  */webhook/crisp-webhook|*/webhook/crisp-webhook\?key=ai-support-healthcheck-invalid)
     STATUS=401
     BODY='{"accepted":false,"reason":"Webhook 校验失败"}'
     ;;
@@ -176,14 +183,14 @@ case "$URL" in
   */api/v1/workspace/*/update)
     WORKSPACE_SLUG=${URL#*/api/v1/workspace/}
     WORKSPACE_SLUG=${WORKSPACE_SLUG%%/*}
-    PROMPT=$(jq -r '.openAiPrompt // ""' <<< "$REQUEST_BODY")
+    PROMPT=$(jq -c '.openAiPrompt // ""' <<< "$REQUEST_BODY")
     if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
       [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[],"prompt":""}\n' > "$MOCK_ANYTHING_STATE"
       STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
-      jq --arg prompt "$PROMPT" '.prompt = $prompt' "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
+      jq --argjson prompt "$PROMPT" '.prompt = $prompt' "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
       mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
     fi
-    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --arg prompt "$PROMPT" \
+    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" \
       '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[]}}')
     ;;
   */api/v1/workspace/new)
@@ -197,12 +204,12 @@ case "$URL" in
     WORKSPACE_SLUG=${URL#*/api/v1/workspace/}
     WORKSPACE_SLUG=${WORKSPACE_SLUG%%/*}
     DOCUMENTS='[]'
-    PROMPT=''
+    PROMPT='""'
     if [[ -n "${MOCK_ANYTHING_STATE:-}" && -f "$MOCK_ANYTHING_STATE" ]]; then
       DOCUMENTS=$(jq -c '[.documents[]? | {docpath:.}]' "$MOCK_ANYTHING_STATE")
-      PROMPT=$(jq -r '.prompt // ""' "$MOCK_ANYTHING_STATE")
+      PROMPT=$(jq -c '.prompt // ""' "$MOCK_ANYTHING_STATE")
     fi
-    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --arg prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
+    BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
       '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:$documents}}')
     ;;
   */healthz|*/api/ping)

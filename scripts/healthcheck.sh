@@ -88,6 +88,11 @@ REQUIRED_FILES=(
   config/tags.yaml config/feedback.yaml data/analytics/events.jsonl
   scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh config/Caddyfile.example
 )
+if [[ -f "${DEPLOY_DIR}/config/runtime.yaml" ]]; then
+  REQUIRED_FILES+=(config/runtime.yaml scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh
+    scripts/provider-adapter.js scripts/launcher.sh scripts/migration.sh scripts/crisp-settings.sh
+    scripts/full-backup.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js)
+fi
 for relative in "${REQUIRED_FILES[@]}"; do
   if [[ -f "${DEPLOY_DIR}/${relative}" && ! -L "${DEPLOY_DIR}/${relative}" ]]; then
     pass "文件存在：$relative"
@@ -95,6 +100,15 @@ for relative in "${REQUIRED_FILES[@]}"; do
     fail "文件缺失或是符号链接：$relative"
   fi
 done
+
+if [[ -f "${DEPLOY_DIR}/config/runtime.yaml" ]]; then
+  if jq -e '.schema_version == 2 and (.enabled | type == "boolean") and (.revision | type == "number") and .revision == .applied_revision' \
+    "${DEPLOY_DIR}/config/runtime.yaml" >/dev/null 2>&1; then
+    pass "客服配置 revision 已应用"
+  else
+    health_warn "客服配置存在待生效 revision；安装器会在应用验证完成后提交"
+  fi
+fi
 
 require_command jq
 for json_file in config/keyword.yaml config/menu.yaml config/handoff.yaml config/tags.yaml config/feedback.yaml n8n/workflow.json; do
@@ -291,11 +305,24 @@ else
       || env_get "${DEPLOY_DIR}/.env" AI_API_BASE_URL 2>/dev/null || true)
     API_KEY=$(env_get "${DEPLOY_DIR}/.env" AI_API_KEY 2>/dev/null || true)
     AI_MODEL_VALUE=$(env_get "${DEPLOY_DIR}/.env" AI_MODEL 2>/dev/null || true)
-    PROVIDER_PAYLOAD=$(jq -cn --arg model "$AI_MODEL_VALUE" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
-    if probe_api_endpoint "${API_BASE}/chat/completions" "$API_KEY" "$PROVIDER_PAYLOAD" "${DEPLOY_DIR}/tmp"; then
-      pass "Provider Chat Completions 与所选模型可用"
+    AI_MODE_VALUE=$(env_get "${DEPLOY_DIR}/.env" AI_API_MODE 2>/dev/null || printf chat_completions)
+    if [[ "$AI_MODE_VALUE" == responses ]]; then
+      PROVIDER_ENDPOINT=responses
+      PROVIDER_PAYLOAD=$(jq -cn --arg model "$AI_MODEL_VALUE" '{model:$model,store:false,input:"Reply only OK.",max_output_tokens:64}')
     else
-      fail "Provider Chat Completions 或所选模型不可用"
+      PROVIDER_ENDPOINT=chat/completions
+      PROVIDER_PAYLOAD=$(jq -cn --arg model "$AI_MODEL_VALUE" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
+    fi
+    if [[ -f "${DEPLOY_DIR}/scripts/provider.sh" ]]; then
+      if bash "${DEPLOY_DIR}/scripts/provider.sh" --deploy-dir "$DEPLOY_DIR" test >/dev/null; then
+        pass "Provider ${AI_MODE_VALUE} 与实际应用容器的受管协议路径均可用"
+      else
+        fail "Provider ${AI_MODE_VALUE} 或应用容器的协议路径不可用"
+      fi
+    elif probe_api_endpoint "${API_BASE}/${PROVIDER_ENDPOINT}" "$API_KEY" "$PROVIDER_PAYLOAD" "${DEPLOY_DIR}/tmp"; then
+      pass "Provider ${AI_MODE_VALUE} 与所选模型可用"
+    else
+      fail "Provider ${AI_MODE_VALUE} 或所选模型不可用"
     fi
 
     if (( APPLICATION_ONLY )); then
@@ -322,12 +349,11 @@ else
 
     ANYTHING_WORKSPACE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)
     ANYTHING_CHAT_MODE_VALUE=$(env_get "${DEPLOY_DIR}/.env" ANYTHINGLLM_CHAT_MODE 2>/dev/null || true)
-    LOCAL_PROMPT=$(<"${DEPLOY_DIR}/config/prompt.md")
     ANYTHING_RESPONSE=$(mktemp "${DEPLOY_DIR}/tmp/anything-health.XXXXXX")
     ANYTHING_STATUS=$(anythingllm_secure_request "$DEPLOY_DIR" GET \
       "http://127.0.0.1:${ANYTHING_PORT_VALUE}/api/v1/workspace/${ANYTHING_WORKSPACE_VALUE}" \
       "$ANYTHING_KEY_VALUE" "" "$ANYTHING_RESPONSE")
-    if [[ "$ANYTHING_STATUS" == 2?? ]] && jq -e --arg slug "$ANYTHING_WORKSPACE_VALUE" --arg prompt "$LOCAL_PROMPT" '
+    if [[ "$ANYTHING_STATUS" == 2?? ]] && jq -e --arg slug "$ANYTHING_WORKSPACE_VALUE" --rawfile prompt "${DEPLOY_DIR}/config/prompt.md" '
       .workspace as $workspace |
       (if ($workspace | type) == "array" then $workspace[0] else $workspace end) as $item |
       $item.slug == $slug and $item.openAiPrompt == $prompt

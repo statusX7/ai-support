@@ -1,155 +1,136 @@
-# 安装说明
+# 从完整发布包安装 CrispAI
 
-## 支持范围
+正常支持系统的依赖由安装脚本自动补齐，不需预先手工安装 Docker、Compose、jq、AnythingLLM 或 n8n。需要自己准备的只有有效第三方 AI 凭据、Crisp 凭据和有权配置的公网接入信息。源码发布不代表已替使用者完成账号授权或 Hook 登记。
 
-本版本的自动依赖分支支持 64 位 `amd64`/`arm64`：
+## 1. 系统、权限和资源
 
-- Debian 12、13
-- Ubuntu 22.04、24.04
+| 系统/架构 | 项目实现与验证等级 |
+| --- | --- |
+| Debian 12 amd64、systemd | 主要部署验收平台；本轮真实结果以 [v1.1.0 报告](reports/v1.1.0-report.md) 的逐项证据为准 |
+| Debian 13 amd64、Ubuntu 22.04/24.04 amd64 | 自动包管理分支覆盖，未据此宣称同等级整机实测 |
+| 上述系统 arm64 | 架构分支与镜像能力检查，不冒充实际 arm64 整机验收 |
+| RHEL-like、衍生发行版、非 systemd、远程 Docker daemon | 当前自动安装不支持，不会乱套用 Debian 软件源 |
 
-Debian 12 `amd64` 已完成从无 Docker 的 systemd 虚拟机真实安装。其他列出的系统完成了发行版与包管理分支自动测试；正式使用前仍建议在同发行版预演。RHEL-like、非 systemd 主机、容器内启动 dockerd 和远程 Docker context 不在自动安装支持范围内，脚本会在变更前说明原因。
+使用 root，或能正常 sudo 的管理员。建议至少 2 CPU、4 GiB 内存及 25 GiB 可用磁盘；镜像、首次 Embedding、知识和完整快照需要额外空间，较大知识库按实际增长预留。虚拟机须提供镜像支持的真实 CPU 能力；不将受限容器嵌套 dockerd 或不稳定 TCG 当作正常部署保证。
 
-安装脚本会自动补齐 `ca-certificates`、`curl`、`jq`、`openssl`、`tar`、`gzip`、`flock`、`ss` 等实际运行工具，以及 Docker Engine、CLI、containerd 与 Compose 插件。不会要求宿主机安装 Node.js、npm、GitHub CLI、Python 包或全局 pip 依赖，也不会执行整机升级、关闭 TLS/签名校验、清理 `/var/lib/docker` 或停止其他容器。
+目标机应可访问其发行版仓库、Docker 官方仓库与镜像源、本地 Embedding 模型源，以及自己的 AI/Crisp HTTPS 服务。80/443 已有网站时使用已有反代分支；不要停掉其他网站给安装器让端口。
 
-使用者只需准备：
+## 2. 获取私有发布包
 
-- 具备 Chat Completions 能力的 OpenAI Compatible API 地址与 Key；
-- 目标 Crisp Website ID、Token Identifier 与 Token Key；
-- 自己掌握的公网域名，或已经反向代理到本项目的 HTTPS 完整 Webhook 地址。
+仓库保持 private。推荐在已有授权的浏览器打开 [Releases](https://github.com/statusX7/ai-support/releases)，下载 `ai-support-v1.1.0.tar.gz` 和 `SHA256SUMS`，上传到服务器的同一目录。不能匿名访问私有包，也不要把 Token 嵌入 URL。
 
-数据库密码、n8n 加密密钥、Webhook URL Secret、AnythingLLM 登录凭据、Developer API Key、工作区和内部端口都由安装器生成或配置。
+若获取文件的机器已经安装并登录 GitHub CLI，可用：
 
-## 获取完整发布包
+```bash
+gh release download v1.1.0 --repo statusX7/ai-support \
+  --pattern ai-support-v1.1.0.tar.gz --pattern SHA256SUMS
+```
 
-仓库为 private。取得源码需要自己的 GitHub 访问权限，运行客服本身不依赖 Git 或 GitHub CLI。
+Git/gh 仅用于取得私有代码或维护发布，不是归档安装及客服运行依赖。获取文件发生在安装器之前；没有相关下载命令时使用浏览器上传，而不是声称脚本能提前替你安装 Git。
 
-推荐从 GitHub Release 下载 `ai-support-v1.0.1.tar.gz` 和 `SHA256SUMS`，上传到服务器后执行：
+## 3. 校验并运行
+
+在两个资产所在目录：
 
 ```bash
 sha256sum --check SHA256SUMS
-tar -xzf ai-support-v1.0.1.tar.gz
-cd ai-support-v1.0.1
+tar -xzf ai-support-v1.1.0.tar.gz
+cd ai-support-v1.1.0
 sudo bash ./install.sh
 ```
 
-也可以在已配置私有仓库访问权限的机器上克隆：
+root 执行 `bash ./install.sh`。校验失败不要继续；发布包解压后不含 `.git` 也能工作。未宣传未经验证的远程 `curl | bash` 管道交互安装。
+
+默认部署目录 `/opt/crisp-ai`，自定义使用 `sudo bash ./install.sh --deploy-dir /srv/crisp-ai`。安装器保存持久程序到部署目录，`crispai` 不指向临时解压目录。已有部署继续原路径，不强制迁移。`--help`、`--version` 在无 Docker 或配置时也可用。
+
+## 4. 十项快速初始化
+
+| 主步骤 | 实际输入 | 系统行为 |
+| --- | --- | --- |
+| 1/10 | AI API 地址 | 保留合法代理前缀、已有 `/v1`，规范尾斜线 |
+| 2/10 | AI API Key | 隐藏输入；说明少量探测可能计费 |
+| 3/10 | 选择模型 | 远端列表去重、数字/分页/搜索；无列表时可手填后验证 |
+| 4/10 | Crisp Website ID | 保存对应网站标识，不重复询问 |
+| 5/10 | Crisp Token Identifier | 隐藏输入，与 Key 分开 |
+| 6/10 | Crisp Token Key | 隐藏输入 |
+| 7/10 | 域名或已有 HTTPS 生产地址 | 受管 Caddy 或已有反代分流 |
+| 8/10 | 客服 Prompt | 回车安全默认、普通文件路径或多行粘贴 |
+| 9/10 | 知识来源 | 文件/目录、粘贴或多个命名库；允许暂时空库 |
+| 10/10 | 脱敏核对 | `1 开始 / 2 修改 / 0 取消` |
+
+路径快速流程十项主要输入，确认后不再问数据库密码、AnythingLLM Key/workspace、n8n owner/workflow、内部端口或 Embedding Key。多行或多库是用户主动展开的输入过程，不称为总共只按十次键。多行结束/取消方式及原文示例见 [MENU](MENU.md)。
+
+新装默认客服启用、人工关键词按钮启用、人工恢复 1800 秒、欢迎启用、自动展开关闭；摘要会显示。升级保留已有自定义值，旧“关键词直接转人工”迁移为按钮确认。空知识库会明确提示没有业务知识，默认 Prompt 不编造价格、政策或已执行操作。
+
+EOF、Ctrl+C 或失败保留受限进度，重跑原命令或 `crispai init` 继续；不会重新生成有效密钥。已有有效配置时可选择保留检查或重配置。自动化 `--non-interactive` 是高级入口，不是普通人的唯一安装方式。
+
+## 5. 自动完成的事情与系统变更
+
+确认前先补齐向导所需工具；确认后按顺序安装/复用 Docker、检查 daemon 与实际测试容器、创建受管目录/密钥、渲染 Compose、拉固定镜像、启动数据库/应用、初始化 AnythingLLM、同步 Prompt/知识、导入发布 n8n、安装全局命令和分层检查。
+
+依赖取自实际生产调用：发行版 `ca-certificates/curl/jq/openssl/tar/gzip`、基础工具、`diffutils/cmp`、`util-linux/flock`、`iproute2/ss`、Python 3/`python3-yaml`；Docker 官方源提供 Engine、CLI、containerd、Compose plugin。不强加宿主 Node/npm 或全局 pip，第三方 Python 库不使用 `--break-system-packages`。Compose 按能力与运行结果检查，不限定必须恰好 v2。
+
+系统级变更限于缺失包、Docker 专用 apt source/keyring、Docker systemd 启动/启用、受管目录及 `/usr/local/bin/crispai`；裸域名模式另有受管 Caddy 容器和持久证书目录。无整机 dist-upgrade、TLS/签名降级、全局 prune 或 Docker 数据目录清空。已有健康 Docker/其他容器不重装、不随意重启。
+
+内部密码、n8n 加密密钥、AnythingLLM 初始认证、Developer API Key、单一客服 workspace、原生本地 Embedder、知识 manifest 与生产 workflow 均自动创建或复用。文件上传后还要实际索引、读回；workflow 导入成功后还要发布和生产节点检查。服务账号 UID/GID 与私密文件权限由脚本处理，不使用全目录 chmod 777。
+
+## 6. Provider 的真正路径
+
+只列模型不等于能调用，HTTP 200 也要有有效正文。Chat-only 与 Responses-only 都通过实际选择协议验证；AnythingLLM 的 Generic OpenAI 请求由随包部署的最小适配器接到所选协议，图片路径同样验证。切换供应商使用 `3 → 10` 整组候选，不用先破坏旧配置。
+
+宿主 `localhost`/`127.0.0.1` 会保存为独立 probe 地址，容器用 `host.docker.internal` 与 host gateway；供应商服务仍需实际允许该受控网络访问。普通远端须 HTTPS，不跟随重定向转发 Token。模型不支持视觉时文本仍可用，访客应补充文字，不自动转人工。
+
+## 7. 公网接入与 Crisp 最小动作
+
+裸域名：DNS A/AAAA 指向正确服务器，80/443 空闲且入站与证书签发条件满足时，受管 Caddy 自动处理 HTTPS 与续期。任何 AAAA 必须真的可达，不只验证 A。条件不足保持 pending，不伪称 HTTPS 成功。
+
+完整 HTTPS URL：使用自己的已有反代。安装器生成 `config/crispai-nginx.conf` 和 `config/crispai-caddy.conf`，内容采用当前实际端口/前缀；管理员将适用片段合入已有站点，不覆盖整份配置。只转发生产 Hook 及可选无密钥 SDK/公开 UI 配置路由，n8n 编辑器、AnythingLLM 管理端和数据库不公开。
+
+在 `crispai → 10 → 7` 私密显示带随机 Secret 的生产 URL，在 Crisp 高级设置登记 Website Hook，至少订阅 `message:send`、`message:received`、`message:updated`。使用网页加载/打开欢迎另订阅 `session:sync:events` 并接一次无密钥网页片段。详细凭据取得路径和按钮测试见 [CRISP](CRISP.md)。没有已验证官方自动登记接口时不模拟后台登录；无需另外创建 Marketplace Plugin。
+
+## 8. 如何读完成结果
+
+| 状态/事实 | 意义 |
+| --- | --- |
+| collecting / installing | 向导或初始化未完成，可恢复 |
+| staged | 显式跳过启动，只落盘，不是安装成功 |
+| local-ready | 本地依赖、应用与必要配置已完成，外部接入或实际客户链路仍待验证；尚不能声称接待客户 |
+| ready | 当前配置的本地/Provider、Crisp API、公网入口及可信真实会话往返事实均通过；协议服务不能产生真实会话通过事实 |
+| uninstalled-data-kept | 服务/程序已移除，数据和秘密保留，同路径可重装 |
+
+完成页列部署目录、版本、服务、知识、回调、日志与管理入口。`crispai status` 读已有事实；`doctor` 发实际探测。正常安装不要求 21 项开发 E2E 变量。凭据修复或 Hook 登记后从菜单继续验证，不需要重填十项或重装内部组件。
+
+安装退出码：`0` 为该操作完成；`2` 可表示本地完成但外部待接入，或用户取消，须结合本次明确文案与状态；`130` 是中断。其他非零看具体失败阶段。同一个“2”不能据此自动删除数据或显示所有步骤失败。
+
+## 9. 日常入口、更新与恢复
 
 ```bash
-git clone https://github.com/statusX7/ai-support.git
-cd ai-support
-sudo bash ./install.sh
+crispai
+crispai status
+crispai doctor
 ```
 
-不要把 GitHub Token 放进下载 URL。未测试从标准输入管道执行交互安装；请先取得完整发布包再运行文件。
+18 项及各子菜单见 [MENU](MENU.md)。全局开关不停止容器；长期维护停机另选 16。密钥、Prompt、知识与配置通过菜单实际应用和回读。
 
-## 十项快速初始化
-
-无有效安装实例时，`bash install.sh` 自动进入同一个十项向导：
-
-1. `AI API 地址`：可含 `/v1` 或受信任路径前缀；非本机地址必须使用 HTTPS。
-2. `AI API Key`：无回显输入，只用于少量连通性与能力请求。
-3. `选择模型`：从 `/v1/models` 去重列表中数字选择，支持翻页和搜索；接口不支持时可手动输入，但仍须通过真实 Chat 请求。
-4. `Crisp Website ID`。
-5. `Crisp Token Identifier`：无回显。
-6. `Crisp Token Key`：无回显。
-7. `公网域名或现有 HTTPS Webhook 地址`：裸域名进入受管 Caddy HTTPS；完整地址进入已有反向代理分支。
-8. `客服提示词`：回车使用安全默认值，也可输入本机普通文件路径或选择粘贴。
-9. `知识库文件或目录`：支持 Markdown、TXT、PDF、DOCX；回车允许空知识库并明确提示没有业务知识。
-10. `核对并开始`：只显示脱敏摘要，选择 `1 开始安装 / 2 返回修改 / 0 取消`。
-
-正常路径共十次输入；确认后不再询问数据库、端口、AnythingLLM、n8n 或 Embedding 参数。EOF、Ctrl+C 或安装失败会保留权限为 `0600` 的进度，重新运行同一命令继续；配置与本地应用成功落盘后，含外部凭据的向导临时文件会删除。
-
-自定义部署目录属于高级用法：
+从 v1.0.1 升级，校验并解压新版，在新版目录运行：
 
 ```bash
-sudo bash ./install.sh --deploy-dir /srv/crisp-ai
+sudo bash ./update.sh --deploy-dir /opt/crisp-ai --source-dir "$PWD" --no-pull
 ```
 
-自动化可以使用 `--non-interactive` 和相应环境变量；它不是普通安装的默认入口。`--help` 与 `--version` 在 Docker、jq 等依赖缺失时仍可使用。
+或 `crispai → 14 → 1` 输入该绝对目录。自动创建一致性快照、迁移单知识目录和按钮规则、验证应用；失败按快照回滚。`14 → 3/4` 查看/恢复历史，更新及回滚后修复受管 `crispai`。旧人工状态不会统一清零；旧仅哈希会话状态的可枚举边界见 MENU。
 
-## 自动安装与初始化顺序
-
-安装器先只依赖 Bash、基础系统命令和包管理器识别系统，然后补齐向导所需工具。用户确认后才执行：
-
-1. 幂等配置 Docker 官方 apt 软件源，安装或复用 Engine、CLI、containerd 与满足项目能力要求的 Compose 插件。
-2. 通过 systemd 启用并启动 daemon，等待 `docker info`，检查本地 socket/context、Engine 版本和架构，再运行 `hello-world`。
-3. 创建 `/opt/crisp-ai` 的受限目录，生成或复用内部密钥，并验证 Compose。
-4. 启动 PostgreSQL、AnythingLLM 和 n8n，等待真实健康接口。
-5. 自动登录 AnythingLLM，创建或复用 `ai-support` Developer API Key 与 `crisp-support` 工作区，同步 Prompt。
-6. 复制所选知识文件，上传、加入工作区并核对索引清单；空知识库也生成明确的空清单。
-7. 在固定 n8n 容器中导入、发布 workflow，重启后导出并检查 `active=true`。
-8. 检查 Provider、AnythingLLM Chat、Crisp REST API 和公网 Webhook；保存分层状态并创建首次可维护状态。
-
-重复执行会复用密钥、工作区、知识和已发布 workflow，不会重复添加 apt 源或重置数据。已有健康 Docker 会直接复用；安装器不会因为版本字符串不是恰好 `v2` 就拒绝兼容 Compose，而是检查实际命令能力。
-
-## Provider 与容器网络
-
-地址规范化只补一个 `/v1`，不会形成 `/v1/v1`。模型列表成功不等于模型可调用；所选模型必须实际通过 `/v1/chat/completions`，因为 AnythingLLM 当前的 `generic-openai` 运行路径依赖它。Responses 与图片能力单独探测并记录； Responses-only 配置会被拒绝，不会把无人使用的模式写成成功。
-
-宿主机 `localhost` Provider 会在容器配置中改为 `host.docker.internal`，Compose 同时设置 `host-gateway`；宿主探测地址单独保存。非本机 HTTP Provider 会被拒绝，Bearer Token 不跟随重定向发送到其他主机。
-
-## Webhook 与 Crisp 后台
-
-裸域名模式仅在 80/443 未被占用时启用本项目 Caddy，并只公开 `/webhook/crisp-webhook`。证书与数据持久化在部署目录。DNS、80/443 入站权限或证书签发不满足时，安装器保留本地服务并把 Webhook 标为 `pending`，不会声称公网接入成功。
-
-若 80/443 已由 Nginx、Caddy、宝塔或其他服务占用，安装器不会停止或覆盖它。请先让现有 HTTPS 反向代理把一个准确路径转发到 `http://127.0.0.1:5678/webhook/crisp-webhook`，然后在第 7 项输入完整 HTTPS 地址。切换出受管 HTTPS 时，只停止并删除本 Compose 项目的 Caddy，不影响外部服务。
-
-默认 Website Hook 必须在 Crisp 后台登记：
-
-```text
-https://你的域名/webhook/crisp-webhook?key=<CRISP_WEBSITE_HOOK_SECRET>
-```
-
-同时订阅：
-
-- `message:send`：访客消息；
-- `message:received`：公开 operator 回复。
-
-URL Secret 可在受控终端从部署 `.env` 获取，不会写入文档、Release、普通日志或统计。Crisp 后台登记属于账户权限边界；无法通过明确官方 API 幂等登记时，安装器只输出上述最小操作，不模拟登录。Plugin Token/签名 Hook 保留为管理菜单中的高级兼容模式。
-
-n8n、AnythingLLM 与 PostgreSQL 不默认暴露公网；前两者绑定 `127.0.0.1`，数据库只在项目网络内。受管 Caddy 对其他路径返回 404。
-
-## 安装状态
-
-- `collecting`：十项向导未确认或可恢复；
-- `installing`：配置或本地初始化正在进行；
-- `staged`：显式 `--skip-start`，不能视为部署完成；
-- `local-ready`：Docker、本地服务、Provider、AnythingLLM、知识与 workflow 已通过，Crisp 外部凭据或接入仍待处理；
-- `ready`：本地应用及 Crisp REST 凭据已通过；WebHook 和真实会话仍由各自 fact 独立表示；
-- `uninstalled-data-kept`：安全卸载后数据和 `.env` 保留。
-
-完成页会列出实际部署目录、状态、Webhook、管理命令和剩余外部动作。只有收到并成功回写真实 Crisp 消息后，才可把会话链路视为已验收。
-
-## 管理、更新与卸载
+业务迁移用选项 12：包含多库原文，不含秘密/客户会话，新实例先准备自己的凭据。完整本机备份用选项 13：包含秘密、数据库和运行状态，需当敏感恢复资产，不上传。命令等价入口：
 
 ```bash
-sudo /opt/crisp-ai/manage.sh
+sudo bash /opt/crisp-ai/scripts/backup.sh --deploy-dir /opt/crisp-ai \
+  --full --output /opt/crisp-ai/backups/full-manual.tar.gz
+sudo bash /opt/crisp-ai/scripts/restore.sh --deploy-dir /opt/crisp-ai \
+  --full --input /opt/crisp-ai/backups/full-manual.tar.gz
 ```
 
-管理工具提供十项中文分组：快速初始化、状态、AI、Prompt/知识、业务规则、标签/统计、日志/依赖修复、备份恢复、更新回滚和卸载。未安装时也能从第 1 项进入同一安装器；“依赖修复”会实际执行引导而非只打印缺失项。
+## 10. 卸载与同路径恢复
 
-从 v1.0.0 升级必须从独立的新版本完整发布包运行新版入口，避免旧进程使用旧复制清单：
+`crispai → 18` 或 `crispai uninstall`：数字选安全卸载/完整清理/返回，危险操作再确认。安全卸载移除本实例服务/程序及自己的全局命令，保留 `.env/config/knowledge/data/backups/logs`。从新完整包使用同一 `--deploy-dir` 重装，验证并复用数据，再创建命令。
 
-```bash
-cd /path/to/ai-support-v1.0.1
-sudo bash ./update.sh \
-  --deploy-dir /opt/crisp-ai \
-  --source-dir "$PWD" \
-  --no-pull
-```
-
-更新前自动执行容量检查、迁移备份和包含 n8n PostgreSQL/AnythingLLM 数据的版本快照；失败自动回滚。新健康检查还能从升级源码补齐旧版清单遗漏的 v1.0.1 运行模块。
-
-默认安全卸载先备份并删除本实例容器、网络和程序，保留 `.env`、`config`、`knowledge`、`data`、`backups` 与 `logs`，且不会卸载宿主 Docker。完整清理在管理菜单中需要两次数字 `1` 确认；直接调用 `uninstall.sh --purge` 仍兼容 `PURGE` 高级确认。完整清理备份位于部署目录之外。
-
-## 排障
-
-```bash
-sudo /opt/crisp-ai/scripts/bootstrap.sh --check
-sudo /opt/crisp-ai/scripts/bootstrap.sh --all
-sudo /opt/crisp-ai/scripts/healthcheck.sh --local
-sudo /opt/crisp-ai/scripts/healthcheck.sh --application
-sudo /opt/crisp-ai/scripts/healthcheck.sh
-```
-
-包管理器锁最多等待有限时间，不删除锁文件；下载与 Docker 等待都有超时和重试。无 root/sudo、软件仓库或网络不可达、systemd 不可用、远程 Docker context、CPU/镜像不兼容时会保留真实退出码和安装进度。不要用手工修改状态标记、删除 Docker 数据或关闭系统安全机制绕过错误。
+完整清理先显示精确删除范围，并将敏感完整备份存于删除范围外；确认后只清本实例。不卸载 Docker、不 prune、不删外部容器。备份失败、网络外部占用或无法证明所有权时停止，不能误报清理完成。具体恢复资产内容和远端竞态边界见 [SECURITY](SECURITY.md)，排障见 [TROUBLESHOOTING](TROUBLESHOOTING.md)。

@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
+# shellcheck source=scripts/launcher.sh
+source "${SCRIPT_DIR}/scripts/launcher.sh"
 
 DEPLOY_REQUEST=""
 SOURCE_REQUEST=""
@@ -171,6 +173,7 @@ write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$OLD_VERSION" installing
 copy_project_files "$SOURCE_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
 migrate_config_files "$DEPLOY_DIR"
+bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate
 [[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
 touch -- "${DEPLOY_DIR}/data/analytics/events.jsonl"
 set_runtime_ownership "$DEPLOY_DIR"
@@ -190,6 +193,8 @@ if (( SKIP_START == 0 )); then
   wait_for_local_health "$DEPLOY_DIR"
   "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
     --application --installation-in-progress
+  bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
+    || die '升级后运行时配置回读失败'
   set_installation_fact "$DEPLOY_DIR" dependencies ready
   set_installation_fact "$DEPLOY_DIR" local_services ready
   set_installation_fact "$DEPLOY_DIR" app_config ready
@@ -200,16 +205,23 @@ if (( SKIP_START == 0 )); then
     set_installation_fact "$DEPLOY_DIR" webhook pending
     warn "更新后公网 Webhook 尚未通过 DNS/TLS/路由检查（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）"
   fi
-  set_installation_fact "$DEPLOY_DIR" conversation pending
   if crisp_api_check "$DEPLOY_DIR"; then
     set_installation_fact "$DEPLOY_DIR" crisp_api ready
-    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" ready
   else
     set_installation_fact "$DEPLOY_DIR" crisp_api failed
-    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" local-ready
     warn "更新完成且本地应用已通过检查，但 Crisp API 待修正（HTTP ${CRISP_API_STATUS:-000}）"
   fi
+  refresh_conversation_fact "$DEPLOY_DIR" || set_installation_fact "$DEPLOY_DIR" conversation pending
+  if [[ "$(installation_fact "$DEPLOY_DIR" crisp_api)" == ready \
+    && "$(installation_fact "$DEPLOY_DIR" webhook)" == ready \
+    && "$(installation_fact "$DEPLOY_DIR" conversation)" == ready ]]; then
+    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" ready
+  else
+    write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$NEW_VERSION" local-ready
+    warn '本地升级已完成；外部接入尚待验证，可运行 crispai doctor 继续检查'
+  fi
   SERVICES_STOPPED=0
+  install_crispai_launcher "$DEPLOY_DIR" 1 || die '升级后无法修复本实例 crispai 管理入口'
 fi
 
 UPDATE_COMPLETE=1

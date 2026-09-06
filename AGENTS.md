@@ -3,7 +3,8 @@
 ## 项目范围
 
 - 项目名称：`ai-support`。
-- 所有项目操作只能在 `/root/projects/crispai` 内进行。
+- 源码、开发资料与测试产物集中于 `/root/projects/crispai`，临时资料放入已忽略的 `.work/`。
+- 安装器可管理用户指定的部署目录（默认 `/opt/crisp-ai`）、必要系统依赖、Docker 官方源和服务、项目拥有的 `/usr/local/bin/crispai`；不得修改无关站点或其他实例。
 - 运行时组合 Crisp、n8n、AnythingLLM 与 OpenAI Compatible API，不重复实现 RAG、向量数据库、文档解析或 LLM 管理。
 
 ## 开发规则
@@ -18,15 +19,24 @@
 
 ## 版本与提交
 
-- 每批修改必须同步更新 `VERSION` 和 `CHANGELOG.md`。
+- 同一发布周期的开发批次使用本地 commit 与进度记录；最终由主 Agent 统一同步版本、CHANGELOG、报告和归档，不为每个编辑递增产品版本。
 - Git commit message 使用英文，并以版本号开头，例如 `v0.1.1 add ai provider detection`。
 - 日常修改只创建本地 commit，不执行 GitHub push。
 - 源码正式版本与部署实例验收分离：缺少用户自有 Crisp、Provider 或公网 Webhook 时，可在本地代码门禁通过后发布，但报告必须明确标记 `External Validation Pending`，不得把未执行项目写成通过。
 - 有 GitHub 权限时才 push 并创建 GitHub Release；没有权限时完成本地 commit、annotated tag、release notes 和推送说明，不得伪造远端状态。
-- 每次完成开发后创建 `docs/reports/v版本-report.md`，记录提交、变更、测试、风险与后续建议。
+- 每次正式交付创建 `docs/reports/v版本-report.md`，记录提交、变更、分层验证和真实外部限制。
+
+## 客服行为与配置
+
+- 关键词命中只展示原生人工确认按钮，不改变会话模式；有效按钮点击或真人公开回复才进入人工模式。
+- 全局客服开关与单会话模式分离；状态按 website + conversation 隔离、持久化。自己的 automated 出站不算真人。
+- 人工恢复秒数新装默认 1800，0 表示不自动恢复；升级保留合法自定义值。访客消息、重复/乱序事件不重置计时。
+- 发送前复核全局配置代次与会话代次；人工控制不能等待模型请求结束。
+- 新装欢迎启用、自动打开关闭；知识未命中、负反馈、模型或图片错误不得自动转人工。
+- 菜单配置必须实际应用并回读；多知识库禁用必须从实际检索中移除。业务迁移排除秘密，本机一致性备份包含恢复所需秘密并受限保管。
 
 ## 验证
 
 - shell 脚本须通过 `shellcheck`。
 - Docker 配置须通过 `docker compose config`。
-- 测试不得使用真实凭据或真实用户数据。
+- 单元及协议测试只用虚构凭据；明确授权的外部 E2E 仅使用隔离测试账号/会话，真实秘密不得进入代码、公开报告或转录。

@@ -1,176 +1,135 @@
-# 测试说明
+# 测试与验收
 
-结果必须按以下层级分别记录，不能用一个总数掩盖关键跳过：
+本章供维护者复现测试；正常管理员接入只需安装向导和 `crispai doctor`，不需要准备开发用 E2E 环境变量。每次发布的实际数量、证据路径和限制以对应 [发布报告](reports/v1.1.0-report.md) 为准。
 
-- `STATIC`：Bash 语法、ShellCheck、Compose/JSON、版本与密钥扫描；
-- `UNIT-STUB`：受控包管理器、Docker、Provider/Crisp 协议分支及十项 PTY 向导；
-- `REAL-BOOTSTRAP`：初始无 Docker/Compose 的独立 systemd Linux，从发布包运行生产安装入口；
-- `REAL-LOCAL-INTEGRATION`：真实 PostgreSQL、AnythingLLM、n8n、workflow、知识索引、持久化、更新和卸载；
-- `EXTERNAL-E2E`：真实 Crisp、真实第三方 Provider、DNS/公网投递和 conversation 回写。
+## 层级与门禁
 
-## 测试分层
+| 层级 | 能证明什么 | 不能替代什么 |
+| --- | --- | --- |
+| STATIC | Bash/ShellCheck、schema、工作流引用、Compose 解析、归档、密钥扫描 | 容器运行、依赖实际安装 |
+| UNIT/CONTRACT | 生产函数、Shell/PTY、事件 fixture、协议服务、可控时钟的分支 | 真实 Crisp、真实模型或真实向量检索 |
+| REAL-LOCAL | 真实 Docker、PostgreSQL、AnythingLLM、n8n、实际索引、生产入口和归档安装 | 用户自有公网/账户授权 |
+| EXTERNAL-E2E | 真实 Crisp 测试访客、真实第三方模型、公网 HTTPS 与实际页面 | 未执行的其他发行版、账户和渠道 |
 
-测试结果必须按以下三层记录，不能用低层结果代替高层验收：
+真实空机引导作为 REAL-LOCAL 的独立硬门槛报告：初始无 Docker/Compose，生产安装器自行补齐。不得挂宿主 Docker socket、隐藏 PATH、手工先装 Docker或复用旧版本报告冒充本次实测。协议服务可以配合真实本地应用，但须写为“真实应用 + 模拟 Crisp/Provider”，不能写为“真实模型回答通过”。
 
-- `STATIC`：Bash 语法、ShellCheck、JSON/YAML、Compose 解析、Git 忽略和密钥扫描、workflow 静态契约。
-- `STUB`：在项目内临时目录使用桩 Docker、curl 和文件状态执行安装、Provider、工作流、备份、恢复、更新、回滚和安全失败路径。
-- `INTEGRATION`：先连接一个已经安装的真实本地 Docker 部署，检查目录权限、Compose、容器、本地健康接口、workflow 已发布以及伪造 Webhook 被拒绝；再通过显式启用的外部 E2E 连接隔离的 Crisp、AnythingLLM 和 Provider。
+运行主驱动的计数与单项复跑分开；嵌套脚本中的多条断言不重复累加到主驱动总数。跳过或证据不足不计通过，失败修复后记录最后复跑及原始原因。
 
-只执行本地部署检查仍不能证明外部链路。`tests/test_external_e2e.sh` 默认跳过，只有同时设置启用开关、隔离环境确认及全部测试凭据时才会访问真实服务。
+## 自动测试
 
-## 日常自动测试
+从开发仓库运行：
 
 ```bash
-./tests/run.sh
+bash tests/run.sh
+bash tests/test_manage_contract.sh
+node tests/test_configuration_protocol.js
+bash tests/test_workflow_contract.sh
+bash tests/test_workflow_runtime.sh
+node tests/test_provider_adapter.js
 ```
 
-开发环境缺少 ShellCheck、Docker Compose、Node.js 或真实部署目录时，对应项目会明确显示“跳过”。日常模式允许跳过，但报告必须逐项列出，不能写成全部通过。
+生产发布归档包含可复现的测试源码，不包含开发工具二进制、运行日志或私密测试配置；普通安装不执行测试驱动。主驱动自行枚举当前正式专项，避免人工漏跑。
 
-`tests/test_bootstrap.sh` 和 `tests/test_wizard.sh` 属于 `UNIT-STUB`，用于穷举失败分支，但不能冒充空机安装。`tests/test_release_package.sh` 只接受干净 Git 提交，并验证归档每个条目都来自固定、已跟踪清单；发布资产须在独立目录解压后再次验收。
+ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服运行依赖。普通安装所需的 Python 3/PyYAML、jq、Docker/Compose 等仍由生产安装器补齐。
 
-自动测试使用项目目录内的临时运行目录，结束后清理。桩凭据只用于测试，不得使用真实 Token、Secret 或用户数据。
-
-## 源码发布模式（External Validation Pending）
-
-源码发布与部署方实例验收分离。缺少 Crisp、Provider、AnythingLLM、公网 Webhook 或隔离 conversation 时，可显式运行：
+发布模式必须指定隔离真实部署，不能把本地集成缺失当外部豁免：
 
 ```bash
+AI_SUPPORT_INTEGRATION_DEPLOY_DIR=/绝对路径/隔离验收实例 \
 AI_SUPPORT_RELEASE_TEST=1 \
 AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1 \
-./tests/run.sh
+bash tests/run.sh
 ```
 
-该模式要求 `STATIC` 与 `STUB` 无失败、无跳过，只允许 `INTEGRATION` 层把未配置的真实部署或外部 E2E 记录为 `External Validation Pending`。它不会把跳过项写成通过，也不会豁免实际执行后返回的失败。`AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1` 不能脱离 `AI_SUPPORT_RELEASE_TEST=1` 单独使用。
+只有无法取得的私有 Crisp、第三方模型或 DNS/站点权限可以使 EXTERNAL-E2E 标记 `External Validation Pending`。STATIC、UNIT/CONTRACT、REAL-LOCAL 的关键失败或跳过都会阻止发布。开启上述变量不改变已执行测试的失败结果。
 
-源码发布报告必须保留外部待验证清单。部署实例获得真实凭据后，仍应运行下一节的不带豁免完整测试。
+`tests/test_deployment_integration.sh` 检查真实目录归属、容器、应用健康和工作流，但单独一次错误 Secret 的 401 不证明正确消息能回复；还必须执行下面的真实故事及归档生命周期验收。
 
-## 完整部署发布模式自动测试
+`tests/workflow-local-integration.js` 使用受限测试配置连接真实 n8n 和隔离协议服务，覆盖按钮、两会话、真实计时、重启、在途取消及发送未知对账。`tests/test_web_chat_browser.js` 在真实 Chromium 中运行生产 SDK 片段，通过实际 n8n 公共路由和 Hook 核验欢迎/展开的七种控制场景；它使用合成 Crisp SDK，不冒充真实 Crisp 页面。后者仅供维护者，依赖 Chromium、Node.js、`ws` 和 OpenSSL，测试配置、浏览器 profile 与 localhost TLS 密钥均留在被忽略的受限工作目录。
 
-完整部署模式不允许关键自动测试跳过，并要求一个 `ready` 的真实部署，以及专用 Crisp Website、Provider、AnythingLLM 工作区和四个互不相同的空白测试 conversation。先通过 root shell 或 CI Secret Store 安全注入以下变量，不要把值写入仓库、命令行参数或 Shell 历史：
+## 最小真实验收故事
 
-执行主机必须提供 ShellCheck、满足项目能力要求的 Docker Compose 插件、Node.js、`curl`、`jq`、Python 3、`realpath`、`base64` 和 `sha256sum`；缺少任一关键依赖都会令发布模式失败。
+在支持 Docker 的隔离 Debian 12 amd64 VM 创建无配置环境，保存发行版、架构、PID 1、初始包清单和命令可用情况。测试数据全部虚构，禁止录制密钥或真实客户正文。
 
-- 控制：`AI_SUPPORT_E2E_ENABLE=1`、`AI_SUPPORT_E2E_CONFIRM_DEDICATED=YES`。
-- 部署：`AI_SUPPORT_INTEGRATION_DEPLOY_DIR`、`AI_SUPPORT_E2E_DEPLOY_DIR`。
-- Provider：`AI_SUPPORT_E2E_PROVIDER_BASE_URL`、`AI_SUPPORT_E2E_PROVIDER_API_KEY`、`AI_SUPPORT_E2E_PROVIDER_MODEL`；使用 Responses 时再设 `AI_SUPPORT_E2E_PROVIDER_API_MODE=responses`。
-- AnythingLLM：`AI_SUPPORT_E2E_ANYTHINGLLM_BASE_URL`、`AI_SUPPORT_E2E_ANYTHINGLLM_API_KEY`、`AI_SUPPORT_E2E_ANYTHINGLLM_WORKSPACE`。
-- Crisp：`AI_SUPPORT_E2E_CRISP_WEBSITE_ID`、`AI_SUPPORT_E2E_CRISP_TOKEN_TIER`、`AI_SUPPORT_E2E_CRISP_TOKEN_IDENTIFIER`、`AI_SUPPORT_E2E_CRISP_TOKEN_KEY`。
-- 会话与图片：`AI_SUPPORT_E2E_TEXT_SESSION_ID`、`AI_SUPPORT_E2E_OPERATOR_SESSION_ID`、`AI_SUPPORT_E2E_HANDOFF_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_SESSION_ID`、`AI_SUPPORT_E2E_IMAGE_URL`、`AI_SUPPORT_E2E_IMAGE_EXPECTED_FACT`。测试图片必须清晰展示最后一个变量指定的 6 到 128 位唯一安全标识；测试只比较该标识，不输出图片或回复正文。
+1. 校验最终归档，解压后用 PTY 执行 `bash install.sh`。文件来源快速路径记录十个主要输入，确认后额外必答为零；多行粘贴逐行计数，不把输入行数误称十次按键。
+2. 确认安装器实际安装缺失包、Docker/Compose，启用 daemon 并运行容器；自动创建内部 Key/workspace，读回 Prompt、文档索引和已发布工作流。
+3. 从 `/`、`/tmp` 和新 shell 调用 `crispai`。通过真实菜单换配置、粘贴中文 Prompt，检查当前 AnythingLLM Prompt 与容器内配置一致。
+4. 创建“订阅使用”“电脑排障”“手机排障”三个命名库；使用有效 MD/TXT/PDF/DOCX。用中文改写问题检查真实向量搜索的来源、内容、排名，不以协议模型固定答复作为检索证据。
+5. 停用中间库、更新同名文件、重同步、重新启用、单库重建、删除条目；确认其他库的文档映射未被覆盖或误删。
+6. A/B 两位测试访客正常聊天。A 输入“人工”仅见原生 picker，不点继续业务问答仍有 AI；A 点击确认后仅 A 暂停并收到一次确认，B 持续正常。
+7. 设置 10 秒恢复；真人再次公开回复 A 更新 A 截止时间。用慢模型验证人工事件已落盘后旧结果不出站；访客消息不重置计时，期限到后只答新问题。
+8. 重启后检查人工状态、截止时间、未过期 offer；另测 0 秒永久人工、旧按钮回放、重复/乱序事件和跨会话伪造。
+9. 停用客服：在途结果、关键词、欢迎、反馈均静默，仍记录真人事件；重新启用不清空 A 的人工状态、不补答停用期间历史。
+10. 欢迎启停、加载/打开事件、自动展开分别验证；页面 SDK 不含密钥。负反馈、图片失败和知识未知都不转人工。
+11. 通过菜单导出完整业务配置和知识原文，校验无秘密，再预览导入、应用并读回；另外验证完整本机备份与故障回滚。
+12. 从真实 v1.0.1 归档升级，保留密钥、Prompt、知识和既有人工状态；再安全卸载、同路径重装、完整清理及同名命令/外部占网保护。
+13. 从正式 GitHub Release 回下载归档和 SHA256SUMS，重新校验、独立解压并检查入口。报告的验收代码应与发布资产相同。
 
-变量就绪后，在该 root shell 中运行：
+没有真实 Crisp 时，上述消息故事必须通过真正运行的 n8n 生产 Webhook 和隔离协议服务执行。模拟回复、回调和前端 SDK 的本地测试分别标注，不能称为真实 Crisp UI 或真实第三方模型验收。
 
-```bash
-AI_SUPPORT_RELEASE_TEST=1 ./tests/run.sh
-```
+## T01～T50 追踪矩阵
 
-该命令必须以 0 退出，且 `STATIC`、`STUB`、`INTEGRATION` 都无失败、无跳过。外部脚本会使用真实 API 验证 Provider、四格式知识文件、Crisp 文本与上下文、防重复、operator 接管、精确转人工、标签并集、视觉和统计增量，并在结束时清理测试文档及恢复被修改的测试标签。它不会覆盖本章列出的全部负向、更新和回滚场景，不能单独作为 Release 依据。
+本表是应执行的场景，不预填通过；对应版本报告记录命令、退出码、证据和实际结果。
 
-Website Hook 和 Plugin Hook 必须在各自配置下分别完整执行一次发布模式测试；每次使用新的四个测试 conversation。测试结束后立即从 root 环境移除凭据。
+| ID | 场景及关键断言 | 必需最高本地证据 |
+| --- | --- | --- |
+| T01 | 最终归档、无 Docker/Compose/jq 自动引导真实 daemon | REAL-LOCAL 空机 |
+| T02 | 文件来源向导十项，确认后零额外必答 | REAL-LOCAL PTY |
+| T03 | 多行中文/Emoji/特殊字符 Prompt 原样且实际生效 | REAL-LOCAL 菜单 + API |
+| T04 | EOF/SIGINT、下载和包管理失败有界且可恢复 | CONTRACT + REAL-LOCAL |
+| T05 | 重复安装/重装不重生成密钥或丢失知识 | REAL-LOCAL |
+| T06 | 任意 cwd、新 shell、root/sudo 快捷入口 | REAL-LOCAL |
+| T07 | 宽屏双栏、窄屏、dumb、无色/Emoji 降级 | 生产 PTY |
+| T08 | 18 主菜单、全部子菜单和取消路径 | 生产 PTY + REAL-LOCAL |
+| T09 | 模型列表成功/空/404/401/429/超时 | CONTRACT |
+| T10 | 路径前缀、loopback 宿主与容器实际请求 | REAL-LOCAL + 协议服务 |
+| T11 | Chat-only/Responses-only 最终推理路径 | REAL-LOCAL + 协议服务 |
+| T12 | Provider 整组修改与失败回滚、运行时读回 | REAL-LOCAL |
+| T13 | 三命名库中文不同事实的真实索引/来源 | REAL-LOCAL |
+| T14 | 跨库同名文件、幂等同步、独立删除 | REAL-LOCAL |
+| T15 | 启停后的实际 workspace/新检索 | REAL-LOCAL |
+| T16 | 索引超时后 pending 对账不误删 | CONTRACT + REAL-LOCAL |
+| T17 | 四种有效格式、中文近义检索 | REAL-LOCAL |
+| T18 | 关键词只展示，A 仍 AI、B 不变 | REAL-LOCAL n8n |
+| T19 | 点击后只暂停 A、确认一次 | REAL-LOCAL n8n |
+| T20 | 取消/未点击后业务问答继续 | REAL-LOCAL n8n |
+| T21 | 无 from/type 的同 fingerprint 更新 | REAL-LOCAL n8n |
+| T22 | 重放/过期/跨会话/伪造按钮拒绝 | CONTRACT + REAL-LOCAL |
+| T23 | 规则启停、排除词、预演与实际读新配置 | CONTRACT + REAL-LOCAL |
+| T24 | 真人公开文字/文件立即暂停 | REAL-LOCAL n8n |
+| T25 | 全部 automated 出站回流不自判真人 | REAL-LOCAL n8n |
+| T26 | note/输入中/在线/operator opened 不接管 | CONTRACT |
+| T27 | 慢模型期间人工控制优先、迟到答案丢弃 | REAL-LOCAL n8n |
+| T28 | A 人工、B/C 独立并发及上下文 | REAL-LOCAL n8n |
+| T29 | N 秒与新真人延长、访客不延长 | 可控时钟 + 真实短计时 |
+| T30 | 0 秒、重复乱序、长期人工不被清理 | CONTRACT + REAL-LOCAL |
+| T31 | 容器/工作流重启及升级持久状态 | REAL-LOCAL |
+| T32 | 总开关关闭屏蔽所有自动出站及在途任务 | REAL-LOCAL n8n |
+| T33 | 再启用保留人工期限、不补旧消息 | REAL-LOCAL n8n |
+| T34 | 欢迎启停、正文、刷新多标签页去重 | CONTRACT + REAL-LOCAL |
+| T35 | SDK 加载/打开/自动展开正确事件链 | 本地 SDK + 实际 n8n |
+| T36 | 多级菜单、父级返回、无环引用校验 | CONTRACT + REAL-LOCAL |
+| T37 | 图片及后续指代关联当前会话 | REAL-LOCAL + 协议视觉 |
+| T38 | 过期/非图片/超大/私网或恶意 URL 拒绝 | CONTRACT |
+| T39 | 收件持久化、重放、重启、发送未知对账 | CONTRACT + REAL-LOCAL |
+| T40 | 标签/统计失败不阻断正文，保留外部标签 | REAL-LOCAL + 协议服务 |
+| T41 | 命中/未知分母、反馈关联与差评不转人工 | CONTRACT + REAL-LOCAL |
+| T42 | 全部业务配置与多库原文迁移、保留本机秘密 | REAL-LOCAL |
+| T43 | 恶意归档/schema/应用失败拒绝并恢复 | CONTRACT + REAL-LOCAL |
+| T44 | v1.0.1 升级、按钮迁移、人工保留 | REAL-LOCAL 旧正式包 |
+| T45 | 自动/手动回滚、再升级、镜像/挂载/入口 | REAL-LOCAL |
+| T46 | 数字取消、安全卸载、重装、完整清理 | REAL-LOCAL |
+| T47 | 外部占网、同名非受管命令保护 | CONTRACT + REAL-LOCAL |
+| T48 | 最终归档、版本、菜单/文档一致 | STATIC + REAL-LOCAL |
+| T49 | 文件、diff、完整历史、归档与转录密钥扫描 | STATIC |
+| T50 | 真实两访客：文本、图片、按钮、人工及恢复 | EXTERNAL-E2E |
 
-## 真实部署验收
+## 外部验收及证据安全
 
-只在隔离的 Crisp 测试 Website、测试 Provider 和虚构知识文件中执行。报告只记录时间、版本、匿名测试会话标识、测试事实标识及 PASS/FAIL；禁止记录 Token、Secret、完整消息正文或真实用户数据。
+外部测试只在账户持有人授权的隔离 Website/专用访客上进行。优先 Website Token + Website Hook，至少订阅 `message:send`、`message:received`、`message:updated`；SDK 欢迎另需 `session:sync:events`。Plugin 只按实例已有模式测契约，不要求普通用户另外建立一套 Plugin。
 
-### 1. 全新安装、自动依赖与分层状态
+`tests/test_external_e2e.sh` 属于维护者显式授权的外部测试驱动，从指定受限部署读取已经配置的凭据和实际协议；默认只需两个独立访客会话，不要求四套会话或额外重填全部秘密。驱动的启用/隔离确认、部署目录、两会话和受控图片参数是测试输入，不是安装或上线必填项目。API 合成的 picker 选择及 Hook 回流不能代替真实浏览器点击体验，需分别记录。真实接入按 [Crisp 接入](CRISP.md) 完成；不要在终端历史中输入凭据，不向随机生产客户发送验收消息。
 
-使用支持嵌套容器能力的独立 VM 或真实服务器；记录镜像来源与校验、发行版、架构、PID 1、完整初始包清单、命令可用状态、容器和部署目录。至少一套环境必须在启动前真实缺少 Docker 与 Compose，且不能挂载宿主 Docker socket。
+只有 current 配置的实际事实通过才可更新接入状态。协议端点成功、模型列表 200、workflow active、错误 Secret 的 401、健康容器均不得单独提升为“真实会话已接入”。详见 [安装状态](INSTALL.md)。
 
-从最终发布归档解压后，通过 PTY 驱动生产 `bash install.sh` 的十项提示；不得预写 `.env`、直接调用内部函数或用环境变量绕过向导。记录十次输入、进入安装后的额外必答次数、退出码和脱敏转录。确认脚本安装 Engine/CLI/containerd/Compose、启用并启动 daemon、运行测试容器，再自动创建 AnythingLLM Developer API Key、工作区、Prompt、知识索引和已发布 workflow。
-
-第三方凭据不足时允许使用明确标记的本地协议服务验证安装接线；这只能计入 `REAL-LOCAL-INTEGRATION`，不能写成真实模型或 Crisp 验收。本地服务完成而 Crisp 外部检查失败时应是 `state=local-ready`，并保留服务和数据；有效 Crisp REST 凭据通过后才提升为 `ready`。
-
-再分别验证：
-
-- Provider 或 AnythingLLM 故障时安装失败；Crisp 外部故障时返回 2 并保留 `local-ready`。
-- 对同一未完成部署重新运行安装可安全续跑。
-- `--skip-start` 的新部署处于 `staged`，不能运行管理或更新；不带该参数重跑后成为 `ready`。
-- 对 `ready` 部署重复安装不改写现有密钥或自定义配置。
-
-### 2. Docker、健康和持久化
-
-在部署目录执行：
-
-```bash
-docker version
-docker compose version
-docker compose config --quiet
-docker compose up -d
-docker compose ps
-sudo ./scripts/healthcheck.sh
-```
-
-PostgreSQL、AnythingLLM 和 n8n 必须运行且健康，workflow 必须处于已发布状态，完整健康检查必须验证 Provider、Crisp 和 AnythingLLM Chat。
-
-在 `data/anythingllm/` 与 n8n 数据库分别创建无敏感测试标记并记录 SHA-256 或查询值。执行 `docker compose restart`，等待本地健康检查通过，确认两类标记仍存在且内容一致，然后删除测试标记。
-
-### 3. Provider
-
-- `/v1/models` 成功时显示模型列表并能选择模型。
-- 列表失败时允许手工模型，但所选模型仍必须实际通过 `/v1/chat/completions`。
-- 分别验证支持和不支持 `/v1/responses` 的 Provider，确认 `AI_API_MODE` 正确。
-- 用测试图片验证安装检测出的 `AI_SUPPORTS_VISION` 与实际能力一致。
-- 无效 Key、错误 Base URL 和不可用模型必须清晰失败，日志不得出现 Key。
-
-### 4. Crisp Hook 与消息链路
-
-Website Hook 和 Plugin Hook 分别执行一轮，且都订阅 `message:send` 与 `message:received`：
-
-- Website 模式：正确 URL Secret 接受，错误 Secret 拒绝。
-- Plugin 模式：正确签名接受；错误签名、过期时间戳、缺少原始请求体均拒绝，且不能用 Website Secret 绕过。
-- 访客文本完成 Crisp → n8n → AnythingLLM → Provider → Crisp 回复。
-- 同一 conversation 连续两轮能引用上一轮用户、AI 和人工上下文；不同 conversation 不串线。
-- 重放同一入站 fingerprint 不产生第二条回复；出站重试使用稳定 fingerprint。
-- 重启 n8n 后当前 conversation 的 AI 开关、接管代次、欢迎/菜单状态和重复指纹仍生效；在隔离环境构造过期及超量控制文件，确认 7 天和 2000/1500 清理阈值生效，且当前会话、非普通文件和不匹配名称的文件不被删除。
-- operator 公开回复后 AI 立即停止；内部 note 和自动消息不触发接管。
-- 在 AI 推理期间插入 operator 回复，确认发送前复核会取消在途 AI 回答。
-- 访客发送精确关键词“转人工”时只回复配置提示、关闭 AI 并添加 `human_required`；“人工智能”不得在默认 `exact` 模式误触发。
-- 知识库未命中、低置信度和 Provider 失败只安全回复或标记，不得自动转人工。
-- Plugin 的 `session:request:initiated` 可发送一次欢迎语；`session:set_opened` 不得发送欢迎语。Website 欢迎语只在第一条访客消息合并一次。
-
-### 5. 标签、统计与反馈
-
-- 预先设置无关标签和已有项目标签，再触发四类标签，确认结果是去重并集且不删除任何既有标签。
-- 临时移除 conversation meta 权限，确认跳过标签更新但正文回复仍成功。
-- 验证 `ai_resolved`、`knowledge_miss`、`low_confidence`、`human_required` 均来自配置。
-- Crisp 发送失败时不得增加 AI 回复、知识命中或待反馈记录；应增加匿名发送失败计数。
-- 正负反馈均能记录匿名 session 和脱敏、截断后的问题与答案；统计结果包含好评率和高频失败问题。
-- 生成超过轮转阈值的非敏感测试事件，确认 `.1` 至 `.5` 与活动文件会被共同汇总，且第六个历史轮转按策略淘汰。
-
-### 6. 知识库四种格式
-
-准备内容真实有效、仅含虚构事实的 Markdown、TXT、PDF 和 DOCX，不能只把文本改扩展名。逐个执行添加、同步、查询、重新索引和删除：
-
-- AnythingLLM 必须真实解析并把文档加入目标工作区。
-- 每种格式的唯一事实都能从 Crisp 查询到。
-- 更新文档时先验证新索引，失败时旧索引仍可查询。
-- 删除后文档和索引都消失。
-- 知识命中、未命中、总问题和命中率增量正确。
-
-### 7. 图片
-
-- 从 Crisp 发送允许主机上的测试图片，视觉模型返回与图片有关的回答。
-- 切换到不支持视觉的模型或让视觉接口返回明确不支持错误，系统提示切换视觉模型且 workflow 不崩溃。
-- 非 HTTPS 或未允许主机的图片 URL 被拒绝。
-
-### 8. 备份、更新和回滚
-
-- 迁移备份和恢复覆盖 Prompt、业务配置、workflow、知识文件和清单，且不包含 `.env` 或任何真实 Secret。
-- 并发启动两个维护操作时，第二个操作因维护锁而安全退出。
-- 正常更新在停机前完成新镜像拉取，创建 v2 快照后升级并恢复 `ready`。
-- 快照包含非空 n8n PostgreSQL 逻辑备份、AnythingLLM 数据和历史镜像 ID，不包含 `.env`、匿名统计或日志。
-- 注入健康失败触发自动回滚；回滚后 n8n 数据库测试记录、AnythingLLM 数据哈希、Prompt、workflow 和旧版本镜像全部恢复，同时当前人工接管控制状态不得因软件回滚被清除。
-- 删除所需历史镜像后，回滚必须在修改当前文件和停止服务前安全失败。
-- 验证容量不足拒绝、历史保留数量以及回滚目标保护策略。
-
-### 9. 安全卸载与恢复
-
-- 通过管理菜单和命令行分别执行默认安全卸载，确认卸载前在 `backups/uninstall-backup-<UTC时间>-<随机值>.tar.gz` 创建了可校验的迁移备份。
-- 确认本项目容器和 Compose 网络已删除，Compose、程序、脚本和随程序发布的服务配置已移除；`.env`、实际 `config/`、`knowledge/`、`data/`、`backups/`、`logs/` 均保留，`.env` 权限仍为 `0600`，安装状态为 `uninstalled-data-kept`。
-- 从新的可信源码目录对同一路径重新运行 `install.sh`，不额外传入 Provider/Crisp 环境变量，确认先校验并复用保留的 `.env` 与实际配置；注入缺失项或占位值时必须在改写卸载状态前拒绝并要求 `--reconfigure`。确认 PostgreSQL、n8n、AnythingLLM、知识索引及原配置可恢复，完整健康检查通过后状态回到 `ready`。
-- 分别模拟 Docker daemon 不可用、Compose 不可用、`docker compose down` 失败，以及 `down` 返回成功但外部容器占用导致带本项目标签的网络残留，确认命令非零退出，程序与数据均未删除、不会强制删除外部容器，且不存在强制离线绕过；即使已生成迁移备份，也不能把该备份误判为卸载完成。
-- 在隔离部署中验证完整清理：第一次未输入 `y`/`yes` 或第二次未精确输入 `PURGE` 时目录保持不变；即使指定 `--yes` 也必须完成两次确认。确认后整个部署目录被删除。
-- 确认完整清理前在部署目录同级生成 `crisp-ai-purge-backup-<UTC时间>-<随机值>.tar.gz`，归档校验有效且能导入新部署；确认命令不存在跳过自动备份的选项，并记录该迁移备份不能恢复 `.env`、数据库或 AnythingLLM 运行数据。
-
-## 结果判定
-
-任何步骤为 FAIL、SKIP、未执行或证据不足，都必须如实写成“失败”“跳过”或“未验收”。源码发布可以按 [发布说明](RELEASE.md) 使用 `External Validation Pending`，但不能把这些项目计入通过；完整部署实例只有在所有门禁均为 PASS 时才算验收完成。
+转录用虚构知识并设 0600；报告只留摘要、匿名标识、hash、HTTP 分类和计数，不包含 URL Secret、API Key、客户正文、图片或完整本机备份。原始敏感资料不进入 Git 或 Release。

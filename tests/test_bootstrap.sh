@@ -220,7 +220,7 @@ MOCK
   for command_name in \
     jq openssl tar gzip base64 sha256sum realpath stat df du install cat dirname basename mkdir rmdir \
     mktemp chmod chown cp mv rm touch date sort head tail tr cut paste wc find grep \
-    sed awk xargs flock ss sleep; do
+    sed awk xargs flock ss sleep python3 cmp; do
     path=$(command -v "$command_name" 2>/dev/null || true)
     [[ -n "$path" ]] || fail "测试主机缺少用于构造隔离工具的命令：${command_name}"
     printf '%s=%s\n' "$command_name" "$path" >> "${state}/runtime-links"
@@ -303,6 +303,9 @@ assert_contains "${CLEAN_ROOT}/state/apt.log" 'ca-certificates'
 assert_contains "${CLEAN_ROOT}/state/apt.log" 'jq'
 assert_contains "${CLEAN_ROOT}/state/apt.log" 'findutils'
 assert_contains "${CLEAN_ROOT}/state/apt.log" 'iproute2'
+assert_contains "${CLEAN_ROOT}/state/apt.log" 'python3'
+assert_contains "${CLEAN_ROOT}/state/apt.log" 'python3-yaml'
+assert_contains "${CLEAN_ROOT}/state/apt.log" 'diffutils'
 MAPPED_XARGS_PACKAGE=$(env PATH="${CLEAN_ROOT}/bin" /bin/bash -c \
   'source "$1"; bootstrap_command_package xargs' bootstrap-map "$BOOTSTRAP_SCRIPT")
 [[ "$MAPPED_XARGS_PACKAGE" == findutils ]] || fail "xargs 未映射到 findutils"

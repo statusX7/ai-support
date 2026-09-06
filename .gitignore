@@ -10,6 +10,11 @@ config/menu.yaml
 config/handoff.yaml
 config/tags.yaml
 config/feedback.yaml
+config/runtime.yaml
+config/.crispai-launcher
+config/crispai-nginx.conf
+config/crispai-caddy.conf
+config/Caddyfile.previous
 config/*.local.yaml
 *.pem
 *.key

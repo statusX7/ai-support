@@ -1,13 +1,17 @@
-# ai-support
+# CrispAI / ai-support
 
-用于自部署 Crisp AI 自动客服，组合 n8n、AnythingLLM 与 OpenAI Compatible API。
+自用 Crisp AI 客服：n8n + AnythingLLM + PostgreSQL，中文 Shell 初始化与日常管理。
 
-支持 Debian 12/13、Ubuntu 22.04/24.04（amd64/arm64）。从完整发布包解压后运行：
+从有权访问的 [私有 Release](https://github.com/statusX7/ai-support/releases) 下载完整包和 `SHA256SUMS`，上传服务器后：
 
 ```bash
+sha256sum --check SHA256SUMS
+tar -xzf ai-support-v1.1.0.tar.gz
+cd ai-support-v1.1.0
 sudo bash ./install.sh
+crispai
 ```
 
-安装器会自动补齐普通运行依赖与 Docker Engine/Compose，并通过十项中文输入完成初始化。需要准备自己的 AI API、Crisp 凭据和公网域名或现有 HTTPS Webhook 地址。
+安装器补齐受支持 Linux 的依赖；准备自己的 AI/Crisp 凭据和公网接入信息。关键词只展示人工按钮，点击才暂停本会话；真人公开回复立即暂停。源码发布不替代真实账号与 Hook 验证。
 
-详细安装、配置和安全说明见 [`docs/`](docs/INSTALL.md)。
+[部署](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布报告](docs/reports/v1.1.0-report.md)

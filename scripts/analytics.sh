@@ -56,21 +56,26 @@ done
 SUMMARY=$(jq -nR '
   reduce inputs as $line (
     {
-      total_questions: 0, ai_replies: 0, knowledge_hits: 0, knowledge_misses: 0,
+      total_questions: 0, ai_replies: 0, knowledge_hits: 0, knowledge_misses: 0, knowledge_unknown: 0,
       handoffs: 0, positive_feedback: 0, negative_feedback: 0,
-      negative_questions: [], failure_counts: {}, invalid_lines: 0
+      negative_questions: [], failure_counts: {}, invalid_lines: 0, knowledge_libraries: {}, feedback_answers: {}
     };
     (try ($line | fromjson) catch null) as $event |
     if $event == null then .invalid_lines += 1
     elif ($event | type) != "object" then .invalid_lines += 1
     elif $event.type == "question" then .total_questions += 1
     elif $event.type == "ai_reply" then .ai_replies += 1
-    elif $event.type == "knowledge_hit" then .knowledge_hits += 1
+    elif $event.type == "knowledge_hit" then .knowledge_hits += 1 |
+      reduce (($event.library_ids // $event.libraries // []) | unique)[] as $library (. ; .knowledge_libraries[$library] = ((.knowledge_libraries[$library] // 0) + 1))
     elif $event.type == "knowledge_miss" then .knowledge_misses += 1
+    elif $event.type == "knowledge_unknown" then .knowledge_unknown += 1
     elif $event.type == "handoff" then .handoffs += 1
-    elif $event.type == "feedback" and $event.feedback == "positive" then .positive_feedback += 1
+    elif $event.type == "feedback" and ($event.answer_id // "") != "" and .feedback_answers[$event.answer_id] then .
+    elif $event.type == "feedback" and $event.feedback == "positive" then .positive_feedback += 1 |
+      if ($event.answer_id // "") != "" then .feedback_answers[$event.answer_id] = true else . end
     elif $event.type == "feedback" and $event.feedback == "negative" then
       .negative_feedback += 1 |
+      (if ($event.answer_id // "") != "" then .feedback_answers[$event.answer_id] = true else . end) |
       .negative_questions = ((.negative_questions + [{
         at: ($event.at // ""), session: ($event.session // ""), question: ($event.question // "")
       }]) | if length > 20 then .[-20:] else . end) |
@@ -79,11 +84,13 @@ SUMMARY=$(jq -nR '
       else . end
     else . end
   ) |
-  .hit_rate = (if .total_questions == 0 then 0 else ((.knowledge_hits * 10000 / .total_questions) | floor / 100) end) |
-  .positive_rate = (if (.positive_feedback + .negative_feedback) == 0 then 0 else ((.positive_feedback * 10000 / (.positive_feedback + .negative_feedback)) | floor / 100) end) |
+  .observable_queries = (.knowledge_hits + .knowledge_misses) |
+  .hit_rate = (if .observable_queries == 0 then null else ((.knowledge_hits * 10000 / .observable_queries) | floor / 100) end) |
+  .positive_rate = (if (.positive_feedback + .negative_feedback) == 0 then null else ((.positive_feedback * 10000 / (.positive_feedback + .negative_feedback)) | floor / 100) end) |
+  .feedback_coverage = (if .ai_replies == 0 then null else (((.positive_feedback + .negative_feedback) * 10000 / .ai_replies) | floor / 100) end) |
   .negative_questions |= reverse |
   .frequent_failures = (.failure_counts | to_entries | map({question: .key, count: .value}) | sort_by([-.count, .question]) | .[:10]) |
-  del(.failure_counts)
+  del(.failure_counts,.feedback_answers)
 ' "${EVENT_FILES[@]}") || die "统计事件读取失败"
 
 INVALID_LINES=$(jq -r '.invalid_lines' <<< "$SUMMARY")
@@ -102,8 +109,11 @@ print_knowledge() {
     "AI回复： \(.ai_replies)",
     "命中： \(.knowledge_hits)",
     "未命中： \(.knowledge_misses)",
+    "检索结果未知： \(.knowledge_unknown)",
+    "可观察检索问题： \(.observable_queries)",
     "转人工： \(.handoffs)",
-    "命中率： \(.hit_rate)%"
+    "命中率： \(if .hit_rate == null then "暂无数据" else (.hit_rate|tostring)+"%" end)",
+    (.knowledge_libraries | to_entries[] | "来源库 \(.key)：\(.value) 次命中（同题跨库不增加总问题数）")
   ' <<< "$SUMMARY"
 }
 
@@ -111,7 +121,8 @@ print_feedback() {
   jq -r '
     "好评： \(.positive_feedback)",
     "差评： \(.negative_feedback)",
-    "好评率： \(.positive_rate)%",
+    "有效好评率： \(if .positive_rate == null then "暂无数据" else (.positive_rate|tostring)+"%" end)",
+    "反馈覆盖率： \(if .feedback_coverage == null then "暂无数据" else (.feedback_coverage|tostring)+"%" end)",
     "",
     "近期差评问题：",
     (if (.negative_questions | length) == 0 then "（无）" else (.negative_questions[] | "- [\(.at)] \(.question)") end),

@@ -1,40 +1,26 @@
 {
-  "keywords": [
+  "schema_version": 2,
+  "rules": [
     {
-      "id": "connection",
-      "match": ["无法连接", "打不开"],
-      "case_sensitive": false,
-      "action": {
-        "type": "prompt",
-        "prompt": "优先检索连接故障排查知识，并按最少必要步骤引导访客。"
-      }
+      "id": "handoff-offer", "name": "人工协助确认", "enabled": true,
+      "match_mode": "contains", "keywords": ["人工", "转人工", "人工客服"],
+      "exclude_keywords": ["不要人工", "不需要人工", "不用人工", "不转人工", "不要转人工", "人工智能"],
+      "priority": 100, "action": "show_handoff_offer",
+      "text": "需要人工协助吗？请点击下方按钮确认。",
+      "confirm_label": "召唤人工客服", "cancel_label": "继续 AI 客服",
+      "confirm_message": "已暂停本次对话的 AI 回复，您的人工协助请求已收到。",
+      "cooldown_seconds": 60, "offer_ttl_seconds": 600
     },
     {
-      "id": "service-hours",
-      "match": ["服务时间"],
-      "case_sensitive": false,
-      "action": {
-        "type": "reply",
-        "text": "人工客服服务时间请以网站公告为准；其他时间可先留言。"
-      }
+      "id": "connection", "name": "连接问题知识问答", "enabled": true,
+      "match_mode": "contains", "keywords": ["无法连接", "打不开"], "exclude_keywords": [],
+      "priority": 10, "action": "prompt",
+      "prompt": "优先检索用户提供的连接故障知识；资料不足时追问，不编造操作步骤。", "cooldown_seconds": 0
     },
     {
-      "id": "subscription",
-      "match": ["充值", "订阅"],
-      "case_sensitive": false,
-      "action": {
-        "type": "menu",
-        "target": "subscription"
-      }
-    },
-    {
-      "id": "refund",
-      "match": ["退款"],
-      "case_sensitive": false,
-      "action": {
-        "type": "prompt",
-        "prompt": "优先检索退款规则，说明适用条件与办理步骤；信息不足时明确要求访客补充。"
-      }
+      "id": "subscription", "name": "订阅菜单", "enabled": true,
+      "match_mode": "contains", "keywords": ["订阅"], "exclude_keywords": [],
+      "priority": 5, "action": "menu", "target": "subscription", "cooldown_seconds": 0
     }
   ]
 }

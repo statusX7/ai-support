@@ -1,14 +1,16 @@
-provider:
-  type: openai-compatible
-  base_url: ""
-  api_key_env: AI_API_KEY
-  model: ""
-  api_mode: responses
-  capabilities:
-    responses: false
-    chat_completions: false
-    vision: false
-  endpoints:
-    models: /v1/models
-    responses: /v1/responses
-    chat_completions: /v1/chat/completions
+{
+  "schema_version": 2,
+  "provider": {
+    "type": "openai-compatible",
+    "base_url": "",
+    "api_key_env": "AI_API_KEY",
+    "model": "",
+    "api_mode": "chat_completions",
+    "custom_header_names": [],
+    "capabilities": {
+      "responses": false,
+      "chat_completions": false,
+      "vision": false
+    }
+  }
+}

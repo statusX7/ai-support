@@ -7,6 +7,36 @@ x-logging: &default-logging
     max-file: "3"
 
 services:
+  provider-adapter:
+    image: ${N8N_IMAGE:-docker.n8n.io/n8nio/n8n:2.33.0}
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["node", "/opt/crisp-ai/scripts/provider-adapter.js"]
+    environment:
+      AI_API_BASE_URL: ${AI_API_BASE_URL}
+      AI_API_KEY: ${AI_API_KEY}
+      AI_MODEL: ${AI_MODEL}
+      AI_API_MODE: ${AI_API_MODE:-chat_completions}
+      AI_CUSTOM_HEADERS_JSON: ${AI_CUSTOM_HEADERS_JSON:-}
+    volumes:
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/config:/opt/crisp-ai/config:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-adapter.js:/opt/crisp-ai/scripts/provider-adapter.js:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: *default-logging
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:16.10-alpine}
     restart: unless-stopped
@@ -48,7 +78,7 @@ services:
       SIG_KEY: ${ANYTHINGLLM_SIG_KEY:?请在 .env 中设置 ANYTHINGLLM_SIG_KEY}
       SIG_SALT: ${ANYTHINGLLM_SIG_SALT:?请在 .env 中设置 ANYTHINGLLM_SIG_SALT}
       LLM_PROVIDER: generic-openai
-      GENERIC_OPEN_AI_BASE_PATH: ${AI_API_BASE_URL:?请在 .env 中设置 AI_API_BASE_URL}
+      GENERIC_OPEN_AI_BASE_PATH: ${AI_ANYTHINGLLM_BASE_URL:-http://provider-adapter:8787/v1}
       GENERIC_OPEN_AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
       GENERIC_OPEN_AI_MODEL_PREF: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
       GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: ${AI_MODEL_TOKEN_LIMIT:-8192}
@@ -113,7 +143,7 @@ services:
       N8N_RUNNERS_GRANT_TOKEN_TTL: "300"
       N8N_RUNNERS_TASK_TIMEOUT: "300"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      NODE_FUNCTION_ALLOW_BUILTIN: crypto,fs
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto,fs,http,https,dns,net,url,path
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_PERSONALIZATION_ENABLED: "false"
       EXECUTIONS_DATA_PRUNE: "true"
@@ -123,6 +153,7 @@ services:
       GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
       TZ: ${TIMEZONE:-UTC}
       CRISP_WEBSITE_ID: ${CRISP_WEBSITE_ID:?请在 .env 中设置 CRISP_WEBSITE_ID}
+      CRISP_API_BASE_URL: ${CRISP_API_BASE_URL:-https://api.crisp.chat/v1}
       CRISP_TOKEN_TIER: ${CRISP_TOKEN_TIER:-website}
       CRISP_AUTH_B64: ${CRISP_AUTH_B64:?请在 .env 中设置 CRISP_AUTH_B64}
       CRISP_HOOK_MODE: ${CRISP_HOOK_MODE:-website}
@@ -136,6 +167,7 @@ services:
       AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
       AI_MODEL: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
       AI_API_MODE: ${AI_API_MODE:-responses}
+      AI_CUSTOM_HEADERS_JSON: ${AI_CUSTOM_HEADERS_JSON:-}
       AI_SUPPORTS_VISION: ${AI_SUPPORTS_VISION:-false}
       AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-1200}
     volumes:

@@ -33,14 +33,24 @@ require_docker_runtime() {
 acquire_maintenance_lock() {
   local deploy_dir=$1
   local lock_file="${deploy_dir}/tmp/maintenance.lock"
+  local lock_owner_pid=$BASHPID
 
-  [[ "${CRISP_AI_MAINTENANCE_LOCK_HELD:-0}" != 1 ]] || return 0
+  if [[ "${CRISP_AI_MAINTENANCE_LOCK_HELD:-0}" == 1 \
+    && "${MAINTENANCE_LOCK_FD:-}" =~ ^[0-9]+$ \
+    && "${CRISP_AI_MAINTENANCE_LOCK_PATH:-}" == "$lock_file" \
+    && "$(readlink "/proc/${lock_owner_pid}/fd/${MAINTENANCE_LOCK_FD}" 2>/dev/null || true)" == "$lock_file" ]]; then
+    flock -n "$MAINTENANCE_LOCK_FD" || die "继承的维护锁已被其他任务占用"
+    return 0
+  fi
   require_command flock
   mkdir -p -- "${deploy_dir}/tmp"
   [[ -d "${deploy_dir}/tmp" && ! -L "${deploy_dir}/tmp" ]] || die "维护锁目录不安全"
+  [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] || die "维护锁文件不安全"
   exec {MAINTENANCE_LOCK_FD}> "$lock_file"
   flock -n "$MAINTENANCE_LOCK_FD" || die "另一个安装、更新、备份或恢复任务正在运行"
   export CRISP_AI_MAINTENANCE_LOCK_HELD=1
+  export MAINTENANCE_LOCK_FD
+  export CRISP_AI_MAINTENANCE_LOCK_PATH="$lock_file"
 }
 
 validate_deploy_dir() {
@@ -53,6 +63,7 @@ validate_deploy_dir() {
   [[ "/${requested#/}/" != *"/../"* && "/${requested#/}/" != *"/./"* ]] || die "部署目录不得包含 . 或 .. 路径段"
   require_command realpath
   resolved=$(realpath -m -- "$requested")
+  [[ "$resolved" == "$(realpath -ms -- "$requested")" ]] || die "部署目录或其父路径不得通过符号链接跳转"
 
   case "$resolved" in
     /|/opt|/root|/home|/var|/usr|/etc|/tmp)
@@ -152,6 +163,16 @@ installation_fact() {
   [[ "$name" =~ ^(dependencies|local_services|app_config|provider|crisp_api|webhook|conversation)$ ]] \
     || return 1
   sed -n "s/^fact_${name}=//p" "${deploy_dir}/${INSTALL_MARKER}" 2>/dev/null | head -n 1
+}
+
+refresh_conversation_fact() {
+  local deploy_dir=$1 observed
+  observed=$(docker_compose "$deploy_dir" exec -T n8n node /opt/crisp-ai/n8n/runtime-cli.js observations 2>/dev/null) || return 1
+  if jq -e '.scope == "official_crisp" and .conversation_observed == true' <<< "$observed" >/dev/null; then
+    set_installation_fact "$deploy_dir" conversation ready
+  else
+    set_installation_fact "$deploy_dir" conversation pending
+  fi
 }
 
 set_installation_fact() {
@@ -322,6 +343,48 @@ configure_webhook_access() {
   esac
   env_set "$env_file" PUBLIC_WEBHOOK_URL "$public_base"
   env_set "$env_file" WEBHOOK_PRODUCTION_URL "$production_url"
+  write_webhook_proxy_snippets "$deploy_dir"
+}
+
+write_webhook_proxy_snippets() {
+  local deploy_dir=$1 production port prefix suffix target temporary
+  production=$(env_get "${deploy_dir}/.env" WEBHOOK_PRODUCTION_URL 2>/dev/null || true)
+  [[ "$production" == https://*'/webhook/crisp-webhook' ]] || return 0
+  port=$(env_get "${deploy_dir}/.env" N8N_PORT 2>/dev/null || printf '5678')
+  validate_port "$port" || return 1
+  prefix=${production#https://}; prefix=/${prefix#*/}; prefix=${prefix%/webhook/crisp-webhook}
+  [[ "$prefix" =~ ^(/[A-Za-z0-9._~-]+)*$ ]] || { warn '公网路径无法安全生成反代片段'; return 1; }
+  target="${deploy_dir}/config/crispai-nginx.conf"
+  [[ ! -L "$target" ]] || return 1
+  if [[ -e "$target" ]] && ! grep -Fxq '# ai-support-managed-proxy' "$target"; then
+    warn '同名反代片段非本项目所有，已保留'; return 1
+  fi
+  temporary=$(mktemp "${target}.tmp.XXXXXX")
+  {
+    printf '# ai-support-managed-proxy\n# 放入已有 HTTPS server 中；不会修改、重启现有网站。\n'
+    for suffix in crisp-webhook crispai-public-config crispai-web-chat; do
+      printf 'location = %s/webhook/%s {\n' "$prefix" "$suffix"
+      printf '  proxy_pass http://127.0.0.1:%s/webhook/%s;\n' "$port" "$suffix"
+      # shellcheck disable=SC2016 # Nginx 变量必须原样写入，不由 Bash 展开。
+      printf '  proxy_set_header Host $host;\n  proxy_set_header X-Forwarded-Proto $scheme;\n'
+      # shellcheck disable=SC2016
+      printf '  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+      printf '  proxy_read_timeout 30s;\n  client_max_body_size 2m;\n  access_log off;\n}\n'
+    done
+  } > "$temporary"
+  chmod 640 "$temporary"; mv -f -- "$temporary" "$target"
+  target="${deploy_dir}/config/crispai-caddy.conf"
+  [[ ! -L "$target" ]] || return 1
+  if [[ -e "$target" ]] && ! grep -Fxq '# ai-support-managed-proxy' "$target"; then return 1; fi
+  temporary=$(mktemp "${target}.tmp.XXXXXX")
+  {
+    printf '# ai-support-managed-proxy\n# 放入已有 HTTPS 站点；不启用含 URL Secret 的访问日志。\n'
+    printf '@crispai path %s/webhook/crisp-webhook %s/webhook/crispai-public-config %s/webhook/crispai-web-chat\n' "$prefix" "$prefix" "$prefix"
+    printf 'handle @crispai {\n'
+    [[ -z "$prefix" ]] || printf '  uri strip_prefix %s\n' "$prefix"
+    printf '  reverse_proxy 127.0.0.1:%s\n}\n' "$port"
+  } > "$temporary"
+  chmod 640 "$temporary"; mv -f -- "$temporary" "$target"
 }
 
 env_set() {
@@ -336,7 +399,7 @@ env_set() {
     encoded=$value
   else
     require_command jq
-    encoded=$(jq -Rn --arg value "$value" '$value')
+    encoded=$(printf '%s' "$value" | jq -Rs '.')
     # Compose 会展开双引号值中的 `$`；使用 `$$` 保留原始字面值。
     encoded=${encoded//\$/\$\$}
   fi
@@ -385,7 +448,37 @@ is_placeholder() {
 
 provider_config_has_secret_field() {
   local provider_file=$1
-  grep -Eiq '^[[:space:]]*(api[-_]?key|key|token|secret|client[-_]?secret|credential|password|authorization|private[-_]?key)[[:space:]]*:' "$provider_file"
+  # Production configuration is JSON (and legacy YAML); inspect nested keys,
+  # not just unquoted top-level YAML. Invalid input is never safe to export.
+  python3 - "$provider_file" <<'PY'
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        text = stream.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        import yaml
+        data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ValueError("invalid provider configuration")
+except Exception:
+    sys.exit(0)
+
+secret_keys = re.compile(r"^(?:api[-_]?key|x[-_]?api[-_]?key|key|token|secret|client[-_]?secret|credential(?:s)?|password|authorization|private[-_]?key|custom[-_]?headers|http[-_]?headers)$", re.I)
+def contains_secret(value):
+    if isinstance(value, dict):
+        return any(secret_keys.fullmatch(str(key)) or contains_secret(child)
+                   for key, child in value.items())
+    if isinstance(value, list):
+        return any(contains_secret(child) for child in value)
+    return False
+
+sys.exit(0 if contains_secret(data) else 1)
+PY
 }
 
 random_hex() {
@@ -468,17 +561,26 @@ wait_for_local_health() {
 }
 
 secure_permissions() {
-  local deploy_dir=$1
+  local deploy_dir=$1 readable_tree
   chmod 700 "$deploy_dir" "${deploy_dir}/data" "${deploy_dir}/logs" "${deploy_dir}/backups" \
     "${deploy_dir}/backups/versions" "${deploy_dir}/tmp" "${deploy_dir}/data/caddy" \
     "${deploy_dir}/data/caddy-config" 2>/dev/null || true
   chmod 750 "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" "${deploy_dir}/scripts" "${deploy_dir}/docs" 2>/dev/null || true
   chmod 770 "${deploy_dir}/data/analytics" 2>/dev/null || true
   [[ -f "${deploy_dir}/.env" ]] && chmod 600 "${deploy_dir}/.env"
-  [[ -f "${deploy_dir}/config/provider.yaml" ]] && chmod 600 "${deploy_dir}/config/provider.yaml"
+  # provider.yaml 不含秘密，供受管容器读取；认证值仅在 0600 的 .env 中。
+  [[ -f "${deploy_dir}/config/provider.yaml" ]] && chmod 640 "${deploy_dir}/config/provider.yaml"
   [[ -f "${deploy_dir}/data/analytics/events.jsonl" ]] && chmod 660 "${deploy_dir}/data/analytics/events.jsonl"
   find "${deploy_dir}/config" -maxdepth 1 -type f ! -name 'provider.yaml' -exec chmod 640 {} + 2>/dev/null || true
   find "${deploy_dir}/knowledge" -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
+  for readable_tree in knowledge n8n; do
+    find "${deploy_dir}/${readable_tree}" -type d -exec chmod 750 {} +
+    find "${deploy_dir}/${readable_tree}" -type f -exec chmod 640 {} +
+  done
+  if [[ -f "${deploy_dir}/scripts/provider-adapter.js" ]]; then
+    chown root:1000 "${deploy_dir}/scripts/provider-adapter.js"
+    chmod 640 "${deploy_dir}/scripts/provider-adapter.js"
+  fi
 }
 
 set_runtime_ownership() {
@@ -518,20 +620,24 @@ repair_runtime_modules_from_source() {
 copy_project_files() {
   local source_dir=$1
   local deploy_dir=$2
-  local file directory
+  local file directory refresh_caddy=0
   local regular_files=(
     VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
-    config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example
-    n8n/workflow.json knowledge/README.md
+    config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
+    n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
+    scripts/provider-adapter.js scripts/archive-guard.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
+    docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md
   )
   local executable_files=(
     install.sh manage.sh update.sh uninstall.sh
     scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
     scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
+    scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
+    scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
@@ -549,6 +655,13 @@ copy_project_files() {
     return 0
   fi
 
+  # 只更新与本实例旧模板逐字相同的受管配置；管理员的反代定制不被覆盖。
+  if [[ -f "${deploy_dir}/config/Caddyfile" && ! -L "${deploy_dir}/config/Caddyfile" \
+    && -f "${deploy_dir}/config/Caddyfile.example" ]] \
+    && cmp -s -- "${deploy_dir}/config/Caddyfile" "${deploy_dir}/config/Caddyfile.example"; then
+    refresh_caddy=1
+  fi
+
   for file in "${regular_files[@]}"; do
     [[ -f "${source_dir}/${file}" && ! -L "${source_dir}/${file}" ]] || die "源码文件缺失或不安全：${file}"
     if [[ "$file" == "knowledge/README.md" && -f "${deploy_dir}/${file}" ]]; then
@@ -560,12 +673,20 @@ copy_project_files() {
     [[ -f "${source_dir}/${file}" && ! -L "${source_dir}/${file}" ]] || die "源码脚本缺失或不安全：${file}"
     install -D -m 0750 -- "${source_dir}/${file}" "${deploy_dir}/${file}"
   done
+  if (( refresh_caddy )); then
+    cp -p -- "${deploy_dir}/config/Caddyfile" "${deploy_dir}/config/Caddyfile.previous"
+    install -m 0640 -- "${source_dir}/config/Caddyfile.example" "${deploy_dir}/config/Caddyfile"
+  elif [[ -f "${deploy_dir}/config/Caddyfile" ]] \
+    && ! grep -Fq '/webhook/crispai-public-config' "${deploy_dir}/config/Caddyfile"; then
+    warn '已保留定制的 Caddy 配置；可选网页欢迎需要放行 /webhook/crispai-public-config 与 /webhook/crispai-web-chat，模板已更新'
+  fi
+  [[ ! -f "${deploy_dir}/.env" ]] || write_webhook_proxy_snippets "$deploy_dir"
 }
 
 initialize_config_files() {
   local deploy_dir=$1
   local name
-  for name in provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
+  for name in provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml runtime.yaml; do
     if [[ ! -e "${deploy_dir}/config/${name}" ]]; then
       install -m 0640 -- "${deploy_dir}/config/${name}.example" "${deploy_dir}/config/${name}"
     fi
@@ -810,15 +931,14 @@ probe_api_endpoint() {
       */chat/completions)
         jq -e '
           ((has("error") | not) or .error == null or .error == false) and
-          (.choices | type == "array" and length > 0)
+          (.choices[0].message.content | type == "string" and test("\\S"))
         ' "$response_file" >/dev/null 2>&1 && valid=true
         ;;
       */responses)
         jq -e '
           ((has("error") | not) or .error == null or .error == false) and
-          ((.id | type == "string" and length > 0) or
-           (.output | type == "array") or
-           (.output_text | type == "string"))
+          (.status != "failed") and
+          ((.output_text // ([.output[]?.content[]? | select(.type == "output_text") | .text] | join(""))) | type == "string" and test("\\S"))
         ' "$response_file" >/dev/null 2>&1 && valid=true
         ;;
     esac
@@ -830,7 +950,7 @@ probe_api_endpoint() {
 crisp_api_check() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
-  local website tier auth config_file escaped_auth escaped_tier status
+  local website tier auth config_file response_file escaped_auth escaped_tier status
 
   website=$(env_get "$env_file" CRISP_WEBSITE_ID 2>/dev/null || true)
   tier=$(env_get "$env_file" CRISP_TOKEN_TIER 2>/dev/null || true)
@@ -851,19 +971,28 @@ crisp_api_check() {
   escaped_auth=$(curl_config_escape "$auth") || return 1
   escaped_tier=$(curl_config_escape "$tier") || return 1
   config_file=$(mktemp "${deploy_dir}/tmp/crisp-api.XXXXXX")
-  chmod 600 "$config_file"
+  response_file=$(mktemp "${deploy_dir}/tmp/crisp-response.XXXXXX")
+  chmod 600 "$config_file" "$response_file"
   {
     printf 'header = "Authorization: Basic %s"\n' "$escaped_auth"
     printf 'header = "X-Crisp-Tier: %s"\n' "$escaped_tier"
   } > "$config_file"
   # 不跟随重定向，避免把 Authorization 发送到其他主机。
-  status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  status=$(curl --silent --output "$response_file" --write-out '%{http_code}' --max-filesize 1048576 \
     --connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --retry-max-time 45 \
     --config "$config_file" \
     "https://api.crisp.chat/v1/website/${website}" 2>/dev/null || true)
   rm -f -- "$config_file"
   CRISP_API_STATUS=${status:-000}
-  [[ "$CRISP_API_STATUS" == 2?? ]]
+  if [[ "$CRISP_API_STATUS" == 2?? ]] && jq -e --arg website "$website" \
+    '.error == false and (.data | type == "object") and .data.website_id == $website' \
+    "$response_file" >/dev/null 2>&1; then
+    rm -f -- "$response_file"
+    return 0
+  fi
+  [[ "$CRISP_API_STATUS" != 2?? ]] || CRISP_API_STATUS=invalid-response
+  rm -f -- "$response_file"
+  return 1
 }
 
 webhook_access_check() {
@@ -882,12 +1011,14 @@ webhook_access_check() {
   status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
     --connect-timeout 8 --max-time 20 \
     --header 'Content-Type: application/json' --data '{}' "$url" 2>/dev/null || true)
-  rm -f -- "$response_file"
   WEBHOOK_ACCESS_STATUS=${status:-000}
-  case "$WEBHOOK_ACCESS_STATUS" in
-    2??|3??|400|401|403|405|422) return 0 ;;
-    *) return 1 ;;
-  esac
+  if [[ "$WEBHOOK_ACCESS_STATUS" == 401 ]] && jq -e \
+    '.accepted == false and .reason == "Webhook 校验失败"' "$response_file" >/dev/null 2>&1; then
+    rm -f -- "$response_file"
+    return 0
+  fi
+  rm -f -- "$response_file"
+  return 1
 }
 
 configure_provider() {
@@ -934,18 +1065,8 @@ configure_provider() {
       if [[ -n "$selected_model" ]] && ! printf '%s\n' "${models[@]}" | grep -Fxq -- "$selected_model"; then
         warn "指定模型不在 /v1/models 返回列表中，将进行实际 Chat 能力验证：$selected_model"
       fi
-      if [[ -z "$selected_model" ]]; then
-        local candidate candidate_payload
-        for candidate in "${models[@]}"; do
-          validate_env_value "$candidate" || continue
-          candidate_payload=$(jq -cn --arg model "$candidate" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
-          if probe_api_endpoint "${base}/chat/completions" "$api_key" "$candidate_payload" "${deploy_dir}/tmp"; then
-            selected_model=$candidate
-            break
-          fi
-        done
-        [[ -n "$selected_model" ]] || die "/v1/models 返回的模型均未通过 Chat Completions 实际请求"
-      fi
+      selected_model=${selected_model:-$default_model}
+      [[ -n "$selected_model" ]] || die "非交互安装必须明确设置 AI_MODEL；普通安装请使用十项向导数字选择，不会付费扫描全部模型"
     else
       printf '检测到模型：\n\n'
       local index
@@ -993,13 +1114,15 @@ configure_provider() {
   chat_payload=$(jq -cn --arg model "$selected_model" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
   if probe_api_endpoint "${base}/responses" "$api_key" "$responses_payload" "${deploy_dir}/tmp"; then responses=true; fi
   if probe_api_endpoint "${base}/chat/completions" "$api_key" "$chat_payload" "${deploy_dir}/tmp"; then chat=true; fi
-  if [[ "$chat" != true ]]; then
-    die "所选模型未通过 /v1/chat/completions 实际请求，AnythingLLM 无法使用该 Provider"
+  if [[ "$chat" != true && "$responses" != true ]]; then
+    die "所选模型未通过 Chat Completions 或 Responses 的有效正文验证"
   fi
-  if [[ "$responses" == true ]]; then
+  if [[ "${AI_API_MODE:-auto}" == responses && "$responses" == true ]]; then
     api_mode=responses
-  else
+  elif [[ "$chat" == true ]]; then
     api_mode=chat_completions
+  else
+    api_mode=responses
   fi
 
   local tiny_image vision_responses_payload vision_chat_payload
@@ -1008,16 +1131,16 @@ configure_provider() {
     '{model:$model,input:[{role:"user",content:[{type:"input_text",text:"Reply only OK."},{type:"input_image",image_url:$image}]}]}')
   vision_chat_payload=$(jq -cn --arg model "$selected_model" --arg image "$tiny_image" \
     '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}]}')
-  if [[ "$responses" == true ]] \
+  if [[ "$api_mode" == responses ]] \
     && probe_api_endpoint "${base}/responses" "$api_key" "$vision_responses_payload" "${deploy_dir}/tmp"; then
     vision_answer=true
-  elif probe_api_endpoint "${base}/chat/completions" "$api_key" "$vision_chat_payload" "${deploy_dir}/tmp"; then
+  elif [[ "$api_mode" == chat_completions ]] && probe_api_endpoint "${base}/chat/completions" "$api_key" "$vision_chat_payload" "${deploy_dir}/tmp"; then
     vision_answer=true
   fi
   if [[ "$vision_answer" == true ]]; then
     info "所选模型已通过实际图片输入能力检测"
   else
-    warn "所选模型未通过图片输入能力检测；图片消息将提示切换视觉模型"
+    warn "所选模型未通过图片输入能力检测；访客会被请补充图片中的文字，文本服务仍可使用"
   fi
 
   runtime_base=$(provider_runtime_base "$base") || die "无法生成容器可用的 Provider 地址"
@@ -1026,29 +1149,19 @@ configure_provider() {
   env_set "$env_file" AI_API_KEY "$api_key"
   env_set "$env_file" AI_MODEL "$selected_model"
   env_set "$env_file" AI_API_MODE "$api_mode"
+  env_set "$env_file" AI_ANYTHINGLLM_BASE_URL http://provider-adapter:8787/v1
   env_set "$env_file" AI_SUPPORTS_VISION "$vision_answer"
 
   local provider_temp
   provider_temp=$(mktemp "${deploy_dir}/config/provider.yaml.tmp.XXXXXX")
-  chmod 600 "$provider_temp"
-  {
-    printf 'provider:\n'
-    printf '  type: openai-compatible\n'
-    printf '  base_url: %s\n' "$(jq -Rn --arg value "$runtime_base" '$value')"
-    printf '  api_key_env: AI_API_KEY\n'
-    printf '  model: %s\n' "$(jq -Rn --arg value "$selected_model" '$value')"
-    printf '  api_mode: %s\n' "$api_mode"
-    printf '  capabilities:\n'
-    printf '    responses: %s\n' "$responses"
-    printf '    chat_completions: %s\n' "$chat"
-    printf '    vision: %s\n' "$vision_answer"
-    printf '  endpoints:\n'
-    printf '    models: /v1/models\n'
-    printf '    responses: /v1/responses\n'
-    printf '    chat_completions: /v1/chat/completions\n'
-  } > "$provider_temp"
+  chmod 640 "$provider_temp"
+  jq -n --arg base "$runtime_base" --arg model "$selected_model" --arg mode "$api_mode" \
+    --argjson responses "$responses" --argjson chat "$chat" --argjson vision "$vision_answer" \
+    '{schema_version:2,provider:{type:"openai-compatible",base_url:$base,api_key_env:"AI_API_KEY",model:$model,api_mode:$mode,
+      capabilities:{responses:$responses,chat_completions:$chat,vision:$vision}}}' > "$provider_temp"
+  chown root:1000 "$provider_temp"
   mv -f -- "$provider_temp" "${deploy_dir}/config/provider.yaml"
-  chmod 600 "${deploy_dir}/config/provider.yaml"
+  chmod 640 "${deploy_dir}/config/provider.yaml"
   if [[ "$runtime_base" != "$base" ]]; then
     info "Provider 已配置：模型 ${selected_model}，模式 ${api_mode}；容器将通过 host.docker.internal 访问宿主服务"
   else
@@ -1233,7 +1346,7 @@ ensure_anythingllm_workspace() {
 sync_prompt_to_anythingllm() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
-  local key workspace port prompt payload response_file response
+  local key workspace port payload response_file response
   if ! anythingllm_api_ready "$deploy_dir"; then
     warn "请先配置 AnythingLLM Developer API Key"
     return 1
@@ -1243,12 +1356,11 @@ sync_prompt_to_anythingllm() {
   key=$(env_get "$env_file" ANYTHINGLLM_API_KEY)
   workspace=$(env_get "$env_file" ANYTHINGLLM_WORKSPACE)
   port=$(env_get "$env_file" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
-  prompt=$(<"${deploy_dir}/config/prompt.md")
-  payload=$(jq -cn --arg prompt "$prompt" '{openAiPrompt:$prompt}')
+  payload=$(jq -cn --rawfile prompt "${deploy_dir}/config/prompt.md" '{openAiPrompt:$prompt}')
   response_file=$(mktemp "${deploy_dir}/tmp/prompt-sync.XXXXXX")
   response=$(anythingllm_secure_request "$deploy_dir" POST \
     "http://127.0.0.1:${port}/api/v1/workspace/${workspace}/update" "$key" "$payload" "$response_file")
-  if [[ "$response" != 2?? ]] || ! jq -e --arg prompt "$prompt" '
+  if [[ "$response" != 2?? ]] || ! jq -e --rawfile prompt "${deploy_dir}/config/prompt.md" '
     .workspace as $workspace |
     (if ($workspace | type) == "array" then $workspace[0]
      elif ($workspace | type) == "object" then $workspace
@@ -1580,9 +1692,10 @@ knowledge_clear_pending() {
   mv -f -- "$manifest_temp" "$manifest"
 }
 
-knowledge_sync() {
+knowledge_sync_legacy() {
   local deploy_dir=$1
   local force=${2:-0}
+  local scope=${3:-null}
   local knowledge_dir="${deploy_dir}/knowledge"
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
   local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations escaped_key
@@ -1605,7 +1718,7 @@ knowledge_sync() {
   ' "$manifest" >/dev/null || die "知识库清单格式无效：$manifest"
 
   garbage_locations=$(jq -c '(.garbage_locations // []) | unique' "$manifest")
-  if [[ "$garbage_locations" != "[]" ]]; then
+  if [[ "$scope" == null && "$garbage_locations" != "[]" ]]; then
     payload=$(jq -cn --argjson deletes "$garbage_locations" '{adds:[],deletes:$deletes}')
     if anythingllm_update_embeddings "$payload" \
       && anythingllm_remove_documents "$garbage_locations"; then
@@ -1632,6 +1745,7 @@ knowledge_sync() {
   for file in "${files[@]}"; do
     [[ ! -L "$file" ]] || { warn "跳过符号链接：$file"; ((failures += 1)); continue; }
     filename=$(basename -- "$file")
+    jq -en --argjson scope "$scope" --arg name "$filename" '$scope == null or ($scope | index($name) != null)' >/dev/null || continue
     [[ "$filename" != */* && "$filename" != *$'\n'* && "$filename" != *$'\r'* \
       && "$filename" != *\\* && "$filename" != *';'* && "$filename" != *','* ]] \
       || { warn "跳过非法文件名"; ((failures += 1)); continue; }
@@ -1777,6 +1891,7 @@ knowledge_sync() {
 
   while IFS= read -r filename; do
     [[ -n "$filename" ]] || continue
+    jq -en --argjson scope "$scope" --arg name "$filename" '$scope == null or ($scope | index($name) != null)' >/dev/null || continue
     [[ -e "${knowledge_dir}/${filename}" ]] && continue
     pending_locations=$(jq -c --arg name "$filename" '.pending_files[$name].locations // []' "$manifest")
     pending_started=$(jq -r --arg name "$filename" '.pending_files[$name].started_at // 0' "$manifest")
@@ -1802,6 +1917,7 @@ knowledge_sync() {
 
   while IFS= read -r filename; do
     [[ -n "$filename" ]] || continue
+    jq -en --argjson scope "$scope" --arg name "$filename" '$scope == null or ($scope | index($name) != null)' >/dev/null || continue
     [[ "$filename" != */* && "$filename" != *$'\n'* && "$filename" != *$'\r'* \
       && "$filename" != *\\* && "$filename" != *';'* && "$filename" != *','* ]] \
       || { warn "清单含非法路径，拒绝处理：$filename"; ((failures += 1)); continue; }
@@ -1831,6 +1947,13 @@ knowledge_sync() {
 
   info "知识库同步完成：新增或更新 ${uploaded}，移除 ${removed}，未变化 ${skipped}，失败 ${failures}"
   (( failures == 0 ))
+}
+
+knowledge_sync() {
+  # 各模块单独执行 lint；动态分派避免静态分析反复展开循环引用。
+  # shellcheck source=/dev/null
+  source "${COMMON_DIR}/knowledge.sh"
+  knowledge_sync_catalog "$@"
 }
 
 knowledge_reindex() {

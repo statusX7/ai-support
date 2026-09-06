@@ -16,6 +16,7 @@ git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 for ignored_path in \
   .env \
   config/provider.yaml \
+  config/runtime.yaml \
   config/prompt.md \
   data/runtime.db \
   logs/runtime.log \
@@ -37,7 +38,7 @@ for tracked in "${tracked_files[@]}"; do
     .env|.env.*)
       [[ "$tracked" == ".env.example" ]] || fail "Git 已跟踪真实环境文件：$tracked"
       ;;
-    config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml)
+    config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml|config/runtime.yaml)
       fail "Git 已跟踪真实配置：$tracked"
       ;;
     knowledge/*)
