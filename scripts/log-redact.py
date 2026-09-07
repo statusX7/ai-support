@@ -220,9 +220,17 @@ def main() -> int:
                 chunk = stream.readline(max_line + 1)
             raw = prefix + "[单行已截断]".encode("utf-8")
         text = raw.decode("utf-8", errors="replace").rstrip("\n\r")
-        print(redact_line(text, secrets, args.mode))
+        # follow 模式下 stdin 会长期保持打开；stdout 重定向文件或管道时
+        # Python 默认使用块缓冲。每条脱敏记录必须立即可见，不能等待 EOF。
+        print(redact_line(text, secrets, args.mode), flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        status = main()
+    except KeyboardInterrupt:
+        # follow 的 Ctrl+C 由外层日志入口给出中文结果；
+        # 脱敏过滤器不应在管理员终端打印 Python traceback。
+        status = 130
+    raise SystemExit(status)

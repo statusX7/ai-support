@@ -178,6 +178,95 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1],encoding="utf-8"))' "$WO
 ! grep -Eq 'unknown-json-token|客户正文|website-unregistered' "$WORK/pretty-redacted.json" || fail 'pretty JSON 正文/未知秘密泄漏'
 pass '脱敏覆盖符号、JSON转义、Base64、URL编码、userinfo/path/query 与 pretty JSON'
 
+# follow 的输入流不会 EOF；当 stdout 被重定向为普通文件时，
+# 每条脱敏日志仍必须在有界时间内可见。Ctrl+C 只结束跟踪进程组。
+install -m 0600 /dev/null "$DEPLOY/logs/maintenance.jsonl"
+stream_business_before=$(business_hash)
+fixture_env python3 - "$DEPLOY" "$WORK/follow-stream.out" "$WORK/follow-stream.err" "$CALLS" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+deploy, out_path, err_path, calls_path = sys.argv[1:]
+child_env = os.environ.copy()
+# 不得靠测试环境强制 Python 无缓冲来掩盖生产缺陷。
+child_env.pop("PYTHONUNBUFFERED", None)
+process = None
+try:
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        process = subprocess.Popen(
+            ["bash", f"{deploy}/scripts/logs.sh", "--deploy-dir", deploy,
+             "follow", "maintenance", "--lines", "1"],
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+            env=child_env,
+        )
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if "正在跟踪维护事件" in pathlib.Path(err_path).read_text(
+                encoding="utf-8", errors="replace"
+            ):
+                break
+            if process.poll() is not None:
+                raise SystemExit(f"跟踪在收到新记录前退出：{process.returncode}")
+            time.sleep(0.05)
+        else:
+            raise SystemExit("跟踪进程未在时限内启动")
+
+        try:
+            event = subprocess.run(
+                ["bash", f"{deploy}/scripts/logs.sh", "--deploy-dir", deploy,
+                 "event", "--action", "doctor", "--phase", "start", "--code", "0"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=4,
+                check=False,
+                env=child_env,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SystemExit("合成维护事件写入超时") from error
+        if event.returncode != 0:
+            raise SystemExit(f"合成维护事件写入失败：{event.returncode}")
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            text = pathlib.Path(out_path).read_text(encoding="utf-8", errors="replace")
+            if '"action":"doctor"' in text and '"phase":"start"' in text:
+                break
+            if process.poll() is not None:
+                raise SystemExit(f"跟踪在输出新记录前退出：{process.returncode}")
+            time.sleep(0.05)
+        else:
+            raise SystemExit("输入保持打开时脱敏输出仍被缓冲")
+
+        os.killpg(process.pid, signal.SIGINT)
+        try:
+            result = process.wait(timeout=4)
+        except subprocess.TimeoutExpired as error:
+            raise SystemExit("跟踪进程未在 Ctrl+C 后及时退出") from error
+        if result not in (-signal.SIGINT, 130):
+            raise SystemExit(f"跟踪进程退出码异常：{result}")
+finally:
+    if process is not None and process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=3)
+
+calls = pathlib.Path(calls_path).read_text(encoding="utf-8", errors="replace")
+if any(word in calls for word in (" stop ", " down ", " kill ")):
+    raise SystemExit("follow SIGINT 触发了服务停止操作")
+PY
+! grep -Eq 'Traceback|KeyboardInterrupt' "$WORK/follow-stream.err" \
+  || fail 'follow Ctrl+C 向管理员回显了 Python 异常栈'
+[[ "$stream_business_before" == "$(business_hash)" ]] || fail 'follow/SIGINT 改动了业务状态'
+pass '非TTY follow 在 stdin 持续打开时流式输出，Ctrl+C 无异常栈且不停服务'
+
 invoke event --action 'install&secret' --phase start --code 0
 (( LAST_RC == 64 )) || fail 'event 未拒绝非白名单字段'
 ! grep -Fq "$SECRET" "$OUT" "$ERR" || fail 'event 参数错误泄漏秘密'
