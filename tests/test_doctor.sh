@@ -262,6 +262,28 @@ env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
 [[ "$before" == "$(business_hash)" ]] || fail '安装/更新 application 健康门禁改动了业务状态'
 pass '安装与更新的 healthcheck --application 不执行付费推理'
 
+cp -p -- "${DEPLOY}/config/.crispai-launcher" "${TEST_ROOT}/launcher-marker.saved"
+cp -p -- "${DEPLOY}/.crisp-ai-installation" "${TEST_ROOT}/installation-marker.saved"
+mv -- "${DEPLOY}/config/.crispai-launcher" "${TEST_ROOT}/launcher-marker.pending"
+sed -i 's/^state=.*/state=installing/' "${DEPLOY}/.crisp-ai-installation"
+invoke --local --installation-in-progress
+(( LAST_RC == 2 )) || fail '安装中尚未登记自定义入口时不应检查其他实例的默认入口'
+assert_result installation.launcher SKIP
+pass '安装门禁尚无入口归属记录时不抢查默认路径，创建入口仍交原安装器校验'
+
+printf '#!/usr/bin/env bash\n# crispai-launcher: ai-support/v1\n# crispai-target-sha256: unrelated-instance\nexit 0\n' \
+  > "${TEST_ROOT}/foreign-crispai"
+chmod 0755 "${TEST_ROOT}/foreign-crispai"
+printf '%s\n' "${TEST_ROOT}/foreign-crispai" > "${DEPLOY}/config/.crispai-launcher"
+chmod 0600 "${DEPLOY}/config/.crispai-launcher"
+invoke --local --installation-in-progress
+(( LAST_RC == 1 )) || fail '安装中已有明确入口记录的错误归属仍必须失败'
+assert_result installation.launcher FAIL
+cp -p -- "${TEST_ROOT}/launcher-marker.saved" "${DEPLOY}/config/.crispai-launcher"
+cp -p -- "${TEST_ROOT}/installation-marker.saved" "${DEPLOY}/.crisp-ai-installation"
+[[ "$before" == "$(business_hash)" ]] || fail '入口时序检查未恢复原业务状态'
+pass '安装中已登记入口指向他人实例仍拒绝，不放宽归属安全校验'
+
 invoke --local
 (( LAST_RC == 0 )) || fail "健康 local 自检退出码应为 0，实际 ${LAST_RC}"
 jq -e '.scope == "local" and .summary.fail == 0 and .summary.warn == 0' "$OUT" >/dev/null || fail 'local JSON 摘要错误'

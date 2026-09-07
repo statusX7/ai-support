@@ -576,7 +576,13 @@ doctor_files_and_config_check() {
   fi
   expected_digest=$(printf '%s' "$DOCTOR_DEPLOY_DIR" | sha256sum | cut -d ' ' -f 1)
   launcher_digest=$(sed -n 's/^# crispai-target-sha256: //p' "$launcher_path" 2>/dev/null | head -n 1 || true)
-  if [[ "$launcher_path" == /* && -f "$launcher_path" && ! -L "$launcher_path" ]] \
+  if (( DOCTOR_INSTALLATION_IN_PROGRESS )) \
+    && [[ ! -e "${DOCTOR_DEPLOY_DIR}/config/.crispai-launcher" \
+      && ! -L "${DOCTOR_DEPLOY_DIR}/config/.crispai-launcher" ]]; then
+    # The installer may have an explicit --command-path not registered yet.
+    # Ownership/conflict checks remain mandatory when it creates that launcher.
+    doctor_skip installation.launcher 'crispai 管理入口' '本实例尚未登记入口路径；安装器将在健康门禁后校验归属并创建入口' filesystem
+  elif [[ "$launcher_path" == /* && -f "$launcher_path" && ! -L "$launcher_path" ]] \
     && grep -Fxq '# crispai-launcher: ai-support/v1' "$launcher_path" 2>/dev/null \
     && [[ "$launcher_digest" == "$expected_digest" ]]; then
     doctor_add installation.launcher 'crispai 管理入口' PASS warning '受管入口指向当前部署目录' filesystem '' "$start"
