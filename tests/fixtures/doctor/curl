@@ -41,8 +41,13 @@ case "$url" in
       status=401; body='{"error":true}'
     else
       workspace=${url##*/}
-      body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
-        '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[{docpath:"custom-documents/fixture.json"}]}}')
+      if [[ "${DOCTOR_FIXTURE_EMPTY_WORKSPACE:-0}" == 1 ]]; then
+        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
+          '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[]}}')
+      else
+        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
+          '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[{docpath:"custom-documents/fixture.json"}]}}')
+      fi
     fi
     ;;
   http://127.0.0.1:*/api/v1/auth)

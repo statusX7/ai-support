@@ -56,6 +56,7 @@ fixture_env() {
     DOCTOR_FIXTURE_DB_FAIL="${DOCTOR_FIXTURE_DB_FAIL:-0}" \
     DOCTOR_FIXTURE_ANYTHING_PING_FAIL="${DOCTOR_FIXTURE_ANYTHING_PING_FAIL:-0}" \
     DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL="${DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL:-0}" \
+    DOCTOR_FIXTURE_EMPTY_WORKSPACE="${DOCTOR_FIXTURE_EMPTY_WORKSPACE:-0}" \
     DOCTOR_FIXTURE_WORKFLOW_FAIL="${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" \
     DOCTOR_FIXTURE_N8N_CODE_FAIL="${DOCTOR_FIXTURE_N8N_CODE_FAIL:-0}" \
     DOCTOR_FIXTURE_ADAPTER_FAIL="${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" \
@@ -284,6 +285,39 @@ assert_result crisp.api SKIP
 [[ "$before" == "$(business_hash)" ]] || fail 'local 自检改动了配置、知识或会话状态'
 pass 'local 自检覆盖组件接线且不访问外部、不扰动业务状态'
 
+# catalog 有启用文档但 manifest 映射和 workspace 同时为空时，两个 location
+# 集合都会是 []；必须在集合比较前拒绝缺失的逐文档 hash/location 映射。
+manifest_saved="${TEST_ROOT}/knowledge-manifest.saved.json"
+cp -p -- "${DEPLOY}/data/knowledge-manifest.json" "$manifest_saved"
+jq '.files={}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
+export DOCTOR_FIXTURE_EMPTY_WORKSPACE=1
+invoke --local
+(( LAST_RC == 1 )) || fail '启用文档缺失 manifest 映射且 workspace 为空时应退出 1'
+assert_result anything.workspace PASS
+assert_result knowledge.catalog FAIL
+grep -q '索引映射' "$OUT" || fail '缺失逐文档映射未给出准确故障摘要'
+
+doc_hash=$(jq -M -r '.libraries[] | select(.enabled) | .documents[0].sha256' "${DEPLOY}/knowledge/catalog.json")
+jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
+  .files={} | .pending_files={"fixture.md":{
+    sha256:$hash,locations:["custom-documents/pending-fixture.json"],old_locations:[],started_at:$now
+  }}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
+invoke --local
+(( LAST_RC == 2 )) || fail '同 hash 且有 location 的正常 pending 文档应退出警告 2'
+assert_result knowledge.catalog WARN
+grep -q '仍在服务端对账' "$OUT" || fail '正常 pending 未给出处理中说明'
+
+jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
+  .files={} | .pending_files={"unrelated.md":{
+    sha256:$hash,locations:["custom-documents/unrelated.json"],old_locations:[],started_at:$now
+  }}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '无关 pending 不得掩盖目标启用文档映射缺失'
+assert_result knowledge.catalog FAIL
+unset DOCTOR_FIXTURE_EMPTY_WORKSPACE
+cp -p -- "$manifest_saved" "${DEPLOY}/data/knowledge-manifest.json"
+pass '逐文档区分有效 pending 与缺失映射，无关 pending 不掩盖损坏'
+
 # 在线安装与管理菜单都在真实终端内调用 doctor。docker compose exec -T 仍会
 # 转发 stdin；若 timeout 将其放入后台进程组且探针未关闭 stdin，会因 SIGTTIN
 # 停住直到 25/15 秒上限。用真实 PTY 和主动读取 stdin 的夹具锁定该问题。
@@ -399,7 +433,7 @@ assert_result database.n8n_binding FAIL
 env_set "${DEPLOY}/.env" POSTGRES_PASSWORD "$ORIGINAL_DB_PASSWORD"
 printf '%s' "$ORIGINAL_DB_PASSWORD" > "$DB_PASSWORD_FILE"
 printf '%s' "$ORIGINAL_DB_PASSWORD" > "$N8N_DB_PASSWORD_FILE"
-pass '用当前受管密码经 TCP 验证 PostgreSQL，并独立核对 n8n 实际凭据接线'
+pass '用当前受管密码经 backend 网络验证 PostgreSQL，并独立核对 n8n 实际凭据接线'
 
 env_set "${DEPLOY}/.env" CRISP_WEBSITE_HOOK_SECRET not-configured
 invoke --local

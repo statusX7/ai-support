@@ -724,11 +724,13 @@ doctor_db_check() {
         IFS= read -r managed_db
         IFS= read -r managed_password
         export PGPASSWORD="$managed_password"
-        pg_isready -h 127.0.0.1 -U "$managed_user" -d "$managed_db" >/dev/null
-        psql -h 127.0.0.1 -U "$managed_user" -d "$managed_db" -Atqc "SELECT 1"
+        # 必须经 Compose 服务名走 backend bridge；官方镜像的容器 loopback
+        # 可能被 pg_hba.conf 配成 trust，使用 127.0.0.1 会让错误密码假通过。
+        pg_isready -h postgres -U "$managed_user" -d "$managed_db" >/dev/null
+        psql -h postgres -U "$managed_user" -d "$managed_db" -Atqc "SELECT 1"
       ' > "$output" 2>/dev/null \
     && [[ "$(tr -d '[:space:]' < "$output")" == 1 ]]; then
-    doctor_add database.authentication 'PostgreSQL 应用认证' PASS critical '使用当前受管密码经 TCP 完成应用角色 SELECT 1' docker '' "$start"
+    doctor_add database.authentication 'PostgreSQL 应用认证' PASS critical '使用当前受管密码经 backend 网络完成应用角色 SELECT 1' docker '' "$start"
   else
     doctor_add database.authentication 'PostgreSQL 应用认证' FAIL critical '当前受管密码无法完成数据库应用角色认证/查询' docker '核对成套恢复的数据库角色密码；不要只看容器内旧环境或 pg_isready' "$start"
   fi
@@ -754,7 +756,8 @@ doctor_db_check() {
 }
 
 doctor_anything_check() {
-  local start port key workspace response status workspace_item enabled_count pending_count failed_count garbage_count actual_locations expected_locations
+  local start port key workspace response status workspace_item enabled_count pending_count failed_count garbage_count
+  local actual_locations expected_locations mapping_summary mapping_invalid_count pending_document_count
   if (( DOCTOR_DOCKER_READY == 0 )); then
     doctor_skip anything.ping 'AnythingLLM 服务' '因 Docker daemon 不可用未检查' local-api
     doctor_skip anything.workspace 'AnythingLLM 工作区与 Prompt' '因上游组件不可用未检查' local-api
@@ -798,13 +801,48 @@ doctor_anything_check() {
   if [[ -f "${DOCTOR_DEPLOY_DIR}/data/knowledge-manifest.json" && ! -L "${DOCTOR_DEPLOY_DIR}/data/knowledge-manifest.json" ]]; then
     pending_count=$(jq '(.pending_files // {}) | length' "${DOCTOR_DEPLOY_DIR}/data/knowledge-manifest.json" 2>/dev/null || printf -1)
     garbage_count=$(jq '(.garbage_locations // []) | length' "${DOCTOR_DEPLOY_DIR}/data/knowledge-manifest.json" 2>/dev/null || printf -1)
-  else pending_count=-1; garbage_count=-1; fi
+    # 不能仅比较 expected/actual location 集合；若 manifest 丢失映射且
+    # workspace 同时为空，两个空数组会相等并产生假 PASS。逐个启用文档
+    # 必须有同 hash、非空 location 的已完成映射，或同等完整的 pending
+    # 对账记录。后者是正常处理中，只能 WARN，不能被误判为损坏。
+    mapping_summary=$(jq -c --slurpfile catalog "${DOCTOR_DEPLOY_DIR}/knowledge/catalog.json" '
+      select((.files | type == "object") and ((.pending_files // {}) | type == "object")) |
+      . as $manifest |
+      [$catalog[0].libraries[] | select(.enabled) | .documents[] |
+        . as $document |
+        ($document.sha256 | type == "string" and test("^[a-f0-9]{64}$")) as $hash_valid |
+        ($manifest.files[$document.projection] // null) as $indexed |
+        (($manifest.pending_files // {})[$document.projection] // null) as $pending |
+        {
+          indexed:($hash_valid and ($indexed | type == "object") and
+            $indexed.sha256 == $document.sha256 and
+            ($indexed.locations | type == "array" and length > 0) and
+            all($indexed.locations[]; type == "string" and length > 0)),
+          pending:($hash_valid and ($pending | type == "object") and
+            $pending.sha256 == $document.sha256 and
+            ($pending.locations | type == "array" and length > 0) and
+            all($pending.locations[]; type == "string" and length > 0))
+        }
+      ] | {
+        invalid:(map(select((.indexed or .pending) | not)) | length),
+        pending:(map(select((.indexed | not) and .pending)) | length)
+      }' "${DOCTOR_DEPLOY_DIR}/data/knowledge-manifest.json" 2>/dev/null || true)
+    if [[ -n "$mapping_summary" ]]; then
+      mapping_invalid_count=$(jq -r '.invalid' <<< "$mapping_summary")
+      pending_document_count=$(jq -r '.pending' <<< "$mapping_summary")
+    else
+      mapping_invalid_count=-1
+      pending_document_count=-1
+    fi
+  else pending_count=-1; garbage_count=-1; mapping_invalid_count=-1; pending_document_count=-1; fi
   if (( failed_count > 0 || pending_count < 0 || garbage_count < 0 )); then
     doctor_add knowledge.catalog '知识库与索引' FAIL critical '启用知识库存在失败状态，或索引 manifest 无效' filesystem '从多知识库菜单查看失败项并执行指定库同步' "$start"
+  elif (( mapping_invalid_count != 0 )); then
+    doctor_add knowledge.catalog '知识库与索引' FAIL critical '启用文档缺少有效的索引映射、内容 hash 不一致或 location 为空' filesystem '从多知识库菜单同步对应库并回读；不要把空 workspace 当作已索引' "$start"
   elif (( enabled_count == 0 )); then
     doctor_add knowledge.catalog '知识库与索引' WARN warning '当前没有启用的知识文档；本地服务可继续运行' filesystem '按业务需要添加或启用知识；AI 不应编造业务事实' "$start"
-  elif (( pending_count > 0 )); then
-    doctor_add knowledge.catalog '知识库与索引' WARN warning "${enabled_count} 个启用文档中有 ${pending_count} 个仍在服务端对账" filesystem '等待当前索引完成后复查；默认自检不会删除或重建' "$start"
+  elif (( pending_count > 0 || pending_document_count > 0 )); then
+    doctor_add knowledge.catalog '知识库与索引' WARN warning "${enabled_count} 个启用文档中有 ${pending_document_count} 个仍在服务端对账（pending 记录共 ${pending_count} 个）" filesystem '等待当前索引完成后复查；默认自检不会删除或重建' "$start"
   elif [[ "$status" == 2?? ]]; then
     actual_locations=$(jq -c '[.workspace | if type == "array" then .[] else . end | .documents[]?.docpath] | unique' "$response" 2>/dev/null || printf '[]')
     expected_locations=$(jq -cn --slurpfile catalog "${DOCTOR_DEPLOY_DIR}/knowledge/catalog.json" \

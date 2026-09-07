@@ -71,6 +71,7 @@ case "$command" in
     joined=" $* "
     if [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
       [[ "${DOCTOR_FIXTURE_DB_FAIL:-0}" != 1 ]] || exit 1
+      [[ "$joined" == *'-h postgres'* ]] || exit 1
       IFS= read -r managed_user
       IFS= read -r managed_db
       IFS= read -r managed_password

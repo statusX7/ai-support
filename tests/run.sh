@@ -783,6 +783,22 @@ fi
 cp -- "${TEST_ROOT}/provider.safe.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 pass "备份敏感字段拒绝"
 
+# 离线业务恢复有意清空实例索引映射；正常回滚夹具须先完成生产同步，
+# 不能把尚待同步的状态快照伪装成可直接恢复的已就绪实例。
+jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
+  || fail "离线业务恢复未失效旧实例索引映射"
+bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" sync \
+  > "${TEST_ROOT}/post-offline-restore-sync.log" 2>&1
+jq -en --slurpfile catalog "${DEPLOY_DIR}/knowledge/catalog.json" \
+  --slurpfile manifest "${DEPLOY_DIR}/data/knowledge-manifest.json" \
+  --slurpfile actual "$MOCK_ANYTHING_STATE" '
+    all($catalog[0].libraries[] | select(.enabled) | .documents[]; . as $document |
+      $manifest[0].files[$document.projection].sha256 == $document.sha256 and
+      ($manifest[0].files[$document.projection].locations | length > 0)) and
+    ([$manifest[0].files[].locations[]] | unique | sort) == ($actual[0].documents | unique | sort)
+  ' >/dev/null || fail "离线恢复后正常回滚夹具未完成真实同步接口对账"
+pass "离线业务恢复后同步并回读索引，再进入正常回滚验收"
+
 printf 'rollback-state-before\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
 FREE_KIB=$(df -Pk -- "${DEPLOY_DIR}/backups/versions" | awk 'NR == 2 { print $4 }')
 INSUFFICIENT_RESERVE_MB=$((FREE_KIB / 1024 + 2048))
@@ -996,7 +1012,10 @@ printf '%s\n' '{"handoff":{"keywords":["人工","客服","真人"],"resume_keywo
 printf '%s\n' '{"tags":{"enabled":true,"ai_resolved":"customer_resolved","knowledge_miss":"knowledge-miss","low_confidence":"low-confidence","human_required":"human-required"}}' \
   > "${DEPLOY_DIR}/config/tags.yaml"
 sed -i '/^SNAPSHOT_MIN_FREE_MB=/d; /^SNAPSHOT_RETENTION_COUNT=/d' "${DEPLOY_DIR}/.env"
-rm -f -- "${DEPLOY_DIR}/scripts/analytics.sh" "${DEPLOY_DIR}/scripts/snapshot.sh" "${DEPLOY_DIR}/scripts/rollback.sh"
+# 这是旧配置/缺维护器的构造夹具（真实 v1.1.0 另有独立 tag 回归）。
+# 旧代不能保留 v1.1.1 才引入的 doctor，否则会错误要求旧代缺少的新文件。
+rm -f -- "${DEPLOY_DIR}/scripts/analytics.sh" "${DEPLOY_DIR}/scripts/snapshot.sh" \
+  "${DEPLOY_DIR}/scripts/rollback.sh" "${DEPLOY_DIR}/scripts/doctor.sh" "${DEPLOY_DIR}/get.sh"
 if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update-rollback.log" 2>&1; then
@@ -1004,6 +1023,8 @@ if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
 fi
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "更新失败后未恢复旧版本"
 grep -Fq '已自动回滚到更新前版本' "${TEST_ROOT}/update-rollback.log" || fail "更新失败未报告自动回滚"
+[[ ! -e "${DEPLOY_DIR}/scripts/doctor.sh" && ! -e "${DEPLOY_DIR}/get.sh" ]] \
+  || fail "旧版本自动回滚遗留了该版本不存在的新维护入口"
 [[ "$(sed -n 's/^SNAPSHOT_MIN_FREE_MB=//p' "${DEPLOY_DIR}/.env")" == 1024 ]] || fail "旧部署未补齐快照预留空间"
 [[ "$(sed -n 's/^SNAPSHOT_RETENTION_COUNT=//p' "${DEPLOY_DIR}/.env")" == 10 ]] || fail "旧部署未补齐快照保留数量"
 pass "更新失败自动回滚"
