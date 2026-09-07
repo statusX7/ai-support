@@ -107,7 +107,7 @@ knowledge_replace_root_contents() {
 }
 
 knowledge_source_inventory() {
-  local requested=$1 output=$2 resolved lexical scan file name extension entries=0 regular_files=0 supported=0 total_bytes=0
+  local requested=$1 output=$2 resolved lexical scan file name extension entries=0 inventory_regular_count=0 supported=0 total_bytes=0
   local -a files=() supported_files=()
   local -A names=() formats=([md]=0 [txt]=0 [pdf]=0 [docx]=0)
   [[ ! "$requested" =~ [[:cntrl:]] && ! -L "$requested" ]] \
@@ -198,7 +198,7 @@ PY
     return 1
   fi
   entries=$(jq -M -r '.scanned_members' "$scan") || { rm -f -- "$scan"; return 1; }
-  regular_files=$(jq -M -r '.regular_files' "$scan") || { rm -f -- "$scan"; return 1; }
+  inventory_regular_count=$(jq -M -r '.regular_files' "$scan") || { rm -f -- "$scan"; return 1; }
   while IFS= read -r -d '' file; do files+=("$file"); done < <(knowledge_inventory_files "$scan")
   rm -f -- "$scan"
   for file in "${files[@]}"; do
@@ -227,7 +227,7 @@ import json, os, sys
 paths = [os.fsdecode(item) for item in sys.stdin.buffer.read().split(b"\0") if item]
 json.dump({"files": paths}, sys.stdout, ensure_ascii=False, separators=(",", ":"))
 ' > "$output" || return 1
-  python3 - "$output" "$entries" "$regular_files" "$supported" "$total_bytes" \
+  python3 - "$output" "$entries" "$inventory_regular_count" "$supported" "$total_bytes" \
     "${formats[md]}" "${formats[txt]}" "${formats[pdf]}" "${formats[docx]}" <<'PY'
 import json
 import pathlib

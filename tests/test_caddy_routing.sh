@@ -3,9 +3,9 @@ set -euo pipefail
 umask 077
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || {
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   printf '跳过：需要隔离 Docker daemon 执行真实 Caddy 路由回归。\n' >&2; exit 77;
-}
+fi
 command -v curl >/dev/null 2>&1 || exit 77
 work=$(mktemp -d "$PROJECT_ROOT/.test-caddy.XXXXXX")
 namespace="crispai-caddy-regression-${BASHPID}"
