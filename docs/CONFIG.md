@@ -34,6 +34,8 @@ AnythingLLM 固定使用 `generic-openai`，内部 Base 为 `AI_ANYTHINGLLM_BASE
 
 图片走同一 Provider 的已验证文本/图片协议，带当前 Prompt 与同会话公开历史；不能支持时安全请求文字补充，不转人工。图片 URL 下载保护见 [SECURITY](SECURITY.md)。默认本地 Embedder由 AnythingLLM 管理，不需要另外的 API Key，不把聊天模型当 Embedding。升级已有模型设置须考虑全索引重建，不能只改显示名称。
 
+`data/runtime/session-*.json` 中的可选 `image_context` 保留最多 3 份视觉摘要，每份 2000 字符、24 小时；后续问答只有匹配该会话近期公开附件才使用，避免依赖模型在公开回答里复述全部细节。它是受限会话数据，不是业务配置，不导出至迁移包；旧会话无此字段仍兼容，不重置原人工状态。
+
 ## 3. Prompt
 
 `config/prompt.md` 保留原文，不加入内部版本号或 hash。文件/多行粘贴上限 256 KiB；空或仅空白拒绝覆盖。修改自动更新 workspace，并检查回读精确一致；n8n 同时读取最新正文。当前 conversation 的新问题使用新 Prompt，公开历史仅作背景，不能覆盖当前知识与系统护栏。

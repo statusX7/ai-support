@@ -30,6 +30,9 @@ let unknownSources = false;
 let miss = false;
 let low = false;
 let imageMode = 'valid';
+let visualAnswer = '受控视觉协议回答';
+let modelAnswerOverride = null;
+let delayedVision;
 const sent = [];
 const histories = new Map();
 const modelRequests = [];
@@ -63,13 +66,14 @@ const request = async (url, options = {}) => {
     modelRequests.push(options.body);
     if (delayed) { const pending = delayed; delayed = null; await pending; }
     if (modelFailure) return { status: 503, body: { error: 'provider_failed' } };
-    const body = { textResponse: '受控协议回答：' + options.body.message.slice(-25) };
+    const body = { textResponse: modelAnswerOverride ?? '受控协议回答：' + options.body.message.slice(-25) };
     if (!unknownSources) body.sources = miss ? [] : [{ docpath: 'controlled/document.json', score: low ? 0.1 : 0.9 }];
     return { status: 200, body };
   }
   if (parsed.hostname === 'provider.invalid') {
     providerRequests.push({ path: parsed.pathname, body: options.body });
-    return { status: 200, body: parsed.pathname.endsWith('/responses') ? { output: [{ content: [{ text: '受控视觉协议回答' }] }] } : { choices: [{ message: { content: '受控视觉协议回答' } }] } };
+    if (delayedVision) { const pending = delayedVision; delayedVision = null; await pending; }
+    return { status: 200, body: parsed.pathname.endsWith('/responses') ? { output: [{ content: [{ text: visualAnswer }] }] } : { choices: [{ message: { content: visualAnswer } }] } };
   }
   if (parsed.hostname === 'storage.crisp.chat') {
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -82,7 +86,7 @@ const runtimeOptions = { root, clock: () => now, request, lookup: (_host, _optio
 runtime = createRuntime(env, runtimeOptions);
 const message = (session, content, overrides = {}) => ({ website_id: env.CRISP_WEBSITE_ID, event: 'message:send', timestamp: now, data: { session_id: session, from: 'user', type: 'text', content, fingerprint: ++sequence, timestamp: now, ...overrides } });
 const receive = async (body) => {
-  if (body.event === 'message:send' && body.data.type === 'text') {
+  if (body.event === 'message:send' && ['text', 'file', 'animation'].includes(body.data.type)) {
     const history = histories.get(body.data.session_id) || []; history.push({ ...body.data }); histories.set(body.data.session_id, history);
   }
   return runtime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
@@ -225,6 +229,56 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     for (const mode of ['expired', 'wrong', 'huge']) { imageMode = mode; await deliver(message('session_badimage-' + mode, image, { type: 'file' })); assert.match(sent.at(-1).content, /补充|重新上传/); assert.equal(state('session_badimage-' + mode).mode, 'ai'); }
     imageMode = 'valid'; const unsafe = createRuntime(env, { ...runtimeOptions, lookup: (_host, _options, callback) => callback(null, [{ address: '127.0.0.1', family: 4 }]) }); await assert.rejects(unsafe.imageContent(image), /受限网络/);
     await assert.rejects(runtime.imageContent({ ...image, url: 'https://evil.invalid/image.png' }), /安全校验/);
+  });
+  await test('T37 图片未在公开答案复述仍保留隔离上下文，重启、容量与过期边界', async () => {
+    const session = 'session_image-memory-a';
+    const image = { url: 'https://storage.crisp.chat/synthetic.png', name: '虚构.png', type: 'image/png' };
+    const marker = '仅视觉可见的虚构蓝灯三闪';
+    modelAnswerOverride = '请先执行第一步，再告诉我结果。';
+    visualAnswer = marker + '图像合成细节'.repeat(500);
+    await deliver(message(session, image, { type: 'file' }));
+    assert.equal(state(session).image_context.length, 1);
+    assert.equal(state(session).image_context[0].summary.length, 2000);
+    assert(!JSON.stringify(state(session).image_context).includes(image.url));
+    assert(!sent.at(-1).content.includes(marker));
+    runtime = createRuntime(env, runtimeOptions);
+    await deliver(message(session, '这是什么意思？'));
+    assert.equal(modelRequests.at(-1).message.split(marker).length - 1, 1);
+    assert.match(modelRequests.at(-1).message, /不可信客户资料/);
+    await deliver(message('session_image-memory-b', '独立访客提问'));
+    assert(!modelRequests.at(-1).message.includes(marker));
+    for (let index = 0; index < 3; index += 1) {
+      visualAnswer = '新图片受控描述-' + index;
+      await deliver(message(session, image, { type: 'file' }));
+    }
+    assert.equal(state(session).image_context.length, 3);
+    assert(!state(session).image_context.some((entry) => entry.summary.includes(marker)));
+    const before = now;
+    now += 86400001;
+    await runtime.transaction(key(session), () => {});
+    assert.equal(state(session).image_context.length, 0);
+    await deliver(message(session, '超过保留期的图片问题'));
+    assert(!modelRequests.at(-1).message.includes('新图片受控描述-'));
+    now = before;
+    modelAnswerOverride = null; visualAnswer = '受控视觉协议回答';
+  });
+  await test('T27/T32 图片慢解析被人工或全局停用打断时不保存过期摘要、不发送', async () => {
+    for (const reason of ['human', 'global']) {
+      const session = 'session_image-race-' + reason;
+      let release;
+      delayedVision = new Promise((resolve) => { release = resolve; });
+      const count = providerRequests.length;
+      const pending = deliver(message(session, { url: 'https://storage.crisp.chat/synthetic.png', name: '虚构.png', type: 'image/png' }, { type: 'file' }));
+      for (let tries = 0; tries < 200 && providerRequests.length === count; tries += 1) await wait(5);
+      assert.equal(providerRequests.length, count + 1);
+      if (reason === 'human') await operator(session);
+      else { const global = readConfig('runtime'); global.enabled = false; global.revision += 1; global.applied_revision = global.revision; writeConfig('runtime', global); }
+      release(); await pending;
+      assert.equal((state(session).image_context || []).length, 0);
+      assert(!sent.some((item) => item.session_id === session));
+      if (reason === 'human') assert.equal(state(session).mode, 'human');
+      else { const global = readConfig('runtime'); global.enabled = true; global.revision += 1; global.applied_revision = global.revision; writeConfig('runtime', global); }
+    }
   });
   await test('T39 持久任务重启、重复Hook和发送结果未知对账', async () => {
     const body = message('session_recovery1', '持久接收'); const entry = await receive(body); assert.equal(entry.reason, '已持久接收');
