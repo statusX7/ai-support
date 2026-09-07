@@ -205,7 +205,19 @@ case "$COMMAND" in
     fi
     ;;
   exec)
-    if [[ "$*" == *'n8n --version'* ]]; then
+    if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* ]]; then
+      expected=''
+      IFS= read -r expected || [[ -n "$expected" ]]
+      if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
+        binding_file="${MOCK_PROJECT_DIR}/scripts/provider-adapter.js"
+      else
+        binding_file="${MOCK_PROJECT_DIR}/config/Caddyfile"
+      fi
+      [[ -f "$binding_file" && ! -L "$binding_file" && "$expected" =~ ^[a-f0-9]{64}$ ]] || exit 1
+      actual=$(sha256sum -- "$binding_file"); actual=${actual%% *}
+      [[ "$actual" == "$expected" && "${MOCK_FILE_BINDING_MISMATCH:-0}" != 1 ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$*" == *'n8n --version'* ]]; then
       printf '2.99.0-test\n'
     elif [[ "$*" == *'pg_dump'* ]]; then
       [[ "${MOCK_DOCKER_FAIL_PG_DUMP:-0}" != 1 ]] || exit 1

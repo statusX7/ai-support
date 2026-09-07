@@ -432,6 +432,7 @@ docker_compose "$DEPLOY_DIR" config --quiet
 docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm
 docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
 docker_compose "$DEPLOY_DIR" up -d --remove-orphans
+refresh_program_file_mounts "$DEPLOY_DIR" || die '回滚后的单文件程序挂载未完成刷新'
 wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"

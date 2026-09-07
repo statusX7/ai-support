@@ -654,6 +654,69 @@ doctor_service_record() {
   fi
 }
 
+doctor_container_file_binding() {
+  local id=$1 name=$2 service=$3 host_file=$4 container_file=$5 marker=$6 start status output expected binding_rc=0
+  start=$(doctor_now_ms)
+  status=$(doctor_result_status "container.${service}")
+  if [[ "$status" != PASS && "$status" != WARN ]]; then
+    doctor_skip "$id" "$name" "因容器 ${service} 未正常运行，本次未读取挂载文件" docker
+    return
+  fi
+  if [[ ! -f "$host_file" || -L "$host_file" || "$(stat -c '%h' -- "$host_file" 2>/dev/null || true)" != 1 ]]; then
+    doctor_add "$id" "$name" FAIL critical '宿主受管文件缺失、为链接或存在额外硬链接' filesystem '从同版本正式包恢复受管文件后重新创建对应容器' "$start"
+    return
+  fi
+  expected=$(sha256sum -- "$host_file" 2>/dev/null | cut -d ' ' -f 1 || true)
+  if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+    doctor_add "$id" "$name" FAIL critical '无法计算宿主受管文件摘要' filesystem '核对受管文件权限与完整性' "$start"
+    return
+  fi
+  output="${DOCTOR_TEMP_ROOT}/${id//./-}.txt"
+  if [[ "$service" == caddy ]]; then
+    # Caddy 镜像不依赖 Node；摘要只经 stdin 输入，容器只输出 matched。
+    # shellcheck disable=SC2016 # $1/变量由容器内 sh 展开。
+    printf '%s\n' "$expected" | doctor_compose_timeout 12 exec -T "$service" sh -ec '
+      marker="CRISPAI_EXPECTED_FILE_BINDING_CADDY"
+      IFS= read -r expected
+      actual=$(sha256sum "$1")
+      actual=${actual%% *}
+      [ -n "$marker" ] && [ "$actual" = "$expected" ]
+      printf "matched\n"
+    ' sh "$container_file" > "$output" 2>/dev/null || binding_rc=$?
+  else
+    # provider-adapter 固定镜像提供 Node；恒定时间比较，不输出代码或摘要。
+    printf '%s' "$expected" | doctor_compose_timeout 12 exec -T "$service" node -e '
+      const crypto=require("crypto"),fs=require("fs");
+      const marker=process.argv[2];
+      const expected=fs.readFileSync(0,"utf8").trim();
+      const actual=crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex");
+      const left=Buffer.from(actual),right=Buffer.from(expected);
+      if(!marker||left.length!==right.length||!crypto.timingSafeEqual(left,right)) process.exit(1);
+      process.stdout.write("matched\n");
+    ' "$container_file" "$marker" > "$output" 2>/dev/null || binding_rc=$?
+  fi
+  if (( binding_rc == 0 )) && grep -Fxq matched "$output"; then
+    doctor_add "$id" "$name" PASS critical '运行容器读取的单文件挂载与当前宿主受管文件逐字节一致' docker '' "$start"
+  elif (( binding_rc == 124 || binding_rc == 137 )) || ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add "$id" "$name" docker "$start"
+  else
+    doctor_add "$id" "$name" FAIL critical '运行容器仍读取旧版或偏离的单文件挂载' docker '用受管安装/更新流程校验文件后强制重新创建该服务' "$start"
+  fi
+}
+
+doctor_file_bindings_check() {
+  local access_mode=$1
+  doctor_container_file_binding provider.adapter_code_binding 'Provider adapter 程序运行代' \
+    provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-adapter.js" \
+    /opt/crisp-ai/scripts/provider-adapter.js CRISPAI_EXPECTED_FILE_BINDING_PROVIDER
+  if [[ "$access_mode" == managed_https ]]; then
+    doctor_container_file_binding caddy.file_binding 'Caddy 配置运行代' caddy \
+      "${DOCTOR_DEPLOY_DIR}/config/Caddyfile" /etc/caddy/Caddyfile CRISPAI_EXPECTED_FILE_BINDING_CADDY
+  else
+    doctor_skip caddy.file_binding 'Caddy 配置运行代' '当前使用已有外部反向代理，受管 Caddy 单文件挂载不适用' docker
+  fi
+}
+
 doctor_docker_check() {
   local start endpoint access_mode service
   start=$(doctor_now_ms)
@@ -757,9 +820,76 @@ doctor_db_check() {
   fi
 }
 
+doctor_projection_prompt_extract() {
+  local projection=$1 output=$2
+  python3 - "$projection" "$output" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+try:
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16_777_216:
+        raise ValueError("unsafe projection")
+    value = json.loads(source.read_text(encoding="utf-8"))
+    prompt = value.get("prompt")
+    if value.get("schema_version") != 1 or value.get("state") != "applied" or not isinstance(prompt, dict):
+        raise ValueError("invalid projection")
+    text = prompt.get("text")
+    if not isinstance(text, str) or not text.strip() or "\x00" in text:
+        raise ValueError("invalid prompt")
+    encoded = text.encode("utf-8")
+    if len(encoded) != prompt.get("bytes"):
+        raise ValueError("invalid prompt")
+    if len(encoded) > 262_144 or hashlib.sha256(encoded).hexdigest() != prompt.get("sha256"):
+        raise ValueError("invalid prompt digest")
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, encoded)
+    finally:
+        os.close(descriptor)
+except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+doctor_legacy_prompt_extract() {
+  local prompt=$1 output=$2
+  python3 - "$prompt" "$output" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+try:
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or not 0 < metadata.st_size <= 262_144:
+        raise ValueError("unsafe prompt")
+    raw = source.read_bytes()
+    text = raw.decode("utf-8", "strict")
+    if not text.strip() or "\x00" in text:
+        raise ValueError("invalid prompt")
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, raw)
+    finally:
+        os.close(descriptor)
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
 doctor_anything_check() {
   local start port key workspace response status workspace_item enabled_count pending_count failed_count garbage_count
   local actual_locations expected_locations mapping_summary mapping_invalid_count pending_document_count
+  local projection expected_prompt prompt_source=projection prompt_valid=0
   if (( DOCTOR_DOCKER_READY == 0 )); then
     doctor_skip anything.ping 'AnythingLLM 服务' '因 Docker daemon 不可用未检查' local-api
     doctor_skip anything.workspace 'AnythingLLM 工作区与 Prompt' '因上游组件不可用未检查' local-api
@@ -779,13 +909,31 @@ doctor_anything_check() {
   key=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)
   workspace=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)
   response="${DOCTOR_TEMP_ROOT}/anything-workspace.json"
+  projection="${DOCTOR_DEPLOY_DIR}/config/materials-applied.json"
+  expected_prompt="${DOCTOR_TEMP_ROOT}/anything-expected-prompt"
+  # --fix 会在同一进程内复查一次；只删除本次 doctor 私有临时文件，
+  # 避免第二轮因 O_EXCL 将有效投影误报为损坏。
+  rm -f -- "$expected_prompt"
+  if [[ -e "$projection" || -L "$projection" ]]; then
+    if doctor_projection_prompt_extract "$projection" "$expected_prompt" >/dev/null 2>&1; then prompt_valid=1; fi
+  else
+    prompt_source=legacy
+    if doctor_legacy_prompt_extract "${DOCTOR_DEPLOY_DIR}/config/prompt.md" "$expected_prompt" >/dev/null 2>&1; then prompt_valid=1; fi
+  fi
   if (( DOCTOR_ANYTHING_READY )) && ! is_placeholder "$key" && [[ "$workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
     status=$(doctor_anything_workspace_probe "$port" "$key" "$workspace" "$response")
   else status=000; fi
-  if [[ "$status" == 2?? ]] && workspace_item=$(jq -c '.workspace | if type == "array" then .[0] else . end' "$response" 2>/dev/null) \
-    && jq -e --arg slug "$workspace" --rawfile prompt "${DOCTOR_DEPLOY_DIR}/config/prompt.md" \
+  if (( prompt_valid )) && [[ "$status" == 2?? ]] \
+    && workspace_item=$(jq -c '.workspace | if type == "array" then .[0] else . end' "$response" 2>/dev/null) \
+    && jq -e --arg slug "$workspace" --rawfile prompt "$expected_prompt" \
       '.slug == $slug and .openAiPrompt == $prompt' <<< "$workspace_item" >/dev/null 2>&1; then
-    doctor_add anything.workspace 'AnythingLLM 工作区与 Prompt' PASS critical 'Developer API 鉴权、目标工作区和 Prompt 回读一致' local-api '' "$start"
+    if [[ "$prompt_source" == projection ]]; then
+      doctor_add anything.workspace 'AnythingLLM 工作区与 Prompt' PASS critical 'Developer API 鉴权、目标工作区和已应用 Prompt 投影回读一致' local-api '' "$start"
+    else
+      doctor_add anything.workspace 'AnythingLLM 工作区与 Prompt' PASS critical 'Developer API 鉴权、目标工作区和 legacy Prompt 回读一致' local-api '' "$start"
+    fi
+  elif (( prompt_valid == 0 )) && [[ "$prompt_source" == projection ]]; then
+    doctor_add anything.workspace 'AnythingLLM 工作区与 Prompt' FAIL critical '当前资料投影无效，拒绝回退使用可编辑 Prompt 原文判断运行状态' filesystem '恢复上一份有效资料投影或完成显式资料应用' "$start"
   else
     doctor_add anything.workspace 'AnythingLLM 工作区与 Prompt' FAIL critical "Developer API、工作区或 Prompt 回读失败（HTTP ${status:-000}）" local-api '从 Prompt/知识配置入口重新同步；不要重置管理员或 API Key' "$start"
   fi
@@ -1521,11 +1669,14 @@ doctor_run_checks() {
     doctor_skip n8n.workflow 'n8n 生产工作流' '离线范围未检查' docker
     doctor_skip n8n.runtime 'n8n Code runner' '离线范围未检查' local-api
     doctor_skip provider.adapter 'Provider adapter' '离线范围未检查' docker
+    doctor_skip provider.adapter_code_binding 'Provider adapter 程序运行代' '离线范围未检查单文件挂载' docker
+    doctor_skip caddy.file_binding 'Caddy 配置运行代' '离线范围未检查单文件挂载' docker
     doctor_skip provider.adapter_binding 'Provider adapter 运行代' '离线范围未检查' docker
     doctor_skip anything.provider_binding 'AnythingLLM Provider 运行代' '离线范围未检查' docker
     doctor_skip n8n.runtime_binding 'n8n AI/Crisp 运行代' '离线范围未检查' docker
   else
     doctor_docker_check
+    doctor_file_bindings_check "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)"
     doctor_db_check
     doctor_anything_check
     doctor_n8n_check

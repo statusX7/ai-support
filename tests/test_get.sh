@@ -7,6 +7,9 @@ TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.get.XXXXXX")
 SERVER_PID=""
 SUDO_TEST_ROOT=""
 PASSED=0
+# UNIT 只隔离命令发现，不代表空机安装验收；外来 crisp 冲突另用真实入口回归。
+GET_FIXTURE_BASE_PATH=/usr/bin:/bin
+GET_FIXTURE_PATH=$GET_FIXTURE_BASE_PATH
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
@@ -406,8 +409,8 @@ run_tty() {
   local cwd=$1 log=$2 capture=$3
   shift 3
   local command argument
-  printf -v command 'cd -- %q && env CRISPAI_GET_TEST_MODE=1 CRISPAI_GET_TEST_LATEST_URL=%q CRISPAI_GET_TEST_RELEASE_ROOT=%q CRISPAI_GET_TEST_RELEASE_API_ROOT=%q CRISPAI_GET_TEST_TAG_PREFIX=%q CRISPAI_GET_TEST_RETRIES=1 CRISPAI_GET_TEST_RETRY_DELAY=0 CRISPAI_GET_TEST_TOTAL_TIMEOUT=%q MOCK_CAPTURE=%q bash %q' \
-    "$cwd" "${BASE_URL}/latest" "${BASE_URL}/releases/download" "${BASE_URL}/api/releases/tags" "${BASE_URL}/tag/" \
+  printf -v command 'cd -- %q && env PATH=%q CRISPAI_GET_TEST_MODE=1 CRISPAI_GET_TEST_LATEST_URL=%q CRISPAI_GET_TEST_RELEASE_ROOT=%q CRISPAI_GET_TEST_RELEASE_API_ROOT=%q CRISPAI_GET_TEST_TAG_PREFIX=%q CRISPAI_GET_TEST_RETRIES=1 CRISPAI_GET_TEST_RETRY_DELAY=0 CRISPAI_GET_TEST_TOTAL_TIMEOUT=%q MOCK_CAPTURE=%q bash %q' \
+    "$cwd" "$GET_FIXTURE_PATH" "${BASE_URL}/latest" "${BASE_URL}/releases/download" "${BASE_URL}/api/releases/tags" "${BASE_URL}/tag/" \
     "${TEST_TOTAL_TIMEOUT:-3}" \
     "$capture" "${TEST_ROOT}/standalone-get.sh"
   for argument in "$@"; do
@@ -518,6 +521,7 @@ pass '已有完整实例直接打开管理菜单，不下载或重问初始化'
 
 REPAIR_DEPLOY="${TEST_ROOT}/repair-deploy"
 REPAIR_COMMAND="${TEST_ROOT}/repair-bin/crispai"
+REPAIR_COMPAT_COMMAND="${TEST_ROOT}/repair-bin/crisp"
 REPAIR_CAPTURE="${TEST_ROOT}/repair.capture"
 REPAIR_LOG="${TEST_ROOT}/repair.typescript"
 mkdir -p -- "$REPAIR_DEPLOY" "$(dirname -- "$REPAIR_COMMAND")"
@@ -528,9 +532,15 @@ printf 'AI_API_KEY=synthetic-repair-secret\n' > "$REPAIR_DEPLOY/.env"
 printf '{"enabled":false}\n' > "$REPAIR_DEPLOY/config/runtime.yaml"
 mkdir -p -- "$REPAIR_DEPLOY/data/runtime"
 printf '{"mode":"human","resume_at":null}\n' > "$REPAIR_DEPLOY/data/runtime/session-fixture.json"
+REPAIR_STATE_FILES=(
+  "$REPAIR_DEPLOY/.env" "$REPAIR_DEPLOY/config/runtime.yaml"
+  "$REPAIR_DEPLOY/data/runtime/session-fixture.json"
+  "$REPAIR_DEPLOY/.crisp-ai-installation" "$REPAIR_DEPLOY/VERSION"
+)
+REPAIR_STATE_BEFORE=$(sha256sum -- "${REPAIR_STATE_FILES[@]}")
 : > "$REPAIR_CAPTURE"
 run_tty "$CALLER_DIR" "$REPAIR_LOG" "$REPAIR_CAPTURE" --repair --deploy-dir "$REPAIR_DEPLOY"
-[[ -x "$REPAIR_COMMAND" && -x "$(dirname -- "$REPAIR_COMMAND")/crisp" ]] \
+[[ -x "$REPAIR_COMMAND" && -x "$REPAIR_COMPAT_COMMAND" ]] \
   || fail '--repair 没有从校验包恢复正式与兼容命令'
 [[ ! -s "$REPAIR_CAPTURE" ]] || fail '--repair 意外运行了安装器、更新器或菜单'
 [[ "$(<"$REPAIR_DEPLOY/.env")" == 'AI_API_KEY=synthetic-repair-secret' \
@@ -538,7 +548,61 @@ run_tty "$CALLER_DIR" "$REPAIR_LOG" "$REPAIR_CAPTURE" --repair --deploy-dir "$RE
   && "$(<"$REPAIR_DEPLOY/data/runtime/session-fixture.json")" == '{"mode":"human","resume_at":null}' ]] \
   || fail '--repair 改动了凭据、总开关或人工状态'
 [[ ! -e "$REPAIR_DEPLOY/config/.online-release" ]] || fail '--repair 改写了部署包来源'
-pass '--repair 绕过已有菜单并用校验同版包仅恢复受管命令，保留业务和人工状态'
+[[ "$(sha256sum -- "${REPAIR_STATE_FILES[@]}")" == "$REPAIR_STATE_BEFORE" ]] \
+  || fail '--repair 改动了原始状态文件字节'
+pass 'UNIT 隔离 PATH 下 --repair 仅恢复受管命令，保留业务、凭据和人工状态'
+
+for foreign_kind in program managed; do
+  FOREIGN_ROOT="${TEST_ROOT}/repair-foreign-${foreign_kind}"
+  FOREIGN_BIN="${FOREIGN_ROOT}/bin"
+  FOREIGN_COMMAND="${FOREIGN_BIN}/crisp"
+  FOREIGN_LOG="${FOREIGN_ROOT}/repair.typescript"
+  mkdir -p -- "$FOREIGN_BIN"
+  FOREIGN_STATE_FILES=("$FOREIGN_COMMAND")
+  if [[ "$foreign_kind" == program ]]; then
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nprintf "foreign crisp fixture\\n"\n' > "$FOREIGN_COMMAND"
+    chmod 0755 "$FOREIGN_COMMAND"
+    FOREIGN_DESCRIPTION='外来普通 crisp 命令'
+  else
+    FOREIGN_DEPLOY="${FOREIGN_ROOT}/deploy"
+    mkdir -p -- "$FOREIGN_DEPLOY/config"
+    cp -- "${BUILD_ROOT}/ai-support-v1.1.1/manage.sh" "$FOREIGN_DEPLOY/manage.sh"
+    printf 'v1.1.1\n' > "$FOREIGN_DEPLOY/VERSION"
+    printf 'ai-support\nstate=local-ready\ninstalled_version=v1.1.1\n' > "$FOREIGN_DEPLOY/.crisp-ai-installation"
+    env PATH="$GET_FIXTURE_BASE_PATH" bash "${PROJECT_ROOT}/scripts/launcher.sh" install \
+      --deploy-dir "$FOREIGN_DEPLOY" --command-path "${FOREIGN_BIN}/crispai" --non-interactive \
+      > "${FOREIGN_ROOT}/launcher.log" 2>&1
+    [[ -x "$FOREIGN_COMMAND" ]] || fail '未建立另一受管实例的真实 crisp 入口夹具'
+    FOREIGN_STATE_FILES+=(
+      "${FOREIGN_BIN}/crispai" "$FOREIGN_DEPLOY/config/.crispai-launcher"
+      "$FOREIGN_DEPLOY/config/.crispai-compat-launcher" "$FOREIGN_DEPLOY/.crisp-ai-installation"
+      "$FOREIGN_DEPLOY/VERSION" "$FOREIGN_DEPLOY/manage.sh"
+    )
+    FOREIGN_DESCRIPTION='另一受管实例的 crisp 命令'
+  fi
+  FOREIGN_BEFORE=$(sha256sum -- "${FOREIGN_STATE_FILES[@]}")
+  FOREIGN_STAT_BEFORE=$(stat -c '%a:%u:%g:%s:%Y:%Z:%i' -- "${FOREIGN_STATE_FILES[@]}")
+  rm -f -- "$REPAIR_COMMAND" "$REPAIR_COMPAT_COMMAND" "$REPAIR_DEPLOY/config/.crispai-compat-launcher"
+  FOREIGN_PATH="$(dirname -- "$REPAIR_COMMAND"):${FOREIGN_BIN}:${GET_FIXTURE_BASE_PATH}"
+  GET_FIXTURE_PATH="$FOREIGN_PATH" run_tty "$CALLER_DIR" "$FOREIGN_LOG" "$REPAIR_CAPTURE" \
+    --repair --deploy-dir "$REPAIR_DEPLOY"
+  [[ -x "$REPAIR_COMMAND" && ! -e "$REPAIR_COMPAT_COMMAND" && ! -L "$REPAIR_COMPAT_COMMAND" \
+    && ! -e "$REPAIR_DEPLOY/config/.crispai-compat-launcher" \
+    && ! -L "$REPAIR_DEPLOY/config/.crispai-compat-launcher" ]] \
+    || fail '--repair 未仅修复正式入口，或新建兼容入口遮蔽了外来命令'
+  [[ "$(env PATH="$FOREIGN_PATH" bash -c 'command -v crisp')" == "$FOREIGN_COMMAND" \
+    && "$(env PATH="$FOREIGN_PATH" "$REPAIR_COMMAND" --version)" == v1.1.1 ]] \
+    || fail '--repair 后正式入口不可用或外来 crisp 的 PATH 解析改变'
+  [[ "$(sha256sum -- "${FOREIGN_STATE_FILES[@]}")" == "$FOREIGN_BEFORE" \
+    && "$(stat -c '%a:%u:%g:%s:%Y:%Z:%i' -- "${FOREIGN_STATE_FILES[@]}")" == "$FOREIGN_STAT_BEFORE" ]] \
+    || fail '--repair 修改了外来命令或另一实例的内容、权限和归属'
+  [[ ! -s "$REPAIR_CAPTURE" && ! -e "$REPAIR_DEPLOY/config/.online-release" \
+    && "$(sha256sum -- "${REPAIR_STATE_FILES[@]}")" == "$REPAIR_STATE_BEFORE" ]] \
+    || fail '外来 crisp 冲突时 --repair 调用了业务入口或改动了凭据、状态与来源'
+  assert_contains "$FOREIGN_LOG" 'PATH 中已有其他程序的 crisp 命令，已保留；请使用 crispai。' \
+    '--repair 未明确解释保留外来 crisp 的原因'
+  pass "--repair 遇到${FOREIGN_DESCRIPTION}时仅修正式入口，原内容、权限与状态不变"
+done
 
 REQUESTS_BEFORE=$(wc -l < "$ACCESS_LOG")
 set +e

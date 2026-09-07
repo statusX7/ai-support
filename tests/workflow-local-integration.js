@@ -11,7 +11,9 @@ const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
 if (!config.deploy_dir || !config.protocol_url || !config.protocol_key || !config.webhook_url || !config.website_id) throw new Error('测试配置缺少必要字段');
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const call = async (route, body) => {
-  const response = await fetch(config.protocol_url + '/test/' + route, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', 'X-Test-Control': config.protocol_key }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(60000) });
+  // 配置应用会同步阻塞测试客户端；不复用这段等待期间可能已关闭的协议服务连接。
+  // 不重试事件：所有状态及真实出站断言保持原样。
+  const response = await fetch(config.protocol_url + '/test/' + route, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', 'X-Test-Control': config.protocol_key, 'Connection': 'close' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(60000) });
   assert.equal(response.status, 200); return response.json();
 };
 const session = 'session_local-' + crypto.randomBytes(6).toString('hex');

@@ -91,7 +91,19 @@ case "$command" in
     ;;
   exec)
     joined=" $* "
-    if [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
+    if [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
+      expected=$(cat)
+      actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/scripts/provider-adapter.js" | awk '{print $1}')
+      [[ "${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
+      [[ "$expected" == "$actual" ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* ]]; then
+      IFS= read -r expected
+      actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/config/Caddyfile" | awk '{print $1}')
+      [[ "${DOCTOR_FIXTURE_CADDY_FILE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
+      [[ "$expected" == "$actual" ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
       [[ "${DOCTOR_FIXTURE_DB_FAIL:-0}" != 1 ]] || exit 1
       [[ "$joined" == *'-h postgres'* ]] || exit 1
       IFS= read -r managed_user

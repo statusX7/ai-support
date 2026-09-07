@@ -41,11 +41,15 @@ case "$url" in
       status=401; body='{"error":true}'
     else
       workspace=${url##*/}
-      if [[ "${DOCTOR_FIXTURE_EMPTY_WORKSPACE:-0}" == 1 ]]; then
-        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
+      prompt_file=${DOCTOR_FIXTURE_WORKSPACE_PROMPT_FILE:-${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md}
+      if [[ "${DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH:-0}" == 1 ]]; then
+        body=$(jq -cn --arg slug "$workspace" \
+          '{workspace:{slug:$slug,openAiPrompt:"虚构的运行时 Prompt 漂移",documents:[{docpath:"custom-documents/fixture.json"}]}}')
+      elif [[ "${DOCTOR_FIXTURE_EMPTY_WORKSPACE:-0}" == 1 ]]; then
+        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "$prompt_file" \
           '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[]}}')
       else
-        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
+        body=$(jq -cn --arg slug "$workspace" --rawfile prompt "$prompt_file" \
           '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[{docpath:"custom-documents/fixture.json"}]}}')
       fi
     fi

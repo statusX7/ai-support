@@ -185,6 +185,7 @@ secure_permissions "$DEPLOY_DIR"
 if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
+  refresh_program_file_mounts "$DEPLOY_DIR" || die '升级后的单文件程序挂载未完成刷新'
   wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"

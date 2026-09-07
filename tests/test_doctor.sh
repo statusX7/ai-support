@@ -19,6 +19,7 @@ STOPPED_FILE="${TEST_ROOT}/stopped-services"
 DB_PASSWORD_FILE="${TEST_ROOT}/postgres-running-password"
 N8N_DB_PASSWORD_FILE="${TEST_ROOT}/n8n-running-password"
 RUNTIME_ENV_FILE="${TEST_ROOT}/running-container-env.json"
+WORKSPACE_PROMPT_FILE="${TEST_ROOT}/anything-workspace-prompt.md"
 SYSTEMD_DIR="${TEST_ROOT}/systemd"
 
 cleanup() {
@@ -49,6 +50,7 @@ fixture_env() {
     DOCTOR_FIXTURE_DB_PASSWORD_FILE="$DB_PASSWORD_FILE" \
     DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE="$N8N_DB_PASSWORD_FILE" \
     DOCTOR_FIXTURE_RUNTIME_ENV_FILE="$RUNTIME_ENV_FILE" \
+    DOCTOR_FIXTURE_WORKSPACE_PROMPT_FILE="$WORKSPACE_PROMPT_FILE" \
     DOCTOR_FIXTURE_DAEMON_FAIL="${DOCTOR_FIXTURE_DAEMON_FAIL:-0}" \
     DOCTOR_FIXTURE_REMOTE_CONTEXT="${DOCTOR_FIXTURE_REMOTE_CONTEXT:-0}" \
     DOCTOR_FIXTURE_OOM_SERVICE="${DOCTOR_FIXTURE_OOM_SERVICE:-}" \
@@ -68,6 +70,9 @@ fixture_env() {
     DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS="${DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS:-0}" \
     DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS="${DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS:-0}" \
     DOCTOR_FIXTURE_MATERIALS_MISMATCH="${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" \
+    DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH="${DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH:-0}" \
+    DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH="${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" \
+    DOCTOR_FIXTURE_CADDY_FILE_MISMATCH="${DOCTOR_FIXTURE_CADDY_FILE_MISMATCH:-0}" \
     DOCTOR_FIXTURE_STDIN_PROBE="${DOCTOR_FIXTURE_STDIN_PROBE:-0}" \
     CRISPAI_LOGS_SYSTEMD_TEST=1 \
     CRISPAI_LOGS_SYSTEMD_DIR="$SYSTEMD_DIR" \
@@ -231,6 +236,8 @@ prepare_fixture() {
   source "${DEPLOY}/scripts/materials.sh"
   materials_prepare_candidate "$DEPLOY" "$materials_stage" 1 applied >/dev/null
   install -m 0640 -- "${materials_stage}/materials-applied.json" "${DEPLOY}/config/materials-applied.json"
+  jq -M -j '.prompt.text' "${materials_stage}/materials-applied.json" > "$WORKSPACE_PROMPT_FILE"
+  chmod 0600 "$WORKSPACE_PROMPT_FILE"
   find "$materials_stage" -depth -delete
   printf 'fixture backup\n' > "${DEPLOY}/backups/manual/fixture.txt"
   : > "${DEPLOY}/data/analytics/events.jsonl"
@@ -331,8 +338,10 @@ assert_result knowledge.catalog PASS
 assert_result n8n.runtime PASS
 assert_result provider.adapter PASS
 assert_result provider.adapter_binding PASS
+assert_result provider.adapter_code_binding PASS
 assert_result anything.provider_binding PASS
 assert_result n8n.runtime_binding PASS
+assert_result caddy.file_binding SKIP
 assert_result materials.applied PASS
 assert_result materials.runtime_binding PASS
 assert_result runtime.scheduler PASS
@@ -361,6 +370,7 @@ invoke --local
 (( LAST_RC == 2 )) || fail '有效原文待应用时应警告而非读取为当前运行配置'
 assert_result materials.applied WARN
 assert_result materials.runtime_binding PASS
+assert_result anything.workspace PASS
 cp -p -- "$prompt_saved" "${DEPLOY}/config/prompt.md"
 
 chmod 0644 "${DEPLOY}/config/prompt.md"
@@ -368,6 +378,7 @@ invoke --local
 (( LAST_RC == 2 )) || fail '可编辑原文权限损坏但有效投影存在时应警告'
 assert_result materials.applied WARN
 assert_result materials.runtime_binding PASS
+assert_result anything.workspace PASS
 cp -p -- "$prompt_saved" "${DEPLOY}/config/prompt.md"
 
 projection_saved="${TEST_ROOT}/materials-applied.saved.json"
@@ -378,7 +389,23 @@ invoke --local
 (( LAST_RC == 1 )) || fail '未完成 applying 投影不得通过运行时健康门禁'
 assert_result materials.applied FAIL
 assert_result materials.runtime_binding SKIP
+assert_result anything.workspace FAIL
 cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+
+rm -f -- "${DEPLOY}/config/materials-applied.json"
+invoke --local
+(( LAST_RC == 1 )) || fail 'legacy 无资料投影时整体资料门禁应失败，但工作区仍应按原 Prompt 准确诊断'
+assert_result anything.workspace PASS
+assert_result materials.applied FAIL
+cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+
+export DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH=1
+invoke --local
+(( LAST_RC == 1 )) || fail 'AnythingLLM 中 Prompt 偏离已应用投影时应退出 1'
+assert_result anything.workspace FAIL
+assert_result materials.applied PASS
+assert_result materials.runtime_binding PASS
+unset DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH
 
 export DOCTOR_FIXTURE_MATERIALS_MISMATCH=1
 invoke --local
@@ -683,6 +710,26 @@ invoke --local
 (( LAST_RC == 1 )) || fail 'adapter 容器路径故障应退出 1'
 assert_result provider.adapter FAIL
 unset DOCTOR_FIXTURE_ADAPTER_FAIL
+
+export DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH=1
+invoke --local
+(( LAST_RC == 1 )) || fail 'provider-adapter 仍读取旧脚本挂载时应退出 1'
+assert_result provider.adapter_code_binding FAIL
+unset DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH
+
+cp -p -- "${DEPLOY}/config/Caddyfile.example" "${DEPLOY}/config/Caddyfile"
+env_set "${DEPLOY}/.env" WEBHOOK_ACCESS_MODE managed_https
+invoke --local
+(( LAST_RC == 0 )) || fail '受管 HTTPS 的 Caddy 当前文件挂载一致时应通过'
+assert_result container.caddy PASS
+assert_result caddy.file_binding PASS
+export DOCTOR_FIXTURE_CADDY_FILE_MISMATCH=1
+invoke --local
+(( LAST_RC == 1 )) || fail 'Caddy 仍读取旧配置单文件挂载时应退出 1'
+assert_result caddy.file_binding FAIL
+unset DOCTOR_FIXTURE_CADDY_FILE_MISMATCH
+env_set "${DEPLOY}/.env" WEBHOOK_ACCESS_MODE external_proxy
+rm -f -- "${DEPLOY}/config/Caddyfile"
 pass 'AnythingLLM、workflow、Code runner 与 adapter 故障可独立定位'
 
 export DOCTOR_FIXTURE_REMOTE_CONTEXT=1
