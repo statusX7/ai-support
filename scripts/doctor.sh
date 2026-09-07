@@ -334,7 +334,16 @@ doctor_add() {
     SKIP) ((DOCTOR_SKIPS += 1)) ;;
     *) return 1 ;;
   esac
-  [[ "$status" != SKIP ]] || fact_state=not_applicable
+  case "$status" in
+    WARN) fact_state=pending ;;
+    SKIP)
+      if [[ "$summary" == 因* || "$summary" == *安装健康门禁* ]]; then
+        fact_state=pending
+      else
+        fact_state=not_applicable
+      fi
+      ;;
+  esac
   jq -M -cn \
     --arg id "$id" --arg name "$name" --arg status "$status" --arg severity "$severity" \
     --arg summary "$summary" --arg checked_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \

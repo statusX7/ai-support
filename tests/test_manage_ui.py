@@ -468,6 +468,17 @@ def main():
         terminal.expect("请选择："); terminal.send("0"); terminal.finish()
         assert (DEPLOY / "manage.sh").exists() and (DEPLOY / ".env").exists()
         passing("主菜单18真实uninstall入口数字取消不动服务或数据")
+        cache = DEPLOY / "logs/doctor-last.json"
+        cache.parent.mkdir(exist_ok=True)
+        cache.write_text(json.dumps({"schema_version": 1, "checked_at": "2026-09-07T00:00:00Z", "summary": {"fail": 1, "warn": 2}}))
+        before_configuration = current_configuration()
+        before_provider = provider_history()
+        terminal = Terminal("cached-doctor-summary")
+        terminal.expect("上次自检（缓存）：2026-09-07T00:00:00Z；失败 1，警告 2")
+        terminal.expect("请选择："); terminal.send("0"); terminal.finish()
+        assert current_configuration() == before_configuration and provider_history() == before_provider
+        cache.unlink()
+        passing("主菜单只读带时间缓存，不联网、不把旧状态冒充当前自检")
         print(f"管理入口专项：{COUNT} 通过，0 失败。协议Fixture不是空机/真实Docker证据。")
         print(f"脱敏测试转录：{WORK.relative_to(ROOT)}")
     finally:

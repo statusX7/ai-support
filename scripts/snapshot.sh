@@ -95,14 +95,93 @@ fi
 SNAPSHOT_MIN_FREE_MB_VALUE=$((10#$SNAPSHOT_MIN_FREE_MB_VALUE))
 SNAPSHOT_RETENTION_COUNT_VALUE=$((10#$SNAPSHOT_RETENTION_COUNT_VALUE))
 
-ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env .env.example docker-compose.yml get.sh install.sh manage.sh update.sh uninstall.sh)
+ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env .env.example docker-compose.yml install.sh manage.sh update.sh uninstall.sh)
+OPTIONAL_ROOT_FILES=(get.sh)
 CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
 OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh doctor.sh)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
 OPTIONAL_DOC_FILES=(RELEASE.md)
+
+snapshot_version_at_least() {
+  local value=$1 wanted_major=$2 wanted_minor=$3 wanted_patch=$4 major minor patch
+  IFS=. read -r major minor patch <<< "${value#v}"
+  (( 10#$major > wanted_major \
+    || (10#$major == wanted_major && 10#$minor > wanted_minor) \
+    || (10#$major == wanted_major && 10#$minor == wanted_minor && 10#$patch >= wanted_patch) ))
+}
+
+# get.sh 与 doctor.sh 是 v1.1.1 新增的版本能力。目标版本自身缺失时拒绝生成
+# 不完整快照；从 v1.1.0 升级时则允许旧部署尚无这些文件。
+if snapshot_version_at_least "$VERSION_VALUE" 1 1 1; then
+  ROOT_FILES+=(get.sh)
+  OPTIONAL_ROOT_FILES=()
+  SCRIPT_FILES+=(doctor.sh)
+  OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
+fi
+
+snapshot_validate_file() {
+  local relative=$1 label=$2 path="${DEPLOY_DIR}/${1}"
+  [[ -f "$path" && ! -L "$path" ]] || die "${label}缺失或不安全：${relative}"
+}
+
+snapshot_validate_optional_file() {
+  local relative=$1 label=$2 path="${DEPLOY_DIR}/${1}"
+  if [[ -e "$path" || -L "$path" ]]; then
+    snapshot_validate_file "$relative" "$label"
+  fi
+}
+
+snapshot_validate_tree() {
+  local relative=$1 item name source="${DEPLOY_DIR}/${1}"
+  [[ -d "$source" && ! -L "$source" ]] || die "快照源目录缺失或不安全：$relative"
+  while IFS= read -r -d '' item; do
+    name=${item#"$source"/}
+    [[ "$name" != *\\* && "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] \
+      || die "快照源包含不安全文件名：$relative"
+    [[ ! -L "$item" && ( -f "$item" || -d "$item" ) ]] \
+      || die "快照源包含链接或特殊文件：$relative"
+  done < <(find "$source" -mindepth 1 -print0)
+}
+
+# 在容量检查及停服务之前完成源代际和树结构检查。这样 --check-capacity 不会
+# 对缺模块的部署给出假绿灯，正式快照也不会先暂停服务才发现源文件损坏。
+for name in "${ROOT_FILES[@]}"; do
+  snapshot_validate_file "$name" '快照源文件'
+done
+for name in "${OPTIONAL_ROOT_FILES[@]}"; do
+  snapshot_validate_optional_file "$name" '可选快照源文件'
+done
+for name in "${CONFIG_FILES[@]}"; do
+  snapshot_validate_optional_file "config/${name}" '快照配置文件'
+done
+for name in "${SCRIPT_FILES[@]}"; do
+  snapshot_validate_file "scripts/${name}" '快照脚本'
+done
+for name in "${OPTIONAL_SCRIPT_FILES[@]}"; do
+  snapshot_validate_optional_file "scripts/${name}" '可选快照脚本'
+done
+for name in "${DOC_FILES[@]}"; do
+  snapshot_validate_file "docs/${name}" '快照文档'
+done
+for name in "${OPTIONAL_DOC_FILES[@]}"; do
+  snapshot_validate_optional_file "docs/${name}" '可选快照文档'
+done
+snapshot_validate_file 'n8n/workflow.json' '快照 workflow'
+for directory in config knowledge n8n scripts docs data/anythingllm; do
+  snapshot_validate_tree "$directory"
+done
+for directory in data/n8n data/runtime; do
+  [[ ! -e "${DEPLOY_DIR}/${directory}" && ! -L "${DEPLOY_DIR}/${directory}" ]] \
+    || snapshot_validate_tree "$directory"
+done
+snapshot_validate_optional_file 'data/knowledge-manifest.json' '知识索引清单'
+
 SNAPSHOT_SOURCE_PATHS=()
 for name in "${ROOT_FILES[@]}"; do
+  SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${name}")
+done
+for name in "${OPTIONAL_ROOT_FILES[@]}"; do
   [[ -e "${DEPLOY_DIR}/${name}" ]] && SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${name}")
 done
 for directory in config knowledge n8n scripts docs data/anythingllm data/n8n data/runtime; do
@@ -182,6 +261,12 @@ restart_paused_services() {
 for name in "${ROOT_FILES[@]}"; do
   [[ -f "${DEPLOY_DIR}/${name}" && ! -L "${DEPLOY_DIR}/${name}" ]] || die "快照源文件缺失或不安全：$name"
   install -m 0600 -- "${DEPLOY_DIR}/${name}" "$STAGING/payload/${name}"
+done
+for name in "${OPTIONAL_ROOT_FILES[@]}"; do
+  if [[ -e "${DEPLOY_DIR}/${name}" || -L "${DEPLOY_DIR}/${name}" ]]; then
+    snapshot_validate_file "$name" '可选快照源文件'
+    install -m 0600 -- "${DEPLOY_DIR}/${name}" "$STAGING/payload/${name}"
+  fi
 done
 for name in "${CONFIG_FILES[@]}"; do
   if [[ -f "${DEPLOY_DIR}/config/${name}" && ! -L "${DEPLOY_DIR}/config/${name}" ]]; then

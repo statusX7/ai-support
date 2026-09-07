@@ -52,6 +52,19 @@ menu_fit_text() {
   (( used >= limit )) || printf '%*s' "$((limit-used))" ''
 }
 
+menu_cached_diagnostic() {
+  local cache="${1}/logs/doctor-last.json" summary
+  if [[ -f "$cache" && ! -L "$cache" ]] && command -v jq >/dev/null 2>&1; then
+    summary=$(jq -M -er 'select(.schema_version == 1) |
+      select(.checked_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
+      select(.summary.fail | type == "number" and . >= 0) |
+      select(.summary.warn | type == "number" and . >= 0) |
+      "上次自检（缓存）：\(.checked_at)；失败 \(.summary.fail)，警告 \(.summary.warn)"' "$cache" 2>/dev/null || true)
+    if [[ -n "$summary" ]]; then printf '%s\n' "$summary"; return; fi
+  fi
+  printf '上次自检：未检测（菜单 2）\n'
+}
+
 menu_render() {
   local version=$1 deploy_dir=$2 enabled=$3 crisp=$4 libraries=$5
   local columns=${COLUMNS:-0} index title left right column_width
@@ -63,7 +76,9 @@ menu_render() {
   fi
   [[ "$columns" =~ ^[1-9][0-9]{1,3}$ ]] || columns=80
   printf '\nCrispAI %s\n自动客服：%s    Crisp：%s    知识库：%s\n' "$version" "$enabled" "$crisp" "$libraries"
-  printf '部署目录：%s\n\n' "$deploy_dir"
+  printf '部署目录：%s\n' "$deploy_dir"
+  menu_cached_diagnostic "$deploy_dir"
+  printf '\n'
   if [[ "${TERM:-dumb}" != dumb && -t 1 && "$columns" -ge 80 ]] && menu_utf8_enabled; then
     column_width=$(( (columns-4)/2 )); (( column_width <= 48 )) || column_width=48
     for (( index=0; index<${#MENU_TITLES[@]}; index+=2 )); do

@@ -130,6 +130,6 @@ crispai doctor --full
 
 下载 403/404/429、DNS/TLS、无 TTY、checksum、Docker、模型 401/403、知识 pending、Hook 无回调或 `crispai` 找不到，按 [故障排查](TROUBLESHOOTING.md) 的对应项处理。不要使用 `curl -k`、修改 checksum、全局 Docker prune 或重新安装来掩盖配置错误。
 
-指定正式版本、离线受控部署、发布资产人工审计和维护者打包流程属于高级操作，见 [发布与维护](RELEASE.md)。公开仓库的匿名安装不需要 Git/gh；GitHub CLI 只用于维护者发布或高级下载，不是客服运行依赖。
+指定正式版本、离线受控部署和旧版在线升级见 [可选高级维护](ADVANCED.md)；发布资产审计和维护者打包流程见 [发布流程](RELEASE.md)。公开仓库的匿名安装不需要 Git/gh；GitHub CLI 只用于维护者发布或高级下载，不是客服运行依赖。
 
 公开源码不包含你的 `.env`、Token、Prompt、知识、客户消息、数据库或完整备份。诊断包与 Issue 也只能上传脱敏内容，详见 [安全说明](SECURITY.md)。

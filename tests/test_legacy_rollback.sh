@@ -89,6 +89,49 @@ env \
   || fail "v1.1.0 隔离安装未形成预期 local-ready（状态 ${install_status}）"
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.1.0 ]] || fail '旧版隔离实例版本错误'
 
+# v1.1.1 的目标版快照器必须能直接处理尚无 get.sh/doctor.sh 的真实 v1.1.0
+# 部署；这是在线升级创建更新前快照时实际采用的调用方向。
+: > "$MOCK_DOCKER_LOG"
+"${PROJECT_ROOT}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --check-capacity --quiet
+[[ ! -s "$MOCK_DOCKER_LOG" ]] \
+  || fail '目标版容量预检不应暂停或启动旧部署服务'
+TARGET_COMPAT_SNAPSHOT_ID=$("${PROJECT_ROOT}/scripts/snapshot.sh" \
+  --deploy-dir "$DEPLOY_DIR" --reason target-v1.1.1-over-v1.1.0 --quiet)
+TARGET_COMPAT_ARCHIVE="${DEPLOY_DIR}/backups/versions/${TARGET_COMPAT_SNAPSHOT_ID}/snapshot.tar.gz"
+[[ -f "$TARGET_COMPAT_ARCHIVE" && ! -L "$TARGET_COMPAT_ARCHIVE" ]] \
+  || fail '目标版快照器未能为真实 v1.1.0 部署创建快照'
+TARGET_COMPAT_LIST=$(tar -tzf "$TARGET_COMPAT_ARCHIVE")
+grep -Fxq 'payload/install.sh' <<< "$TARGET_COMPAT_LIST" \
+  || fail '目标版兼容快照缺少传统安装入口'
+if grep -Eq '^payload/(get\.sh|scripts/doctor\.sh)$' <<< "$TARGET_COMPAT_LIST"; then
+  fail '目标版快照器向 v1.1.0 快照混入了不存在的新版本能力'
+fi
+
+# 同一检查对 v1.1.1 自身仍必须要求新能力，不能将损坏的新部署降级成
+# “旧版兼容”；且源文件错误必须在 --check-capacity 阶段、停服务之前发现。
+cp -p -- "${DEPLOY_DIR}/VERSION" "${TEST_ROOT}/VERSION.saved"
+printf 'v1.1.1\n' > "${DEPLOY_DIR}/VERSION"
+: > "$MOCK_DOCKER_LOG"
+missing_capability_status=0
+"${PROJECT_ROOT}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --check-capacity --quiet \
+  > "${TEST_ROOT}/missing-capability.log" 2>&1 || missing_capability_status=$?
+install -m 0600 -- "${TEST_ROOT}/VERSION.saved" "${DEPLOY_DIR}/VERSION"
+(( missing_capability_status != 0 )) || fail 'v1.1.1 缺少 get.sh 时容量预检错误通过'
+grep -Fq '快照源文件缺失或不安全：get.sh' "${TEST_ROOT}/missing-capability.log" \
+  || fail 'v1.1.1 能力缺失没有指出 get.sh'
+[[ ! -s "$MOCK_DOCKER_LOG" ]] || fail '版本能力预检失败后仍操作了服务'
+
+mv -- "${DEPLOY_DIR}/manage.sh" "${TEST_ROOT}/manage.sh.saved"
+: > "$MOCK_DOCKER_LOG"
+missing_core_status=0
+"${PROJECT_ROOT}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --check-capacity --quiet \
+  > "${TEST_ROOT}/missing-core.log" 2>&1 || missing_core_status=$?
+mv -- "${TEST_ROOT}/manage.sh.saved" "${DEPLOY_DIR}/manage.sh"
+(( missing_core_status != 0 )) || fail '缺少传统入口时容量预检错误通过'
+grep -Fq '快照源文件缺失或不安全：manage.sh' "${TEST_ROOT}/missing-core.log" \
+  || fail '传统入口缺失没有在容量预检中准确报告'
+[[ ! -s "$MOCK_DOCKER_LOG" ]] || fail '源完整性预检失败后仍操作了服务'
+
 LEGACY_SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" \
   --deploy-dir "$DEPLOY_DIR" --reason legacy-v1.1.0-layout --quiet)
 LEGACY_SNAPSHOT_DIR="${DEPLOY_DIR}/backups/versions/${LEGACY_SNAPSHOT_ID}"
