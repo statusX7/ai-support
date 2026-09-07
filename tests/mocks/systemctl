@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 生命周期夹具按单元保存状态，绝不透传到宿主 systemd。
+state=${MOCK_SYSTEMD_STATE:?}
+mkdir -p -- "$state"
+command_name=${1:-}
+[[ "$command_name" != daemon-reload ]] || exit 0
+unit=${*: -1}
+[[ "$unit" =~ ^crispai-log-maintenance-[0-9a-f]{16}\.(timer|service)$ ]] || exit 2
+enabled="$state/${unit}.enabled"
+active="$state/${unit}.active"
+case "$command_name" in
+  enable)
+    [[ " $* " == *' --now '* ]] || exit 2
+    : > "$enabled"; : > "$active"
+    ;;
+  disable)
+    [[ " $* " == *' --now '* ]] || exit 2
+    rm -f -- "$enabled" "$active"
+    ;;
+  start) : > "$active" ;;
+  stop) rm -f -- "$active" ;;
+  is-enabled) [[ -f "$enabled" ]] ;;
+  is-active) [[ -f "$active" ]] && exit 0; exit 3 ;;
+  *) exit 2 ;;
+esac

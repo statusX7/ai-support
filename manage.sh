@@ -15,14 +15,23 @@ DEPLOY_REQUEST=""
 ORIGINAL_ARGS=("$@")
 MANAGE_COMMAND=menu
 DOCTOR_ARGS=()
+LOG_ARGS=()
+MATERIALS_COMMAND=apply
+MATERIALS_ARGS=()
 MANAGE_EOF=0
 MANAGE_TEMP=""
+MANAGE_READER_PID=''
+MANAGE_READER_DIR=''
+MANAGE_READER_TTY=''
+MANAGE_INPUT_SIGNAL=0
 
 manage_usage() {
   printf '%s\n' '用法：crispai [--deploy-dir PATH] [命令]' '无参数打开中文管理菜单。' \
     'status：本地状态；doctor：非破坏自检；init：快速初始化或继续安装。' \
     'doctor [--local|--full] [--json] [--fix]：本地/完整检查、JSON 与显式安全修复。' \
     'enable / disable：客服总开关；uninstall：数字确认卸载。' \
+    'apply [--check|--force-external]：应用资料；--check 只校验，--force-external 重新同步并回读组件。' \
+    'logs --help：日志查看、清理和保留策略。' \
     '--help / --version：帮助与版本，不要求 Docker 或完整配置。'
 }
 
@@ -31,9 +40,20 @@ while (( $# > 0 )); do
     --deploy-dir) (( $# >= 2 )) || die '--deploy-dir 缺少参数'; DEPLOY_REQUEST=$2; shift 2 ;;
     --help|-h) manage_usage; exit 0 ;;
     --version) printf '%s\n' "$(<"${SCRIPT_DIR}/VERSION")"; exit 0 ;;
-    menu|status|init|doctor|enable|disable|uninstall)
+    logs)
+      [[ "$MANAGE_COMMAND" == menu ]] || die '一次只能执行一个管理命令'
+      MANAGE_COMMAND=logs; shift; LOG_ARGS=("$@"); break ;;
+    menu|status|init|doctor|enable|disable|uninstall|apply)
       [[ "$MANAGE_COMMAND" == menu ]] || die '一次只能执行一个管理命令'
       MANAGE_COMMAND=$1; shift ;;
+    --check)
+      [[ "$MANAGE_COMMAND" == apply ]] || { printf '错误：--check 仅用于 apply。\n' >&2; exit 64; }
+      (( ${#MATERIALS_ARGS[@]} == 0 )) || { printf '错误：只校验不能同时强制应用。\n' >&2; exit 64; }
+      MATERIALS_COMMAND=validate; shift ;;
+    --force-external)
+      [[ "$MANAGE_COMMAND" == apply && "$MATERIALS_COMMAND" == apply && ${#MATERIALS_ARGS[@]} == 0 ]] \
+        || { printf '错误：--force-external 仅用于 apply，不能与 --check 或自身重复。\n' >&2; exit 64; }
+      MATERIALS_ARGS=(--force-external); shift ;;
     --local|--full|--json|--fix|--last|--offline)
       [[ "$MANAGE_COMMAND" == doctor ]] || { printf '错误：%s 仅用于 doctor 命令。\n' "$1" >&2; exit 64; }
       DOCTOR_ARGS+=("$1"); shift ;;
@@ -56,23 +76,86 @@ if [[ "$MANAGE_COMMAND" == doctor ]]; then
 fi
 bootstrap_prepare_minimal_dependencies || die '基础工具自动修复失败，请查看上方具体原因'
 
+manage_reader_cleanup() {
+  local interrupted=${1:-0}
+  if [[ -n "$MANAGE_READER_PID" ]]; then
+    # 仅终止当前输入子进程，不能向菜单/服务所在进程组广播信号。
+    kill -TERM "$MANAGE_READER_PID" 2>/dev/null || true
+    wait "$MANAGE_READER_PID" 2>/dev/null || true
+    MANAGE_READER_PID=''
+  fi
+  if [[ -n "$MANAGE_READER_TTY" ]]; then
+    if (( interrupted )); then
+      # 定向 kill 不会像终端 Ctrl+C 一样丢弃尚未换行的秘密输入。
+      python3 -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)' 2>/dev/null || true
+    fi
+    stty "$MANAGE_READER_TTY" <&0 2>/dev/null || true
+    MANAGE_READER_TTY=''
+  fi
+  if [[ "$MANAGE_READER_DIR" == /tmp/crispai-menu-input.* && -d "$MANAGE_READER_DIR" && ! -L "$MANAGE_READER_DIR" ]]; then
+    rm -f -- "$MANAGE_READER_DIR/line"
+    rmdir -- "$MANAGE_READER_DIR"
+  fi
+  MANAGE_READER_DIR=''
+}
+
 manage_cleanup() {
+  manage_reader_cleanup 1
   if [[ -n "$MANAGE_TEMP" && "$MANAGE_TEMP" == "$DEPLOY_DIR"/tmp/manage.* && -d "$MANAGE_TEMP" && ! -L "$MANAGE_TEMP" ]]; then
     find "$MANAGE_TEMP" -depth -delete
   fi
 }
 trap manage_cleanup EXIT
-trap 'printf "\n操作已中断；已生效配置保留，未确认输入未应用。\n" >&2; exit 130' INT TERM
+manage_interrupt() {
+  trap '' INT TERM
+  printf '\n操作已中断；已生效配置保留，未确认输入未应用。\n' >&2
+  exit 130
+}
+trap manage_interrupt INT TERM
+
+menu_input_line() {
+  local input_target=$1 input_prompt=${2:-} input_hidden=${3:-0} input_status=0 input_value
+  # Bash 5.2 的 read 在信号早于 read(2) 时可能延后执行 trap，read -p 也有此窗口。
+  # 将读取隔离；父进程使用会检查 pending trap 的 wait，不用超时轮询。
+  MANAGE_INPUT_SIGNAL=0
+  trap 'MANAGE_INPUT_SIGNAL=1' INT TERM
+  MANAGE_READER_DIR=$(mktemp -d /tmp/crispai-menu-input.XXXXXXXX) || input_status=1
+  if (( input_status == 0 )); then
+    : > "$MANAGE_READER_DIR/line"
+    if (( input_hidden )) && [[ -t 0 ]]; then
+      MANAGE_READER_TTY=$(stty -g <&0) || input_status=1
+      if (( input_status == 0 )); then stty -echo <&0 || input_status=1; fi
+    fi
+  fi
+  if (( input_status == 0 && MANAGE_INPUT_SIGNAL == 0 )); then
+    (
+      # 异步 Bash 默认忽略 INT；父进程负责用默认 TERM 结束这个唯一 reader。
+      trap - INT TERM EXIT
+      printf '%s' "$input_prompt"
+      IFS= read -r input_value || exit 1
+      printf '%s' "$input_value" > "$MANAGE_READER_DIR/line"
+    ) <&0 &
+    MANAGE_READER_PID=$!
+  fi
+  trap manage_interrupt INT TERM
+  (( MANAGE_INPUT_SIGNAL == 0 )) || manage_interrupt
+  if (( input_status == 0 )); then
+    wait "$MANAGE_READER_PID" || input_status=$?
+    MANAGE_READER_PID=''
+  fi
+  if (( input_status == 0 )); then input_value=$(<"$MANAGE_READER_DIR/line"); fi
+  manage_reader_cleanup
+  (( input_status < 128 )) || manage_interrupt
+  (( input_status == 0 )) || return "$input_status"
+  printf -v "$input_target" '%s' "$input_value"
+}
 
 menu_read() {
   local target=$1 prompt=$2 hidden=${3:-0} typed
-  printf '%s' "$prompt"
-  if (( hidden )); then
-    if ! IFS= read -r -s typed; then MANAGE_EOF=1; printf '\n输入已结束。\n'; return 1; fi
-    printf '\n'
-  elif ! IFS= read -r typed; then
+  if ! menu_input_line typed "$prompt" "$hidden"; then
     MANAGE_EOF=1; printf '\n输入已结束，未确认操作已取消。\n'; return 1
   fi
+  if (( hidden )); then printf '\n'; fi
   printf -v "$target" '%s' "$typed"
 }
 
@@ -125,10 +208,11 @@ manager_apply() { manager_action manager_tool configuration apply "$1" --input "
 
 menu_multiline() {
   local output=$1 line bytes=0 max_bytes=${2:-262144}
+  local LC_ALL=C
   printf '请粘贴多行正文。单独一行 ::END:: 保存，::CANCEL:: 取消。\n正文需要结束符字面量时，在行首加反斜线，例如 \\::END::。\n'
   : > "$output"
   while true; do
-    if ! IFS= read -r line; then MANAGE_EOF=1; warn '输入结束，正文未应用'; return 1; fi
+    if ! menu_input_line line; then MANAGE_EOF=1; warn '输入结束，正文未应用'; return 1; fi
     case "$line" in ::END::) break ;; ::CANCEL::) printf '已取消正文修改。\n'; return 1 ;; '\::END::'|'\::CANCEL::') line=${line:1} ;; esac
     bytes=$((bytes+${#line}+1))
     (( bytes <= max_bytes )) || { warn '正文超过输入上限，未应用'; return 1; }
@@ -159,7 +243,7 @@ quick_initialization() {
 }
 
 show_installation_facts() {
-  local fact label value
+  local fact label value state_file
   if [[ ! -f "$DEPLOY_DIR/$INSTALL_MARKER" ]]; then printf '本地尚未初始化；运行 crispai init。\n'; return; fi
   printf '安装状态：%s\n' "$(installation_state "$DEPLOY_DIR")"
   for fact in dependencies local_services app_config provider crisp_api webhook conversation; do
@@ -170,8 +254,12 @@ show_installation_facts() {
     value=$(installation_fact "$DEPLOY_DIR" "$fact" 2>/dev/null || true)
     printf '%s：%s\n' "$label" "${value:-未检测}"
   done
-  if [[ -f "$DEPLOY_DIR/config/runtime.yaml" ]]; then
-    jq -M -Mr '"客服总开关：\(if .enabled then "启用" else "停用" end)；配置版本：\(.revision // 0) / 已应用：\(.applied_revision // 0)"' "$DEPLOY_DIR/config/runtime.yaml"
+  state_file="$DEPLOY_DIR/config/runtime.yaml"
+  if [[ -f "$DEPLOY_DIR/config/materials-applied.json" ]]; then state_file="$DEPLOY_DIR/config/materials-applied.json"; fi
+  if [[ -f "$state_file" && ! -L "$state_file" ]]; then
+    jq -M -r '(.configuration.runtime // .) | select(.enabled|type=="boolean") |
+      "客服总开关（已应用）：\(if .enabled then "启用" else "停用" end)；配置版本：\(.revision // 0) / 已应用：\(.applied_revision // 0)"' \
+      "$state_file" 2>/dev/null || printf '客服配置：无法解析；请从菜单 2 检查，未修改当前配置。\n'
   fi
 }
 
@@ -779,32 +867,79 @@ update_rollback_menu() {
   done
 }
 
-redact_logs() {
-  local line secret key
-  local -a secrets=()
-  for key in AI_API_KEY CRISP_TOKEN_IDENTIFIER CRISP_TOKEN_KEY CRISP_AUTH_B64 CRISP_WEBSITE_HOOK_SECRET CRISP_PLUGIN_SIGNING_SECRET ANYTHINGLLM_API_KEY POSTGRES_PASSWORD N8N_ENCRYPTION_KEY; do
-    secret=$(env_get "$DEPLOY_DIR/.env" "$key" 2>/dev/null || true); [[ -z "$secret" ]] || secrets+=("$secret")
-  done
-  while IFS= read -r line; do
-    for secret in "${secrets[@]}"; do line=${line//"$secret"/[REDACTED]}; done
-    printf '%s\n' "$line"
-  done
+menu_log_source() {
+  local filter=${1:-all} list
+  manager_temporary || return 1
+  list=$MANAGE_FILE
+  manager_tool logs sources --json > "$list" || return 1
+  jq -M --arg filter "$filter" '.sources | map(select(
+    if $filter=="follow" then .followable
+    elif $filter=="mutable" then .mutable
+    else true end))' "$list" > "$list.filtered" || return 1
+  menu_pick_json "$list.filtered" id name
+}
+
+follow_log_source() {
+  local source=$1 status=0
+  printf '持续查看日志，Ctrl+C 仅停止查看并返回日志菜单。\n'
+  # 父菜单与前台查看进程同属终端进程组；只在查看期间抑制父菜单退出。
+  trap ':' INT
+  bash "$DEPLOY_DIR/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" follow "$source" || status=$?
+  trap manage_interrupt INT
+  if (( status == 130 )); then printf '\n已停止日志查看，服务未停止。\n'; return 0; fi
+  return "$status"
 }
 
 diagnostics_menu() {
-  local choice service path
+  local choice source lines since days size files operation
+  local -a viewing=()
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. n8n 最近日志\n2. AnythingLLM 最近日志\n3. PostgreSQL 最近日志\n4. 导出脱敏诊断信息\n5. 查看排障说明\n0. 返回\n'
+    printf '\n1. 日志来源、占用与保留策略\n2. 按来源查看最近日志\n3. 持续查看指定来源（Ctrl+C 返回）\n4. 轮转或清空选定受管日志\n5. 删除指定天数以前的历史日志\n6. 修改保留天数与容量限制\n7. 按当前策略立即清理过期日志\n8. 导出脱敏诊断包\n9. 查看排障说明\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1|2|3) case "$choice" in 1) service=n8n ;; 2) service=anythingllm ;; 3) service=postgres ;; esac
-        printf '已替换已知秘密，日志仍可能含业务错误摘要，请勿公开。\n'
-        docker_compose "$DEPLOY_DIR" logs --tail 200 --no-color "$service" 2>&1 | redact_logs || warn '读取日志失败' ;;
-      4) manager_temporary || return; path=$MANAGE_FILE
-        { printf 'CrispAI %s\n' "$(<"$SCRIPT_DIR/VERSION")"; show_installation_facts; } > "$path"
-        install -m 0600 -- "$path" "$DEPLOY_DIR/logs/diagnostics.txt"
-        printf '诊断信息：%s/logs/diagnostics.txt（不含环境值、聊天或知识正文）\n' "$DEPLOY_DIR" ;;
-      5) show_document TROUBLESHOOTING.md ;;
+      1) manager_action manager_tool logs status ;;
+      2) menu_log_source || continue; source=$MENU_SELECTED_ID
+        menu_read lines '最近行数（1～2000，0 或回车返回）：' || return
+        if [[ ! "$lines" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$lines > 2000 )); then continue; fi
+        menu_read since '时间窗口（如 30m、2h、7d；回车不限定）：' || return
+        viewing=(show "$source" --lines "$lines")
+        [[ -z "$since" ]] || viewing+=(--since "$since")
+        manager_action manager_tool logs "${viewing[@]}" ;;
+      3) menu_log_source follow || continue
+        manager_action follow_log_source "$MENU_SELECTED_ID" ;;
+      4) menu_log_source mutable || continue; source=$MENU_SELECTED_ID; operation=clear
+        if [[ "$source" == maintenance ]]; then
+          printf '1. 轮转当前维护日志\n2. 清空该维护日志\n0. 返回\n'
+          menu_read choice '请选择：' || return
+          case "$choice" in 1) operation=rotate ;; 2) ;; *) continue ;; esac
+        fi
+        if manager_tool logs "$operation" "$source" --preview \
+          && menu_confirm '只处理上述日志；清空内容不可恢复。确认？'; then
+          manager_action manager_tool logs "$operation" "$source" --apply
+        fi ;;
+      5) menu_read days '删除多少天以前的受管历史（1～3650，0 或回车返回）：' || return
+        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$days > 3650 )); then continue; fi
+        if manager_tool logs cleanup --days "$days" --preview \
+          && menu_confirm '删除上述历史日志（不可恢复），不改变当前保留策略？'; then
+          manager_action manager_tool logs cleanup --days "$days" --apply
+        fi ;;
+      6) manager_action manager_tool logs policy
+        printf '文件日志按天清理；Docker 按每容器容量轮转；n8n execution 按小时保留。\n'
+        menu_read days '文件日志保留天数（1～3650，0 或回车返回）：' || return
+        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$days > 3650 )); then continue; fi
+        menu_read size '每份日志上限 MiB（正整数，回车返回）：' || return
+        [[ "$size" =~ ^[1-9][0-9]{0,3}$ ]] || continue
+        menu_read files '最多保留份数（1～20，回车返回）：' || return
+        if [[ ! "$files" =~ ^[1-9][0-9]?$ ]] || (( 10#$files > 20 )); then continue; fi
+        if manager_tool logs configure --days "$days" --max-size-mib "$size" --max-files "$files" --preview \
+          && menu_confirm '应用容量策略需要重建本项目容器，短暂停机但保留数据及人工状态。继续？'; then
+          manager_action manager_tool logs configure --days "$days" --max-size-mib "$size" --max-files "$files" --apply
+        fi ;;
+      7) if manager_tool logs cleanup --preview && menu_confirm '按当前策略删除上述过期日志（不可恢复）？'; then
+          manager_action manager_tool logs cleanup --apply
+        fi ;;
+      8) manager_action manager_tool logs export ;;
+      9) show_document TROUBLESHOOTING.md ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -817,15 +952,30 @@ maintain_services() (
 
 services_menu() {
   local choice
+  local -a material_options=()
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 启动本项目服务\n2. 停止本项目服务\n3. 重启本项目服务\n4. 检查依赖与 Docker\n5. 自动修复依赖\n6. 重新同步配置与工作流\n7. 修复 crispai 入口\n0. 返回\n'
+    printf '\n1. 启动本项目服务\n2. 停止本项目服务\n3. 重启本项目服务\n4. 检查依赖与 Docker\n5. 自动修复依赖\n6. 校验并应用已编辑资料\n7. 修复 crispai / crisp 入口\n8. 查看用户资料路径与未应用变更\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
       1) manager_action maintain_services up -d ;;
       2) if menu_confirm '停机时无法接收 Hook/真人事件。停止本项目？'; then manager_action maintain_services stop; fi ;;
       3) if menu_confirm '重启本项目服务？人工状态会保留。'; then manager_action maintain_services restart; fi ;;
       4) manager_action bash "$DEPLOY_DIR/scripts/bootstrap.sh" --check ;; 5) manager_action bash "$DEPLOY_DIR/scripts/bootstrap.sh" --all ;;
-      6) manager_action manager_tool configuration resync ;; 7) manager_action bash "$DEPLOY_DIR/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" ;;
+      6) printf '会校验原文，备份上一有效版并同步 Prompt/知识；慢同步期间暂缓自动回复，不清空人工状态。\n'
+        printf '1. 仅应用已编辑的资料变更\n2. 重新同步现有资料并回读组件（增量知识对账）\n0. 返回\n'
+        menu_read choice '请选择：' || return
+        material_options=()
+        case "$choice" in
+          1) ;;
+          2) material_options=(--force-external) ;;
+          0|'') continue ;;
+          *) warn '请输入有效数字'; continue ;;
+        esac
+        if menu_confirm '按上述范围校验并应用用户资料？'; then
+          manager_action manager_tool materials apply "${material_options[@]}"
+        fi ;;
+      7) manager_action bash "$DEPLOY_DIR/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" ;;
+      8) manager_action manager_tool materials status ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -870,18 +1020,26 @@ case "$MANAGE_COMMAND" in
   status) show_installation_facts; exit 0 ;; init) quick_initialization; exit 0 ;; doctor) doctor; exit $? ;;
   enable) require_installation; set_global_switch true; exit $? ;; disable) require_installation; set_global_switch false; exit $? ;;
   uninstall) require_installation; uninstall_menu; exit 0 ;;
+  apply) require_installation; manager_tool materials "$MATERIALS_COMMAND" "${MATERIALS_ARGS[@]}"; exit $? ;;
+  logs) require_installation; manager_tool logs "${LOG_ARGS[@]}"; exit $? ;;
 esac
 
 while (( MANAGE_EOF == 0 )); do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
   MENU_ENABLED=未配置 MENU_CRISP=未检测 MENU_KNOWLEDGE=0
-  if [[ -f "$DEPLOY_DIR/config/runtime.yaml" ]]; then MENU_ENABLED=$(jq -M -r 'if .enabled then "启用" else "停用" end' "$DEPLOY_DIR/config/runtime.yaml" 2>/dev/null || printf 未检测); fi
+  if [[ -f "$DEPLOY_DIR/config/materials-applied.json" && ! -L "$DEPLOY_DIR/config/materials-applied.json" ]]; then
+    MENU_ENABLED=$(jq -M -er 'if .state == "applying" then "应用中" elif .state == "applied" and (.configuration.runtime.enabled|type=="boolean") then
+      (if .configuration.runtime.enabled then "启用" else "停用" end) else error("invalid") end' "$DEPLOY_DIR/config/materials-applied.json" 2>/dev/null || printf 未检测)
+  elif [[ -f "$DEPLOY_DIR/config/runtime.yaml" && ! -L "$DEPLOY_DIR/config/runtime.yaml" ]]; then
+    MENU_ENABLED=$(jq -M -er 'if (.enabled|type)=="boolean" then (if .enabled then "启用" else "停用" end) else error("invalid") end' "$DEPLOY_DIR/config/runtime.yaml" 2>/dev/null || printf 未检测)
+  fi
   if [[ -f "$DEPLOY_DIR/$INSTALL_MARKER" ]]; then
     case "$(installation_fact "$DEPLOY_DIR" conversation 2>/dev/null || true)" in ready) MENU_CRISP=已验证 ;; *) MENU_CRISP=待验证 ;; esac
   fi
   if [[ -f "$DEPLOY_DIR/knowledge/catalog.json" ]]; then MENU_KNOWLEDGE=$(jq -M '[.libraries[]? | select(.enabled)] | length' "$DEPLOY_DIR/knowledge/catalog.json" 2>/dev/null || printf 0); fi
   menu_render "$CURRENT_VERSION" "$DEPLOY_DIR" "$MENU_ENABLED" "$MENU_CRISP" "$MENU_KNOWLEDGE"
-  if ! IFS= read -r CHOICE; then printf '\n输入结束，已退出。\n'; exit 0; fi
+  CHOICE=''
+  if ! menu_read CHOICE '请选择：'; then printf '\n输入结束，已退出。\n'; exit 0; fi
   case "$CHOICE" in
     1) manager_action quick_initialization ;; 2) status_menu ;;
     3) if require_installation; then ai_config_menu; fi ;; 4) if require_installation; then prompt_menu; fi ;;

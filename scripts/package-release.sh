@@ -98,8 +98,9 @@ RELEASE_FILES=(
   tests/test_wizard.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
   tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker
-  tests/mocks/curl tests/mocks/curl_knowledge_timeout tests/mocks/docker tests/mocks/stat
+  tests/mocks/curl tests/mocks/curl_knowledge_timeout tests/mocks/docker tests/mocks/stat tests/mocks/systemctl
   tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl
+  tests/fixtures/logs/docker tests/fixtures/logs/journalctl tests/fixtures/logs/systemctl
   "docs/releases/${VERSION_VALUE}.md"
   "docs/reports/${VERSION_VALUE}-report.md"
 )

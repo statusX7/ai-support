@@ -108,7 +108,7 @@ SHELL_FILES=(
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
   tests/test_caddy_routing.sh tests/test_logs.sh
   tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
-  tests/mocks/curl_knowledge_timeout
+  tests/mocks/curl_knowledge_timeout tests/mocks/systemctl
 )
 for file in "${SHELL_FILES[@]}"; do
   assert_file "${PROJECT_ROOT}/${file}"
@@ -285,6 +285,10 @@ TEST_LAYER=UNIT/CONTRACT
 export PATH="${MOCK_DIR}:${ORIGINAL_PATH}"
 export MOCK_DOCKER_LOG="${TEST_ROOT}/docker.log"
 export MOCK_ANYTHING_STATE="${TEST_ROOT}/anythingllm-state.json"
+export MOCK_SYSTEMD_STATE="${TEST_ROOT}/systemd-state"
+export CRISPAI_LOGS_SYSTEMD_TEST=1
+export CRISPAI_LOGS_SYSTEMD_DIR="${TEST_ROOT}/systemd"
+mkdir -p -- "$MOCK_SYSTEMD_STATE" "$CRISPAI_LOGS_SYSTEMD_DIR"
 STUB_HOST_FIXTURE="${TEST_ROOT}/host-fixture"
 mkdir -p -- "${STUB_HOST_FIXTURE}/etc/ssl/certs"
 printf '%s\n' 'ID=debian' 'VERSION_ID="12"' 'VERSION_CODENAME=bookworm' \
@@ -945,6 +949,9 @@ assert_rollback_mutation_failure() {
     -- "$case_deploy" "$PROJECT_ROOT" "$PROJECT_VERSION" "$target_password"
   "${case_deploy}/scripts/launcher.sh" install --deploy-dir "$case_deploy" \
     --command-path "${case_root}/crispai" --non-interactive > "${case_root}/launcher.log" 2>&1
+  # 拷贝的资料归属仍指向原实例；为本例登记独立调度后才注入数据库故障。
+  "${case_deploy}/scripts/logs.sh" --deploy-dir "$case_deploy" timer install \
+    > "${case_root}/timer.log" 2>&1
   printf '目标快照的 AnythingLLM 数据：%s\n' "$failure_stage" > "${case_deploy}/data/anythingllm/rollback-failure.txt"
   printf '目标快照的 Prompt：%s\n' "$failure_stage" > "${case_deploy}/config/prompt.md"
   target_hash=$(sha256sum "${case_deploy}/data/anythingllm/rollback-failure.txt" | cut -d ' ' -f 1)
@@ -961,9 +968,10 @@ assert_rollback_mutation_failure() {
   env "${failure_variable}=1" "${case_deploy}/scripts/rollback.sh" --deploy-dir "$case_deploy" \
     --snapshot "$target_id" > "${case_root}/failure.log" 2>&1 || failure_status=$?
   (( failure_status != 0 )) || fail "${failure_stage} 失败被错误报告为回滚成功"
-  grep -Fq "$failed_command" "$MOCK_DOCKER_LOG" || fail "未实际执行 ${failure_stage} 失败分支"
+  grep -Eq " exec -T postgres .* ${failed_command}([[:space:]]|$)" "$MOCK_DOCKER_LOG" \
+    || fail "未实际执行 ${failure_stage} 失败分支"
   failed_tail="${case_root}/failed-tail.log"
-  awk -v command="$failed_command" 'index($0,command) { failed=1 } failed { print }' \
+  awk -v command="$failed_command" '$0 ~ (" exec -T postgres .* " command "([[:space:]]|$)") { failed=1 } failed { print }' \
     "$MOCK_DOCKER_LOG" > "$failed_tail"
   if grep -Eq '(^| )(up|restart)( |$)' "$failed_tail"; then
     fail "${failure_stage} 失败之后仍重新启动应用，可能运行混合恢复状态"

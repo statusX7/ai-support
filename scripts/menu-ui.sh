@@ -100,5 +100,5 @@ menu_render() {
       printf '%d. %s\n' "$((index+1))" "$title"
     done
   fi
-  printf '0. 退出\n\n请选择：'
+  printf '0. 退出\n\n'
 }

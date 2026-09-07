@@ -44,6 +44,8 @@ class Terminal:
     def __init__(self, name, *, width=110, extra=None, command=None, cwd=WORK):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, width, 0, 0))
+        self.tty_before = termios.tcgetattr(slave)
+        self.slave_name = os.ttyname(slave)
         self.process = subprocess.Popen(command or ["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)],
                                         stdin=slave, stdout=slave, stderr=slave, cwd=cwd,
                                         start_new_session=True,
@@ -162,6 +164,71 @@ def menu_case(number, first_label):
     terminal.send("0")
     terminal.finish()
     passing(f"生产主菜单 {number} 进入真实子菜单并返回")
+
+
+def log_menu_cases():
+    """通过生产 PTY 菜单执行日志查看、取消、轮转、清理与 follow 中断。"""
+    logs = ["bash", str(DEPLOY / "scripts/logs.sh"), "--deploy-dir", str(DEPLOY)]
+    result = invoke(logs + ["initialize"])
+    assert result.returncode == 0, result.stdout
+    result = invoke(logs + ["event", "--action", "ui_regression", "--phase", "complete", "--code", "0"])
+    assert result.returncode == 0, result.stdout
+    active = DEPLOY / "logs/maintenance.jsonl"
+    original = active.read_bytes()
+    sentinel = DEPLOY / "data/runtime/log-cleanup-sentinel.json"
+    sentinel.write_text('{"mode":"human","resume_at":null,"generation":17}', encoding="utf-8")
+    protected = {p: p.read_bytes() for name in ("config", "knowledge", "data")
+                 for p in (DEPLOY / name).rglob("*") if p.is_file()}
+
+    def enter(name):
+        terminal = Terminal(name)
+        terminal.expect("请选择："); terminal.send("15")
+        terminal.expect("日志来源、占用与保留策略"); terminal.expect("请选择：")
+        return terminal
+
+    def leave(terminal):
+        terminal.expect("日志来源、占用与保留策略"); terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        return terminal.finish()
+
+    terminal = enter("logs-show")
+    terminal.send("2"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+    terminal.expect("最近行数"); terminal.send("1")
+    terminal.expect("时间窗口"); terminal.send("2h")
+    terminal.expect("ui_regression"); leave(terminal)
+    assert active.read_bytes() == original
+    passing("日志菜单按来源/行数/时间窗调用真实查看器，不修改日志或业务资料")
+
+    terminal = enter("logs-clear-cancel")
+    terminal.send("4"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+    terminal.expect("请选择："); terminal.send("2")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("0"); leave(terminal)
+    assert active.read_bytes() == original
+    passing("日志清空预览后数字取消保持原文件")
+
+    terminal = enter("logs-follow-interrupt")
+    terminal.send("3"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+    terminal.expect("ui_regression")
+    os.killpg(terminal.process.pid, signal.SIGINT)
+    terminal.expect("已停止日志查看，服务未停止"); leave(terminal)
+    assert active.read_bytes() == original
+    passing("持续查看 Ctrl+C 仅终止日志子进程并返回主菜单，服务和资料不变")
+
+    terminal = enter("logs-rotate-confirm")
+    terminal.send("4"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+    terminal.expect("请选择："); terminal.send("1")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("维护事件日志已安全轮转"); leave(terminal)
+    rotated = DEPLOY / "logs/maintenance.jsonl.1"
+    assert rotated.read_bytes() == original
+    os.utime(rotated, (time.time() - 9 * 86400, time.time() - 9 * 86400))
+    terminal = enter("logs-cleanup-confirm")
+    terminal.send("5"); terminal.expect("删除多少天"); terminal.send("7")
+    terminal.expect("1 个受管历史文件"); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("清理完成：删除 1 个过期受管历史文件"); leave(terminal)
+    assert not rotated.exists() and active.exists()
+    assert all(path.read_bytes() == content for path, content in protected.items())
+    passing("生产日志菜单数字确认真实轮转/过期删除，永久人工哨兵/配置/知识逐字保留")
 
 
 def online_update_menu_case():
@@ -328,6 +395,142 @@ exec "${BASH_SOURCE[0]%/*}/configuration-docker-readback" "${arguments[@]}"
         docker.chmod(0o755)
 
 
+def material_menu_cases():
+    materials = ["bash", str(DEPLOY / "scripts/materials.sh"), "--deploy-dir", str(DEPLOY)]
+    result = invoke(materials + ["initialize"])
+    assert result.returncode == 0, result.stdout
+    command = ["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY), "apply"]
+    source = DEPLOY / "config/prompt.md"
+    original = source.read_bytes()
+    projection = DEPLOY / "config/materials-applied.json"
+    before = projection.read_bytes()
+    calls = MODEL_LIST["chat_calls"]
+    result = invoke(command + ["--check"])
+    assert result.returncode == 0 and projection.read_bytes() == before, result.stdout
+    for options in (("--check", "--force-external"), ("--force-external", "--check")):
+        result = invoke(command + list(options))
+        assert result.returncode == 64 and projection.read_bytes() == before, result.stdout
+    passing("生产 apply --check 只校验，拒绝与强制应用互斥参数")
+    try:
+        candidate = "资料直接编辑回归：中文 Emoji 🧪 与 $ 不执行。\n"
+        source.write_text(candidate, encoding="utf-8")
+        assert PROMPT["text"] != candidate
+        terminal = Terminal("material-apply-menu")
+        terminal.expect("请选择："); terminal.send("16"); terminal.expect("请选择："); terminal.send("6")
+        terminal.expect("仅应用已编辑的资料变更"); terminal.expect("请选择："); terminal.send("1")
+        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('"applied": true')
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        terminal.finish()
+        assert PROMPT["text"] == candidate
+        assert json.loads(projection.read_text())["prompt"]["text"] == candidate
+        passing("生产菜单16→6→1将直接编辑原文应用到HTTP工作区并发布同版投影")
+        PROMPT["text"] = "仅在协议工作区模拟的外部偏移"
+        terminal = Terminal("material-force-menu")
+        terminal.expect("请选择："); terminal.send("16"); terminal.expect("请选择："); terminal.send("6")
+        terminal.expect("重新同步现有资料"); terminal.expect("请选择："); terminal.send("2")
+        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('"applied": true')
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        terminal.finish()
+        assert PROMPT["text"] == candidate and source.read_text() == candidate
+        before = projection.read_bytes()
+        source.write_bytes(b"")
+        result = invoke(command)
+        assert result.returncode == 1 and projection.read_bytes() == before and PROMPT["text"] == candidate, result.stdout
+        assert MODEL_LIST["chat_calls"] == calls
+        passing("生产菜单16→6→2修复外部Prompt偏离；空原文拒绝且不修改生效版、不调用模型")
+    finally:
+        source.write_bytes(original)
+        result = invoke(command + ["--force-external"])
+        assert result.returncode == 0 and PROMPT["text"] == original.decode(), result.stdout
+
+
+def signal_menu_cases():
+    protected = {path: path.read_bytes() for name in ("config", "knowledge", "data")
+                 for path in (DEPLOY / name).rglob("*") if path.is_file()}
+    protected[DEPLOY / ".env"] = (DEPLOY / ".env").read_bytes()
+    input_directories = set(Path("/tmp").glob("crispai-menu-input.*"))
+    pending_secret = "synthetic-hidden-signal-value"
+
+    def finish_interrupt(terminal, signals=(signal.SIGINT,), *, parent_only=False, hidden=False, eof=False, eof_status=0):
+        children = Path(f"/proc/{terminal.process.pid}/task/{terminal.process.pid}/children").read_text().split()
+        if hidden:
+            assert not (termios.tcgetattr(terminal.master)[3] & termios.ECHO)
+            if not eof:
+                os.write(terminal.master, pending_secret.encode())
+        if eof:
+            os.write(terminal.master, b"\x04")
+        else:
+            for requested in signals:
+                try:
+                    if parent_only:
+                        os.kill(terminal.process.pid, requested)
+                    else:
+                        os.killpg(terminal.process.pid, requested)
+                except ProcessLookupError:
+                    break
+        try:
+            terminal.process.wait(timeout=2)
+        except subprocess.TimeoutExpired as error:
+            os.killpg(terminal.process.pid, signal.SIGKILL)
+            terminal.process.wait(timeout=2)
+            terminal.read()
+            raise AssertionError(f"{terminal.name}: 信号后 2 秒内未退出，不允许用超时重试代替修复") from error
+        assert termios.tcgetattr(terminal.master) == terminal.tty_before, terminal.name
+        assert all(not Path(f"/proc/{pid}").exists() for pid in children), terminal.name
+        if hidden and not eof:
+            reader = os.open(terminal.slave_name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+            try:
+                os.write(terminal.master, b"\n")
+                assert os.read(reader, 4096) == b"\n", "中断后的秘密输入残留在终端输入队列"
+            finally:
+                os.close(reader)
+        output = terminal.finish(eof_status if eof else 130)
+        assert pending_secret not in output
+        assert not (set(Path("/tmp").glob("crispai-menu-input.*")) - input_directories), terminal.name
+        assert all(path.read_bytes() == value for path, value in protected.items()), terminal.name
+
+    for index in range(30):
+        terminal = Terminal(f"sigint-prompt-race-{index}")
+        terminal.expect("请选择：")
+        finish_interrupt(terminal)
+
+    for name, signals, parent_only in (
+        ("sigterm", (signal.SIGTERM,), False),
+        ("double-sigint", (signal.SIGINT, signal.SIGINT), False),
+        ("parent-sigint", (signal.SIGINT,), True),
+    ):
+        terminal = Terminal(name)
+        terminal.expect("请选择：")
+        finish_interrupt(terminal, signals, parent_only=parent_only)
+
+    for name, commands, ready in (
+        ("submenu", ("2",), "请选择："),
+        ("hidden", ("3", "3"), "新 API Key（隐藏输入，回车保留）："),
+        ("multiline", ("4", "2"), "正文需要结束符字面量时"),
+        ("confirm", ("16", "2"), "1 确认 / 0 返回："),
+    ):
+        for suffix, signals, eof in (
+            ("int", (signal.SIGINT,), False),
+            ("term", (signal.SIGTERM,), False),
+            ("double", (signal.SIGINT, signal.SIGINT), False),
+            ("eof", (), True),
+        ):
+            terminal = Terminal(f"{name}-{suffix}")
+            for command in commands:
+                terminal.expect("请选择：")
+                terminal.send(command)
+            terminal.expect(ready)
+            # 保留既有语义：直接传播 read 失败的子菜单为 1，捕捉取消的分支为 0。
+            finish_interrupt(terminal, signals, hidden=name == "hidden", eof=eof,
+                             eof_status=1 if name in ("submenu", "hidden") else 0)
+
+    result = invoke(["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)], content="2\n0\n0\n")
+    assert result.returncode == 0 and "快速自检" in result.stdout, result.stdout
+    assert all(path.read_bytes() == value for path, value in protected.items())
+    assert not (set(Path("/tmp").glob("crispai-menu-input.*")) - input_directories)
+    passing("SIGINT 提示瞬间30轮、子菜单/隐藏/多行/确认的INT/TERM/双信号/EOF及非TTY输入，2秒内退出且TTY/秘密/配置保持")
+
+
 def main():
     global ENV
     for name in ("config", "scripts", "n8n", "docs"):
@@ -344,13 +547,20 @@ def main():
     (DEPLOY / ".crisp-ai-installation").write_text("ai-support\nstate=local-ready\nfact_conversation=pending\n", encoding="utf-8")
     (DEPLOY / "config/prompt.md").write_text(PROMPT["text"], encoding="utf-8")
     (DEPLOY / "knowledge/catalog.json").write_text('{"schema_version":2,"revision":1,"libraries":[]}', encoding="utf-8")
+    (DEPLOY / "data/knowledge-manifest.json").write_text('{"version":1,"files":{},"garbage_locations":[]}', encoding="utf-8")
+    for directory in (DEPLOY / "config", DEPLOY / "knowledge", DEPLOY / "data"):
+        directory.chmod(0o750)
+        for file in directory.rglob("*"):
+            if file.is_file():
+                file.chmod(0o640)
     fixture = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ApplicationFixture)
     threading.Thread(target=fixture.serve_forever, daemon=True).start()
     port = fixture.server_address[1]
     (DEPLOY / ".env").write_text(
         f"DEPLOY_DIR={json.dumps(str(DEPLOY), ensure_ascii=False)}\nANYTHINGLLM_API_KEY=synthetic-menu-secret\nANYTHINGLLM_PORT={port}\nANYTHINGLLM_WORKSPACE=crisp-support\nN8N_PORT={port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=5\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=5\n"
         f"AI_API_BASE_URL=http://127.0.0.1:{port}/proxy/v1\nAI_API_PROBE_BASE_URL=http://127.0.0.1:{port}/proxy/v1\nAI_API_KEY=synthetic-menu-key\nAI_MODEL=synthetic-menu-model\nAI_API_MODE=chat_completions\n"
-        "CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111\nCRISP_TOKEN_TIER=website\nCRISP_HOOK_MODE=website\nCRISP_TOKEN_IDENTIFIER=synthetic-identifier\nCRISP_TOKEN_KEY=synthetic-crisp-key\nWEBHOOK_PRODUCTION_URL=https://support.example.invalid/webhook/crisp-webhook\n",
+        "CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111\nCRISP_TOKEN_TIER=website\nCRISP_HOOK_MODE=website\nCRISP_TOKEN_IDENTIFIER=synthetic-identifier\nCRISP_TOKEN_KEY=synthetic-crisp-key\nWEBHOOK_PRODUCTION_URL=https://support.example.invalid/webhook/crisp-webhook\n"
+        "CRISPAI_LOG_MAX_SIZE=10m\nCRISPAI_LOG_MAX_FILES=5\nCRISPAI_LOG_RETENTION_DAYS=7\nCRISPAI_LOG_RETENTION_HOURS=168\n",
         encoding="utf-8")
     (DEPLOY / ".env").chmod(0o600)
     ENV = {**os.environ, "PATH": str(BIN) + ":" + os.environ["PATH"], "LANG": "C.UTF-8", "CONFIGURATION_FIXTURE_DEPLOY": str(DEPLOY)}
@@ -359,10 +569,12 @@ def main():
             result = invoke(["bash", str(DEPLOY / "manage.sh"), argument])
             assert result.returncode == 0, result.stdout
         passing("帮助与版本不调用 Docker 或外部 Provider")
-        labels = ["保留现有配置", "快速自检", "查看脱敏配置", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "匿名在线更新至最新正式版", "n8n 最近日志", "启动本项目服务", "安装部署", "安全卸载"]
+        labels = ["保留现有配置", "快速自检", "查看脱敏配置", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "匿名在线更新至最新正式版", "日志来源、占用与保留策略", "启动本项目服务", "安装部署", "安全卸载"]
         for number, label in enumerate(labels, 1):
             menu_case(number, label)
         online_update_menu_case()
+        log_menu_cases()
+        material_menu_cases()
         for name, width, extra in (("wide", 110, {}), ("narrow", 42, {}), ("dumb", 110, {"TERM": "dumb", "NO_COLOR": "1"}), ("plain", 110, {"CRISPAI_NO_EMOJI": "1"}), ("nonutf8", 110, {"LC_ALL": "C"})):
             terminal = Terminal(name, width=width, extra=extra)
             terminal.expect("请选择：")
@@ -378,16 +590,21 @@ def main():
             if name in ("plain", "dumb", "nonutf8"):
                 assert "🚀" not in output
         passing("宽屏双栏、窄屏/dumb/NO_COLOR/无Emoji/非UTF8降级")
+        lock_path = DEPLOY / "tmp/maintenance.lock"
+        lock_before = lock_path.read_bytes() if lock_path.exists() else None
         terminal = Terminal("invalid-eof")
-        terminal.expect("请选择："); terminal.send("")
+        terminal.expect("请选择：")
+        if lock_path.exists():
+            with lock_path.open("rb") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+        terminal.send("")
         terminal.expect("回车不会执行操作"); terminal.expect("请选择："); terminal.send("999")
         terminal.expect("请输入菜单中的数字"); terminal.expect("请选择：")
         os.write(terminal.master, b"\x04"); terminal.finish()
-        assert not (DEPLOY / "tmp/maintenance.lock").exists()
+        assert (lock_path.read_bytes() if lock_path.exists() else None) == lock_before
         passing("回车/非法数字/EOF 安全退出，空闲菜单不持维护锁")
-        terminal = Terminal("sigint")
-        terminal.expect("请选择："); os.killpg(terminal.process.pid, signal.SIGINT); terminal.finish(130)
-        passing("SIGINT 保留现有配置并有限退出")
+        signal_menu_cases()
         provider_retry_cases()
         prompt = '## 中文 🙂 Prompt\n\n$ # = " \\ `touch should-not-execute`\n::END::\n\n'
         terminal = Terminal("prompt-paste")
