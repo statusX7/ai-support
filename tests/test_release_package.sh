@@ -82,6 +82,7 @@ VERSION_VALUE=$(<"${PROJECT_ROOT}/VERSION")
 [[ "$VERSION_VALUE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "VERSION 格式无效"
 
 PRODUCTION_EXECUTABLES=(
+  get.sh
   install.sh
   manage.sh
   update.sh
@@ -89,6 +90,7 @@ PRODUCTION_EXECUTABLES=(
   scripts/bootstrap.sh
   scripts/wizard.sh
   scripts/package-release.sh
+  scripts/doctor.sh
 )
 for relative in "${PRODUCTION_EXECUTABLES[@]}"; do
   require_executable_file "${PROJECT_ROOT}/${relative}"
@@ -247,6 +249,8 @@ ARCHIVE="${DIST_DIR}/ai-support-${VERSION_VALUE}.tar.gz"
 CHECKSUMS="${DIST_DIR}/SHA256SUMS"
 require_regular_file "$ARCHIVE"
 require_regular_file "$CHECKSUMS"
+require_executable_file "${DIST_DIR}/get.sh"
+cmp -s -- "${DIST_DIR}/get.sh" "${PROJECT_ROOT}/get.sh" || fail "get.sh 审计资产与源码不一致"
 [[ "$(wc -l < "$CHECKSUMS")" -eq 1 ]] || fail "SHA256SUMS 必须只列出本版本归档"
 assert_contains "$CHECKSUMS" \
   "^[0-9a-f]{64}  ai-support-${VERSION_VALUE//./\\.}\\.tar\\.gz$" \
@@ -326,12 +330,14 @@ mkdir -p -- "$MINIMAL_BIN" "${TEST_ROOT}/foreign-cwd"
 for command_name in bash basename cat dirname grep head sed tr; do
   ln -s -- "$(command -v "$command_name")" "${MINIMAL_BIN}/${command_name}"
 done
-for relative in install.sh manage.sh update.sh uninstall.sh \
-  scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh; do
+for relative in get.sh install.sh manage.sh update.sh uninstall.sh \
+  scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh; do
   run_lightweight_option "$PACKAGE_ROOT" "$relative" --help '用法' "${relative} --help"
 done
 run_lightweight_option "$PACKAGE_ROOT" install.sh --version "$VERSION_VALUE" "install.sh --version"
 run_lightweight_option "$PACKAGE_ROOT" manage.sh --version "$VERSION_VALUE" "manage.sh --version"
+run_lightweight_option "$PACKAGE_ROOT" get.sh --version "$VERSION_VALUE" "get.sh --version"
+run_lightweight_option "$PACKAGE_ROOT" scripts/doctor.sh --version "$VERSION_VALUE" "doctor.sh --version"
 pass "无 .git 的绝对路径入口可执行 help/version 且不依赖 Docker 或开发工具"
 
 HOST_FIXTURE="${TEST_ROOT}/host-fixture"

@@ -176,10 +176,10 @@ fi
 
 INSTALLED_VERSION=$(<"${DEPLOY_DIR}/VERSION")
 
-PROGRAM_FILES=(
-  VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml
-  install.sh manage.sh update.sh uninstall.sh
-)
+  PROGRAM_FILES=(
+    VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml
+    get.sh install.sh manage.sh update.sh uninstall.sh
+  )
 for name in "${PROGRAM_FILES[@]}"; do
   target="${DEPLOY_DIR}/${name}"
   [[ ! -d "$target" ]] || die "预期程序文件却发现目录，已停止清理：$target"

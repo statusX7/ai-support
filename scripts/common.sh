@@ -599,7 +599,7 @@ repair_runtime_modules_from_source() {
   local marker="${deploy_dir}/${INSTALL_MARKER}"
   local source_dir relative source target mode
   local -a required=(
-    scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
+    get.sh scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh
     config/Caddyfile.example
   )
 
@@ -611,7 +611,7 @@ repair_runtime_modules_from_source() {
     source="${source_dir}/${relative}"
     [[ -f "$source" && ! -L "$source" ]] \
       || die "升级后缺少运行模块 ${relative}，且原始源码中无法恢复；请从完整新版本发布包运行 update.sh"
-    case "$relative" in scripts/*.sh) mode=0750 ;; *) mode=0640 ;; esac
+    case "$relative" in get.sh|scripts/*.sh) mode=0750 ;; *) mode=0640 ;; esac
     install -D -m "$mode" -- "$source" "$target"
     info "已从升级源码补齐运行模块：${relative}"
   done
@@ -629,15 +629,16 @@ copy_project_files() {
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
     scripts/provider-adapter.js scripts/archive-guard.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
-    docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md
+    docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   )
   local executable_files=(
-    install.sh manage.sh update.sh uninstall.sh
+    get.sh install.sh manage.sh update.sh uninstall.sh
     scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
     scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
     scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
+    scripts/doctor.sh
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \

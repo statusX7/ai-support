@@ -56,6 +56,11 @@ if [[ "${1:-}" == info ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == inspect ]]; then
+  printf '{"Running":true,"Restarting":false,"OOMKilled":false,"ExitCode":0}\n'
+  exit 0
+fi
+
 if [[ "${1:-}" == run ]]; then
   [[ "${MOCK_DOCKER_FAIL_RUN:-0}" != 1 ]]
   exit
@@ -162,6 +167,22 @@ case "$COMMAND" in
     exit 0
     ;;
   ps)
+    if [[ " $* " == *' --format json '* ]]; then
+      service=${!#}
+      state=running
+      if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" == 1 ]]; then
+        state=exited
+      elif [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
+        [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
+        grep -Fxq -- "$service" "$MOCK_DOCKER_SERVICE_STATE" || state=exited
+      fi
+      if [[ "$state" == running ]]; then
+        jq -cn --arg service "$service" '{ID:("mock-"+$service),Service:$service,State:"running",Health:"healthy",ExitCode:0}'
+      else
+        jq -cn --arg service "$service" '{ID:("mock-"+$service),Service:$service,State:"exited",Health:"",ExitCode:1}'
+      fi
+      exit 0
+    fi
     if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]]; then
       if [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
         [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
@@ -189,6 +210,25 @@ case "$COMMAND" in
       fi
       unset restore_password_first restore_password_second
       [[ "${MOCK_DOCKER_FAIL_PG_PASSWORD:-0}" != 1 ]] || exit 1
+    elif [[ "$*" == *' postgres '* && "$*" == *'SELECT 1'* ]]; then
+      IFS= read -r managed_user
+      IFS= read -r managed_db
+      IFS= read -r managed_password
+      [[ "$managed_user" == crisp_ai && "$managed_db" == n8n && -n "$managed_password" ]] || exit 1
+      printf '1\n'
+    elif [[ "$*" == *' n8n '* && "$*" == *'DB_POSTGRESDB_PASSWORD'* ]]; then
+      IFS= read -r managed_user
+      IFS= read -r managed_db
+      IFS= read -r managed_password
+      [[ "$managed_user" == crisp_ai && "$managed_db" == n8n && -n "$managed_password" ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$*" == *'CRISPAI_EXPECTED_ENV_BINDING'* ]]; then
+      # 专项 fixture 验证旧代差异；主回归桩只证明安全 stdin/固定输出调用契约。
+      expected=$(python3 -c 'import sys; values=sys.stdin.buffer.read().split(b"\0"); print(len(values)-1 if values and values[-1]==b"" else len(values))')
+      [[ "$expected" =~ ^[1-9][0-9]*$ ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$*" == *' anythingllm '* && "$*" == *'provider-adapter:8787/healthz'* ]]; then
+      printf 'ready\n'
     elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
       CONFIG_NAME=${!#}
       [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1
@@ -207,6 +247,7 @@ case "$COMMAND" in
       : > "${MOCK_PROJECT_DIR}/tmp/mock-workflow-active"
     elif [[ "$*" == *'export:workflow'* ]]; then
       [[ -f "${MOCK_PROJECT_DIR}/tmp/mock-workflow-active" ]] || exit 1
+      [[ "$*" != *'crispai-doctor-workflow'* ]] || printf 'verified\n'
     else
       printf 'docker compose exec 测试桩未实现该调用，不返回假成功。\n' >&2
       exit 2

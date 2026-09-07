@@ -122,13 +122,13 @@ is_allowed_snapshot_path() {
     payload|payload/config|payload/knowledge|payload/n8n|payload/scripts|payload/docs|payload/data|payload/data/anythingllm|payload/data/postgres|payload/data/postgres/n8n.dump|payload/data/knowledge-manifest.json)
       return 0
       ;;
-    payload/VERSION|payload/CHANGELOG.md|payload/README.md|payload/LICENSE|payload/AGENTS.md|payload/.env.example|payload/docker-compose.yml|payload/install.sh|payload/manage.sh|payload/update.sh|payload/uninstall.sh|payload/n8n/workflow.json)
+    payload/VERSION|payload/CHANGELOG.md|payload/README.md|payload/LICENSE|payload/AGENTS.md|payload/.env.example|payload/docker-compose.yml|payload/get.sh|payload/install.sh|payload/manage.sh|payload/update.sh|payload/uninstall.sh|payload/n8n/workflow.json)
       return 0
       ;;
     payload/config/app.yaml|payload/config/provider.yaml|payload/config/provider.yaml.example|payload/config/prompt.md|payload/config/prompt.md.example|payload/config/keyword.yaml|payload/config/keyword.yaml.example|payload/config/menu.yaml|payload/config/menu.yaml.example|payload/config/handoff.yaml|payload/config/handoff.yaml.example|payload/config/tags.yaml|payload/config/tags.yaml.example|payload/config/feedback.yaml|payload/config/feedback.yaml.example|payload/config/Caddyfile|payload/config/Caddyfile.example)
       return 0
       ;;
-    payload/scripts/common.sh|payload/scripts/healthcheck.sh|payload/scripts/backup.sh|payload/scripts/restore.sh|payload/scripts/analytics.sh|payload/scripts/snapshot.sh|payload/scripts/rollback.sh|payload/scripts/bootstrap.sh|payload/scripts/wizard.sh|payload/scripts/package-release.sh)
+    payload/scripts/common.sh|payload/scripts/healthcheck.sh|payload/scripts/backup.sh|payload/scripts/restore.sh|payload/scripts/analytics.sh|payload/scripts/snapshot.sh|payload/scripts/rollback.sh|payload/scripts/bootstrap.sh|payload/scripts/wizard.sh|payload/scripts/package-release.sh|payload/scripts/doctor.sh)
       return 0
       ;;
     payload/docs/INSTALL.md|payload/docs/ARCHITECTURE.md|payload/docs/CONFIG.md|payload/docs/SECURITY.md|payload/docs/TESTING.md|payload/docs/RELEASE.md)
@@ -210,6 +210,55 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   fi
 fi
 
+ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml)
+# v1.1.0 及更早快照只有这四个根目录入口；它们始终是可回滚版本的必需文件。
+ROOT_EXECUTABLES=(install.sh manage.sh update.sh uninstall.sh)
+CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
+SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
+DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
+OPTIONAL_DOC_FILES=(RELEASE.md)
+
+validate_optional_version_file() {
+  local source=$1 destination=$2 label=$3
+  if [[ -e "$source" || -L "$source" ]]; then
+    [[ -f "$source" && ! -L "$source" ]] || die "快照可选模块不安全：$label"
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -f "$destination" && ! -L "$destination" ]] \
+      || die "当前受管模块路径不安全，未开始回滚：$label"
+  fi
+}
+
+sync_optional_version_file() {
+  local source=$1 destination=$2 mode=$3 label=$4
+  if [[ -f "$source" && ! -L "$source" ]]; then
+    install -m "$mode" -- "$source" "$destination"
+  elif [[ -e "$source" || -L "$source" ]]; then
+    die "快照可选模块不安全：$label"
+  elif [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -f "$destination" && ! -L "$destination" ]] \
+      || die "当前受管模块路径在回滚期间发生变化：$label"
+    rm -f -- "$destination"
+    info "目标快照不含 ${label}，已移除当前版本的受管模块"
+  fi
+}
+
+# 在停止服务前验证后续无条件安装的文件。损坏或跨版本不完整的快照不得让现有实例停机。
+for name in "${ROOT_FILES[@]}"; do
+  [[ -f "${PAYLOAD}/${name}" && ! -L "${PAYLOAD}/${name}" ]] \
+    || die "版本快照缺少必要文件：$name"
+done
+for name in "${ROOT_EXECUTABLES[@]}"; do
+  [[ -f "${PAYLOAD}/${name}" && ! -L "${PAYLOAD}/${name}" ]] \
+    || die "版本快照缺少必要入口：$name"
+done
+for name in "${DOC_FILES[@]}"; do
+  [[ -f "${PAYLOAD}/docs/${name}" && ! -L "${PAYLOAD}/docs/${name}" ]] \
+    || die "版本快照缺少必要文档：$name"
+done
+validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
+validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
+
 require_docker_runtime
 docker_compose "$DEPLOY_DIR" config --quiet
 
@@ -246,13 +295,6 @@ done
 image_value=$(jq -r '.image_variables.CADDY_IMAGE // "caddy:2.10.2-alpine"' "$MANIFEST")
 env_set "${DEPLOY_DIR}/.env" CADDY_IMAGE "$image_value"
 
-ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml)
-ROOT_EXECUTABLES=(install.sh manage.sh update.sh uninstall.sh)
-CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
-SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
-DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
-OPTIONAL_DOC_FILES=(RELEASE.md)
-
 for name in "${ROOT_FILES[@]}"; do
   install -m 0640 -- "${PAYLOAD}/${name}" "${DEPLOY_DIR}/${name}"
 done
@@ -288,6 +330,11 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   done
   find "${DEPLOY_DIR}/scripts" -type f -name '*.sh' -exec chmod 0750 {} +
 fi
+
+# get.sh 与 doctor.sh 从 v1.1.1 起才属于版本载荷。回滚旧快照时必须删除当前代文件，
+# 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
+sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
+sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
 
 find "${DEPLOY_DIR}/knowledge" -maxdepth 1 -type f ! -name 'README.md' \
   \( -iname '*.md' -o -iname '*.txt' -o -iname '*.pdf' -o -iname '*.docx' \) -delete

@@ -52,8 +52,9 @@ install_crispai_launcher() {
     printf 'CRISPAI_MANAGED_DIR=%q\nCRISPAI_LAUNCHER_PATH=%q\n' "$deploy_dir" "$launcher_path"
     printf 'case "${1:-}" in\n'
     printf '  --version) printf "%%s\\n" %q; exit 0 ;;\n' "$version"
-    printf '  --help|-h) printf "%%s\\n" %q %q %q; exit 0 ;;\n' \
+    printf '  --help|-h) printf "%%s\\n" %q %q %q %q; exit 0 ;;\n' \
       '用法：crispai [status|init|doctor|enable|disable|uninstall|--help|--version]' \
+      'crispai doctor [--local|--full] [--json] [--fix]：非破坏自检或显式安全修复。' \
       '无参数打开中文管理菜单；日常配置由受管实例自动应用。' \
       '管理操作需要 root，普通用户将通过 sudo 受控提权。'
     printf 'esac\n'

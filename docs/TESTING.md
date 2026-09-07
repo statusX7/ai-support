@@ -1,6 +1,6 @@
 # 测试与验收
 
-本章供维护者复现测试；正常管理员接入只需安装向导和 `crispai doctor`，不需要准备开发用 E2E 环境变量。每次发布的实际数量、证据路径和限制以对应 [发布报告](reports/v1.1.0-report.md) 为准。
+本章供维护者复现测试；正常管理员使用 [在线安装命令](INSTALL.md) 和 `crispai doctor`，不需要准备开发用 E2E 环境变量。每次发布的实际数量、证据路径和限制以对应 [发布报告](reports/v1.1.1-report.md) 为准。
 
 ## 层级与门禁
 
@@ -9,6 +9,7 @@
 | STATIC | Bash/ShellCheck、schema、工作流引用、Compose 解析、归档、密钥扫描 | 容器运行、依赖实际安装 |
 | UNIT/CONTRACT | 生产函数、Shell/PTY、事件 fixture、协议服务、可控时钟的分支 | 真实 Crisp、真实模型或真实向量检索 |
 | REAL-LOCAL | 真实 Docker、PostgreSQL、AnythingLLM、n8n、实际索引、生产入口和归档安装 | 用户自有公网/账户授权 |
+| PUBLIC-DISTRIBUTION | 无认证读取公开 repo/raw/Latest/固定资产并执行推荐命令 | Crisp/模型外部业务 E2E |
 | EXTERNAL-E2E | 真实 Crisp 测试访客、真实第三方模型、公网 HTTPS 与实际页面 | 未执行的其他发行版、账户和渠道 |
 
 真实空机引导作为 REAL-LOCAL 的独立硬门槛报告：初始无 Docker/Compose，生产安装器自行补齐。不得挂宿主 Docker socket、隐藏 PATH、手工先装 Docker或复用旧版本报告冒充本次实测。协议服务可以配合真实本地应用，但须写为“真实应用 + 模拟 Crisp/Provider”，不能写为“真实模型回答通过”。
@@ -21,6 +22,9 @@
 
 ```bash
 bash tests/run.sh
+bash tests/test_get.sh
+bash tests/test_doctor.sh
+bash tests/test_public_distribution.sh --local
 bash tests/test_manage_contract.sh
 node tests/test_configuration_protocol.js
 bash tests/test_workflow_contract.sh
@@ -51,7 +55,7 @@ bash tests/run.sh
 
 在支持 Docker 的隔离 Debian 12 amd64 VM 创建无配置环境，保存发行版、架构、PID 1、初始包清单和命令可用情况。测试数据全部虚构，禁止录制密钥或真实客户正文。
 
-1. 校验最终归档，解压后用 PTY 执行 `bash install.sh`。文件来源快速路径记录十个主要输入，确认后额外必答为零；多行粘贴逐行计数，不把输入行数误称十次按键。
+1. 在无登录的干净 VM 原样执行 README/INSTALL 中同一条推荐命令，由入口取得并校验最终正式包，PTY 自动进入安装器。文件来源快速路径记录十个主要输入，确认后额外必答为零；多行粘贴逐行计数，不把输入行数误称十次按键。
 2. 确认安装器实际安装缺失包、Docker/Compose，启用 daemon 并运行容器；自动创建内部 Key/workspace，读回 Prompt、文档索引和已发布工作流。
 3. 从 `/`、`/tmp` 和新 shell 调用 `crispai`。通过真实菜单换配置、粘贴中文 Prompt，检查当前 AnythingLLM Prompt 与容器内配置一致。
 4. 创建“订阅使用”“电脑排障”“手机排障”三个命名库；使用有效 MD/TXT/PDF/DOCX。用中文改写问题检查真实向量搜索的来源、内容、排名，不以协议模型固定答复作为检索证据。
@@ -62,12 +66,31 @@ bash tests/run.sh
 9. 停用客服：在途结果、关键词、欢迎、反馈均静默，仍记录真人事件；重新启用不清空 A 的人工状态、不补答停用期间历史。
 10. 欢迎启停、加载/打开事件、自动展开分别验证；页面 SDK 不含密钥。负反馈、图片失败和知识未知都不转人工。
 11. 通过菜单导出完整业务配置和知识原文，校验无秘密，再预览导入、应用并读回；另外验证完整本机备份与故障回滚。
-12. 从真实 v1.0.1 归档升级，保留密钥、Prompt、知识和既有人工状态；再安全卸载、同路径重装、完整清理及同名命令/外部占网保护。
+12. 从真实 v1.1.0 正式实例升级到 v1.1.1，保留密钥、Prompt、知识和既有人工状态；再安全卸载、同路径重装、完整清理及同名命令/外部占网保护。v1.0.1 迁移继续由原契约回归覆盖，不把历史实测算成本轮新实测。
 13. 从正式 GitHub Release 回下载归档和 SHA256SUMS，重新校验、独立解压并检查入口。报告的验收代码应与发布资产相同。
 
 没有真实 Crisp 时，上述消息故事必须通过真正运行的 n8n 生产 Webhook 和隔离协议服务执行。模拟回复、回调和前端 SDK 的本地测试分别标注，不能称为真实 Crisp UI 或真实第三方模型验收。
 
 ## T01～T50 追踪矩阵
+
+本轮新增 I01～I15、D01～D16、R01～R07、P01～P07 在 [v1.1.1 报告](reports/v1.1.1-report.md) 逐项记录层级和证据。主要驱动对应如下：
+
+| 验收组 | 实际入口与断言 |
+| --- | --- |
+| I01～I15 | `tests/test_get.sh` 的完整 HTTP/PTY 入口、坏包/限流/重定向/旧版恢复；干净 VM 原样命令确认真实依赖和十项初始化 |
+| D01～D16 | `tests/test_doctor.sh` 的受控协议故障；真实隔离实例逐项停止组件、修改无效候选/工作流、心跳停滞并恢复；默认自检前后业务 hash 对比 |
+| R01～R07 | `tests/run.sh` 生命周期、实际 v1.1.0 升级/回滚、安全卸载/重装，以及生产 n8n 两会话、Prompt/知识/图片/协议集成 |
+| P01～P07 | 历史/资产/协作公开面审查；`tests/test_public_distribution.sh --remote` 无认证访问并比较 main/tag/包；最终干净 VM 公开安装 |
+
+doctor 故障测试必须核对错误组件 ID、状态和退出码；恢复后重新检查，不只看输出含 PASS。D14 比较 .env、config、knowledge、会话文件，排除诊断缓存和实际运行扫描的正常时间变化；不把正常服务的自主心跳误归因于自检。D12 同时验证无客户流量仍有心跳、停止扫描后变旧；0 秒人工状态不清理。
+
+远端验收应在正式发布后执行：
+
+```bash
+bash tests/test_public_distribution.sh --remote
+```
+
+该驱动用匿名 HTTP 客户端核对分发，不代替最终推荐命令在干净 VM 的实装。下面 T01～T50 是保留的 v1.1.0 功能回归映射。
 
 本表是应执行的场景，不预填通过；对应版本报告记录命令、退出码、证据和实际结果。
 

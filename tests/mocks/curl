@@ -212,7 +212,7 @@ case "$URL" in
     BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
       '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:$documents}}')
     ;;
-  */healthz|*/api/ping)
+  */healthz|*/healthz/readiness|*/api/ping)
     BODY='{"status":"ok"}'
     ;;
 esac

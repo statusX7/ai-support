@@ -14,12 +14,14 @@ source "${SCRIPT_DIR}/scripts/menu-ui.sh"
 DEPLOY_REQUEST=""
 ORIGINAL_ARGS=("$@")
 MANAGE_COMMAND=menu
+DOCTOR_ARGS=()
 MANAGE_EOF=0
 MANAGE_TEMP=""
 
 manage_usage() {
   printf '%s\n' '用法：crispai [--deploy-dir PATH] [命令]' '无参数打开中文管理菜单。' \
-    'status：本地状态；doctor：联网诊断；init：快速初始化或继续安装。' \
+    'status：本地状态；doctor：非破坏自检；init：快速初始化或继续安装。' \
+    'doctor [--local|--full] [--json] [--fix]：本地/完整检查、JSON 与显式安全修复。' \
     'enable / disable：客服总开关；uninstall：数字确认卸载。' \
     '--help / --version：帮助与版本，不要求 Docker 或完整配置。'
 }
@@ -32,6 +34,12 @@ while (( $# > 0 )); do
     menu|status|init|doctor|enable|disable|uninstall)
       [[ "$MANAGE_COMMAND" == menu ]] || die '一次只能执行一个管理命令'
       MANAGE_COMMAND=$1; shift ;;
+    --local|--full|--json|--fix|--last|--offline)
+      [[ "$MANAGE_COMMAND" == doctor ]] || { printf '错误：%s 仅用于 doctor 命令。\n' "$1" >&2; exit 64; }
+      DOCTOR_ARGS+=("$1"); shift ;;
+    --timeout)
+      [[ "$MANAGE_COMMAND" == doctor && $# -ge 2 ]] || { printf '错误：doctor --timeout 需要秒数。\n' >&2; exit 64; }
+      DOCTOR_ARGS+=("$1" "$2"); shift 2 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -41,8 +49,12 @@ if (( EUID != 0 )); then
   exec sudo -- bash "$SCRIPT_DIR/manage.sh" "${ORIGINAL_ARGS[@]}"
 fi
 umask 077
-bootstrap_prepare_minimal_dependencies || die '基础工具自动修复失败，请查看上方具体原因'
 DEPLOY_DIR=$(resolve_deploy_dir "$DEPLOY_REQUEST")
+if [[ "$MANAGE_COMMAND" == doctor ]]; then
+  # 默认自检不得隐式补依赖；缺失项由 doctor 报告，只有 --fix 才修复。
+  exec bash "$SCRIPT_DIR/scripts/doctor.sh" --deploy-dir "$DEPLOY_DIR" "${DOCTOR_ARGS[@]}"
+fi
+bootstrap_prepare_minimal_dependencies || die '基础工具自动修复失败，请查看上方具体原因'
 
 manage_cleanup() {
   if [[ -n "$MANAGE_TEMP" && "$MANAGE_TEMP" == "$DEPLOY_DIR"/tmp/manage.* && -d "$MANAGE_TEMP" && ! -L "$MANAGE_TEMP" ]]; then
@@ -164,26 +176,38 @@ show_installation_facts() {
 }
 
 doctor() {
-  local result=0 status
+  bash "$SCRIPT_DIR/scripts/doctor.sh" --deploy-dir "$DEPLOY_DIR" "$@"
+}
+
+export_doctor_report() {
+  local status=0 target temporary
   require_installation || return 1
-  if bash "$DEPLOY_DIR/scripts/bootstrap.sh" --check; then :; else result=1; fi
-  if bash "$DEPLOY_DIR/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application; then :; else result=1; fi
-  if manager_tool configuration status; then :; else result=1; fi
-  if manager_tool configuration crisp-test; then :; else
-    status=$?; if (( result == 0 )); then result=$status; fi
+  [[ -d "$DEPLOY_DIR/logs" && ! -L "$DEPLOY_DIR/logs" ]] || return 1
+  temporary=$(mktemp "$DEPLOY_DIR/logs/.doctor-export.XXXXXX") || return 1
+  doctor --json > "$temporary" || status=$?
+  if ! jq -e '.schema_version == 1 and (.results | type == "array")' "$temporary" >/dev/null 2>&1; then
+    rm -f -- "$temporary"
+    warn '自检没有生成有效 JSON，未导出报告'
+    return 1
   fi
-  show_installation_facts
-  return "$result"
+  target="$DEPLOY_DIR/logs/doctor-$(date -u '+%Y%m%dT%H%M%SZ')-$$.json"
+  chmod 0600 "$temporary"
+  mv -- "$temporary" "$target"
+  printf '已导出脱敏自检报告：%s（不含密钥、Prompt、知识或客户正文）\n' "$target"
+  return "$status"
 }
 
 status_menu() {
   local choice
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 初始化与接入事实\n2. 查看容器\n3. 完整诊断与接入复核\n4. 配置应用状态\n5. 自动修复依赖\n0. 返回\n'
+    printf '\n1. 快速自检：本地组件与配置状态\n2. 完整自检：外部连接与少量模型测试\n3. 查看上次自检结果（缓存）\n4. 修复本次发现的可自动修复问题\n5. 导出脱敏自检报告\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) show_installation_facts ;; 2) manager_action docker_compose "$DEPLOY_DIR" ps ;; 3) manager_action doctor ;;
-      4) manager_action manager_tool configuration status ;; 5) manager_action bash "$SCRIPT_DIR/scripts/bootstrap.sh" --all ;;
+      1) manager_action doctor --local ;;
+      2) printf '完整自检会发出少量合成模型请求，可能产生费用；不会向客户发送消息。\n'; manager_action doctor --full ;;
+      3) manager_action doctor --last ;;
+      4) manager_action doctor --fix ;;
+      5) manager_action export_doctor_report ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -732,18 +756,24 @@ backup_restore_menu() {
 update_rollback_menu() {
   local choice path snapshot
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 从已解压的新版本目录升级\n2. 从原 Git 源码更新\n3. 查看历史快照\n4. 回滚指定快照\n5. 检查 GitHub 最新 Release\n0. 返回\n'
+    printf '\n1. 匿名在线更新至最新正式版\n2. 从已解压的新版本目录离线升级\n3. 从原 Git 源码更新（高级）\n4. 查看历史快照\n5. 回滚指定快照\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) menu_read path '完整新版发布包的解压目录：' || return; [[ -n "$path" ]] || continue
+      1) if [[ ! -f "$DEPLOY_DIR/get.sh" || -L "$DEPLOY_DIR/get.sh" ]]; then
+          warn '受管在线更新入口缺失或不安全；请从完整正式包修复当前实例'
+          continue
+        fi
+        printf '将匿名读取公开仓库的 Latest 正式版，锁定版本后下载完整包与 SHA256SUMS 并校验。\n'
+        if menu_confirm '更新会先创建一致性快照，失败自动回滚。继续？'; then
+          manager_action bash "$DEPLOY_DIR/get.sh" --update --deploy-dir "$DEPLOY_DIR"
+        fi ;;
+      2) menu_read path '完整新版发布包的解压目录：' || return; [[ -n "$path" ]] || continue
         if menu_confirm '更新前自动快照，失败自动回滚。继续？'; then manager_action bash "$DEPLOY_DIR/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$path" --no-pull; fi ;;
-      2) if menu_confirm '从原 Git 工作区更新并升级？'; then manager_action bash "$DEPLOY_DIR/update.sh" --deploy-dir "$DEPLOY_DIR"; fi ;;
-      3) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list ;;
-      4) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
+      3) if menu_confirm '从原 Git 工作区更新并升级？'; then manager_action bash "$DEPLOY_DIR/update.sh" --deploy-dir "$DEPLOY_DIR"; fi ;;
+      4) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list ;;
+      5) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
         menu_read snapshot '要恢复的快照 ID（回车返回）：' || return; [[ -n "$snapshot" ]] || continue
         if menu_confirm '恢复该版本程序、配置及数据？'; then manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --snapshot "$snapshot"; fi ;;
-      5) if command -v gh >/dev/null 2>&1; then manager_action gh release view --repo statusX7/ai-support --json tagName,url,publishedAt
-        else printf '浏览器访问私有仓库：https://github.com/statusX7/ai-support/releases\n下载完整包后选择 1 离线升级，运行不依赖 Git/gh。\n'; fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done

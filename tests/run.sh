@@ -96,16 +96,17 @@ expect_local_ready_install() {
 
 if [[ "$TEST_SELECTION" == all ]]; then
 SHELL_FILES=(
-  install.sh manage.sh update.sh uninstall.sh
+  get.sh install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
-  scripts/wizard.sh scripts/package-release.sh
+  scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
   scripts/launcher.sh scripts/menu-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
-  tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
+  tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
+  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout
 )
 for file in "${SHELL_FILES[@]}"; do
@@ -127,6 +128,18 @@ fi
 TEST_LAYER=UNIT/CONTRACT
 "${SCRIPT_DIR}/test_bootstrap.sh"
 pass "依赖与 Docker 自动引导专项"
+
+"${SCRIPT_DIR}/test_get.sh"
+pass "独立在线入口、固定正式版校验与 TTY 专项"
+
+"${SCRIPT_DIR}/test_doctor.sh"
+pass "组件自检、故障注入、只读与显式修复专项"
+
+"${SCRIPT_DIR}/test_public_distribution.sh"
+pass "公共分发入口与文档契约专项"
+
+"${SCRIPT_DIR}/test_legacy_rollback.sh"
+pass "真实 v1.1.0 快照布局回滚与新模块代际收敛专项"
 
 "${SCRIPT_DIR}/test_knowledge_timeout.sh"
 pass "AnythingLLM 首次索引超时对账与恢复专项"
@@ -528,11 +541,11 @@ sed -i 's/^state=.*/state=ready/' "${DEPLOY_DIR}/.crisp-ai-installation"
   > "${TEST_ROOT}/health-online.log" 2>&1
 pass "离线与在线健康检查成功路径"
 
-if env MOCK_CRISP_FAIL=1 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
+if env MOCK_CRISP_FAIL=1 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --full \
   > "${TEST_ROOT}/crisp-failure.log" 2>&1; then
   fail "Crisp API 失败未导致健康检查失败"
 fi
-grep -Fq 'Crisp REST API 检查失败' "${TEST_ROOT}/crisp-failure.log" || fail "未报告 Crisp API 失败"
+grep -Eq '\[FAIL\] Crisp REST API|当前凭据只读校验失败' "${TEST_ROOT}/crisp-failure.log" || fail "未报告 Crisp API 失败"
 if grep -Fq "$TEST_CRISP_KEY" "${TEST_ROOT}/crisp-failure.log"; then
   fail "失败日志泄露 Crisp Token"
 fi

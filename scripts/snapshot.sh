@@ -95,10 +95,10 @@ fi
 SNAPSHOT_MIN_FREE_MB_VALUE=$((10#$SNAPSHOT_MIN_FREE_MB_VALUE))
 SNAPSHOT_RETENTION_COUNT_VALUE=$((10#$SNAPSHOT_RETENTION_COUNT_VALUE))
 
-ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env .env.example docker-compose.yml install.sh manage.sh update.sh uninstall.sh)
+ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env .env.example docker-compose.yml get.sh install.sh manage.sh update.sh uninstall.sh)
 CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
-OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
+OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh doctor.sh)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
 OPTIONAL_DOC_FILES=(RELEASE.md)
 SNAPSHOT_SOURCE_PATHS=()

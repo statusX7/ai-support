@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -z "${DOCTOR_FIXTURE_LOG:-}" ]] || printf 'docker %s\n' "$*" >> "$DOCTOR_FIXTURE_LOG"
+
+case "${1:-}" in
+  info)
+    [[ "${DOCTOR_FIXTURE_DAEMON_FAIL:-0}" != 1 ]]
+    printf 'fixture daemon\n'
+    exit 0
+    ;;
+  context)
+    [[ "${DOCTOR_FIXTURE_REMOTE_CONTEXT:-0}" != 1 ]] || { printf 'tcp://docker.invalid:2376\n'; exit 0; }
+    printf 'unix:///var/run/docker.sock\n'
+    exit 0
+    ;;
+  inspect)
+    inspected_id=${!#}
+    if [[ "${DOCTOR_FIXTURE_OOM_SERVICE:-}" == "${inspected_id#fixture-}" ]]; then
+      printf '{"Running":true,"Restarting":false,"OOMKilled":true,"ExitCode":137}\n'
+    else
+      printf '{"Running":true,"Restarting":false,"OOMKilled":false,"ExitCode":0}\n'
+    fi
+    exit 0
+    ;;
+  compose) shift ;;
+  *) printf 'doctor docker fixture 不支持：%s\n' "$*" >&2; exit 2 ;;
+esac
+
+if [[ "${1:-}" == version ]]; then
+  printf 'Docker Compose version v2.99.0-fixture\n'
+  exit 0
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --project-directory) shift 2 ;;
+    --env-file|-f|--profile) shift 2 ;;
+    *) break ;;
+  esac
+done
+command=${1:-}
+shift || true
+
+service_stopped() {
+  [[ -n "${DOCTOR_FIXTURE_STOPPED_FILE:-}" && -f "$DOCTOR_FIXTURE_STOPPED_FILE" ]] \
+    && grep -Fxq -- "$1" "$DOCTOR_FIXTURE_STOPPED_FILE"
+}
+
+case "$command" in
+  config) exit 0 ;;
+  ps)
+    if [[ " $* " == *' --services '* ]]; then
+      printf '%s\n' postgres anythingllm n8n provider-adapter
+      exit 0
+    fi
+    service=${!#}
+    if [[ "$service" == n8n && "${DOCTOR_FIXTURE_DELAY_N8N_SECONDS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+      sleep "$DOCTOR_FIXTURE_DELAY_N8N_SECONDS"
+    fi
+    if service_stopped "$service"; then
+      jq -cn --arg service "$service" '{ID:("fixture-"+$service),Service:$service,State:"exited",Health:"",ExitCode:1}'
+    else
+      health=healthy
+      [[ "${DOCTOR_FIXTURE_UNHEALTHY_SERVICE:-}" != "$service" ]] || health=unhealthy
+      [[ "${DOCTOR_FIXTURE_STARTING_SERVICE:-}" != "$service" ]] || health=starting
+      jq -cn --arg service "$service" --arg health "$health" '{ID:("fixture-"+$service),Service:$service,State:"running",Health:$health,ExitCode:0}'
+    fi
+    ;;
+  exec)
+    joined=" $* "
+    if [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
+      [[ "${DOCTOR_FIXTURE_DB_FAIL:-0}" != 1 ]] || exit 1
+      IFS= read -r managed_user
+      IFS= read -r managed_db
+      IFS= read -r managed_password
+      [[ "$managed_user" == crisp_ai && "$managed_db" == n8n \
+        && -f "${DOCTOR_FIXTURE_DB_PASSWORD_FILE:-}" \
+        && "$managed_password" == "$(<"$DOCTOR_FIXTURE_DB_PASSWORD_FILE")" ]] || exit 1
+      printf '1\n'
+    elif [[ "$joined" == *' n8n '* && "$joined" == *'DB_POSTGRESDB_PASSWORD'* ]]; then
+      IFS= read -r managed_user
+      IFS= read -r managed_db
+      IFS= read -r managed_password
+      [[ "$managed_user" == crisp_ai && "$managed_db" == n8n \
+        && -f "${DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE:-}" \
+        && "$managed_password" == "$(<"$DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE")" ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_ENV_BINDING'* ]]; then
+      service=''
+      for candidate in provider-adapter anythingllm n8n; do
+        [[ "$joined" != *" ${candidate} "* ]] || { service=$candidate; break; }
+      done
+      [[ -n "$service" && -f "${DOCTOR_FIXTURE_RUNTIME_ENV_FILE:-}" ]] || exit 1
+      python3 -c '
+import hmac,json,sys
+service,path=sys.argv[1:]
+expected=sys.stdin.buffer.read().split(b"\0")
+if expected and expected[-1] == b"": expected.pop()
+with open(path,encoding="utf-8") as handle: actual=json.load(handle).get(service,[])
+actual=[str(value).encode() for value in actual]
+if len(expected)!=len(actual) or not all(hmac.compare_digest(left,right) for left,right in zip(expected,actual)): sys.exit(1)
+' "$service" "$DOCTOR_FIXTURE_RUNTIME_ENV_FILE"
+      printf 'matched\n'
+    elif [[ "$joined" == *' n8n '* && "$joined" == *'export:workflow'* ]]; then
+      [[ "${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" != 1 ]] || exit 1
+      printf 'verified\n'
+    elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/healthz'* ]]; then
+      [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1
+      printf 'ready\n'
+    elif [[ "$joined" == *' anythingllm '* && "$joined" == *'GENERIC_OPEN_AI_BASE_PATH'* ]]; then
+      [[ "${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" != 1 ]] || exit 1
+      printf '{"verified":true,"environment":"doctor-fixture","path":"/chat/completions"}\n'
+    else
+      printf 'doctor docker fixture 未实现 exec：%s\n' "$*" >&2
+      exit 2
+    fi
+    ;;
+  up)
+    [[ -z "${DOCTOR_FIXTURE_STOPPED_FILE:-}" || ! -f "$DOCTOR_FIXTURE_STOPPED_FILE" ]] && exit 0
+    for service in "$@"; do
+      case "$service" in
+        postgres|anythingllm|n8n|provider-adapter|caddy)
+          temporary=$(mktemp "${DOCTOR_FIXTURE_STOPPED_FILE}.tmp.XXXXXX")
+          awk -v wanted="$service" '$0 != wanted' "$DOCTOR_FIXTURE_STOPPED_FILE" > "$temporary"
+          mv -f -- "$temporary" "$DOCTOR_FIXTURE_STOPPED_FILE"
+          ;;
+      esac
+    done
+    ;;
+  *) printf 'doctor docker fixture 不支持 compose：%s\n' "$command" >&2; exit 2 ;;
+esac

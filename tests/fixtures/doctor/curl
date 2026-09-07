@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=''
+write_out=''
+url=''
+fail_http=0
+while (( $# > 0 )); do
+  case "$1" in
+    --output|-o) output=$2; shift 2 ;;
+    --write-out|-w) write_out=$2; shift 2 ;;
+    --config|-K|--header|-H|--connect-timeout|--max-time|--request|-X|--data|--data-raw|--data-binary|--max-filesize|--retry|--retry-delay|--retry-max-time)
+      shift 2 ;;
+    --fail|-f) fail_http=1; shift ;;
+    --silent|-s|--show-error|-S|--disable|-q) shift ;;
+    http://*|https://*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+
+[[ -n "$url" ]] || { printf 'doctor curl fixture 未收到 URL\n' >&2; exit 2; }
+[[ -z "${DOCTOR_FIXTURE_LOG:-}" ]] || printf 'curl %s\n' "$url" >> "$DOCTOR_FIXTURE_LOG"
+case "$url" in
+  https://api.crisp.chat/*|https://support.example.test/*)
+    if [[ "${DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+      sleep "$DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS"
+    fi
+    ;;
+esac
+status=200
+body='{"status":"ok"}'
+case "$url" in
+  http://127.0.0.1:*/api/ping)
+    [[ "${DOCTOR_FIXTURE_ANYTHING_PING_FAIL:-0}" != 1 ]] || { status=503; body='{"error":true}'; }
+    ;;
+  http://127.0.0.1:*/api/v1/workspace/*)
+    if [[ "${DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+      sleep "$DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS"
+    fi
+    if [[ "${DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL:-0}" == 1 ]]; then
+      status=401; body='{"error":true}'
+    else
+      workspace=${url##*/}
+      body=$(jq -cn --arg slug "$workspace" --rawfile prompt "${DOCTOR_FIXTURE_DEPLOY}/config/prompt.md" \
+        '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[{docpath:"custom-documents/fixture.json"}]}}')
+    fi
+    ;;
+  http://127.0.0.1:*/api/v1/auth)
+    if [[ "${DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL:-0}" == 1 ]]; then
+      status=401; body='{"authenticated":false}'
+    else
+      body='{"authenticated":true}'
+    fi
+    ;;
+  http://127.0.0.1:*/webhook/crisp-webhook\?key=ai-support-healthcheck-invalid)
+    if [[ "${DOCTOR_FIXTURE_N8N_CODE_FAIL:-0}" == 1 ]]; then
+      status=401; body='{"error":"generic proxy rejection"}'
+    else
+      status=401; body='{"accepted":false,"reason":"Webhook 校验失败"}'
+    fi
+    ;;
+  https://api.crisp.chat/v1/website/*)
+    website=${url##*/}
+    if [[ "${DOCTOR_FIXTURE_CRISP_FAIL:-0}" == 1 ]]; then
+      status=401; body='{"error":true}'
+    else
+      body=$(jq -cn --arg website "$website" '{error:false,data:{website_id:$website}}')
+    fi
+    ;;
+  https://support.example.test/webhook/crisp-webhook)
+    if [[ "${DOCTOR_FIXTURE_WEBHOOK_FAIL:-0}" == 1 ]]; then
+      status=503; body='{"error":true}'
+    else
+      status=401; body='{"accepted":false,"reason":"Webhook 校验失败"}'
+    fi
+    ;;
+  https://provider.example.test/v1/responses)
+    if [[ "${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" == 1 ]]; then
+      status=503; body='{"error":{"message":"fixture secret must not appear"}}'
+    else
+      body='{"id":"response-fixture","output_text":"OK"}'
+    fi
+    ;;
+  https://provider.example.test/v1/chat/completions)
+    status=404; body='{"error":{"message":"responses only"}}'
+    ;;
+  *) body='{"status":"ok"}' ;;
+esac
+
+if [[ -n "$output" ]]; then printf '%s' "$body" > "$output"; else printf '%s' "$body"; fi
+[[ -z "$write_out" ]] || printf '%s' "$status"
+if (( fail_http )) && (( status >= 400 )); then exit 22; fi

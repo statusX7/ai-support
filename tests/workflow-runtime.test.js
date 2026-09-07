@@ -285,5 +285,20 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert(fs.readFileSync(file, 'utf8').includes('synthetic_current'));
     assert.equal(state('session_permanent1').mode, 'human');
   });
+  await test('D12 无客户流量时持久扫描心跳仍更新且不包含客户资料', async () => {
+    await runtime.scan();
+    const file = path.join(root, 'data/runtime/scheduler-health.json');
+    const first = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(first.completed_at, now);
+    now += 5000;
+    await runtime.scan();
+    const next = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(next.started_at, now);
+    assert.equal(next.completed_at, now);
+    assert(next.completed_at > first.completed_at);
+    assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'schema_version', 'started_at']);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(state('session_permanent1').mode, 'human');
+  });
   process.stdout.write(JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed: 0, evidence: path.relative(project, root) }) + '\n');
 })().catch((error) => { process.stderr.write(error.stack + '\n'); process.exitCode = 1; });

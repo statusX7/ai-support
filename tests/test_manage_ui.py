@@ -164,6 +164,67 @@ def menu_case(number, first_label):
     passing(f"生产主菜单 {number} 进入真实子菜单并返回")
 
 
+def online_update_menu_case():
+    """确认菜单 14 只在数字确认后调用受管在线入口，并透传当前部署目录。"""
+    online_entry = DEPLOY / "get.sh"
+    original_entry = online_entry.read_bytes()
+    update_log = WORK / "online-update.log"
+    online_entry.write_text(r'''#!/usr/bin/env bash
+set -euo pipefail
+[[ -t 0 && -t 1 ]]
+printf '%s\n' "$@" > "${MENU_ONLINE_UPDATE_LOG:?}"
+printf '受管匿名在线更新入口已调用\n'
+''', encoding="utf-8")
+    online_entry.chmod(0o750)
+    extra = {"MENU_ONLINE_UPDATE_LOG": str(update_log)}
+    try:
+        terminal = Terminal("online-update-cancel", extra=extra)
+        terminal.expect("请选择："); terminal.send("14")
+        terminal.expect("1. 匿名在线更新至最新正式版")
+        terminal.expect("请选择："); terminal.send("1")
+        terminal.expect("锁定版本后下载完整包与 SHA256SUMS 并校验")
+        terminal.expect("1 确认 / 0 返回："); terminal.send("0")
+        terminal.expect("1. 匿名在线更新至最新正式版")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.finish()
+        assert not update_log.exists()
+        passing("菜单14在线更新取消不联网、不调用更新入口")
+
+        terminal = Terminal("online-update-confirm", extra=extra)
+        terminal.expect("请选择："); terminal.send("14")
+        terminal.expect("请选择："); terminal.send("1")
+        terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+        terminal.expect("受管匿名在线更新入口已调用")
+        terminal.expect("1. 匿名在线更新至最新正式版")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.finish()
+        assert update_log.read_text(encoding="utf-8").splitlines() == [
+            "--update", "--deploy-dir", str(DEPLOY)
+        ]
+        passing("菜单14经数字确认调用受管 get.sh --update 并保持生产 TTY")
+
+        online_entry.unlink()
+        online_entry.symlink_to("/bin/true")
+        terminal = Terminal("online-update-unsafe-entry", extra=extra)
+        terminal.expect("请选择："); terminal.send("14")
+        terminal.expect("请选择："); terminal.send("1")
+        terminal.expect("受管在线更新入口缺失或不安全")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.finish()
+        assert update_log.read_text(encoding="utf-8").splitlines() == [
+            "--update", "--deploy-dir", str(DEPLOY)
+        ]
+        passing("菜单14拒绝缺失或符号链接在线入口")
+    finally:
+        if online_entry.exists() or online_entry.is_symlink():
+            online_entry.unlink()
+        online_entry.write_bytes(original_entry)
+        online_entry.chmod(0o750)
+
+
 def provider_retry_cases():
     """PTY 驱动生产 models/apply；Docker 仅在本测试的明确边界内模拟。"""
     docker = BIN / "docker"
@@ -271,7 +332,7 @@ def main():
     global ENV
     for name in ("config", "scripts", "n8n", "docs"):
         shutil.copytree(ROOT / name, DEPLOY / name)
-    for name in ("manage.sh", "install.sh", "update.sh", "uninstall.sh", "VERSION", "docker-compose.yml"):
+    for name in ("get.sh", "manage.sh", "install.sh", "update.sh", "uninstall.sh", "VERSION", "docker-compose.yml"):
         shutil.copy2(ROOT / name, DEPLOY / name)
     for name in ("tmp", "logs", "backups/config-history", "knowledge", "data/runtime"):
         (DEPLOY / name).mkdir(parents=True, exist_ok=True)
@@ -298,9 +359,10 @@ def main():
             result = invoke(["bash", str(DEPLOY / "manage.sh"), argument])
             assert result.returncode == 0, result.stdout
         passing("帮助与版本不调用 Docker 或外部 Provider")
-        labels = ["保留现有配置", "初始化与接入事实", "查看脱敏配置", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "从已解压", "n8n 最近日志", "启动本项目服务", "安装部署", "安全卸载"]
+        labels = ["保留现有配置", "快速自检", "查看脱敏配置", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "匿名在线更新至最新正式版", "n8n 最近日志", "启动本项目服务", "安装部署", "安全卸载"]
         for number, label in enumerate(labels, 1):
             menu_case(number, label)
+        online_update_menu_case()
         for name, width, extra in (("wide", 110, {}), ("narrow", 42, {}), ("dumb", 110, {"TERM": "dumb", "NO_COLOR": "1"}), ("plain", 110, {"CRISPAI_NO_EMOJI": "1"}), ("nonutf8", 110, {"LC_ALL": "C"})):
             terminal = Terminal(name, width=width, extra=extra)
             terminal.expect("请选择：")

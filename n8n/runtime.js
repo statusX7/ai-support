@@ -723,7 +723,7 @@ function createRuntime(env = {}, options = {}) {
       if (unresolved || !await active(key, job)) return 'cancelled';
     }
     const feedback = config('feedback.yaml', {}).feedback || {};
-    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true, properties: { ai_support: true, ai_support_version: 'v1.1.0' } };
+    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true, properties: { ai_support: true, ai_support_version: 'v1.1.1' } };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
     if (plan.feedback && feedback.enabled !== false && body.type === 'text') body.content = (body.content + '\n\n' + String(feedback.prompt || '是否解决问题？\n👍 是\n👎 否')).slice(0, 8000);
     const registered = await transaction(key, (current) => {
@@ -820,6 +820,11 @@ function createRuntime(env = {}, options = {}) {
     return result;
   };
   const scan = async () => {
+    ensureDirectory();
+    const healthPath = directory + '/scheduler-health.json';
+    const previousHealth = safeRead(healthPath, {});
+    const startedAt = clock();
+    atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0 });
     pruneAnalytics();
     const sessions = await list();
     const jobs = [];
@@ -831,6 +836,7 @@ function createRuntime(env = {}, options = {}) {
         }
       });
     }
+    atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: clock() });
     return jobs.sort((left, right) => Number(right.control) - Number(left.control)).slice(0, 16);
   };
   const pruneAnalytics = () => {

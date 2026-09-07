@@ -1,18 +1,16 @@
 # CrispAI / ai-support
 
-自用 Crisp AI 客服：n8n + AnythingLLM + PostgreSQL，中文 Shell 初始化与日常管理。
+自用 Crisp AI 客服：n8n + AnythingLLM + PostgreSQL，提供中文快速初始化与 Shell 管理。
 
-公开仓库，无需 GitHub 登录或 Token。[新手安装教程](docs/INSTALL.md)提供浏览器下载、服务器直链下载和逐项填写说明。
+在 Debian 12/13 或 Ubuntu 22.04/24.04 服务器终端执行唯一推荐命令（普通用户会调用 `sudo`）：
 
-从 [v1.1.0 Release](https://github.com/statusX7/ai-support/releases/tag/v1.1.0) 下载 `ai-support-v1.1.0.tar.gz` 和 `SHA256SUMS`，上传服务器同一目录后（root 去掉 `sudo`）：
-
+<!-- CRISPAI_RECOMMENDED_INSTALL_COMMAND -->
 ```bash
-sha256sum --check --strict SHA256SUMS &&
-tar -xzf ai-support-v1.1.0.tar.gz &&
-cd ai-support-v1.1.0 &&
-sudo bash ./install.sh
+bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-support/main/get.sh; t=$(mktemp /tmp/crispai-get.XXXXXXXX); cleanup(){ r=$?; trap - EXIT; rm -f -- "$t"; exit "$r"; }; trap cleanup EXIT; f=; if [[ -s /etc/ssl/certs/ca-certificates.crt ]] && command -v curl >/dev/null 2>&1; then f=curl; elif [[ -s /etc/ssl/certs/ca-certificates.crt ]] && command -v wget >/dev/null 2>&1; then f=wget; else command -v apt-get >/dev/null 2>&1 || { printf "错误：当前系统无法自动安装安全下载工具。\n" >&2; exit 1; }; p=(); if (( EUID != 0 )); then command -v sudo >/dev/null 2>&1 || { printf "错误：需要 root 或 sudo 补齐安全下载工具。\n" >&2; exit 1; }; p=(sudo --); fi; "${p[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -q -o APT::Color=0 -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; "${p[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -q -o APT::Color=0 -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends ca-certificates curl; f=curl; fi; if [[ "$f" == curl ]]; then curl -q --fail --location --silent --show-error --max-redirs 5 --proto "=https" --proto-redir "=https" --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 --output "$t" "$u"; else wget --no-config --no-netrc --https-only --secure-protocol=TLSv1_2 --timeout=30 --tries=3 --output-document="$t" "$u"; fi; e=; while IFS= read -r l || [[ -n "$l" ]]; do e=$l; done < "$t"; [[ -s "$t" && "$e" == "# crispai-get-end" ]] && bash -n "$t" || { printf "错误：get.sh 下载不完整或语法无效。\n" >&2; exit 1; }; chmod 0700 "$t"; bash "$t"'
 ```
 
-安装器自动补齐依赖；日常管理在任意目录输入 `crispai`。请准备自己的 AI/Crisp 凭据和公网接入信息，按教程登记 Hook；`local-ready` 只表示本地就绪，不能当作已接待客户。公开源码不包含你的凭据、知识或数据。
+命令会匿名下载并校验 Latest 正式包，随后进入十项中文初始化；无需 Git、GitHub 登录、手工解压或预装 Docker。安装完成后，在任意目录运行 `crispai`，状态检查用 `crispai doctor`。
 
-[部署](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布报告](docs/reports/v1.1.0-report.md)
+请准备自己的 AI/Crisp 凭据与公网接入信息；`local-ready` 表示本地已就绪，仍需按教程完成 Crisp Hook 或其他外部授权。
+
+[新手安装](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布说明](docs/releases/v1.1.1.md)

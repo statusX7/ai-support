@@ -9,7 +9,7 @@ import tarfile
 def validate(path, kind, max_bytes):
     seen, total = set(), 0
     root_files = {"VERSION", "CHANGELOG.md", "README.md", "LICENSE", "AGENTS.md",
-                  ".env", ".env.example", "docker-compose.yml", "install.sh",
+                  ".env", ".env.example", "docker-compose.yml", "get.sh", "install.sh",
                   "manage.sh", "update.sh", "uninstall.sh"}
     with tarfile.open(path, "r:gz") as archive:
         for member in archive:

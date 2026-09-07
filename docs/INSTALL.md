@@ -1,258 +1,135 @@
-# 新手教程：从公开发布包安装 CrispAI
+# CrispAI 新手安装教程
 
-本仓库现为公开仓库，阅读文档、下载正式包、通过 HTTPS 获取源码均无需 GitHub 登录、Token 或邀请。公开的是软件，不是你的客服数据；AI 服务、Crisp 账号和域名仍需自行准备，相关费用与权限由对应服务决定。
+这条路径适用于 Debian 12/13、Ubuntu 22.04/24.04 的正常服务器。准备一个拥有 root 或 `sudo` 权限的账号、可访问 GitHub/Docker/模型源的网络，以及你自己的第三方 AI、Crisp 和公网接入信息。Docker、Compose、`jq`、Python 等运行依赖由安装器补齐。
 
-本教程以已发布的 **v1.1.0** 为例：下载完整包 → 校验 → 执行安装器 → 十项中文初始化 → 登记 Crisp 回调 → 用 `crispai` 管理。建议首次部署先完整阅读第 1～6 节。
+Debian 12 amd64 是完整空机实测平台；其他列出的系统具有安装分支，但不代表同等级整机实测。建议至少准备 2 CPU、4 GiB 内存和 25 GiB 可用磁盘。不要在受限容器里把不能启动 Docker daemon 当作普通服务器环境。
 
-## 1. 开始前准备什么
+## 1. 执行唯一推荐安装命令
 
-| 准备项 | 需要做的事 |
-| --- | --- |
-| Linux 服务器 | 使用有 root 或 sudo 权限的账号，通过 SSH 打开服务器终端。不要在自己电脑的 Windows 命令行直接运行 Linux 安装器。 |
-| 第三方 AI | 从供应商取得 API Base URL 和 API Key；模型由向导获取列表后选择。列表不可用时才需填写供应商实际支持的模型名。 |
-| Crisp | 准备对应 workspace 的 Website ID、Token Identifier 和 Token Key；取得方法见下文及 [Crisp 接入教程](CRISP.md)。 |
-| 公网接入 | 准备自己能配置的域名，或已经配置反向代理的 HTTPS 地址。安装器不能代替你取得域名、修改云安全组或获取 Crisp 后台权限。 |
-| Prompt 与知识 | 可以直接粘贴文字，也可上传文件到服务器；知识支持 MD、TXT、PDF、DOCX。暂时没有知识可跳过，但 AI 不应编造业务事实。 |
+在 SSH 或服务器本机的交互终端复制并执行下面这一整行。无需 Git、GitHub 账号、Token、手工下载、上传、解压或切换到源码目录：
 
-**不需要预先安装 Docker、Compose、jq、Python、AnythingLLM 或 n8n，也不用手工写 `.env`、生成数据库密码或创建内部 API Key。** 正常支持系统上的缺失依赖和内部初始化由安装器完成。
-
-### 系统与资源边界
-
-| 系统/架构 | 项目实现与验证等级 |
-| --- | --- |
-| Debian 12 amd64、systemd | 已完成真实空机与本地应用验收，详见 [v1.1.0 报告](reports/v1.1.0-report.md) |
-| Debian 13 amd64、Ubuntu 22.04/24.04 amd64 | 自动包管理分支覆盖，未作同等级整机实测承诺 |
-| 上述系统 arm64 | 有架构分支与镜像能力检查，未作实际 arm64 整机验收承诺 |
-| RHEL-like、衍生发行版、非 systemd、远程 Docker daemon | 当前自动安装不支持，不会套用其他发行版的软件源 |
-
-资源规划起点为至少 2 CPU、4 GiB 内存、25 GiB 可用磁盘；知识、镜像、Embedding 模型和完整快照会继续占用空间，这不是任意规模下的容量保证。虚拟机需提供镜像所需 CPU 能力，受限容器内嵌套 Docker 不等同正常服务器。
-
-服务器需能访问发行版软件源、Docker 官方仓库和镜像源、Embedding 模型源，以及自己的 AI/Crisp 服务。自动 HTTPS 还需要正确 DNS、可用的 80/443 端口与证书签发网络条件。不要为安装而停掉已有网站或关闭防火墙。
-
-### Crisp 凭据从哪里拿
-
-在 Crisp 中选对 workspace，Website ID 位于 `Settings → Workspace Settings → Setup Instructions`。工作区拥有者在 `Settings → Workspace Settings → Advanced configuration → API Token → Generate Token` 生成 Identifier 与 Secret Key，妥善保存只显示一次的凭据。默认单网站不需要 Marketplace Plugin。脚本负责认证编码，不要把真实值送到在线 Base64 工具。[官方 Website Token 说明](https://docs.crisp.chat/guides/rest-api/authentication/website-token/)
-
-## 2. 获取完整发布包：任选一种方法
-
-### 方法 A：浏览器下载，再上传服务器（适合新手）
-
-1. 无需登录，打开 [v1.1.0 发布页面](https://github.com/statusX7/ai-support/releases/tag/v1.1.0)。后续版本可从 [全部 Releases](https://github.com/statusX7/ai-support/releases) 选择。
-2. 展开 **Assets**，下载这两个文件：[ai-support-v1.1.0.tar.gz](https://github.com/statusX7/ai-support/releases/download/v1.1.0/ai-support-v1.1.0.tar.gz) 和 [SHA256SUMS](https://github.com/statusX7/ai-support/releases/download/v1.1.0/SHA256SUMS)。
-3. 用现成的 SFTP 工具或服务器文件管理器，将两个文件上传到服务器上同一个新的空目录，再在 SSH 终端进入该目录。
-
-选择项目上传的完整包，不要选 GitHub 自动附带的 `Source code (zip)` / `Source code (tar.gz)`：它们不是本教程校验文件对应的资产，解压目录名也不同。保留两个下载文件的原名，不要混用不同版本的包与校验文件。
-
-### 方法 B：服务器直接下载（已有 curl 时）
-
-在服务器终端执行。下列目录名若已存在且有文件，请换一个新的空目录；无需填写任何 GitHub 凭据：
-
+<!-- CRISPAI_RECOMMENDED_INSTALL_COMMAND -->
 ```bash
-mkdir crispai-download-v1.1.0 &&
-cd crispai-download-v1.1.0 &&
-curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
-  --output ai-support-v1.1.0.tar.gz \
-  https://github.com/statusX7/ai-support/releases/download/v1.1.0/ai-support-v1.1.0.tar.gz &&
-curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
-  --output SHA256SUMS \
-  https://github.com/statusX7/ai-support/releases/download/v1.1.0/SHA256SUMS
+bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-support/main/get.sh; t=$(mktemp /tmp/crispai-get.XXXXXXXX); cleanup(){ r=$?; trap - EXIT; rm -f -- "$t"; exit "$r"; }; trap cleanup EXIT; f=; if [[ -s /etc/ssl/certs/ca-certificates.crt ]] && command -v curl >/dev/null 2>&1; then f=curl; elif [[ -s /etc/ssl/certs/ca-certificates.crt ]] && command -v wget >/dev/null 2>&1; then f=wget; else command -v apt-get >/dev/null 2>&1 || { printf "错误：当前系统无法自动安装安全下载工具。\n" >&2; exit 1; }; p=(); if (( EUID != 0 )); then command -v sudo >/dev/null 2>&1 || { printf "错误：需要 root 或 sudo 补齐安全下载工具。\n" >&2; exit 1; }; p=(sudo --); fi; "${p[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -q -o APT::Color=0 -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; "${p[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -q -o APT::Color=0 -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends ca-certificates curl; f=curl; fi; if [[ "$f" == curl ]]; then curl -q --fail --location --silent --show-error --max-redirs 5 --proto "=https" --proto-redir "=https" --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 --output "$t" "$u"; else wget --no-config --no-netrc --https-only --secure-protocol=TLSv1_2 --timeout=30 --tries=3 --output-document="$t" "$u"; fi; e=; while IFS= read -r l || [[ -n "$l" ]]; do e=$l; done < "$t"; [[ -s "$t" && "$e" == "# crispai-get-end" ]] && bash -n "$t" || { printf "错误：get.sh 下载不完整或语法无效。\n" >&2; exit 1; }; chmod 0700 "$t"; bash "$t"'
 ```
 
-出现 `curl: command not found` 时改用方法 A。获取安装包发生在运行安装器之前；不需要为下载额外安装 Git/gh，也不使用未经验证的 `curl | bash` 管道安装。下载失败时先修复网络，不加 `-k` 跳过证书验证。
+这条命令只先补齐取得 `get.sh` 必需的 CA/下载工具，然后把脚本保存到随机受限临时文件，检查完整结束标记和 Bash 语法后运行。`get.sh` 会：
 
-## 3. 校验、解压并启动安装器
+1. 从公开仓库解析一个具体的 Latest 稳定 tag；
+2. 把完整包与 `SHA256SUMS` 固定到同一个 tag 下载；
+3. 严格核对唯一目标文件的 SHA-256，检查归档顶层目录、路径、文件类型、重复成员和展开上限；
+4. 只有全部检查通过后，才从完整包调用原有生产安装器并进入 `1/10`。
 
-以下命令在两个下载文件所在目录执行。普通管理员使用 `sudo`；如果当前已经是 root，最后一行改为 `bash ./install.sh`，不用安装 sudo。
+整个下载过程不读取 GitHub Token，也不会把 AI/Crisp 凭据发往 GitHub。HTTPS 和 SHA-256 能验证传输与 Release 清单一致；它们不是独立代码签名，信任边界仍包括 GitHub 上的本仓库和维护者发布流程。
 
-```bash
-sha256sum --check --strict SHA256SUMS &&
-tar -xzf ai-support-v1.1.0.tar.gz &&
-cd ai-support-v1.1.0 &&
-sudo bash ./install.sh
-```
+必须在交互终端运行。无 TTY、`curl | bash`、下载中断、HTTP 错误、HTML 登录页、校验不符或不安全归档都会在执行包内代码前失败，不会静默跳过检查。按提示修复网络或权限后，重新执行同一行即可。
 
-校验应显示 `ai-support-v1.1.0.tar.gz: OK`（中文系统可能显示“成功”）。命令用 `&&` 串联，前一步失败不会继续安装。校验失败不要跳过：重新下载同一 Release 的两个资产；不要改校验值让它通过。SHA256 可发现文件损坏或不匹配，不能替代对下载来源的信任。
+### 如果 Prompt 或知识已经在服务器上
 
-默认程序与数据部署到 `/opt/crisp-ai`，快捷命令安装到 `/usr/local/bin/crispai`。源码解压目录只是安装来源；安装完成后，在其他目录也能管理。不要把正式包解压覆盖到已有部署目录。
+先进入这些文件所在的目录，再执行同一行命令。在线引导会记住调用时的真实目录；即使内部在 `/tmp` 下载和解压，向导中的相对路径仍以你的原目录为准。也可以直接在第 8/9 项粘贴正文，不准备文件。
 
-需要自定义位置时，在上述已解压目录运行 `sudo bash ./install.sh --deploy-dir /srv/crisp-ai`。已有部署继续使用原路径。`bash ./install.sh --help`、`bash ./manage.sh --version` 不要求 Docker 或完整配置。
+## 2. 完成十项中文初始化
 
-## 4. 按屏幕完成十项中文初始化
+表中的地址与内容仅为格式示例，请填写自己的真实配置。Key 输入不回显文字或星号，这是正常的保护行为。
 
-表内网址和文件路径仅为格式示例；请换成自己的有效值。向导中输入路径时不加 Shell 引号；文件要在服务器上，不是你电脑里的 `C:\...` 路径。粘贴 Key 后按回车，屏幕不显示文字或星号是正常的保护行为。
-
-| 主步骤 | 填写什么 | 说明或示例 |
+| 步骤 | 输入 | 说明 |
 | --- | --- | --- |
-| 1/10 | 第三方 AI API 地址 | 使用供应商给定 Base URL，例如 `https://api.example.com/proxy/v1`；不手工追加第二个 `/v1`。 |
-| 2/10 | AI API Key | 隐藏输入。少量连通性和能力测试可能计费，不扫描全部模型。 |
-| 3/10 | 模型 | 从实际返回列表按数字选择；`n`/`p` 翻页、`/词` 搜索。无列表可手填，401/403 则先修凭据。 |
-| 4/10 | Crisp Website ID | 填上一步取得的工作区标识，不是域名或邮箱。 |
-| 5/10 | Crisp Token Identifier | 隐藏输入，不是 AI API Key。 |
+| 1/10 | 第三方 AI Base URL | 可填根地址、已有 `/v1` 或合法代理前缀，例如 `https://api.example.com/proxy/v1`。 |
+| 2/10 | AI API Key | 隐藏输入；只做少量有界能力请求。 |
+| 3/10 | 模型 | 从实际模型列表按数字选择；可搜索/翻页，列表不支持时可手填。401/403 会提示先修凭据。 |
+| 4/10 | Crisp Website ID | 对应目标 workspace，不是域名或邮箱。 |
+| 5/10 | Crisp Token Identifier | 隐藏输入，与 AI Key 不同。 |
 | 6/10 | Crisp Token Key | 隐藏输入，与 Identifier 配对。 |
-| 7/10 | 域名或现有 HTTPS 地址 | 裸域名如 `support.example.com` 走受管 HTTPS；完整地址走已有反代，详见第 5 节。 |
-| 8/10 | 客服提示词 | 回车使用安全默认；也可直接写一句话、填服务器文件路径，或输入 `::PASTE::` 粘贴多行。 |
-| 9/10 | 知识来源 | 填文件/目录路径；`::PASTE::` 粘贴首库，`::LIBRARIES::` 添加多个命名库；回车暂不导入。 |
-| 10/10 | 核对脱敏摘要 | `1` 开始安装、`2` 返回修改、`0` 取消。 |
+| 7/10 | 公网域名或现有 HTTPS 地址 | 裸域名走受管 HTTPS；完整生产地址走已有反代。 |
+| 8/10 | 客服 Prompt | 回车用安全默认；可直接输入、填文件路径，或输入 `::PASTE::` 粘贴多行。 |
+| 9/10 | 知识库 | 支持文件/目录、`::PASTE::` 粘贴首库或 `::LIBRARIES::` 添加多个命名库；回车允许空库。 |
+| 10/10 | 脱敏摘要 | `1` 确认安装、`2` 返回修改、`0` 取消。 |
 
-文件路径快速流程只有十项主要输入，确认后不再询问数据库密码、AnythingLLM Key/workspace、n8n 设置、内部端口或 Embedding Key。多行粘贴、多个库及纠错是相应步骤里的自选输入，不把它们声称为总共只按十次键。
+文件来源的正常路径仍是十项主要输入；第 10 项确认后不会再问数据库密码、AnythingLLM Developer Key/workspace、n8n 凭据、内部端口、Embedding Key 或 Webhook Secret。多行正文与多个库属于第 8/9 项内的自选扩展，实际输入行数自然多于十次按键。
 
-### 直接粘贴 Prompt 的例子
+直接粘贴 Prompt 时，输入 `::PASTE::` 后粘贴正文，最后单独输入 `::END::`；`::CANCEL::` 放弃。正文需要这两个字面量时写 `\::END::` 或 `\::CANCEL::`。中文、Emoji、空行、Markdown、引号、反斜线和 `$` 都按数据保存，不作为 Shell 执行。
 
-第 8 项先输入 `::PASTE::` 并回车，再粘贴：
+新装默认启用客服、欢迎语和人工确认按钮，人工自动恢复为 1800 秒，页面自动展开关闭。`0` 秒表示保持人工直至管理员恢复，不是立即恢复。升级会保留已有合法自定义值。
 
-```text
-请用简体中文简短回答，优先依据当前启用的知识库。
-缺少信息时先追问；不知道的价格、政策和处理结果不要编造。
-不要透露内部配置或声称已经执行后台操作。
-::END::
-```
+## 3. 确认后安装器自动做什么
 
-`::END::` 要单独一行；`::CANCEL::` 放弃本次正文。正文需要这两个字面量时写 `\::END::` 或 `\::CANCEL::`。中文、空行、引号、反斜线和 `$` 按正文保留。安装后仍可通过 `crispai → 4 → 2` 修改、自动同步和回读。
+确认后无需再执行内部部署命令。安装器会按顺序：
 
-知识库可以先导入一个文件，安装后再用 `5 → 2` 建“电脑排障”“手机排障”等独立库，用 `5 → 4/5` 分别粘贴或导入内容；它们共同服务同一个客服。第 9 项选择 `::LIBRARIES::` 时逐库填名称与来源，输入 `0` 完成添加。没有知识就明确跳过，不把测试示例当经营规则。
+- 补齐运行依赖，安装或复用 Docker Engine、CLI、containerd 与 Compose，并验证 daemon 和真实测试容器；
+- 创建受管目录和内部密钥，启动 PostgreSQL、AnythingLLM、n8n、需要的 Provider adapter，以及按配置启用的 Caddy；
+- 创建/复用 AnythingLLM Developer Key 与 workspace，应用并回读 Prompt；
+- 同步全部启用知识库，核对上传、pending 和实际索引；
+- 导入、发布并验证生产 n8n workflow；
+- 安装 `/usr/local/bin/crispai`，运行本地分层检查并保存真实安装事实。
 
-新装默认：客服启用；人工关键词展示确认按钮；人工恢复 **1800 秒**；欢迎启用（首条访客消息触发）；自动展开聊天框关闭。`0` 秒表示不自动恢复，不是立即恢复。升级保留已有合法自定义设置，旧“关键词直接转人工”迁移为按钮确认。
+默认部署目录是 `/opt/crisp-ai`。安装过程可因首次镜像、Embedding 模型下载和知识索引持续较长时间。Ctrl+C、EOF 或网络失败后，向导进度和已生成的有效密钥保存在受限部署状态中；重跑同一命令继续，不需要卸载或重新填写已完成项。
 
-### 确认后等待什么
+在线入口会按本机状态分流：
 
-安装器会安装或复用 Docker、启动 daemon、检查真实容器，生成内部凭据，启动 PostgreSQL/AnythingLLM/n8n 及所需协议适配器，初始化 workspace、同步 Prompt、导入并索引知识、发布生产 workflow，安装 `crispai` 并做分层检查。不要再去 Web UI 重复创建内部账号、Key 或工作流。
-
-首次镜像/Embedding 下载和索引可能较慢；根据实际阶段等待，不因 pending 反复删文件。Ctrl+C、EOF 或失败后，保留安装来源，重跑同一命令继续；若 `crispai` 已安装，也可用 `crispai init`。已有效的密钥与数据默认复用，不以重新安装解决普通凭据错误。
-
-## 5. 让 Crisp 能把客户消息交给服务
-
-### 先确认公网 HTTPS 路径
-
-- **裸域名**：将 DNS A/AAAA 指向本服务器，确保对应地址可达、80/443 未被其他网站占用、云安全组和证书签发条件满足。安装器可用受管 Caddy 配置 HTTPS 与续期；不会替你购买域名或修改 DNS。没有可用 IPv6 时不要保留错误 AAAA。
-- **已有 Nginx、宝塔或 Caddy**：不要停掉现有网站。填写自己的完整 HTTPS 接入地址，按安装器生成的 `/opt/crisp-ai/config/crispai-nginx.conf` 或 `crispai-caddy.conf` 将相应片段合入受管站点，再按现有站点流程检查并重载。自定义部署替换目录；片段以实际端口和路径为准，不把整份站点配置覆盖掉。
-
-只公开需要的生产 Hook 和可选无密钥网页路由；不要为方便配置公开 n8n 编辑器、AnythingLLM 管理端或数据库。安装器不把 DNS 已解析或容器 healthy 当作 HTTPS 已成功。
-
-### 在 Crisp 后台登记一次 Website Hook
-
-1. 运行 `crispai`，依次选 `10 → 7`，按提示确认，在私密终端复制本实例的**完整生产 URL**。它包含随机 Secret，不要截图分享，也不要使用完成页中带占位符的示意 URL。
-2. 在 Crisp 进入 `Settings → Workspace Settings → Advanced configuration → Web Hooks → Add a Web Hook`，填入名称和刚复制的地址。不要用 `/webhook-test/`。
-3. 至少订阅 `message:send`（访客消息）、`message:received`（operator 消息，程序区分真人与自动消息）、`message:updated`（按钮选择更新），保存 Hook。
-4. 回到服务器运行 `crispai doctor` 复核，再进行第 6 节的测试。默认 Website 路径没有已验证的自动后台登记接口，不会猜接口或模拟登录；不要求同时配置 Plugin Hook。[Crisp 官方登记步骤](https://docs.crisp.chat/guides/web-hooks/website-hooks/)
-
-首条消息欢迎不需要新增网页片段。若选择“页面加载/打开欢迎”或启用自动展开，在 `9 → 9` 获取无密钥 SDK 片段，按 [Crisp 页面接入教程](CRISP.md) 放在已有 Crisp 代码之后，并追加订阅 `session:sync:events`。欢迎文字与浏览器展开是两个开关，不能仅改文字就认为页面已自动打开。
-
-## 6. 安装完成后怎么判断真的可用
-
-安装结束后，在任意目录运行；普通账号可用 `sudo crispai`：
-
-```bash
-crispai status
-crispai doctor
-```
-
-`status` 读取本地事实，`doctor` 会联网并做少量实际探测。诊断不能凭空制造一次真实客户往返。
-
-| 状态 | 应如何处理 |
+| 当前状态 | 再次执行同一命令 |
 | --- | --- |
-| `collecting` / `installing` | 初始化未完成，按报错阶段修复后同命令继续。 |
-| `staged` | 使用了显式跳过启动，只落盘；不带 `--skip-start` 继续安装。 |
-| `local-ready` | 本地已就绪，但外部接入或真实往返仍待验证；不能当作已经接待客户。 |
-| `ready` | 当前本地/模型、Crisp API、公网及可信真实往返事实均通过，仍服从总开关和每个会话的人工状态。 |
-| `uninstalled-data-kept` | 服务已移除，数据保留；从正式包在原路径重装。 |
+| 未安装 | 下载当前稳定正式包并直接初始化。 |
+| 初始化中断 | 固定到记录的原版本并继续进度，防止混入另一版本。 |
+| 同版本或旧版本已完整安装 | 直接打开受管 `crispai` 菜单，不静默升级或重问十项。 |
+| 安全卸载且资料保留 | 用原版本包验证并恢复原路径、Prompt、知识和内部密钥。 |
+| 目录非空但不属于本项目 | 下载前拒绝，不覆盖或删除该目录。 |
 
-只在自己的测试访客中做一次完整检查：
+显式在线升级由 `crispai → 14. 更新与回滚` 完成；该入口同样使用固定 Release 与校验逻辑。降级必须走现有快照回滚，`get.sh` 不会静默安装低版本。
 
-1. 发一个知识库里有依据的问题，观察正文和上下文；需要图片时另发一张无敏感信息的测试图。
-2. 访客 A 输入“人工”：应看到原生“召唤人工客服”按钮，**此时仍是 AI 模式**；先不点、再问一个正常问题，AI 应继续服务。
-3. A 点击确认：只有 A 暂停、确认一次。用不同浏览器/独立访客 B 发问题，B 应继续由 AI 回复。
-4. 在 Crisp 后台给 A 发一条真人公开回复：A 立即暂停或继续人工，最近一次真人回复重新计时；内部 note、在线或打开后台不触发。
-5. 用 `7 → 3` 看 A 的状态。正秒数到期后仅对新问题恢复 AI，不补答积压；`0` 则等管理员在 `7 → 4` 手动恢复。
-6. 再运行 `crispai doctor`，在 `10 → 12` 看 Hook/真实会话事实。失败只修对应项，不重填十项或重建 workspace。
+## 4. 看懂安装结果
 
-安装退出码 `0` 表示该操作完成；`2` 可能是明确取消，也可能是本地完成但外部待接入，应结合屏幕说明和状态；`130` 为中断，其他非零按失败阶段排查。不要把所有非零都当成要卸载重装。
+安装完成会分别显示依赖、本地服务、应用配置、Provider、Crisp API、公网 Hook 和真实会话事实：
 
-v1.1.0 报告中的真实 Crisp、真实第三方模型与公网/页面仍为 `External Validation Pending`；本地协议测试不能替代你自己的上线检查。公开仓库不改变这一证据边界。
+| 状态 | 含义 |
+| --- | --- |
+| `ready` | 当前本地组件及已配置外部链路均有足够的本次证据；实际回复仍服从总开关与单会话人工状态。 |
+| `local-ready` | 本地服务、Prompt、知识和 workflow 已就绪，但 Crisp、DNS/HTTPS、Hook 或真实往返仍待完成/验证。 |
+| `collecting` / `installing` | 初始化未完成，按屏幕所示阶段修复后重跑同一命令。 |
+| `uninstalled-data-kept` | 程序已安全移除，配置和数据保留，可从原路径恢复。 |
 
-## 7. 以后日常只用 crispai
+退出码 `0` 表示所选操作完成；`2` 可表示用户明确取消，或本地安装成功但外部仍待接入，需结合屏幕文字与状态判断；`64` 是参数错误；`130` 是中断；其他非零代表对应阶段失败。`local-ready` 不会被冒充为已经接待客户，也无需因此重装本地组件。
+
+## 5. 完成 Crisp 最小外部接入
+
+脚本不能替你取得 Crisp 账号权限、购买域名、修改 DNS 或接管已有网站。
+
+1. 在 Crisp 的 `Settings → Workspace Settings → Setup Instructions` 找到 Website ID。
+2. 由 workspace owner 在 `Settings → Workspace Settings → Advanced configuration → API Token` 生成 Website Token 的 Identifier 与 Secret Key。不要发送给在线 Base64 网站。
+3. 运行 `crispai`，在 Crisp 接入菜单的私密显示项取得本实例完整生产 Hook URL。
+4. 在 Crisp 的 `Advanced configuration → Web Hooks` 登记该 URL，至少订阅 `message:send`、`message:received` 和 `message:updated`；不要使用 `/webhook-test/`。
+5. 回服务器执行 `crispai doctor --full`，再只用自己的测试访客完成文本、按钮、真人暂停和另一个会话不受影响的验证。
+
+裸域名只有在 DNS 正确、80/443 可用且证书签发网络正常时，安装器才能完成受管 Caddy。已有 Nginx、宝塔或 Caddy 时不会停站抢端口；按安装器生成的精确片段合入现有站点，再复查公网状态。凭据取得、Hook、Picker 按钮、欢迎页面 SDK 和故障排查见 [Crisp 接入教程](CRISP.md)。
+
+真实 Crisp、真实第三方模型、DNS/TLS 和站点页面权限属于部署者的外部资源。缺少时源码与本地安装仍可交付，但报告必须标记 `External Validation Pending`，协议服务测试不能冒充真实客户往返。
+
+## 6. 安装后只用 crispai
+
+在任意目录执行：
 
 ```bash
 crispai
 ```
 
-所有菜单编号和子菜单见 [18 项完整菜单说明](MENU.md)。`3 → 10` 表示先选主菜单 3，再选子菜单 10；不是 Shell 命令。
-
-| 要做什么 | 菜单路径 |
-| --- | --- |
-| 换供应商地址、Key、协议和模型 | `3 → 10` 整组验证；同供应商只换 Key 用 `3 → 3` |
-| 粘贴或改客服 Prompt | `4 → 2`，保存后自动应用并回读 |
-| 创建多个库、添加内容、停用一个库 | `5 → 2`、`5 → 4/5`、`5 → 8`；停用保留原文并移出新检索 |
-| 修改人工关键词及按钮文案 | `6 → 3`，`6 → 7` 可预演且不对外发消息 |
-| 设人工恢复秒数、看某会话状态 | `7 → 2/3`；新默认不静默改写已有截止时间 |
-| 开启/关闭机器人回复 | `8 → 1/2`，或 `crispai enable` / `crispai disable` |
-| 改欢迎文字、启停、展开和多级菜单 | `9 → 4`、`9 → 2/3`、`9 → 6/8` |
-| 修 Crisp 凭据、登记或检查回调 | `10`，用对应子项修改，不重装 |
-
-客服总开关不等于停止容器、不等于所有会话转人工，也不隐藏 Crisp 聊天框。停用时 Hook 和真人状态记录继续运行；维护停机才选 `16`。所有子菜单 `0` 返回，空输入/EOF 不表示同意删除。窄终端自动单栏，Emoji 不适配时用 `CRISPAI_NO_EMOJI=1 crispai`。
-
-## 8. 更新、回滚与备份
-
-更新前阅读 [Release 说明](https://github.com/statusX7/ai-support/releases)，从**同一个版本**下载完整包和校验文件，在新的独立目录校验并解压。不要直接拉取开发中的 `main` 覆盖部署。
-
-已有 `crispai` 时选择 `14 → 1`，填写新版解压目录的绝对路径（可在该目录运行 `pwd` 获取），数字确认后升级。也可在新版解压目录执行下面命令；从 v1.0.1 升级优先用此目标版本入口：
+常用非交互入口：
 
 ```bash
-sudo bash ./update.sh --deploy-dir /opt/crisp-ai --source-dir "$PWD" --no-pull
+crispai status
+crispai doctor
+crispai doctor --local
+crispai doctor --full
 ```
 
-使用自定义部署目录时替换 `/opt/crisp-ai`。升级会创建一致性快照、迁移知识与按钮规则并验证，期间有服务中断；失败按快照回滚。用 `14 → 3/4` 查看与恢复历史，完成后运行 `crispai doctor`。旧人工状态、Key、Prompt 与知识不会统一清空。v1.0.1 的旧仅哈希会话枚举边界见 [菜单说明](MENU.md)。
+`status` 快速读取本地事实；普通 `doctor` 是非破坏检查；`--local` 不访问外部业务服务；`--full` 才执行已配置外部连接和极少量可能计费的合成模型检查。默认自检不会给客户发消息、打开客服、解除人工、重建知识或重启容器。自动修复必须显式选择 `doctor --fix` 或菜单中的修复项，并受其安全边界限制。
 
-- **迁移业务配置**用 `12`：包含全部库原文和规则，不含 Key、客户会话、数据库；新实例先准备自己的凭据。即使无 Token，知识正文也不应公开上传。
-- **本机完整备份/恢复**用 `13`：包含 `.env`、内部密码、数据库及人工状态，是敏感灾难恢复资产。创建/恢复需短暂停止有关应用；备份失败必须先修复，不能假定已有安全副本。
+日常功能都在 [18 项中文菜单](MENU.md)：AI 地址/Key/模型、Prompt、多知识库、关键词 Picker、逐会话人工恢复、客服总开关、欢迎语、多级菜单、统计、配置迁移、备份、更新回滚、日志、服务维护和数字确认卸载。
 
-完整备份的等价命令如下；先创建并确认成功，只有确实要覆盖恢复时才运行第二条：
+客服总开关不等于停止容器、不等于把所有会话转人工，也不会隐藏 Crisp 聊天框。用户命中“人工”只看到确认按钮；只有有效按钮点击或真人公开回复才暂停当前 conversation，其他客户继续使用 AI。
 
-```bash
-sudo bash /opt/crisp-ai/scripts/backup.sh --deploy-dir /opt/crisp-ai \
-  --full --output /opt/crisp-ai/backups/full-manual.tar.gz
-```
+## 7. 故障和高级入口
 
-```bash
-sudo bash /opt/crisp-ai/scripts/restore.sh --deploy-dir /opt/crisp-ai \
-  --full --input /opt/crisp-ai/backups/full-manual.tar.gz
-```
+下载 403/404/429、DNS/TLS、无 TTY、checksum、Docker、模型 401/403、知识 pending、Hook 无回调或 `crispai` 找不到，按 [故障排查](TROUBLESHOOTING.md) 的对应项处理。不要使用 `curl -k`、修改 checksum、全局 Docker prune 或重新安装来掩盖配置错误。
 
-## 9. 卸载与保留数据重装
+指定正式版本、离线受控部署、发布资产人工审计和维护者打包流程属于高级操作，见 [发布与维护](RELEASE.md)。公开仓库的匿名安装不需要 Git/gh；GitHub CLI 只用于维护者发布或高级下载，不是客服运行依赖。
 
-运行 `crispai uninstall` 或选择 `18`。菜单提供 `1 安全卸载 / 2 完整清理 / 0 返回`，危险操作再用数字确认。
-
-- **安全卸载**移除本实例服务/程序及自己的 `crispai` 入口，保留 `.env`、`config`、`knowledge`、`data`、`backups`、`logs`。以后从完整包用原 `--deploy-dir` 安装，会验证并复用数据、重建命令，不要求重新准备所有内部密码。
-- **完整清理**先显示精确删除范围，在删除范围外创建含秘密的完整备份，再确认删除本实例数据。保存屏幕给出的外部备份路径；恢复参考 [故障排查](TROUBLESHOOTING.md)。
-
-两种方式都不卸载 Docker、不全局 prune、不删其他容器或网站。备份失败、外部容器占用网络或不能证明归属时会停止。安全卸载后 `crispai` 找不到是预期现象，不要用重复手建 alias 代替重装。
-
-## 10. 常见卡点与求助
-
-下载 404、校验失败、凭据 401/403、按钮点击无反应、计时、索引、`crispai` 找不到等，见 [故障排查](TROUBLESHOOTING.md)。当前包中的旧文档或菜单可能仍提到“私有仓库”：那是公开前的文字，不再代表访问限制。历史 tag/包不因文档更新重写，以 [main 上的安装教程](https://github.com/statusX7/ai-support/blob/main/docs/INSTALL.md) 为最新操作说明。
-
-可以在 [公开 Issues](https://github.com/statusX7/ai-support/issues) 提交脱敏问题（发表评论需要 GitHub 账号，下载不需要）。只提供版本、系统、步骤、错误摘要和已脱敏诊断；不要上传 `.env`、完整 Hook URL、Key、知识、聊天、截图或完整备份。发现凭据泄露先撤销/轮换，再按 [安全说明](SECURITY.md) 处理。
-
-## 附录：其他获取方式与系统变更
-
-### 已安装 Git 的使用者：HTTPS clone
-
-这不是新手必选步骤。不用 SSH key、GitHub Token 或私有仓库授权；固定到已发布 tag，不直接安装未验收的 `main`：
-
-```bash
-git clone --depth 1 --branch v1.1.0 \
-  https://github.com/statusX7/ai-support.git ai-support-source-v1.1.0 &&
-cd ai-support-source-v1.1.0 &&
-sudo bash ./install.sh
-```
-
-看到 detached HEAD 提示是检出固定 tag 的正常现象。此路径不是 Release 资产下载，不对 Git 工作区运行资产的 `SHA256SUMS`；Git 缺失时用前述发布包方案，不让用户为了部署强行安装 Git。
-
-已有正常登录的 GitHub CLI 也可执行 `gh release download v1.1.0 --repo statusX7/ai-support --pattern ai-support-v1.1.0.tar.gz --pattern SHA256SUMS`。这是可选客户端用法；公共浏览器/HTTPS 下载本身无需登录，不应只为装客服配置 gh。
-
-### 安装器会自动修改哪些位置
-
-实际依赖包括发行版 `ca-certificates/curl/jq/openssl/tar/gzip`、基础工具、`diffutils/cmp`、`util-linux/flock`、`iproute2/ss`、Python 3/`python3-yaml`，以及 Docker 官方源的 Engine、CLI、containerd、Compose plugin。确认前可先补向导工具，确认后准备服务。不要求宿主 Node/npm 或全局 pip，不使用 `--break-system-packages`。
-
-受控系统变更包括缺失包、Docker 专用 apt source/keyring、Docker systemd 启动/启用、部署目录、`/usr/local/bin/crispai`；裸域名模式另有 Caddy 容器与持久证书目录。已有健康 Docker 复用，不为升级而重启其他容器，不执行整机 dist-upgrade、关闭 TLS/签名校验或清空 Docker 数据。
-
-Provider 保留 URL 前缀；宿主 loopback 使用独立探测地址，容器通过 host gateway 访问，供应商服务仍需允许该受控连接。Chat/Responses 由随包适配器接到实际协议；本地 Embedding 不需要额外 Key。具体字段与高级配置见 [CONFIG](CONFIG.md)，不要把宿主 curl 成功当成容器已能调用。
+公开源码不包含你的 `.env`、Token、Prompt、知识、客户消息、数据库或完整备份。诊断包与 Issue 也只能上传脱敏内容，详见 [安全说明](SECURITY.md)。
