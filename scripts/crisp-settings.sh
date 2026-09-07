@@ -90,7 +90,7 @@ crisp_settings_apply() (
   done
   identifier=$(env_get "$env_candidate" CRISP_TOKEN_IDENTIFIER)
   token=$(env_get "$env_candidate" CRISP_TOKEN_KEY)
-  auth=$(printf '%s' "$identifier:$token" | base64 | tr -d '\n')
+  auth=$(crisp_auth_b64 "$identifier" "$token") || die 'Crisp Token 配对无效，原配置保持'
   env_set "$env_candidate" CRISP_AUTH_B64 "$auth"
   hook_mode=$(env_get "$env_candidate" CRISP_HOOK_MODE)
   if [[ "$hook_mode" == plugin ]]; then

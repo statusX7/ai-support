@@ -162,9 +162,8 @@ validate_preserved_installation() {
 
     if ! is_placeholder "$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER 2>/dev/null || true)" \
       && ! is_placeholder "$(env_get "$env_file" CRISP_TOKEN_KEY 2>/dev/null || true)"; then
-      expected_auth=$(printf '%s' \
-        "$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER):$(env_get "$env_file" CRISP_TOKEN_KEY)" \
-        | base64 | tr -d '\n')
+      expected_auth=$(crisp_auth_b64 "$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER)" \
+        "$(env_get "$env_file" CRISP_TOKEN_KEY)")
       [[ "$(env_get "$env_file" CRISP_AUTH_B64 2>/dev/null || true)" == "$expected_auth" ]] \
         || reconfigure_reasons+=(".env:CRISP_AUTH_B64")
     fi
@@ -526,7 +525,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
   validate_env_value "$CRISP_KEY_VALUE" || die "Crisp Token Key 无效"
   validate_env_value "$ANYTHING_KEY_VALUE" || die "AnythingLLM API Key 无效"
 
-  CRISP_AUTH_VALUE=$(printf '%s' "${CRISP_IDENTIFIER_VALUE}:${CRISP_KEY_VALUE}" | base64 | tr -d '\n')
+  CRISP_AUTH_VALUE=$(crisp_auth_b64 "$CRISP_IDENTIFIER_VALUE" "$CRISP_KEY_VALUE")
   env_set "$ENV_FILE" N8N_HOST "$N8N_HOST_VALUE"
   configure_webhook_access "$DEPLOY_DIR" "$WEBHOOK_MODE_VALUE" "$PUBLIC_URL_VALUE" \
     "$WEBHOOK_PRODUCTION_VALUE" "$N8N_HOST_VALUE"

@@ -761,6 +761,16 @@ migrate_runtime_env() {
 
   [[ -f "$env_file" && ! -L "$env_file" ]] || die "运行配置缺失或不安全：$env_file"
 
+  # 新装 .env 模板有显式值；旧实例缺字段时保持原有 10m/3 份策略。
+  value=$(env_get "$env_file" CRISPAI_LOG_MAX_SIZE 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" CRISPAI_LOG_MAX_SIZE 10m
+  value=$(env_get "$env_file" CRISPAI_LOG_MAX_FILES 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" CRISPAI_LOG_MAX_FILES 3
+  value=$(env_get "$env_file" CRISPAI_LOG_RETENTION_DAYS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" CRISPAI_LOG_RETENTION_DAYS 7
+  value=$(env_get "$env_file" CRISPAI_LOG_RETENTION_HOURS 2>/dev/null || true)
+  [[ -n "$value" ]] || env_set "$env_file" CRISPAI_LOG_RETENTION_HOURS 168
+
   value=$(env_get "$env_file" N8N_IMAGE 2>/dev/null || true)
   case "$value" in
     ""|docker.n8n.io/n8nio/n8n:2) env_set "$env_file" N8N_IMAGE docker.n8n.io/n8nio/n8n:2.33.0 ;;
@@ -948,10 +958,37 @@ probe_api_endpoint() {
   [[ "$valid" == true ]]
 }
 
+crisp_auth_b64() {
+  local identifier=$1 token=$2
+  validate_env_value "$identifier" && [[ "$identifier" != *:* ]] \
+    && validate_env_value "$token" || return 1
+  # printf 保留输入的 UTF-8 字节；仅编码一次，删除 base64 的自动换行。
+  printf '%s:%s' "$identifier" "$token" | base64 | tr -d '\n'
+}
+
+crisp_write_auth_config() {
+  local env_file=$1 target=$2 auth tier identifier token expected
+  [[ -f "$env_file" && ! -L "$env_file" && -f "$target" && ! -L "$target" ]] || return 1
+  tier=$(env_get "$env_file" CRISP_TOKEN_TIER 2>/dev/null || true)
+  auth=$(env_get "$env_file" CRISP_AUTH_B64 2>/dev/null || true)
+  [[ "$tier" == website || "$tier" == plugin ]] && validate_env_value "$auth" || return 1
+  identifier=$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER 2>/dev/null || true)
+  token=$(env_get "$env_file" CRISP_TOKEN_KEY 2>/dev/null || true)
+  if [[ -n "$identifier" || -n "$token" ]]; then
+    expected=$(crisp_auth_b64 "$identifier" "$token") || return 1
+    [[ "$expected" == "$auth" ]] || return 1
+  fi
+  chmod 0600 "$target" || return 1
+  {
+    printf 'header = "Authorization: Basic %s"\n' "$(curl_config_escape "$auth")"
+    printf 'header = "X-Crisp-Tier: %s"\n' "$tier"
+  } > "$target"
+}
+
 crisp_api_check() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
-  local website tier auth config_file response_file escaped_auth escaped_tier status
+  local website tier auth config_file response_file status
 
   website=$(env_get "$env_file" CRISP_WEBSITE_ID 2>/dev/null || true)
   tier=$(env_get "$env_file" CRISP_TOKEN_TIER 2>/dev/null || true)
@@ -969,17 +1006,16 @@ crisp_api_check() {
     return 1
   }
 
-  escaped_auth=$(curl_config_escape "$auth") || return 1
-  escaped_tier=$(curl_config_escape "$tier") || return 1
   config_file=$(mktemp "${deploy_dir}/tmp/crisp-api.XXXXXX")
   response_file=$(mktemp "${deploy_dir}/tmp/crisp-response.XXXXXX")
   chmod 600 "$config_file" "$response_file"
-  {
-    printf 'header = "Authorization: Basic %s"\n' "$escaped_auth"
-    printf 'header = "X-Crisp-Tier: %s"\n' "$escaped_tier"
-  } > "$config_file"
+  if ! crisp_write_auth_config "$env_file" "$config_file"; then
+    rm -f -- "$config_file" "$response_file"
+    CRISP_API_STATUS=configuration
+    return 1
+  fi
   # 不跟随重定向，避免把 Authorization 发送到其他主机。
-  status=$(curl --silent --output "$response_file" --write-out '%{http_code}' --max-filesize 1048576 \
+  status=$(curl -q --silent --output "$response_file" --write-out '%{http_code}' --max-filesize 1048576 \
     --connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --retry-max-time 45 \
     --config "$config_file" \
     "https://api.crisp.chat/v1/website/${website}" 2>/dev/null || true)

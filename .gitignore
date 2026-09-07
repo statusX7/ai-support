@@ -49,3 +49,5 @@ backup.tar.gz
 .vscode/
 *.swp
 *~
+config/.crispai-compat-launcher
+__pycache__/
