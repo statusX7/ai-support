@@ -74,7 +74,7 @@ normalize_archive_entry() {
   printf '%s\n' "$entry"
 }
 
-for command_name in awk bash dirname env find git grep gzip jq ln mkdir mkfifo mktemp rm sed sha256sum stat tar timeout tr wc; do
+for command_name in awk bash dirname env find git grep gzip jq ln mkdir mkfifo mktemp python3 rm sed sha256sum sleep stat tar timeout tr wc; do
   require_command "$command_name"
 done
 
@@ -433,7 +433,7 @@ timeout --preserve-status --signal=INT --kill-after=3 10 \
 INTERRUPT_STATUS=$?
 set -e
 exec 9>&-
-(( INTERRUPT_STATUS == 130 || INTERRUPT_STATUS == 2 )) \
+(( INTERRUPT_STATUS == 130 )) \
   || fail "install.sh 收到 SIGINT 后退出码异常：${INTERRUPT_STATUS}"
 assert_contains "$INTERRUPT_LOG" '\[1/10\] AI API 地址' \
   "install.sh 未进入可发送 SIGINT 的首次向导"
@@ -444,6 +444,105 @@ if [[ -f "${INTERRUPT_DEPLOY}/.crisp-ai-installation" ]] \
   fail "install.sh 收到 SIGINT 后错误提交 ready 状态"
 fi
 pass "生产 install.sh 收到 SIGINT 后明确退出并保留恢复入口"
+
+# timeout 和真实终端都可能先向直接子进程、再向整个进程组投递同一次中断。
+# 用 BASH_ENV 仅延长 handler 的输出窗口，确定性验证第二个 SIGINT 不会在提示前杀死安装器。
+INTERRUPT_RACE_DEPLOY="${TEST_ROOT}/interrupt-race-install"
+INTERRUPT_RACE_LOG="${TEST_ROOT}/interrupt-race-install.log"
+INTERRUPT_RACE_ENV="${TEST_ROOT}/interrupt-race-bash-env"
+INTERRUPT_RACE_ENTERED="${TEST_ROOT}/interrupt-race-entered"
+INTERRUPT_RACE_RESULT="${TEST_ROOT}/interrupt-race-result.txt"
+cat > "$INTERRUPT_RACE_ENV" <<'BASH_ENV_EOF'
+printf() {
+  if [[ "${1:-}" == *'安装已中断'* ]]; then
+    : > "${CRISP_AI_INTERRUPT_HANDLER_ENTERED:?}"
+    sleep 0.2
+  fi
+  builtin printf "$@"
+}
+BASH_ENV_EOF
+chmod 0600 "$INTERRUPT_RACE_ENV"
+python3 - \
+  "${PACKAGE_ROOT}/install.sh" "$INTERRUPT_RACE_DEPLOY" "$INTERRUPT_RACE_LOG" \
+  "$INTERRUPT_RACE_ENV" "$INTERRUPT_RACE_ENTERED" "$PATH" \
+  "${HOST_FIXTURE}/os-release" "${HOST_FIXTURE}/etc" \
+  > "$INTERRUPT_RACE_RESULT" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+installer, deploy, log_name, bash_env, entered, path, os_release, etc_root = sys.argv[1:]
+log_path = pathlib.Path(log_name)
+entered_path = pathlib.Path(entered)
+fifo_path = log_path.parent / "interrupt-race-input.fifo"
+os.mkfifo(fifo_path, 0o600)
+fifo_fd = os.open(fifo_path, os.O_RDWR)
+log = open(log_path, "wb", buffering=0)
+environment = {
+    "PATH": path,
+    "LANG": "C.UTF-8",
+    "TERM": "dumb",
+    "BASH_ENV": bash_env,
+    "CRISP_AI_INTERRUPT_HANDLER_ENTERED": entered,
+    "CRISP_AI_BOOTSTRAP_TEST_MODE": "1",
+    "CRISP_AI_BOOTSTRAP_OS_RELEASE": os_release,
+    "CRISP_AI_BOOTSTRAP_ETC_ROOT": etc_root,
+}
+process = subprocess.Popen(
+    [installer, "--deploy-dir", deploy, "--skip-start"],
+    stdin=fifo_fd,
+    stdout=log,
+    stderr=subprocess.STDOUT,
+    env=environment,
+    start_new_session=True,
+)
+try:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if b"[1/10] AI API" in log_path.read_bytes():
+            break
+        if process.poll() is not None:
+            raise RuntimeError("安装器在首次输入提示前退出")
+        time.sleep(0.01)
+    else:
+        raise RuntimeError("安装器未进入首次输入提示")
+
+    os.kill(process.pid, signal.SIGINT)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if entered_path.exists():
+            break
+        if process.poll() is not None:
+            raise RuntimeError("安装器在进入中断收尾窗口前退出")
+        time.sleep(0.001)
+    else:
+        raise RuntimeError("安装器未进入中断收尾窗口")
+
+    os.killpg(process.pid, signal.SIGINT)
+    return_code = process.wait(timeout=5)
+finally:
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    log.close()
+    os.close(fifo_fd)
+    fifo_path.unlink(missing_ok=True)
+
+print(f"return_code={return_code}")
+PY
+chmod 0600 "$INTERRUPT_RACE_RESULT" "$INTERRUPT_RACE_LOG"
+assert_contains "$INTERRUPT_RACE_RESULT" '^return_code=130$' \
+  "install.sh 重复 SIGINT 收尾的退出码不是 130"
+assert_contains "$INTERRUPT_RACE_LOG" '\[1/10\] AI API 地址' \
+  "install.sh 重复 SIGINT 测试未进入首次向导"
+assert_contains "$INTERRUPT_RACE_LOG" '安装已中断.*下次运行.*恢复' \
+  "install.sh 被重复 SIGINT 在写出中文恢复提示前终止"
+assert_contains "${INTERRUPT_RACE_DEPLOY}/.crisp-ai-installation" '^state=collecting$' \
+  "install.sh 重复 SIGINT 后未保留 collecting 恢复状态"
+pass "生产 install.sh 对进程及进程组重复 SIGINT 只执行一次完整收尾"
 
 MANAGE_DEPLOY="${TEST_ROOT}/manage-first-run"
 set +e

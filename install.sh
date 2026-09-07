@@ -19,7 +19,9 @@ RECONFIGURE=0
 COMMAND_PATH=""
 
 handle_install_interrupt() {
-  trap - INT TERM
+  # timeout 和终端可能把同一中断同时投递给进程及进程组；收尾期间忽略重复信号，
+  # 确保恢复说明完整写出，再以稳定的中断状态退出。
+  trap '' INT TERM
   printf '\n警告：安装已中断；已完成的初始化或安装步骤可在下次运行同一命令时恢复。\n' >&2
   exit 130
 }
