@@ -20,6 +20,7 @@ doctor_usage() {
 --json    stdout 只输出机器可读 JSON；说明信息写入 stderr。
 --fix     只修复白名单内的依赖、受管入口、权限和已停止项目服务，再复查。
 --last    查看上次自检缓存，不执行新检查。
+--timeout N  设置本次总截止秒数（1～600；日常默认 90）。
 
 退出码：0 无警告或失败；2 有警告/待接入；1 有故障；64 参数错误；130 中断。
 EOF
@@ -226,6 +227,17 @@ doctor_compose_timeout() {
     shift 2
     docker_compose "$deploy_dir" "$@"
   ' doctor-compose "${DOCTOR_DIR}/common.sh" "$DOCTOR_DEPLOY_DIR" "$@"
+}
+
+doctor_deadline_add() {
+  local id=$1 name=$2 source=$3 start=${4:-0}
+  if (( DOCTOR_INSTALLATION_IN_PROGRESS )); then
+    doctor_add "$id" "$name" FAIL critical '自检总截止时间已到，本项未完成；安装健康门禁不能据此放行' \
+      "$source" '确认组件未卡住后，以更充足的显式自检预算重试' "$start"
+  else
+    doctor_add "$id" "$name" WARN warning '自检总截止时间已到，本项未完成；未据此判定组件故障' \
+      "$source" '使用 --timeout 增加本次诊断预算后重试' "$start"
+  fi
 }
 
 # 外部检查不能直接调用 common.sh 中可能自行重试的函数，否则已耗尽的总预算
@@ -815,7 +827,7 @@ doctor_anything_check() {
 }
 
 doctor_n8n_check() {
-  local start port response status workflow_output
+  local start port response status workflow_output remaining
   if (( DOCTOR_DOCKER_READY == 0 )); then
     doctor_skip n8n.health 'n8n 服务' '因 Docker daemon 不可用未检查' local-api
     doctor_skip n8n.workflow 'n8n 生产工作流' '因 Docker daemon 不可用未检查' docker
@@ -833,13 +845,19 @@ doctor_n8n_check() {
   fi
   start=$(doctor_now_ms)
   workflow_output="${DOCTOR_TEMP_ROOT}/workflow-check.txt"
+  remaining=$(doctor_remaining 2>/dev/null || printf 0)
+  if (( remaining < 8 )); then
+    doctor_deadline_add n8n.workflow 'n8n 生产工作流' docker "$start"
+    doctor_skip n8n.runtime 'n8n Code runner' '因自检总截止时间已到未检查' local-api
+    return
+  fi
   # shellcheck disable=SC2016
   if (( DOCTOR_N8N_READY )) && doctor_compose_timeout 25 exec -T n8n sh -ec '
     output=$(mktemp /tmp/crispai-doctor-workflow.XXXXXX)
     trap '\''rm -f "$output"'\'' EXIT
     timeout 20 n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1
-    node - "$output" "$1" "$2" "$3" <<'\''NODE'\''
-const fs=require("fs");
+    node - "$output" "$1" "$2" "$3" /opt/crisp-ai/n8n/runtime.js <<'\''NODE'\''
+const fs=require("fs"),crypto=require("crypto");
 const raw=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
 const workflow=Array.isArray(raw)?raw[0]:raw;
 const nodes=workflow.nodes||[];
@@ -848,10 +866,22 @@ const types=(workflow.nodes||[]).map(node=>String(node.type));
 const schedule=nodes.find(node=>String(node.type).endsWith(".scheduleTrigger") && node.disabled!==true);
 const scanner=nodes.find(node=>String(node.type).includes("code") && String(node.parameters?.jsCode||"").includes("runtime.scan"));
 const scheduleTargets=(workflow.connections?.[schedule?.name]?.main||[]).flat().map(connection=>connection.node);
+const runtimeFile=fs.readFileSync(process.argv[6],"utf8");
+const source=runtimeFile.replace(/^if \(typeof module[^\n]+\n?$/m,"").replace(/ai_support_version: '\''v[^'\'']+'\''/g,"ai_support_version: '\''"+process.argv[4]+"'\''");
+const sourceHash=crypto.createHash("sha256").update(source).digest("hex");
+const fileHash=crypto.createHash("sha256").update(runtimeFile).digest("hex");
+const runtimePrefix=source+"\nconst runtime = createRuntime($env);\n";
+const runtimeNodeNames=["校验并持久接收","处理持久任务","扫描持久会话与任务","只读公开显示选项"];
+const runtimeNodesMatch=runtimeNodeNames.every(name=>{
+  const node=nodes.find(candidate=>candidate.name===name && String(candidate.type).includes("code"));
+  return node && String(node.parameters?.jsCode||"").startsWith(runtimePrefix);
+});
 if (workflow.id!==process.argv[3] || workflow.active!==true || !types.some(type=>type.endsWith(".webhook")) ||
     !schedule || !scanner || !scheduleTargets.includes(scanner.name) || !code.includes("runtime.receive") ||
     !code.includes("runtime.process") || !code.includes("runtime.scan") ||
-    workflow.meta?.aiSupportVersion!==process.argv[4] || workflow.meta?.runtimeSha256!==process.argv[5]) process.exit(1);
+    workflow.meta?.aiSupportVersion!==process.argv[4] || workflow.meta?.runtimeFileSha256!==fileHash ||
+    workflow.meta?.runtimeFileSha256!==process.argv[5] || workflow.meta?.runtimeSha256!==sourceHash ||
+    !runtimeNodesMatch) process.exit(1);
 process.stdout.write("verified\n");
 NODE
   ' sh "$WORKFLOW_ID" "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION")" \
@@ -859,15 +889,26 @@ NODE
     && grep -Fxq verified "$workflow_output"; then
     doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，接收/处理/五秒扫描代码均存在' docker '' "$start"
   else
+    if ! doctor_remaining >/dev/null 2>&1; then
+      doctor_deadline_add n8n.workflow 'n8n 生产工作流' docker "$start"
+      doctor_skip n8n.runtime 'n8n Code runner' '因自检总截止时间已到未检查' local-api
+      return
+    fi
     doctor_add n8n.workflow 'n8n 生产工作流' FAIL critical '目标 workflow 未激活、版本偏离或无法导出验证' docker '从受管安装/更新流程重新导入并发布目标 workflow' "$start"
   fi
   start=$(doctor_now_ms)
+  if ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add n8n.runtime 'n8n Code runner' local-api "$start"
+    return
+  fi
   response="${DOCTOR_TEMP_ROOT}/n8n-runtime.json"
   status=$(doctor_timeout 15 curl --silent --output "$response" --write-out '%{http_code}' \
     --connect-timeout 3 --max-time 12 --header 'Content-Type: application/json' --data '{}' \
     "http://127.0.0.1:${port}/webhook/crisp-webhook?key=ai-support-healthcheck-invalid" 2>/dev/null || true)
   if [[ "$status" == 401 ]] && jq -e '.accepted == false and .reason == "Webhook 校验失败"' "$response" >/dev/null 2>&1; then
     doctor_add n8n.runtime 'n8n Code runner' PASS critical '生产 Webhook 到达项目 Code 并返回特有拒绝结构；未产生业务任务' local-api '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1 && [[ -z "$status" || "$status" == 000 ]]; then
+    doctor_deadline_add n8n.runtime 'n8n Code runner' local-api "$start"
   else
     doctor_add n8n.runtime 'n8n Code runner' FAIL critical "生产 Code 执行探针失败（HTTP ${status:-000}）" local-api '检查 workflow 发布状态、task runner 与生产 Webhook 路由' "$start"
   fi
@@ -875,7 +916,7 @@ NODE
 
 doctor_adapter_check() {
   local start output mode configured_mode runtime_base configured_base configured_model runtime_model
-  local header_json header_names vision configured_vision mode_capability hook_secret
+  local header_json header_names vision configured_vision mode_capability hook_secret plugin_secret remaining
   start=$(doctor_now_ms)
   if ! jq -e '.schema_version == 2 and (.provider.base_url | type == "string" and length > 0) and
       (.provider.model | type == "string" and length > 0) and (.provider.api_mode == "chat_completions" or .provider.api_mode == "responses")' \
@@ -927,6 +968,15 @@ doctor_adapter_check() {
     return
   fi
 
+  remaining=$(doctor_remaining 2>/dev/null || printf 0)
+  if (( remaining < 8 )); then
+    doctor_skip provider.adapter_binding 'Provider adapter 运行代' '因自检总截止时间已到未检查' docker
+    doctor_skip anything.provider_binding 'AnythingLLM Provider 运行代' '因自检总截止时间已到未检查' docker
+    doctor_skip n8n.runtime_binding 'n8n AI/Crisp 运行代' '因自检总截止时间已到未检查' docker
+    doctor_deadline_add provider.adapter 'Provider adapter' docker "$start"
+    return
+  fi
+
   start=$(doctor_now_ms)
   if doctor_container_env_binding provider-adapter \
     'AI_API_BASE_URL,AI_API_KEY,AI_MODEL,AI_API_MODE,AI_CUSTOM_HEADERS_JSON' \
@@ -937,6 +987,12 @@ doctor_adapter_check() {
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_API_MODE 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_CUSTOM_HEADERS_JSON 2>/dev/null || true)"; then
     doctor_add provider.adapter_binding 'Provider adapter 运行代' PASS critical '运行容器的地址、Key、模型、协议和 Header 与当前受管配置一致' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.adapter_binding 'Provider adapter 运行代' docker "$start"
+    doctor_skip anything.provider_binding 'AnythingLLM Provider 运行代' '因自检总截止时间已到未检查' docker
+    doctor_skip n8n.runtime_binding 'n8n AI/Crisp 运行代' '因自检总截止时间已到未检查' docker
+    doctor_deadline_add provider.adapter 'Provider adapter' docker
+    return
   else
     doctor_add provider.adapter_binding 'Provider adapter 运行代' FAIL critical '运行容器仍持有旧版或偏离的 Provider 环境' docker '重新创建本实例 provider-adapter；不要只修改宿主 .env' "$start"
   fi
@@ -949,12 +1005,22 @@ doctor_adapter_check() {
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_API_KEY 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_MODEL 2>/dev/null || true)"; then
     doctor_add anything.provider_binding 'AnythingLLM Provider 运行代' PASS critical 'AnythingLLM 实际 Provider 地址、Key 和模型与当前受管配置一致' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add anything.provider_binding 'AnythingLLM Provider 运行代' docker "$start"
+    doctor_skip n8n.runtime_binding 'n8n AI/Crisp 运行代' '因自检总截止时间已到未检查' docker
+    doctor_deadline_add provider.adapter 'Provider adapter' docker
+    return
   else
     doctor_add anything.provider_binding 'AnythingLLM Provider 运行代' FAIL critical 'AnythingLLM 仍持有旧版或偏离的 Provider 环境' docker '重新创建本实例 AnythingLLM 并执行受管 Provider 回读' "$start"
   fi
 
   start=$(doctor_now_ms)
   hook_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
+  plugin_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+  # Compose 的 ${VAR:-not-configured} 会把缺失或空的非当前 Hook secret 规范化为哨兵值。
+  # 当前模式所需 secret 已由 config.crisp_mode 严格验证，这里只核对实际容器展开结果。
+  [[ -n "$hook_secret" ]] || hook_secret=not-configured
+  [[ -n "$plugin_secret" ]] || plugin_secret=not-configured
   if doctor_container_env_binding n8n \
     'CRISP_WEBSITE_ID,CRISP_API_BASE_URL,CRISP_TOKEN_TIER,CRISP_AUTH_B64,CRISP_HOOK_MODE,CRISP_WEBSITE_HOOK_SECRET,CRISP_PLUGIN_SIGNING_SECRET,WEBHOOK_URL,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,AI_API_BASE_URL,AI_API_KEY,AI_MODEL,AI_API_MODE,AI_CUSTOM_HEADERS_JSON,AI_SUPPORTS_VISION' \
     "${DOCTOR_TEMP_ROOT}/n8n-runtime-binding.txt" \
@@ -964,7 +1030,7 @@ doctor_adapter_check() {
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_AUTH_B64 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_HOOK_MODE 2>/dev/null || true)" \
     "$hook_secret" \
-    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)" \
+    "$plugin_secret" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PUBLIC_WEBHOOK_URL 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)" \
@@ -975,17 +1041,33 @@ doctor_adapter_check() {
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_CUSTOM_HEADERS_JSON 2>/dev/null || true)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_SUPPORTS_VISION 2>/dev/null || true)"; then
     doctor_add n8n.runtime_binding 'n8n AI/Crisp 运行代' PASS critical 'n8n 的 Crisp、AnythingLLM 与 AI 环境均属于当前受管配置代' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add n8n.runtime_binding 'n8n AI/Crisp 运行代' docker "$start"
+    doctor_deadline_add provider.adapter 'Provider adapter' docker
+    return
   else
     doctor_add n8n.runtime_binding 'n8n AI/Crisp 运行代' FAIL critical 'n8n 仍持有旧版或偏离的 Crisp/AI 环境' docker '按受管流程重新创建 n8n；不要清空人工会话状态' "$start"
   fi
   # 从实际 AnythingLLM 网络命名空间验证，不以宿主可达代替容器接线。
   if doctor_compose_timeout 15 exec -T anythingllm node -e '
-    const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),8000);
-    fetch("http://provider-adapter:8787/healthz",{signal:controller.signal}).then(async response=>{
-      const body=await response.json(); if(!response.ok||body.ready!==true) throw new Error(); process.stdout.write("ready\n");
-    }).catch(()=>process.exitCode=1).finally(()=>clearTimeout(timer));
+    const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    (async()=>{
+      for(let attempt=0;attempt<3;attempt++){
+        const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),2500);
+        try {
+          const response=await fetch("http://provider-adapter:8787/healthz",{signal:controller.signal});
+          const body=await response.json();
+          if(response.ok&&body.ready===true){process.stdout.write("ready\n");return;}
+        } catch {}
+        finally {clearTimeout(timer);}
+        if(attempt<2) await wait(400);
+      }
+      process.exitCode=1;
+    })();
   ' > "$output" 2>/dev/null && grep -Fxq ready "$output"; then
     doctor_add provider.adapter 'Provider adapter' PASS critical 'AnythingLLM 容器可访问 adapter，受管配置可加载' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.adapter 'Provider adapter' docker "$start"
   else
     doctor_add provider.adapter 'Provider adapter' FAIL critical 'adapter 未运行、配置不可加载或容器网络不可达' docker '检查 provider-adapter health、配置挂载和 backend 网络' "$start"
   fi

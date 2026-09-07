@@ -106,7 +106,7 @@ SHELL_FILES=(
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
-  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
+  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout
 )
 for file in "${SHELL_FILES[@]}"; do

@@ -95,7 +95,7 @@ RELEASE_FILES=(
   tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
   tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker
   tests/mocks/curl tests/mocks/curl_knowledge_timeout tests/mocks/docker tests/mocks/stat
-  tests/fixtures/doctor/curl tests/fixtures/doctor/docker
+  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df
   "docs/releases/${VERSION_VALUE}.md"
   "docs/reports/${VERSION_VALUE}-report.md"
 )

@@ -163,7 +163,8 @@ prepare_fixture() {
     secret="doctor-fixture-${name,,}-do-not-print"
     env_set "${DEPLOY}/.env" "$name" "$secret"
   done
-  env_set "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET not-configured
+  # Website 模式下 Plugin Secret 可以为空；Compose 会以 :-not-configured 展开到容器。
+  env_unset "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET
   env_set "${DEPLOY}/.env" CRISP_AUTH_B64 "$(printf '%s:%s' \
     "$(env_get "${DEPLOY}/.env" CRISP_TOKEN_IDENTIFIER)" \
     "$(env_get "${DEPLOY}/.env" CRISP_TOKEN_KEY)" | base64 | tr -d '\n')"
@@ -184,7 +185,7 @@ prepare_fixture() {
     --arg auth "$(env_get "${DEPLOY}/.env" CRISP_AUTH_B64)" \
     --arg hook "$(env_get "${DEPLOY}/.env" CRISP_HOOK_MODE)" \
     --arg website_secret "$(env_get "${DEPLOY}/.env" CRISP_WEBSITE_HOOK_SECRET)" \
-    --arg plugin_secret "$(env_get "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET)" \
+    --arg plugin_secret 'not-configured' \
     --arg public_url "$(env_get "${DEPLOY}/.env" PUBLIC_WEBHOOK_URL)" \
     --arg anything_key "$(env_get "${DEPLOY}/.env" ANYTHINGLLM_API_KEY)" \
     --arg workspace "$(env_get "${DEPLOY}/.env" ANYTHINGLLM_WORKSPACE)" \
@@ -277,6 +278,23 @@ assert_result crisp.api SKIP
 ! grep -q 'https://' "$FIXTURE_LOG" || fail 'local 自检访问了外部 URL'
 [[ "$before" == "$(business_hash)" ]] || fail 'local 自检改动了配置、知识或会话状态'
 pass 'local 自检覆盖组件接线且不访问外部、不扰动业务状态'
+
+# 运行代核对遵循 Compose 对空非当前 Hook Secret 的 :- 默认展开语义。
+[[ -z "$(env_get "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)" ]] \
+  || fail 'Website fixture 应保留空的非当前 Plugin Secret'
+assert_result n8n.runtime_binding PASS
+pass '空的非当前 Hook Secret 与 Compose not-configured 容器展开值一致'
+
+workflow_saved="${TEST_ROOT}/workflow.saved.json"
+cp -p -- "${DEPLOY}/n8n/workflow.json" "$workflow_saved"
+jq '.meta.runtimeFileSha256="stale-runtime-file-hash"' "${DEPLOY}/n8n/workflow.json" \
+  > "${DEPLOY}/n8n/workflow.json.new"
+mv -f -- "${DEPLOY}/n8n/workflow.json.new" "${DEPLOY}/n8n/workflow.json"
+invoke --local
+(( LAST_RC == 1 )) || fail 'workflow 原文件 hash metadata 偏离应退出 1'
+assert_result n8n.workflow FAIL
+cp -p -- "$workflow_saved" "${DEPLOY}/n8n/workflow.json"
+pass 'n8n workflow 同时核对 runtime 原文件 hash、规范化嵌入 hash 与 Code 前缀'
 
 invoke
 (( LAST_RC == 0 )) || fail "健康 default 自检退出码应为 0，实际 ${LAST_RC}"
@@ -524,9 +542,11 @@ invoke --local --timeout 2
 elapsed=$((SECONDS-started))
 (( LAST_RC == 1 )) || fail '超时场景应退出 1'
 (( elapsed < 5 )) || fail "Compose 函数超时没有生效（${elapsed} 秒）"
-assert_result container.n8n FAIL
+jq -e 'any(.results[]; .id == "container.n8n" and .status != "PASS")' "$OUT" >/dev/null \
+  || fail '卡住的 n8n Compose 检查被误报为 PASS'
+grep -Eq 'compose .* ps .* n8n' "$FIXTURE_LOG" || fail 'Compose 函数超时测试未到达 n8n 状态读取'
 unset DOCTOR_FIXTURE_DELAY_N8N_SECONDS
-pass 'Compose 函数在重新加载 common.sh 的受限子进程中受到真实截止时间约束'
+pass 'Compose 函数受真实截止约束，超时项不会误报 PASS'
 
 export DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS=20
 started=$SECONDS

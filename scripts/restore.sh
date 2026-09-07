@@ -207,6 +207,10 @@ if (( SKIP_RESTART == 0 )); then
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
   import_and_publish_workflow "$DEPLOY_DIR"
   wait_for_local_health "$DEPLOY_DIR"
+  if [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]]; then
+    bash "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application --installation-in-progress \
+      || die '恢复后的组件或配置接线检查失败；未宣称恢复完成，请保留安全备份继续修复'
+  fi
   SERVICES_STOPPED=0
 fi
 

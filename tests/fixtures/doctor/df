@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Unit doctor fixtures must not inherit transient disk pressure from concurrent VM builds.
+case " ${*} " in
+  *' -Pm '*) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 8192 1024 7168 13%% /fixture\n' ;;
+  *' -Pi '*) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nfixture 1000000 1000 999000 1%% /fixture\n' ;;
+  *) exec /usr/bin/df "$@" ;;
+esac

@@ -74,6 +74,9 @@ case "$SCOPE" in
   default) ;;
 esac
 (( INSTALLATION_IN_PROGRESS == 0 )) || arguments+=(--installation-in-progress)
+# 安装/更新门禁需要完成全部本地运行代对账；保留日常 doctor 的 90 秒默认，
+# 对首次 CLI 冷启动给予更充足但仍有界的 180 秒预算。
+(( INSTALLATION_IN_PROGRESS == 0 )) || arguments+=(--timeout 180)
 (( JSON == 0 )) || arguments+=(--json)
 
 status=0

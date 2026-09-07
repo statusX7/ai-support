@@ -412,6 +412,11 @@ wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"
 wait_for_local_health "$DEPLOY_DIR"
+# 老快照没有统一 doctor；恢复到新版本时，在提交完成状态前核验实际运行代。
+if [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]]; then
+  bash "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application --installation-in-progress \
+    || die '回滚后的组件或配置接线检查失败；未提交完成状态，请成套恢复安全快照'
+fi
 set_installation_fact "$DEPLOY_DIR" dependencies ready
 set_installation_fact "$DEPLOY_DIR" local_services ready
 set_installation_fact "$DEPLOY_DIR" app_config ready

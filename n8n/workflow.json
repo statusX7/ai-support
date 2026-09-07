@@ -327,7 +327,8 @@
   "meta": {
     "templateCredsSetupCompleted": true,
     "aiSupportVersion": "v1.1.1",
-    "runtimeSha256": "18c77a58cc399e007845e5a49a4655bded9ad049caa109552ef2ad4c21a86670"
+    "runtimeSha256": "18c77a58cc399e007845e5a49a4655bded9ad049caa109552ef2ad4c21a86670",
+    "runtimeFileSha256": "fa83c094dc9c6735695a079e89ea75f06187e098fc36c6af028e075438d29821"
   },
   "tags": []
 }

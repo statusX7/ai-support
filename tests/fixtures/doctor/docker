@@ -104,6 +104,30 @@ if len(expected)!=len(actual) or not all(hmac.compare_digest(left,right) for lef
       printf 'matched\n'
     elif [[ "$joined" == *' n8n '* && "$joined" == *'export:workflow'* ]]; then
       [[ "${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" != 1 ]] || exit 1
+      python3 - "${DOCTOR_FIXTURE_DEPLOY:?}" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+deploy = pathlib.Path(sys.argv[1])
+workflow = json.loads((deploy / "n8n/workflow.json").read_text(encoding="utf-8"))
+runtime_file = (deploy / "n8n/runtime.js").read_text(encoding="utf-8")
+version = (deploy / "VERSION").read_text(encoding="utf-8").strip()
+source = re.sub(r"^if \(typeof module[^\n]+\n?$", "", runtime_file, count=1, flags=re.MULTILINE)
+source = re.sub(r"ai_support_version: 'v[^']+'", f"ai_support_version: '{version}'", source)
+metadata = workflow.get("meta", {})
+if metadata.get("runtimeFileSha256") != hashlib.sha256(runtime_file.encode()).hexdigest():
+    raise SystemExit(1)
+if metadata.get("runtimeSha256") != hashlib.sha256(source.encode()).hexdigest():
+    raise SystemExit(1)
+prefix = source + "\nconst runtime = createRuntime($env);\n"
+by_name = {node.get("name"): node for node in workflow.get("nodes", [])}
+for name in ("校验并持久接收", "处理持久任务", "扫描持久会话与任务", "只读公开显示选项"):
+    if not str(by_name.get(name, {}).get("parameters", {}).get("jsCode", "")).startswith(prefix):
+        raise SystemExit(1)
+PY
       printf 'verified\n'
     elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/healthz'* ]]; then
       [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1
