@@ -16,7 +16,10 @@ case "${1:-}" in
     ;;
   inspect)
     inspected_id=${!#}
-    if [[ "${DOCTOR_FIXTURE_OOM_SERVICE:-}" == "${inspected_id#fixture-}" ]]; then
+    if [[ " $* " == *'HostConfig.LogConfig'* ]]; then
+      printf '{"Type":"json-file","Config":{"max-size":"%s","max-file":"%s"}}\n' \
+        "${DOCTOR_FIXTURE_LOG_MAX_SIZE:-10m}" "${DOCTOR_FIXTURE_LOG_MAX_FILES:-5}"
+    elif [[ "${DOCTOR_FIXTURE_OOM_SERVICE:-}" == "${inspected_id#fixture-}" ]]; then
       printf '{"Running":true,"Restarting":false,"OOMKilled":true,"ExitCode":137}\n'
     else
       printf '{"Running":true,"Restarting":false,"OOMKilled":false,"ExitCode":0}\n'
@@ -48,13 +51,32 @@ service_stopped() {
 }
 
 case "$command" in
-  config) exit 0 ;;
+  config)
+    if [[ " $* " == *' --format json '* ]]; then
+      jq -M -cn --arg size "${DOCTOR_FIXTURE_LOG_MAX_SIZE:-10m}" \
+        --arg files "${DOCTOR_FIXTURE_LOG_MAX_FILES:-5}" \
+        --arg hours "${DOCTOR_FIXTURE_LOG_RETENTION_HOURS:-168}" '
+        {services:{
+          postgres:{logging:{driver:"json-file",options:{"max-size":$size,"max-file":$files}}},
+          anythingllm:{logging:{driver:"json-file",options:{"max-size":$size,"max-file":$files}}},
+          n8n:{logging:{driver:"json-file",options:{"max-size":$size,"max-file":$files}},environment:{
+            EXECUTIONS_DATA_PRUNE:"true",EXECUTIONS_DATA_MAX_AGE:$hours,
+            EXECUTIONS_DATA_SAVE_ON_SUCCESS:"none",EXECUTIONS_DATA_SAVE_ON_ERROR:"none"}},
+          "provider-adapter":{logging:{driver:"json-file",options:{"max-size":$size,"max-file":$files}}}
+        }}'
+    fi
+    exit 0
+    ;;
   ps)
     if [[ " $* " == *' --services '* ]]; then
       printf '%s\n' postgres anythingllm n8n provider-adapter
       exit 0
     fi
     service=${!#}
+    if [[ " $* " == *' -q '* ]]; then
+      service_stopped "$service" || printf 'fixture-%s\n' "$service"
+      exit 0
+    fi
     if [[ "$service" == n8n && "${DOCTOR_FIXTURE_DELAY_N8N_SECONDS:-0}" =~ ^[1-9][0-9]*$ ]]; then
       sleep "$DOCTOR_FIXTURE_DELAY_N8N_SECONDS"
     fi
@@ -87,6 +109,15 @@ case "$command" in
         && -f "${DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE:-}" \
         && "$managed_password" == "$(<"$DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE")" ]] || exit 1
       printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_MATERIALS_PROJECTION'* ]]; then
+      expected=$(cat)
+      actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/config/materials-applied.json" | awk '{print $1}')
+      [[ "${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
+      [[ -z "${DOCTOR_FIXTURE_LOG:-}" ]] || printf 'materials-binding expected_length=%s actual_length=%s matched=%s mismatch_flag=%s\n' \
+        "${#expected}" "${#actual}" "$([[ "$expected" == "$actual" ]] && printf true || printf false)" \
+        "${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" >> "$DOCTOR_FIXTURE_LOG"
+      [[ "$expected" == "$actual" ]] || exit 1
+      printf 'matched\n'
     elif [[ "$joined" == *'CRISPAI_EXPECTED_ENV_BINDING'* ]]; then
       service=''
       for candidate in provider-adapter anythingllm n8n; do
@@ -103,6 +134,9 @@ actual=[str(value).encode() for value in actual]
 if len(expected)!=len(actual) or not all(hmac.compare_digest(left,right) for left,right in zip(expected,actual)): sys.exit(1)
 ' "$service" "$DOCTOR_FIXTURE_RUNTIME_ENV_FILE"
       printf 'matched\n'
+    elif [[ "$joined" == *' n8n '* && "$joined" == *'EXECUTIONS_DATA_PRUNE'* ]]; then
+      jq -M -cn --arg hours "${DOCTOR_FIXTURE_LOG_RETENTION_HOURS:-168}" \
+        '{prune:"true",max_age_hours:$hours,save_success:"none",save_error:"none"}'
     elif [[ "$joined" == *' n8n '* && "$joined" == *'export:workflow'* ]]; then
       # 真实 docker compose exec 会尝试转发 stdin。doctor 若在 PTY 中通过
       # coreutils timeout 的后台进程组调用它，未显式关闭 stdin 就会收到

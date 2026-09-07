@@ -77,12 +77,14 @@ RELEASE_FILES=(
   config/app.yaml config/Caddyfile.example config/feedback.yaml.example
   config/handoff.yaml.example config/keyword.yaml.example config/menu.yaml.example
   config/prompt.md.example config/provider.yaml.example config/tags.yaml.example config/runtime.yaml.example
+  config/logging.yaml.example
   knowledge/README.md n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
   scripts/analytics.sh scripts/backup.sh scripts/bootstrap.sh scripts/common.sh
   scripts/healthcheck.sh scripts/doctor.sh scripts/package-release.sh scripts/restore.sh
   scripts/rollback.sh scripts/snapshot.sh scripts/wizard.sh scripts/launcher.sh scripts/menu-ui.sh
   scripts/configuration.sh scripts/provider.sh scripts/provider-adapter.js scripts/knowledge.sh
   scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
+  scripts/materials.sh scripts/logs.sh scripts/log-redact.py
   docs/ARCHITECTURE.md docs/CONFIG.md docs/INSTALL.md docs/RELEASE.md
   docs/SECURITY.md docs/TESTING.md docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   tests/run.sh tests/test_archive_security.sh tests/test_bootstrap.sh
@@ -90,12 +92,14 @@ RELEASE_FILES=(
   tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
   tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
   tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
+  tests/test_crisp_auth.js tests/test_caddy_routing.sh tests/fixtures/caddy-order-v111.conf
+  tests/test_launcher.py tests/test_materials_apply.js tests/test_material_limits.js tests/test_logs.sh tests/test_docs_acceptance.py
   tests/test_provider_adapter.js tests/test_release_package.sh tests/test_static_security.sh tests/test_web_chat_browser.js
   tests/test_wizard.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
   tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker
   tests/mocks/curl tests/mocks/curl_knowledge_timeout tests/mocks/docker tests/mocks/stat
-  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df
+  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl
   "docs/releases/${VERSION_VALUE}.md"
   "docs/reports/${VERSION_VALUE}-report.md"
 )
@@ -116,6 +120,7 @@ for required in VERSION get.sh install.sh manage.sh update.sh uninstall.sh docke
   scripts/common.sh scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh \
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/provider-adapter.js \
   scripts/launcher.sh scripts/doctor.sh scripts/migration.sh scripts/full-backup.sh scripts/archive-guard.py \
+  scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
   n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js config/app.yaml config/provider.yaml.example; do
   grep -zFxq -- "$required" "$LIST_FILE" \
     || { printf '错误：发布清单缺少必要文件：%s\n' "$required" >&2; exit 1; }

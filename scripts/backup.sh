@@ -13,7 +13,7 @@ usage() {
   cat <<'EOF'
 用法：backup.sh [--deploy-dir PATH] [--output FILE] [--full]
 
-备份包含配置、Prompt、规则、n8n workflow、知识文件和知识库清单。
+默认导出完整业务迁移包：配置、Prompt、规则、workflow 模板、全部命名知识库与原文。
 备份不包含 .env、API Key、Crisp Token、Webhook Secret、日志或用户会话数据。
 --full 创建包含内部凭据、数据库、全部知识库和会话状态的本机一致性备份；仅存放于受限可信位置。
 EOF
@@ -64,6 +64,21 @@ OUTPUT_FILE=$(realpath -m -- "$OUTPUT_REQUEST")
 [[ "$OUTPUT_FILE" != "$DEPLOY_DIR"/*/../* ]] || die "备份路径无效"
 [[ ! -L "$OUTPUT_FILE" ]] || die "备份目标不得是符号链接"
 mkdir -p -- "$(dirname -- "$OUTPUT_FILE")" "${DEPLOY_DIR}/tmp"
+
+# 新代业务备份与菜单 12 复用一个实现，不能退回只备份 knowledge 根文件的旧格式。
+# 没有命名库目录的历史实例仍可用本脚本生成旧格式的升级前保全。
+if [[ -f "${DEPLOY_DIR}/knowledge/catalog.json" && ! -L "${DEPLOY_DIR}/knowledge/catalog.json" \
+  && -f "${SCRIPT_DIR}/migration.sh" && ! -L "${SCRIPT_DIR}/migration.sh" ]]; then
+  if [[ -f "${DEPLOY_DIR}/config/provider.yaml" ]] \
+    && provider_config_has_secret_field "${DEPLOY_DIR}/config/provider.yaml"; then
+    die 'provider.yaml 包含疑似密钥字段；未导出业务备份'
+  fi
+  bash "${SCRIPT_DIR}/migration.sh" --deploy-dir "$DEPLOY_DIR" export "$OUTPUT_FILE" >/dev/null
+  record_maintenance_event "$DEPLOY_DIR" backup complete
+  info "完整业务备份已生成：$OUTPUT_FILE"
+  warn '包含全部知识原文，仍须私密保管；不含密钥、数据库或会话。请用菜单 12 导入或 restore.sh 恢复'
+  exit 0
+fi
 
 STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/backup-stage.XXXXXX")
 ARCHIVE_TEMP=$(mktemp "$(dirname -- "$OUTPUT_FILE")/.backup.tmp.XXXXXX")

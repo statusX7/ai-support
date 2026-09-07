@@ -1,6 +1,6 @@
 # 测试与验收
 
-本章供维护者复现测试；正常管理员使用 [在线安装命令](INSTALL.md) 和 `crispai doctor`，不需要准备开发用 E2E 环境变量。每次发布的实际数量、证据路径和限制以对应 [发布报告](reports/v1.1.1-report.md) 为准。
+本章供维护者复现测试；正常管理员使用[在线安装命令](INSTALL.md)和 `crispai doctor`，不需要准备开发用 E2E 环境变量。当前 v1.2.0 的实际数量、证据与限制以[发布报告](reports/v1.2.0-report.md)和独立 Release 核验附件为准；历史数字不累计。
 
 ## 层级与门禁
 
@@ -10,7 +10,8 @@
 | UNIT/CONTRACT | 生产函数、Shell/PTY、事件 fixture、协议服务、可控时钟的分支 | 真实 Crisp、真实模型或真实向量检索 |
 | REAL-LOCAL | 真实 Docker、PostgreSQL、AnythingLLM、n8n、实际索引、生产入口和归档安装 | 用户自有公网/账户授权 |
 | PUBLIC-DISTRIBUTION | 无认证读取公开 repo/raw/Latest/固定资产并执行推荐命令 | Crisp/模型外部业务 E2E |
-| EXTERNAL-E2E | 真实 Crisp 测试访客、真实第三方模型、公网 HTTPS 与实际页面 | 未执行的其他发行版、账户和渠道 |
+| TARGET-A | 本轮授权故障机上的命令、组件、候选/正式包与恢复验证（公开仅用代号） | 另一台机器或没有发生的客户往返 |
+| REAL-EXTERNAL | 真实 Crisp 测试访客、真实第三方模型、公网 HTTPS 与实际页面 | 合成 Hook、仅 REST 写权限、构造的真人事件；旧套件名 EXTERNAL-E2E 保留兼容 |
 
 真实空机引导作为 REAL-LOCAL 的独立硬门槛报告：初始无 Docker/Compose，生产安装器自行补齐。不得挂宿主 Docker socket、隐藏 PATH、手工先装 Docker或复用旧版本报告冒充本次实测。协议服务可以配合真实本地应用，但须写为“真实应用 + 模拟 Crisp/Provider”，不能写为“真实模型回答通过”。
 
@@ -30,11 +31,19 @@ node tests/test_configuration_protocol.js
 bash tests/test_workflow_contract.sh
 bash tests/test_workflow_runtime.sh
 node tests/test_provider_adapter.js
+node tests/test_crisp_auth.js
+python3 tests/test_launcher.py
+python3 tests/test_docs_acceptance.py
+node tests/test_materials_apply.js
+node tests/test_material_limits.js
+bash tests/test_logs.sh
 ```
 
 生产发布归档包含可复现的测试源码，不包含开发工具二进制、运行日志或私密测试配置；普通安装不执行测试驱动。主驱动自行枚举当前正式专项，避免人工漏跑。
 
 ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服运行依赖。普通安装所需的 Python 3/PyYAML、jq、Docker/Compose 等仍由生产安装器补齐。
+
+`test_docs_acceptance.py` 独立核对活跃链接、唯一推荐命令原样、18 项菜单标题、帮助/版本的无副作用执行，以及资料限制和反代日志文档接线；不执行在线安装，也不能替代真实组件与 Crisp 验收。资料应用及强制同步的生产 PTY 分支由 `test_manage_contract.sh` 覆盖。
 
 发布模式必须指定隔离真实部署，不能把本地集成缺失当外部豁免：
 
@@ -66,14 +75,34 @@ bash tests/run.sh
 9. 停用客服：在途结果、关键词、欢迎、反馈均静默，仍记录真人事件；重新启用不清空 A 的人工状态、不补答停用期间历史。
 10. 欢迎启停、加载/打开事件、自动展开分别验证；页面 SDK 不含密钥。负反馈、图片失败和知识未知都不转人工。
 11. 通过菜单导出完整业务配置和知识原文，校验无秘密，再预览导入、应用并读回；另外验证完整本机备份与故障回滚。
-12. 从真实 v1.1.0 正式实例升级到 v1.1.1，保留密钥、Prompt、知识和既有人工状态；再安全卸载、同路径重装、完整清理及同名命令/外部占网保护。v1.0.1 迁移继续由原契约回归覆盖，不把历史实测算成本轮新实测。
+12. 从真实 v1.1.1 正式实例升级到 v1.2.0，保留密钥、Prompt、知识和既有人工状态；在隔离实例测试故障回滚、再次升级、安全卸载、同路径重装、完整清理与同名命令/外部占网保护。不要卸载授权故障目标机来凑测试。更旧版本由保留的契约回归覆盖，历史实测不算本轮新实测。
 13. 从正式 GitHub Release 回下载归档和 SHA256SUMS，重新校验、独立解压并检查入口。报告的验收代码应与发布资产相同。
 
 没有真实 Crisp 时，上述消息故事必须通过真正运行的 n8n 生产 Webhook 和隔离协议服务执行。模拟回复、回调和前端 SDK 的本地测试分别标注，不能称为真实 Crisp UI 或真实第三方模型验收。
 
-## T01～T50 追踪矩阵
+## v1.2.0 实机与维护闭环矩阵
 
-本轮新增 I01～I15、D01～D16、R01～R07、P01～P07 在 [v1.1.1 报告](reports/v1.1.1-report.md) 逐项记录层级和证据。主要驱动对应如下：
+以下是必须核验的分组，不预填通过。每次失败保留脱敏负例、文件/函数根因和复测结果；`--help` 可用不等于客服回复可用。真实目标的 IP、账号、域名、会话身份和业务正文不得写进测试源码、公开日志或报告。
+
+| 本轮 ID | 关键可观察断言 | 实际入口/层级 |
+| --- | --- | --- |
+| R01～R06 | 分别复现 crisp/crispai；root/sudo、新登录、陌生 cwd、坏链接、WARN/EOF/SIGINT；入口完全损坏可同版救援 | `test_launcher.py`、`test_get.sh`、生产 PTY、TARGET-A |
+| R07～R10 | 修前保全、候选升级、断开新登录、最终包逐文件核对；保留真实配置和人工状态 | 完整备份/升级器、隔离 VM、TARGET-A |
+| I01～I07 | 匿名原样命令、依赖先补、十项/零额外、续装、TTY与坏包、无.git归档 | get/wizard/bootstrap/归档专项、真实 Debian VM、PUBLIC-DISTRIBUTION |
+| W01～W05 | 稳定资料路径、UTF-8 bytes/N+1、父链接/递归、编辑应用、坏候选不替换有效版 | materials/limits/wizard 专项及生产菜单、实际 API |
+| W06～W08 | 三命名库真实索引/停用/更新、pending 对账、迁移/回滚根目录 inode 与原文保持 | knowledge/protocol/timeout、真实 AnythingLLM、隔离升级/恢复 |
+| L01～L05 | 来源/容量、限量查看、follow中断、并发轮转、期限清理与数字取消 | `test_logs.sh`、真实菜单 PTY、系统级 timer 至少一个实际周期 |
+| L06～L10 | Docker/n8n独立保留；业务状态不清；假秘密落盘/导出；JSON/时间预算/关闭客服/永久人工 | 日志与 doctor 专项、故障注入隔离 VM |
+| C01～C04 | Basic/tier/配对/轮换、错误 HTTP/200错误JSON、最终 Chat/Responses 路由、Crisp 出站字段 | auth/adapter/runtime 专项、真实模型和官方 Crisp 受限测试 |
+| C05～C08 | 反代路由次序、DNS代理/TLS/挑战HTML、SDK真实往返、原生picker及更新 | Caddy真实容器对照、TARGET-A/REAL-EXTERNAL |
+| B01～B06 | 真人优先/迟到结果取消、A/B与N/0/重启、开关欢迎、图像记忆、失败不handoff、发送未知对账 | runtime全部既有断言、真实n8n协议集成、独立实际访客 |
+| P01～P08 | 文档/限制/菜单、旧版升级/坏包回滚/数字卸载、隐私扫描、publicLatest/匿名取包、目标正式内容 | 固定包门禁、隔离VM、公共发行、最终TARGET-A |
+
+真实 REST 202 只证明写权限；必须由 SDK 访客发言、Crisp 公网 Hook 到生产工作流、当前模型生成并回到同一窗口，才记录真实往返。人工后台操作不可得时，API 构造 `automated:false` 仅算协议场景，不能冒称真人实测。旧 Caddy 404 与自定义出站 properties 被官方拒绝的现场负例均应先复现再回归；不能把固定协议服务的宽松接受当成官方支持。
+
+## 保留的历史验收矩阵
+
+v1.1.1 的 I01～I15、D01～D16、R01～R07、P01～P07 在[历史报告](reports/v1.1.1-report.md)记录。它们作为回归继续保留，不与本轮重用编号混淆，主要驱动如下：
 
 | 验收组 | 实际入口与断言 |
 | --- | --- |
@@ -155,4 +184,4 @@ bash tests/test_public_distribution.sh --remote
 
 只有 current 配置的实际事实通过才可更新接入状态。协议端点成功、模型列表 200、workflow active、错误 Secret 的 401、健康容器均不得单独提升为“真实会话已接入”。详见 [安装状态](INSTALL.md)。
 
-转录用虚构知识并设 0600；报告只留摘要、匿名标识、hash、HTTP 分类和计数，不包含 URL Secret、API Key、客户正文、图片或完整本机备份。原始敏感资料不进入 Git 或 Release。
+通用转录用虚构知识并设 0600；真实目标的原始材料留授权现场或 0700 私密目录。公开报告只留目标代号、软件/资产 hash、白名单错误类别和计数，不含连接资料、业务端点、真实/测试会话身份、秘密及其不必要 hash、客户正文、图片或完整本机备份。原始敏感资料不进入 Git 或 Release。

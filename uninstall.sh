@@ -126,6 +126,7 @@ BACKUP_SCRIPT="${DEPLOY_DIR}/scripts/backup.sh"
 [[ -f "$BACKUP_SCRIPT" && ! -L "$BACKUP_SCRIPT" && -x "$BACKUP_SCRIPT" ]] \
   || die "自动备份脚本缺失或不安全：$BACKUP_SCRIPT"
 info "卸载前创建包含凭据与运行数据的完整备份，请勿公开或上传"
+record_maintenance_event "$DEPLOY_DIR" uninstall start
 "$BACKUP_SCRIPT" --deploy-dir "$DEPLOY_DIR" --full --output "$BACKUP_FILE"
 [[ -f "$BACKUP_FILE" && ! -L "$BACKUP_FILE" ]] || die "自动备份没有生成有效文件"
 
@@ -162,6 +163,11 @@ if [[ -n "$REMAINING_COMPOSE_CONTAINERS" || -n "$REMAINING_COMPOSE_NETWORKS" ]];
     || warn "仍存在本 Compose 项目网络：${REMAINING_COMPOSE_NETWORKS//$'\n'/, }"
   die "Docker Compose 清理未完成，网络可能被外部容器占用；未删除任何外部容器，也未删除程序文件。请先分离占用者后重试，自动备份位于：$BACKUP_FILE"
 fi
+
+# 调度属于本实例，必须在删除执行模块前停止并核验；不触碰用户级 cron 或系统 journal。
+remove_log_maintenance "$DEPLOY_DIR" \
+  || die '日志维护调度未能安全移除；程序和数据保留，请先修复调度后重试卸载'
+record_maintenance_event "$DEPLOY_DIR" uninstall complete
 
 if [[ "$MODE" == purge ]]; then
   remove_crispai_launcher "$DEPLOY_DIR"

@@ -28,6 +28,21 @@ handle_install_interrupt() {
 
 trap handle_install_interrupt INT TERM
 
+handle_install_exit() {
+  local status=$? phase=failed
+  trap - EXIT
+  if [[ -n "${DEPLOY_DIR:-}" && -f "${DEPLOY_DIR}/${INSTALL_MARKER}" ]]; then
+    if (( status == 0 )) || { (( status == 2 )) && [[ "$(installation_state "$DEPLOY_DIR")" == local-ready ]]; }; then
+      phase=complete
+    elif (( status == 130 )); then
+      phase=interrupted
+    fi
+    record_maintenance_event "$DEPLOY_DIR" install "$phase" "$status"
+  fi
+  exit "$status"
+}
+trap handle_install_exit EXIT
+
 validate_preserved_installation() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"
@@ -555,7 +570,10 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
       inline)
         PROMPT_TEMP=$(mktemp "${DEPLOY_DIR}/config/prompt.md.tmp.XXXXXX")
         jq -j '.prompt.content' "$WIZARD_RESULT" > "$PROMPT_TEMP"
-        [[ -s "$PROMPT_TEMP" ]] || { rm -f -- "$PROMPT_TEMP"; die "自定义 Prompt 不能为空"; }
+        if ! (source "${DEPLOY_DIR}/scripts/configuration.sh"; configuration_prompt_candidate_validate "$PROMPT_TEMP"); then
+          rm -f -- "$PROMPT_TEMP"
+          die '自定义 Prompt 未通过字节、UTF-8 和非空校验，未覆盖原文'
+        fi
         chmod 0640 "$PROMPT_TEMP"
         mv -f -- "$PROMPT_TEMP" "${DEPLOY_DIR}/config/prompt.md"
         ;;
@@ -577,7 +595,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
         info '知识来源已加入默认知识库，将在应用启动后同步并核对索引'
       else
         KNOWLEDGE_IMPORTED=$(import_knowledge_source "$DEPLOY_DIR" "$KNOWLEDGE_SOURCE_VALUE")
-        info "已复制 ${KNOWLEDGE_IMPORTED} 个知识文件到受管目录"
+        info "默认知识库已登记 ${KNOWLEDGE_IMPORTED} 个原文条目，待应用启动后索引"
       fi
     fi
   fi
@@ -586,7 +604,13 @@ else
   info '检测到已有配置；本次重复安装将保留 .env 和实际配置文件'
 fi
 
+if (( EXISTING == 0 )) && [[ -z "$(env_get "$ENV_FILE" CRISPAI_LOG_MAX_FILES 2>/dev/null || true)" ]]; then
+  # 旧代迁移缺字段保留 3 份；新装先显式登记 5 份，不能被迁移缺省值覆盖。
+  env_set "$ENV_FILE" CRISPAI_LOG_MAX_FILES 5
+fi
 migrate_runtime_env "$DEPLOY_DIR"
+bash "${DEPLOY_DIR}/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" initialize
+record_maintenance_event "$DEPLOY_DIR" install start
 
 [[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
 set_runtime_ownership "$DEPLOY_DIR"
@@ -610,10 +634,11 @@ if (( SKIP_START == 0 )); then
   knowledge_sync "$DEPLOY_DIR" || die "知识库同步未完全成功；保留安装进度供重试"
   import_and_publish_workflow "$DEPLOY_DIR" || die "n8n 工作流导入或发布失败；保留安装进度供重试"
   wait_for_local_health "$DEPLOY_DIR"
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
-    --application --installation-in-progress
   bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
     || die '配置或知识的运行时回读失败，安装进度已保留'
+  install_log_maintenance "$DEPLOY_DIR" || die '日志维护调度安装失败；应用与已填写资料保留，可重试同一安装命令'
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
+    --application --installation-in-progress
   set_installation_fact "$DEPLOY_DIR" app_config ready
   set_installation_fact "$DEPLOY_DIR" provider ready
   set_installation_fact "$DEPLOY_DIR" crisp_api pending
@@ -628,12 +653,14 @@ if (( SKIP_START == 0 )); then
       >/dev/null || die "首次迁移备份失败；本地服务保持 local-ready，可修复后重试"
     info "首次迁移备份已创建：$INITIAL_BACKUP（不含密钥）"
   fi
+  WEBHOOK_ACCESS_STATUS=000
   if webhook_access_check "$DEPLOY_DIR"; then
     set_installation_fact "$DEPLOY_DIR" webhook ready
   else
     set_installation_fact "$DEPLOY_DIR" webhook pending
     warn "公网 Webhook 尚未通过 DNS/TLS/路由检查（HTTP ${WEBHOOK_ACCESS_STATUS:-000}）；本地服务保持可用"
   fi
+  CRISP_API_STATUS=000
   if crisp_api_check "$DEPLOY_DIR"; then
     set_installation_fact "$DEPLOY_DIR" crisp_api ready
   else
@@ -675,6 +702,9 @@ else
   printf '请在 Crisp 的 Workspace Settings → Advanced configuration → Web Hooks 登记生产地址。\n'
   printf '订阅 message:send、message:received、message:updated；页面欢迎模式另需 session:sync:events。\n'
   printf '管理入口：crispai；继续接入验证：crispai doctor；日志：%s/logs\n' "$DEPLOY_DIR"
+  printf '用户资料根目录：%s；Prompt：config/prompt.md；知识原文：knowledge/kb_*/sources/。\n' "$DEPLOY_DIR"
+  printf '编辑后运行 crispai apply --check，再运行 crispai apply；菜单 16 → 8 可查看具体路径与未应用变化。\n'
+  printf '日志查看/轮转/保留：菜单 15；兼容 crisp 仅在未被其他程序占用时安装。\n'
   printf '含 Secret 的真实 Hook 地址只在 crispai → 10 → 7 的私密终端显示。\n'
   if [[ "$(installation_state "$DEPLOY_DIR")" == ready ]]; then
     printf 'Crisp REST、公网端点与已观察真实会话均已验证；客服按总开关及逐会话模式运行。\n'

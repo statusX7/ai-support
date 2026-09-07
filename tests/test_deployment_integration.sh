@@ -16,10 +16,12 @@ command -v realpath >/dev/null 2>&1 || {
   printf '失败：缺少命令 realpath。\n' >&2
   exit 1
 }
-command -v curl >/dev/null 2>&1 || {
-  printf '失败：缺少命令 curl。\n' >&2
-  exit 1
-}
+for required in curl jq mktemp; do
+  command -v "$required" >/dev/null 2>&1 || {
+    printf '失败：缺少命令 %s。\n' "$required" >&2
+    exit 1
+  }
+done
 command -v stat >/dev/null 2>&1 || {
   printf '失败：缺少命令 stat。\n' >&2
   exit 1
@@ -64,7 +66,11 @@ docker_compose "$DEPLOY_DIR" config --quiet
 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --local
 
 RUNNING=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=running)
-for service in postgres anythingllm n8n; do
+SERVICES=(postgres anythingllm n8n provider-adapter)
+if [[ "$(env_get "${DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)" == managed_https ]]; then
+  SERVICES+=(caddy)
+fi
+for service in "${SERVICES[@]}"; do
   grep -Fxq "$service" <<< "$RUNNING" || {
     printf '失败：真实容器未运行：%s\n' "$service" >&2
     exit 1
@@ -77,7 +83,15 @@ N8N_PORT_VALUE=$(env_get "${DEPLOY_DIR}/.env" N8N_PORT 2>/dev/null || printf '56
   printf '失败：N8N_PORT 格式无效。\n' >&2
   exit 1
 }
-WEBHOOK_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+PROBE_DIR=$(mktemp -d "${DEPLOY_DIR}/tmp/local-probe.XXXXXX")
+chmod 700 "$PROBE_DIR"
+cleanup() {
+  [[ "$PROBE_DIR" == "${DEPLOY_DIR}/tmp/"local-probe.* && -d "$PROBE_DIR" ]] || return
+  rm -f -- "$PROBE_DIR/response.json"
+  rmdir -- "$PROBE_DIR"
+}
+trap cleanup EXIT
+WEBHOOK_STATUS=$(curl -q --silent --output "$PROBE_DIR/response.json" --write-out '%{http_code}' \
   --connect-timeout 3 --max-time 15 \
   --request POST --header 'Content-Type: application/json' \
   --data '{"event":"message:send","website_id":"integration-invalid","data":{"session_id":"session_integration1234","from":"user","type":"text","content":"安全探针"}}' \
@@ -85,6 +99,11 @@ WEBHOOK_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   2>/dev/null || true)
 [[ "$WEBHOOK_STATUS" == 401 ]] || {
   printf '失败：生产 Webhook 未发布或未拒绝伪造请求（HTTP %s）。\n' "${WEBHOOK_STATUS:-000}" >&2
+  exit 1
+}
+jq -e 'type == "object" and .accepted == false and .reason == "Webhook 校验失败"' \
+  "$PROBE_DIR/response.json" >/dev/null || {
+  printf '失败：401 不是本项目生产 Code 的拒绝结构，不能证明工作流可执行。\n' >&2
   exit 1
 }
 

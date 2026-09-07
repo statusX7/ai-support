@@ -1,5 +1,12 @@
 {
   admin off
+  log default {
+    format filter {
+      request>uri replace [REDACTED]
+      request>headers>Authorization delete
+      request>headers>Cookie delete
+    }
+  }
 }
 
 {$WEBHOOK_DOMAIN} {

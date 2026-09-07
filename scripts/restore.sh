@@ -18,7 +18,7 @@ usage() {
 
 选项：
   --deploy-dir PATH    指定部署目录
-  --skip-restart       恢复后不重启容器
+  --skip-restart       仅用于旧 v1 单目录备份的离线文件恢复；新业务迁移必须应用并回读
   --no-safety-backup   不创建恢复前安全备份
   --full              恢复可信的本机完整备份（包含密钥、数据库及会话）
 EOF
@@ -67,13 +67,83 @@ require_command tar
 require_command jq
 require_command sha256sum
 require_command realpath
+require_command python3
+require_command timeout
 
 if [[ "$INPUT_REQUEST" != /* ]]; then
   INPUT_REQUEST="${PWD}/${INPUT_REQUEST}"
 fi
+[[ ! -L "$INPUT_REQUEST" && "$INPUT_REQUEST" != *[[:cntrl:]]* ]] || die '备份路径不能包含符号链接或控制字符'
 INPUT_FILE=$(realpath -e -- "$INPUT_REQUEST")
+[[ "$INPUT_FILE" == "$(realpath -ms -- "$INPUT_REQUEST")" ]] || die '备份路径的父目录不能包含符号链接'
 [[ -f "$INPUT_FILE" && ! -L "$INPUT_FILE" ]] || die "备份必须是普通文件且不能是符号链接"
 [[ "$INPUT_FILE" == *.tar.gz ]] || die "备份文件必须以 .tar.gz 结尾"
+
+# 只读取归档中大小受限的 manifest 判断既有格式，不提取或执行归档内容。
+# 后续仍由对应恢复器完整验证成员、checksum、大小、schema 和路径。
+BACKUP_FORMAT=$(timeout --signal=TERM --kill-after=2s 30s python3 - "$INPUT_FILE" <<'PY'
+import json
+import pathlib
+import sys
+import tarfile
+
+rejection = "压缩包损坏或格式无效"
+try:
+    path = pathlib.Path(sys.argv[1])
+    if not 0 < path.stat().st_size <= 512 * 1024 * 1024:
+        rejection = "压缩包大小必须为 1～536870912 字节"
+        raise ValueError("size")
+    total = 0
+    seen = set()
+    format_name = ""
+    with tarfile.open(path, "r:gz") as archive:
+        for count, member in enumerate(archive):
+            if count >= 20000:
+                rejection = "归档成员超过 20000 个"
+                raise ValueError("members")
+            name = member.name
+            while name.startswith("./"):
+                name = name[2:]
+            name = name.rstrip("/")
+            if name == ".":
+                name = ""
+            if (name.startswith("/") or ".." in pathlib.PurePosixPath(name).parts
+                    or "\\" in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+                rejection = "备份包含路径穿越或控制字符"
+                raise ValueError("path")
+            if name in seen:
+                rejection = "备份包含重复归档路径"
+                raise ValueError("duplicate")
+            if not (member.isfile() or member.isdir()):
+                rejection = "备份包含链接或特殊文件"
+                raise ValueError("type")
+            seen.add(name)
+            total += member.size
+            if total > 4 * 1024 * 1024 * 1024:
+                rejection = "归档展开大小超过 4 GiB"
+                raise ValueError("expanded")
+            if name == "manifest.json":
+                if not member.isfile() or member.size > 65536:
+                    rejection = "备份清单类型或大小无效"
+                    raise ValueError("manifest")
+                value = json.load(archive.extractfile(member))
+                if value.get("format") == "ai-support-business-v2":
+                    format_name = "ai-support-business-v2"
+    print(format_name)
+except (OSError, ValueError, AttributeError, tarfile.TarError):
+    print("错误：" + rejection + "；现有资料未改变", file=sys.stderr)
+    raise SystemExit(1)
+PY
+) || die '备份格式预检失败或超时：请检查压缩包完整性、重复/链接/越界路径及大小（压缩 512 MiB、展开 4 GiB、成员 20000）；现有资料未改变'
+if [[ "$BACKUP_FORMAT" == ai-support-business-v2 ]]; then
+  # 即使指定不适用的离线参数，也先通过安全校验给出准确的坏包原因。
+  bash "${SCRIPT_DIR}/migration.sh" --deploy-dir "$DEPLOY_DIR" import-preview "$INPUT_FILE" >/dev/null \
+    || die '业务备份校验和、成员或 schema 校验失败；现有资料未改变'
+  (( SKIP_RESTART == 0 )) || die '新业务备份必须通过应用与回读完成恢复，不支持 --skip-restart；未修改资料'
+  bash "${SCRIPT_DIR}/migration.sh" --deploy-dir "$DEPLOY_DIR" import "$INPUT_FILE"
+  record_maintenance_event "$DEPLOY_DIR" restore complete
+  exit 0
+fi
 
 is_allowed_archive_path() {
   local path=${1#./}
@@ -207,6 +277,11 @@ if (( SKIP_RESTART == 0 )); then
   sync_prompt_to_anythingllm "$DEPLOY_DIR"
   import_and_publish_workflow "$DEPLOY_DIR"
   wait_for_local_health "$DEPLOY_DIR"
+  if [[ -f "${DEPLOY_DIR}/scripts/materials.sh" && ! -L "${DEPLOY_DIR}/scripts/materials.sh" ]]; then
+    bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
+      || die '恢复后的资料应用回读失败；未宣称恢复完成'
+  fi
+  install_log_maintenance "$DEPLOY_DIR" || die '恢复后的日志维护调度回读失败'
   if [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]]; then
     bash "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application --installation-in-progress \
       || die '恢复后的组件或配置接线检查失败；未宣称恢复完成，请保留安全备份继续修复'
@@ -215,5 +290,6 @@ if (( SKIP_RESTART == 0 )); then
 fi
 
 trap - EXIT
+record_maintenance_event "$DEPLOY_DIR" restore complete
 rm -rf -- "$STAGING"
 info '备份恢复完成；.env 和现有密钥未被覆盖'

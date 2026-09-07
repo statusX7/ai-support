@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "applied_revision": 1,
+  "retention_days": 7,
+  "max_size_mib": 10,
+  "max_files": 5,
+  "timer_enabled": true,
+  "updated_at": "1970-01-01T00:00:00Z"
+}

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -z "${DOCTOR_FIXTURE_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >> "$DOCTOR_FIXTURE_LOG"
+case "${1:-}" in
+  is-enabled|is-active) exit 0 ;;
+  daemon-reload|enable|disable|start|stop) exit 0 ;;
+  *) exit 0 ;;
+esac

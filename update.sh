@@ -131,6 +131,7 @@ rollback_on_failure() {
   local status=$?
   trap - EXIT
   if (( status != 0 && UPDATE_COMPLETE == 0 )); then
+    record_maintenance_event "$DEPLOY_DIR" update failed "$status"
     warn "更新失败，开始自动回滚"
     if [[ -n "$SNAPSHOT_ID" ]]; then
       rollback_args=(--deploy-dir "$DEPLOY_DIR" --snapshot "$SNAPSHOT_ID" --no-safety-snapshot)
@@ -172,6 +173,8 @@ SERVICES_STOPPED=1
 write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$OLD_VERSION" installing
 copy_project_files "$SOURCE_DIR" "$DEPLOY_DIR"
 initialize_config_files "$DEPLOY_DIR"
+bash "${DEPLOY_DIR}/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" initialize
+record_maintenance_event "$DEPLOY_DIR" update start
 migrate_config_files "$DEPLOY_DIR"
 bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate
 [[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
@@ -191,10 +194,11 @@ if (( SKIP_START == 0 )); then
   knowledge_sync "$DEPLOY_DIR" || die "更新后知识库同步失败"
   import_and_publish_workflow "$DEPLOY_DIR" || die "更新后 workflow 发布失败"
   wait_for_local_health "$DEPLOY_DIR"
-  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
-    --application --installation-in-progress
   bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
     || die '升级后运行时配置回读失败'
+  install_log_maintenance "$DEPLOY_DIR" || die '升级后日志维护调度回读失败'
+  "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
+    --application --installation-in-progress
   set_installation_fact "$DEPLOY_DIR" dependencies ready
   set_installation_fact "$DEPLOY_DIR" local_services ready
   set_installation_fact "$DEPLOY_DIR" app_config ready
@@ -225,6 +229,7 @@ if (( SKIP_START == 0 )); then
 fi
 
 UPDATE_COMPLETE=1
+record_maintenance_event "$DEPLOY_DIR" update complete
 trap - EXIT
 info "更新完成：${OLD_VERSION} -> ${NEW_VERSION}"
 info "如需撤销，请运行：${DEPLOY_DIR}/scripts/rollback.sh --deploy-dir ${DEPLOY_DIR} --snapshot ${SNAPSHOT_ID}"

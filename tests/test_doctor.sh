@@ -8,7 +8,7 @@ FIXTURE_BIN="${SCRIPT_DIR}/fixtures/doctor"
 ORIGINAL_PATH=$PATH
 PASSED=0
 LAST_RC=0
-TEST_WORK_ROOT="${PROJECT_ROOT}/.work/v1.1.1"
+TEST_WORK_ROOT="${PROJECT_ROOT}/.work/v1.2.0"
 mkdir -p -- "$TEST_WORK_ROOT"
 TEST_ROOT=$(mktemp -d "${TEST_WORK_ROOT}/doctor-test.XXXXXXXX")
 DEPLOY="${TEST_ROOT}/deploy"
@@ -19,6 +19,7 @@ STOPPED_FILE="${TEST_ROOT}/stopped-services"
 DB_PASSWORD_FILE="${TEST_ROOT}/postgres-running-password"
 N8N_DB_PASSWORD_FILE="${TEST_ROOT}/n8n-running-password"
 RUNTIME_ENV_FILE="${TEST_ROOT}/running-container-env.json"
+SYSTEMD_DIR="${TEST_ROOT}/systemd"
 
 cleanup() {
   if [[ "${AI_SUPPORT_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -66,7 +67,10 @@ fixture_env() {
     DOCTOR_FIXTURE_DELAY_N8N_SECONDS="${DOCTOR_FIXTURE_DELAY_N8N_SECONDS:-0}" \
     DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS="${DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS:-0}" \
     DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS="${DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS:-0}" \
+    DOCTOR_FIXTURE_MATERIALS_MISMATCH="${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" \
     DOCTOR_FIXTURE_STDIN_PROBE="${DOCTOR_FIXTURE_STDIN_PROBE:-0}" \
+    CRISPAI_LOGS_SYSTEMD_TEST=1 \
+    CRISPAI_LOGS_SYSTEMD_DIR="$SYSTEMD_DIR" \
     "$@"
 }
 
@@ -91,15 +95,18 @@ business_hash() {
 }
 
 write_binding_state() {
-  local env_file="${DEPLOY}/.env" binding_file="${TEST_ROOT}/binding.bin" binding state_key
+  local env_file="${DEPLOY}/.env" binding_file="${TEST_ROOT}/binding.bin" binding state_key website_secret plugin_secret
+  website_secret=$(env_get "$env_file" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
+  plugin_secret=$(env_get "$env_file" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+  website_secret=${website_secret:-not-configured}; plugin_secret=${plugin_secret:-not-configured}
   # n8n/runtime.js connectionBinding(): 七个字段用 NUL 分隔，结尾无 NUL。
   {
     printf '%s\0' \
       "$(env_get "$env_file" CRISP_WEBSITE_ID)" \
       "$(env_get "$env_file" CRISP_AUTH_B64)" \
       "$(env_get "$env_file" CRISP_HOOK_MODE)" \
-      "$(env_get "$env_file" CRISP_WEBSITE_HOOK_SECRET)" \
-      "$(env_get "$env_file" CRISP_PLUGIN_SIGNING_SECRET)" \
+      "$website_secret" \
+      "$plugin_secret" \
       "$(env_get "$env_file" PUBLIC_WEBHOOK_URL)"
     printf '%s' "$(env_get "$env_file" CRISP_API_BASE_URL)"
   } > "$binding_file"
@@ -117,20 +124,23 @@ write_binding_state() {
 }
 
 prepare_fixture() {
-  local name secret digest launcher doc_hash version
-  mkdir -p "$DEPLOY"/{config,knowledge/kb_default/sources,data/runtime,data/n8n,data/anythingllm,data/analytics,backups/manual,logs,tmp,n8n,scripts}
+  local name secret digest launcher doc_hash version timer_digest materials_stage
+  mkdir -p "$DEPLOY"/{config,knowledge/kb_default/sources,data/runtime,data/n8n,data/anythingllm,data/analytics,backups/manual,logs,tmp,n8n,scripts} "$SYSTEMD_DIR"
   for name in VERSION docker-compose.yml get.sh manage.sh install.sh update.sh uninstall.sh; do
     cp -p -- "${PROJECT_ROOT}/${name}" "${DEPLOY}/${name}"
   done
   for name in workflow.json runtime.js runtime-cli.js build-workflow.js web-chat.js; do
     cp -p -- "${PROJECT_ROOT}/n8n/${name}" "${DEPLOY}/n8n/${name}"
   done
+  node "${DEPLOY}/n8n/build-workflow.js"
+  jq -M '.active=true' "${DEPLOY}/n8n/workflow.json" > "${DEPLOY}/n8n/workflow.json.new"
+  mv -f -- "${DEPLOY}/n8n/workflow.json.new" "${DEPLOY}/n8n/workflow.json"
   for name in common.sh doctor.sh healthcheck.sh provider.sh configuration.sh provider-adapter.js launcher.sh bootstrap.sh \
     wizard.sh package-release.sh knowledge.sh migration.sh crisp-settings.sh full-backup.sh archive-guard.py \
-    backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh; do
+    backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh materials.sh logs.sh log-redact.py; do
     cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
   done
-  for name in runtime provider keyword menu handoff tags feedback; do
+  for name in runtime provider keyword menu handoff tags feedback logging; do
     cp -p -- "${PROJECT_ROOT}/config/${name}.yaml.example" "${DEPLOY}/config/${name}.yaml"
   done
   cp -p -- "${PROJECT_ROOT}/config/prompt.md.example" "${DEPLOY}/config/prompt.md"
@@ -211,6 +221,17 @@ prepare_fixture() {
   }]}' > "${DEPLOY}/knowledge/catalog.json"
   jq -M -n --arg hash "$doc_hash" '{version:1,files:{"fixture.md":{sha256:$hash,locations:["custom-documents/fixture.json"]}},pending_files:{},garbage_locations:[]}' \
     > "${DEPLOY}/data/knowledge-manifest.json"
+  # v1.2 runtime 只读取已验证的生效资料投影。测试夹具从同一生产构建函数生成，
+  # 不手写一个可能绕过 schema/哈希约束的假投影。
+  chmod 0640 "${DEPLOY}/config/"{runtime,handoff,keyword,menu,tags,feedback}.yaml
+  chmod 0600 "${DEPLOY}/config/prompt.md" "${DEPLOY}/knowledge/catalog.json" \
+    "${DEPLOY}/knowledge/kb_default/sources/doc_1111111111111111.md"
+  materials_stage=$(mktemp -d "${DEPLOY}/tmp/materials-doctor-fixture.XXXXXXXX")
+  # shellcheck source=scripts/materials.sh disable=SC1091
+  source "${DEPLOY}/scripts/materials.sh"
+  materials_prepare_candidate "$DEPLOY" "$materials_stage" 1 applied >/dev/null
+  install -m 0640 -- "${materials_stage}/materials-applied.json" "${DEPLOY}/config/materials-applied.json"
+  find "$materials_stage" -depth -delete
   printf 'fixture backup\n' > "${DEPLOY}/backups/manual/fixture.txt"
   : > "${DEPLOY}/data/analytics/events.jsonl"
 
@@ -223,6 +244,15 @@ prepare_fixture() {
   chmod 0755 "$launcher"
   printf '%s\n' "$launcher" > "${DEPLOY}/config/.crispai-launcher"
   chmod 0600 "${DEPLOY}/config/.crispai-launcher"
+  timer_digest=$(printf '%s' "$DEPLOY" | sha256sum | awk '{print $1}')
+  printf 'ai-support-log-maintenance/v1\ndeploy_sha256=%s\nunit=crispai-log-maintenance-%s\n' \
+    "$timer_digest" "${timer_digest:0:16}" > "${DEPLOY}/config/.crispai-log-timer"
+  chmod 0600 "${DEPLOY}/config/.crispai-log-timer"
+  for name in service timer; do
+    printf '# ai-support-log-maintenance/v1\n# deploy-sha256: %s\n' "$timer_digest" \
+      > "${SYSTEMD_DIR}/crispai-log-maintenance-${timer_digest:0:16}.${name}"
+    chmod 0644 "${SYSTEMD_DIR}/crispai-log-maintenance-${timer_digest:0:16}.${name}"
+  done
   chmod 0700 "${DEPLOY}/data/runtime" "${DEPLOY}/tmp"
   chmod 0770 "${DEPLOY}/data/analytics"
   chmod 0660 "${DEPLOY}/data/analytics/events.jsonl"
@@ -237,7 +267,7 @@ prepare_fixture() {
 }
 
 prepare_fixture
-chmod 0755 "$DOCTOR" "$FIXTURE_BIN/docker" "$FIXTURE_BIN/curl"
+chmod 0755 "$DOCTOR" "$FIXTURE_BIN/docker" "$FIXTURE_BIN/curl" "$FIXTURE_BIN/systemctl"
 
 before=$(business_hash)
 SESSION_FILE=$(find "${DEPLOY}/data/runtime" -maxdepth 1 -type f -name 'session-*.json' -print -quit)
@@ -254,6 +284,8 @@ env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
   DOCTOR_FIXTURE_DB_PASSWORD_FILE="$DB_PASSWORD_FILE" \
   DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE="$N8N_DB_PASSWORD_FILE" \
   DOCTOR_FIXTURE_RUNTIME_ENV_FILE="$RUNTIME_ENV_FILE" \
+  CRISPAI_LOGS_SYSTEMD_TEST=1 \
+  CRISPAI_LOGS_SYSTEMD_DIR="$SYSTEMD_DIR" \
   "${DEPLOY}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY" --application \
   > "${TEST_ROOT}/health-application.out" 2> "${TEST_ROOT}/health-application.err" || health_rc=$?
 (( health_rc == 0 )) || fail "安装/更新 application 健康门禁失败（${health_rc}）"
@@ -301,11 +333,61 @@ assert_result provider.adapter PASS
 assert_result provider.adapter_binding PASS
 assert_result anything.provider_binding PASS
 assert_result n8n.runtime_binding PASS
+assert_result materials.applied PASS
+assert_result materials.runtime_binding PASS
 assert_result runtime.scheduler PASS
 assert_result crisp.api SKIP
 ! grep -q 'https://' "$FIXTURE_LOG" || fail 'local 自检访问了外部 URL'
 [[ "$before" == "$(business_hash)" ]] || fail 'local 自检改动了配置、知识或会话状态'
 pass 'local 自检覆盖组件接线且不访问外部、不扰动业务状态'
+
+# 离线门禁仍必须从受管 Compose 原文静态核对日志与 execution 接线；
+# 只跳过运行中容器回读，不能因 `--no-docker` 把合法配置误报为损坏。
+invoke --offline
+(( LAST_RC == 0 )) || fail "健康 offline 自检退出码应为 0，实际 ${LAST_RC}"
+assert_result logs.policy PASS
+assert_result logs.capacity SKIP
+assert_result logs.n8n_execution SKIP
+! grep -q '^docker ' "$FIXTURE_LOG" || fail 'offline 日志自检访问了 Docker'
+[[ "$before" == "$(business_hash)" ]] || fail 'offline 自检改动了业务状态'
+pass 'offline 静态核对日志/n8n配置，运行容器项明确跳过而不误报故障'
+
+# 可编辑原文不是运行时权威源。它发生变化或损坏时，应保留并证明上一有效
+# 投影仍在运行；只有投影本身/运行中挂载偏离才是关键故障。
+prompt_saved="${TEST_ROOT}/prompt.saved.md"
+cp -p -- "${DEPLOY}/config/prompt.md" "$prompt_saved"
+printf '\n尚未应用的虚构编辑。\n' >> "${DEPLOY}/config/prompt.md"
+invoke --local
+(( LAST_RC == 2 )) || fail '有效原文待应用时应警告而非读取为当前运行配置'
+assert_result materials.applied WARN
+assert_result materials.runtime_binding PASS
+cp -p -- "$prompt_saved" "${DEPLOY}/config/prompt.md"
+
+chmod 0644 "${DEPLOY}/config/prompt.md"
+invoke --local
+(( LAST_RC == 2 )) || fail '可编辑原文权限损坏但有效投影存在时应警告'
+assert_result materials.applied WARN
+assert_result materials.runtime_binding PASS
+cp -p -- "$prompt_saved" "${DEPLOY}/config/prompt.md"
+
+projection_saved="${TEST_ROOT}/materials-applied.saved.json"
+cp -p -- "${DEPLOY}/config/materials-applied.json" "$projection_saved"
+jq '.state="applying"' "$projection_saved" > "${DEPLOY}/config/materials-applied.json"
+chmod 0640 "${DEPLOY}/config/materials-applied.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '未完成 applying 投影不得通过运行时健康门禁'
+assert_result materials.applied FAIL
+assert_result materials.runtime_binding SKIP
+cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+
+export DOCTOR_FIXTURE_MATERIALS_MISMATCH=1
+invoke --local
+(( LAST_RC == 1 )) || fail 'n8n 仍挂载旧资料投影时应退出 1'
+assert_result materials.applied PASS
+assert_result materials.runtime_binding FAIL
+unset DOCTOR_FIXTURE_MATERIALS_MISMATCH
+[[ "$before" == "$(business_hash)" ]] || fail '资料投影自检没有恢复原业务状态'
+pass '资料 doctor 区分原文待应用/损坏、有效投影、applying 与运行代偏离'
 
 # catalog 有启用文档但 manifest 映射和 workspace 同时为空时，两个 location
 # 集合都会是 []；必须在集合比较前拒绝缺失的逐文档 hash/location 映射。
@@ -356,7 +438,9 @@ fixture_env script -qefc "$pty_command" /dev/null >/dev/null || pty_rc=$?
 pty_elapsed=$((SECONDS-pty_started))
 unset DOCTOR_FIXTURE_STDIN_PROBE
 (( pty_rc == 0 )) || fail "PTY 中的无输入容器探针被挂起或失败（${pty_rc}）"
-(( pty_elapsed < 10 )) || fail "PTY 中的容器探针疑似等待 stdin（${pty_elapsed} 秒）"
+# 完整本地 doctor 现在还会校验资料投影；无 PTY 的同一 fixture 通常约 9 秒。
+# 20 秒仍显著低于 workflow 25 秒的 SIGTTIN 超时，并继续要求两个探针真实到达。
+(( pty_elapsed < 20 )) || fail "PTY 中的容器探针疑似等待 stdin（${pty_elapsed} 秒）"
 assert_result n8n.workflow PASS
 assert_result provider.adapter PASS
 grep -q 'export:workflow' "$FIXTURE_LOG" || fail 'PTY 回归未执行 workflow 导出探针'
@@ -390,6 +474,15 @@ assert_result provider.inference SKIP
 [[ "$before" == "$(business_hash)" ]] || fail 'default 自检改动了配置、知识或会话状态'
 pass 'default 仅做 Crisp/公网只读检查并使用当前绑定 observation'
 
+# Compose 把缺失/空的非当前 Hook Secret 投影成 not-configured；显式写入同一
+# sentinel 不得让已有可信 observation 假失效。
+env_set "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET not-configured
+invoke
+(( LAST_RC == 0 )) || fail '显式非当前 Hook sentinel 应与缺失值绑定等价'
+assert_result crisp.observations PASS
+env_unset "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET
+pass '缺失/空与显式 not-configured 使用同一 runtime observation 绑定'
+
 export DOCTOR_FIXTURE_CRISP_FAIL=1
 invoke
 (( LAST_RC == 1 )) || fail '已配置 Crisp 凭据返回 401 时默认自检应明确失败'
@@ -407,6 +500,8 @@ env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
   DOCTOR_FIXTURE_DB_PASSWORD_FILE="$DB_PASSWORD_FILE" \
   DOCTOR_FIXTURE_N8N_DB_PASSWORD_FILE="$N8N_DB_PASSWORD_FILE" \
   DOCTOR_FIXTURE_RUNTIME_ENV_FILE="$RUNTIME_ENV_FILE" \
+  CRISPAI_LOGS_SYSTEMD_TEST=1 \
+  CRISPAI_LOGS_SYSTEMD_DIR="$SYSTEMD_DIR" \
   "${DEPLOY}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY" --application \
   > "${TEST_ROOT}/health-local-ready.out" 2> "${TEST_ROOT}/health-local-ready.err" || health_rc=$?
 (( health_rc == 0 )) || fail 'local-ready 被安装/升级 application 门禁误判为回滚条件'

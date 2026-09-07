@@ -20,6 +20,39 @@ die() {
   exit 1
 }
 
+# 只落白名单操作标识，不捕获向导输入、第三方响应或带凭据的终端转录。
+record_maintenance_event() {
+  local deploy_dir=$1 action=$2 phase=$3 status=${4:-0}
+  [[ -f "${deploy_dir}/scripts/logs.sh" && ! -L "${deploy_dir}/scripts/logs.sh" \
+    && -f "${deploy_dir}/${INSTALL_MARKER}" ]] || return 0
+  if ! bash "${deploy_dir}/scripts/logs.sh" --deploy-dir "$deploy_dir" \
+    event --action "$action" --phase "$phase" --code "$status" >/dev/null 2>&1; then
+    warn '维护摘要未能写入；原操作的结果不因此改变，请检查菜单 15 的日志权限与容量'
+  fi
+  return 0
+}
+
+install_log_maintenance() {
+  local deploy_dir=$1 status=0
+  [[ -f "${deploy_dir}/scripts/logs.sh" && ! -L "${deploy_dir}/scripts/logs.sh" ]] || return 0
+  bash "${deploy_dir}/scripts/logs.sh" --deploy-dir "$deploy_dir" timer install || status=$?
+  case "$status" in
+    0) return 0 ;;
+    2) warn '当前环境没有可运行的 systemd 日志调度；文件日志可从菜单 15 手动清理，自检会保留警告'; return 0 ;;
+    *) return "$status" ;;
+  esac
+}
+
+remove_log_maintenance() {
+  local deploy_dir=$1
+  if [[ -f "${deploy_dir}/scripts/logs.sh" && ! -L "${deploy_dir}/scripts/logs.sh" ]]; then
+    bash "${deploy_dir}/scripts/logs.sh" --deploy-dir "$deploy_dir" timer remove
+  elif [[ -e "${deploy_dir}/config/.crispai-log-timer" || -L "${deploy_dir}/config/.crispai-log-timer" ]]; then
+    warn '日志调度归属记录仍在，但对应管理模块缺失；未删除调度或程序，请先从完整同版包恢复'
+    return 1
+  fi
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
 }
@@ -59,7 +92,7 @@ validate_deploy_dir() {
 
   [[ -n "$requested" ]] || die "部署目录不能为空"
   [[ "$requested" == /* ]] || die "部署目录必须是绝对路径"
-  [[ "$requested" != *$'\n'* && "$requested" != *$'\r'* ]] || die "部署目录包含非法字符"
+  [[ ! "$requested" =~ [[:cntrl:]] ]] || die "部署目录包含非法控制字符"
   [[ "/${requested#/}/" != *"/../"* && "/${requested#/}/" != *"/./"* ]] || die "部署目录不得包含 . 或 .. 路径段"
   require_command realpath
   resolved=$(realpath -m -- "$requested")
@@ -369,7 +402,10 @@ write_webhook_proxy_snippets() {
       printf '  proxy_set_header Host $host;\n  proxy_set_header X-Forwarded-Proto $scheme;\n'
       # shellcheck disable=SC2016
       printf '  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-      printf '  proxy_read_timeout 30s;\n  client_max_body_size 2m;\n  access_log off;\n}\n'
+      printf '  proxy_read_timeout 30s;\n  client_max_body_size 2m;\n  access_log off;\n'
+      printf '  # 上游错误可能包含完整 Secret URL；仅此精确 location 丢弃原始错误日志。\n'
+      printf '  # 使用 crispai doctor 和应用脱敏日志诊断，不影响其他站点的日志。\n'
+      printf '  error_log /dev/null;\n}\n'
     done
   } > "$temporary"
   chmod 640 "$temporary"; mv -f -- "$temporary" "$target"
@@ -379,6 +415,9 @@ write_webhook_proxy_snippets() {
   temporary=$(mktemp "${target}.tmp.XXXXXX")
   {
     printf '# ai-support-managed-proxy\n# 放入已有 HTTPS 站点；不启用含 URL Secret 的访问日志。\n'
+    printf '# 仅关闭访问日志不保护 Caddy 运行时错误日志！站点管理员还需在全局\n'
+    printf '# log default 的 format filter 中设置 request>uri replace [REDACTED]，\n'
+    printf '# 并 delete request>headers>Authorization / request>headers>Cookie；见 docs/CRISP.md。\n'
     printf '@crispai path %s/webhook/crisp-webhook %s/webhook/crispai-public-config %s/webhook/crispai-web-chat\n' "$prefix" "$prefix" "$prefix"
     printf 'handle @crispai {\n'
     [[ -z "$prefix" ]] || printf '  uri strip_prefix %s\n' "$prefix"
@@ -561,7 +600,7 @@ wait_for_local_health() {
 }
 
 secure_permissions() {
-  local deploy_dir=$1 readable_tree
+  local deploy_dir=$1 readable_tree ownership_record
   chmod 700 "$deploy_dir" "${deploy_dir}/data" "${deploy_dir}/logs" "${deploy_dir}/backups" \
     "${deploy_dir}/backups/versions" "${deploy_dir}/tmp" "${deploy_dir}/data/caddy" \
     "${deploy_dir}/data/caddy-config" 2>/dev/null || true
@@ -572,6 +611,11 @@ secure_permissions() {
   [[ -f "${deploy_dir}/config/provider.yaml" ]] && chmod 640 "${deploy_dir}/config/provider.yaml"
   [[ -f "${deploy_dir}/data/analytics/events.jsonl" ]] && chmod 660 "${deploy_dir}/data/analytics/events.jsonl"
   find "${deploy_dir}/config" -maxdepth 1 -type f ! -name 'provider.yaml' -exec chmod 640 {} + 2>/dev/null || true
+  for ownership_record in .crispai-launcher .crispai-compat-launcher .crispai-log-timer; do
+    if [[ -f "${deploy_dir}/config/${ownership_record}" && ! -L "${deploy_dir}/config/${ownership_record}" ]]; then
+      chmod 0600 "${deploy_dir}/config/${ownership_record}"
+    fi
+  done
   find "${deploy_dir}/knowledge" -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
   for readable_tree in knowledge n8n; do
     find "${deploy_dir}/${readable_tree}" -type d -exec chmod 750 {} +
@@ -617,6 +661,25 @@ repair_runtime_modules_from_source() {
   done
 }
 
+caddy_is_known_rescue_template() {
+  # 本轮早期只修路由的默认救援模板；逐字确认，无定制配置不被泛化匹配。
+  cmp -s -- "$1" /dev/stdin <<'CADDY'
+{
+  admin off
+}
+
+{$WEBHOOK_DOMAIN} {
+  @crisp_webhook path /webhook/crisp-webhook /webhook/crispai-public-config /webhook/crispai-web-chat
+  handle @crisp_webhook {
+    reverse_proxy n8n:5678
+  }
+  handle {
+    respond 404
+  }
+}
+CADDY
+}
+
 copy_project_files() {
   local source_dir=$1
   local deploy_dir=$2
@@ -626,8 +689,9 @@ copy_project_files() {
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
     config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
+    config/logging.yaml.example
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
-    scripts/provider-adapter.js scripts/archive-guard.py knowledge/README.md
+    scripts/provider-adapter.js scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
     docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   )
@@ -638,7 +702,7 @@ copy_project_files() {
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
     scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
-    scripts/doctor.sh
+    scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
@@ -657,10 +721,12 @@ copy_project_files() {
   fi
 
   # 只更新与本实例旧模板逐字相同的受管配置；管理员的反代定制不被覆盖。
-  if [[ -f "${deploy_dir}/config/Caddyfile" && ! -L "${deploy_dir}/config/Caddyfile" \
-    && -f "${deploy_dir}/config/Caddyfile.example" ]] \
-    && cmp -s -- "${deploy_dir}/config/Caddyfile" "${deploy_dir}/config/Caddyfile.example"; then
-    refresh_caddy=1
+  if [[ -f "${deploy_dir}/config/Caddyfile" && ! -L "${deploy_dir}/config/Caddyfile" ]]; then
+    if { [[ -f "${deploy_dir}/config/Caddyfile.example" && ! -L "${deploy_dir}/config/Caddyfile.example" ]] \
+        && cmp -s -- "${deploy_dir}/config/Caddyfile" "${deploy_dir}/config/Caddyfile.example"; } \
+      || caddy_is_known_rescue_template "${deploy_dir}/config/Caddyfile"; then
+      refresh_caddy=1
+    fi
   fi
 
   for file in "${regular_files[@]}"; do
@@ -1483,15 +1549,17 @@ is_supported_knowledge_file() {
 import_prompt_source() {
   local deploy_dir=$1
   local requested=${2:-}
-  local resolved target size
+  local resolved target
 
   [[ -n "$requested" ]] || return 0
+  [[ ! "$requested" =~ [[:cntrl:]] && ! -L "$requested" ]] || die 'Prompt 来源路径包含控制字符或符号链接'
   resolved=$(realpath -e -- "$requested") || die "Prompt 文件不存在：$requested"
+  [[ "$resolved" == "$(realpath -ms -- "$requested")" ]] || die 'Prompt 来源及其父目录不能经符号链接跳转'
   [[ -f "$resolved" && ! -L "$resolved" ]] || die "Prompt 必须是普通文件且不能是符号链接"
-  size=$(stat -c '%s' "$resolved")
-  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size <= 0 || size > 262144 )); then
-    die "Prompt 文件必须为 1 到 262144 字节"
-  fi
+  # 用独立 Bash 加载配置校验器，避免重新加载模块污染安装器的公共变量。
+  bash -c 'source "$1"; configuration_prompt_candidate_validate "$2"' \
+    _ "${COMMON_DIR}/configuration.sh" "$resolved" \
+    || die 'Prompt 未通过与管理菜单相同的字节、UTF-8 和非空校验'
   target="${deploy_dir}/config/prompt.md"
   if [[ "$(realpath -m -- "$resolved")" != "$(realpath -m -- "$target")" ]]; then
     install -m 0640 -- "$resolved" "$target"
@@ -1502,48 +1570,18 @@ import_prompt_source() {
 import_knowledge_source() {
   local deploy_dir=$1
   local requested=${2:-}
-  local resolved file name staging target count=0
-  local -a files=()
+  local result library
 
   [[ -n "$requested" ]] || {
     printf '0\n'
     return 0
   }
-  resolved=$(realpath -e -- "$requested") || die "知识来源不存在：$requested"
-  [[ ! -L "$resolved" ]] || die "知识来源不能是符号链接"
-  if [[ -f "$resolved" ]]; then
-    is_supported_knowledge_file "$resolved" || die "知识文件只支持 Markdown、TXT、PDF 或 DOCX"
-    files+=("$resolved")
-  elif [[ -d "$resolved" ]]; then
-    while IFS= read -r -d '' file; do
-      is_supported_knowledge_file "$file" || continue
-      files+=("$file")
-    done < <(find "$resolved" -maxdepth 1 -type f ! -type l -print0 | sort -z)
-  else
-    die "知识来源必须是普通文件或目录"
-  fi
-
-  staging=$(mktemp -d "${deploy_dir}/tmp/knowledge-import.XXXXXX")
-  for file in "${files[@]}"; do
-    name=$(basename -- "$file")
-    [[ "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *\\* \
-      && "$name" != */* && "$name" != *';'* && "$name" != *','* ]] \
-      || { rm -rf -- "$staging"; die "知识文件名包含不安全字符：$name"; }
-    [[ ! -e "${staging}/${name}" ]] \
-      || { rm -rf -- "$staging"; die "知识目录存在重名文件：$name"; }
-    install -m 0640 -- "$file" "${staging}/${name}"
-  done
-  while IFS= read -r -d '' file; do
-    name=$(basename -- "$file")
-    target="${deploy_dir}/knowledge/${name}"
-    if [[ "$(realpath -m -- "$file")" != "$(realpath -m -- "$target")" ]]; then
-      install -m 0640 -- "$file" "$target"
-    fi
-    ((count += 1))
-  done < <(find "$staging" -maxdepth 1 -type f -print0 | sort -z)
-  rm -rf -- "$staging"
-  chown -R root:1000 "${deploy_dir}/knowledge" 2>/dev/null || true
-  printf '%d\n' "$count"
+  # 首次向导与菜单使用同一文件/目录校验、命名库原文和稳定文档 ID。
+  # bootstrap 只登记资料；待应用启动后由原有初始化链实际索引。
+  result=$(bash "${COMMON_DIR}/knowledge.sh" --deploy-dir "$deploy_dir" \
+    bootstrap-source 默认知识库 "$requested") || die '知识来源校验或登记失败，未宣称索引完成'
+  library=$(jq -er '.library_id' <<< "$result") || die '知识登记未返回有效库标识'
+  jq -er --arg id "$library" '.libraries[] | select(.id==$id) | .documents | length' "${deploy_dir}/knowledge/catalog.json"
 }
 
 anythingllm_connection() {

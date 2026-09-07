@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 MOCK_DIR="${SCRIPT_DIR}/mocks"
 ORIGINAL_PATH=$PATH
+PROJECT_VERSION=$(<"${PROJECT_ROOT}/VERSION")
 
 fail() {
   printf '失败：[UNIT/CONTRACT] %s\n' "$1" >&2
@@ -144,7 +145,7 @@ if grep -Eq '^payload/(get\.sh|scripts/doctor\.sh)$' <<< "$LEGACY_LIST"; then
   fail '旧版快照意外包含 v1.1.1 才有的 get.sh 或 doctor.sh'
 fi
 
-# 在同一部署上模拟已完成的 v1.1.1 程序代切换；运行数据与旧快照仍属于同一实例。
+# 在同一部署上模拟已完成的当前程序代切换；运行数据与旧快照仍属于同一实例。
 bash -c 'set -euo pipefail
   source "$1/scripts/common.sh"
   copy_project_files "$1" "$2"
@@ -155,7 +156,7 @@ bash -c 'set -euo pipefail
 ' -- "$PROJECT_ROOT" "$DEPLOY_DIR"
 bash "${PROJECT_ROOT}/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" \
   --command-path "$COMMAND_PATH" --non-interactive >/dev/null
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.1.1 ]] || fail '未形成待回滚的 v1.1.1 程序代'
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail '未形成待回滚的当前程序代'
 [[ -f "${DEPLOY_DIR}/get.sh" && ! -L "${DEPLOY_DIR}/get.sh" ]] || fail '升级代缺少 get.sh'
 [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]] \
   || fail '升级代缺少 doctor.sh'
@@ -184,7 +185,7 @@ grep -Fq '版本快照缺少必要入口：install.sh' "${TEST_ROOT}/broken-roll
 if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
   fail '旧快照必要入口预检失败后仍停止了服务'
 fi
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.1.1 ]] || fail '预检失败修改了当前版本'
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail '预检失败修改了当前版本'
 [[ -f "${DEPLOY_DIR}/get.sh" && -f "${DEPLOY_DIR}/scripts/doctor.sh" ]] \
   || fail '预检失败移除了当前代模块'
 

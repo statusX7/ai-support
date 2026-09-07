@@ -57,7 +57,12 @@ if [[ "${1:-}" == info ]]; then
 fi
 
 if [[ "${1:-}" == inspect ]]; then
-  printf '{"Running":true,"Restarting":false,"OOMKilled":false,"ExitCode":0}\n'
+  if [[ "$*" == *'HostConfig.LogConfig'* ]]; then
+    printf '{"Type":"json-file","Config":{"max-size":"%s","max-file":"%s"}}\n' \
+      "${MOCK_LOG_MAX_SIZE:-10m}" "${MOCK_LOG_MAX_FILES:-5}"
+  else
+    printf '{"Running":true,"Restarting":false,"OOMKilled":false,"ExitCode":0}\n'
+  fi
   exit 0
 fi
 
@@ -167,6 +172,13 @@ case "$COMMAND" in
     exit 0
     ;;
   ps)
+    if [[ " $* " == *' -q '* ]]; then
+      service=${!#}
+      [[ "$service" != caddy ]] || exit 0
+      [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]] || exit 0
+      printf 'mock-%s\n' "$service"
+      exit 0
+    fi
     if [[ " $* " == *' --format json '* ]]; then
       service=${!#}
       state=running
@@ -227,8 +239,21 @@ case "$COMMAND" in
       expected=$(python3 -c 'import sys; values=sys.stdin.buffer.read().split(b"\0"); print(len(values)-1 if values and values[-1]==b"" else len(values))')
       [[ "$expected" =~ ^[1-9][0-9]*$ ]] || exit 1
       printf 'matched\n'
+    elif [[ "$*" == *'CRISPAI_EXPECTED_MATERIALS_PROJECTION'* ]]; then
+      expected=''
+      IFS= read -r expected || [[ -n "$expected" ]]
+      actual=$(sha256sum -- "${MOCK_PROJECT_DIR}/config/materials-applied.json" | cut -d ' ' -f 1)
+      [[ "$expected" =~ ^[a-f0-9]{64}$ && "$actual" == "$expected" && "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      printf 'matched\n'
+    elif [[ "$*" == *'EXECUTIONS_DATA_PRUNE'* && "$*" == *'save_success:'* ]]; then
+      jq -cn --arg hours "${MOCK_LOG_RETENTION_HOURS:-168}" \
+        '{prune:"true",max_age_hours:$hours,save_success:"none",save_error:"none"}'
     elif [[ "$*" == *' anythingllm '* && "$*" == *'provider-adapter:8787/healthz'* ]]; then
       printf 'ready\n'
+    elif [[ "$*" == *' n8n '* && "$*" == *'/opt/crisp-ai/config/materials-applied.json'* && "$*" == *'crypto.createHash("sha256")'* ]]; then
+      [[ -f "${MOCK_PROJECT_DIR}/config/materials-applied.json" && ! -L "${MOCK_PROJECT_DIR}/config/materials-applied.json" ]] || exit 1
+      [[ "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      sha256sum -- "${MOCK_PROJECT_DIR}/config/materials-applied.json" | cut -d ' ' -f 1
     elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
       CONFIG_NAME=${!#}
       [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1

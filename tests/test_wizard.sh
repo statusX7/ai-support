@@ -54,6 +54,89 @@ printf '%s\n' "$TEST_PROVIDER_SECRET" "$TEST_PROVIDER_REPLACEMENT" \
   "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET" \
   > "$MOCK_FORBIDDEN_ARG_FILE"
 
+python3 - "$WIZARD" "$TEST_ROOT" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+
+wizard = sys.argv[1]
+root = pathlib.Path(sys.argv[2])
+environment = {**os.environ, "LC_ALL": "C.UTF-8"}
+
+def run(script, data, *arguments):
+    result = subprocess.run(
+        ["bash", "-c", 'set -euo pipefail; source "$1"; ' + script,
+         "wizard-boundary", wizard, *arguments],
+        input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        timeout=15,
+    )
+    return result.returncode
+
+multiline = 'value=; wizard_read_multiline value "$2"; [[ "$value" == "$3" ]]'
+text = "人工客服\n"
+if run(multiline, (text + "::END::\n").encode(), "13", text) != 0:
+    raise SystemExit("13 字节中文多行边界错误")
+if run(multiline, (text + "::END::\n").encode(), "12", text) == 0:
+    raise SystemExit("中文多行按字符计数，超过 UTF-8 字节上限仍被接受")
+
+step = '''
+wizard_init_values
+wizard_write_state(){ :; }
+wizard_collect_step 8 "$2/unused.json" "$2"
+[[ "$WIZARD_PROMPT_MODE" == inline && "$WIZARD_PROMPT_CONTENT" == "$3" ]]
+'''
+valid = "有效虚构提示"
+for label, raw in (("empty", b""), ("blank", " \t\n\u3000".encode()),
+                   ("invalid-utf8", b"\xff"), ("nul", b"hello\x00world"),
+                   ("too-large", b"a" * 262145)):
+    path = root / (label + ".md")
+    path.write_bytes(raw)
+    if run(step, (str(path) + "\n" + valid + "\n").encode(), str(root), valid) != 0:
+        raise SystemExit(f"第 8 项未在确认前拒绝 {label} Prompt 文件")
+
+for label, target in (("linked", root / "客服 提示.md"),
+                      ("broken-link", root / "missing.md")):
+    link = root / (label + ".md")
+    link.symlink_to(target)
+    if run(step, (str(link) + "\n" + valid + "\n").encode(), str(root), valid) != 0:
+        raise SystemExit(f"第 8 项未拒绝原始 {label} 路径")
+
+parent_link = root / "链接父目录"
+parent_link.symlink_to(root, target_is_directory=True)
+if run(step, (str(parent_link / "客服 提示.md") + "\n" + valid + "\n").encode(), str(root), valid) != 0:
+    raise SystemExit("第 8 项未在确认前拒绝父目录符号链接")
+
+nested = root / "只有 子目录 🙂"
+(nested / "下一层").mkdir(parents=True)
+(nested / "下一层/中文说明.md").write_text("虚构知识事实。\n", encoding="utf-8")
+knowledge_step = '''
+wizard_init_values
+wizard_write_state(){ :; }
+wizard_collect_step 9 "$2/unused.json" "$2"
+[[ "$WIZARD_KNOWLEDGE_MODE" == directory && "$WIZARD_KNOWLEDGE_FILES" == 1 ]]
+'''
+if run(knowledge_step, (str(nested) + "\n").encode(), str(root)) != 0:
+    raise SystemExit("第 9 项把只有子目录的有效知识误报为空库")
+
+for bad in (" \t\u3000", "汉" * 87382):
+    if run(step, (bad + "\n" + valid + "\n").encode(), str(root), valid) != 0:
+        raise SystemExit("第 8 项未拒绝全空白或超过 262144 字节的单行 Prompt")
+
+# 大正文不经过命令参数传递，避免 ARG_MAX 掩盖真实输入边界。
+exact = "汉" * 87381 + "A"
+exact_step = '''
+wizard_init_values
+wizard_write_state(){ :; }
+wizard_collect_step 8 "$2/unused.json" "$2"
+[[ "$WIZARD_PROMPT_MODE" == inline ]]
+[[ $(printf '%s' "$WIZARD_PROMPT_CONTENT" | wc -c) == 262144 ]]
+'''
+if run(exact_step, (exact + "\n").encode(), str(root)) != 0:
+    raise SystemExit("恰好 262144 个 UTF-8 字节的单行 Prompt 未被接受")
+print("通过：[UNIT/CONTRACT] 向导 UTF-8 字节边界、空白/损坏 Prompt 与原始链接拒绝")
+PY
+
 run_pty_case() {
   local scenario=$1
   local output_file=$2
@@ -117,6 +200,7 @@ paste_steps = normal_steps[:7] + [
     ("[8/10] 客服提示词", "::PASTE::", False),
     ("正文需要结束符字面量时", '## 中文 🙂\n\n$ # = " \\ 保留。\n\\::END::\n\n::END::', False),
     ("[9/10] 知识库文件或目录", "::LIBRARIES::", False),
+    ("知识库名称", "界" * 34, False),
     ("知识库名称", "电脑排障", False),
     ("文件/目录路径", knowledge_dir, False),
     ("知识库名称", "手机排障", False),
@@ -276,11 +360,12 @@ jq -e --arg expected $'## 中文 🙂\n\n$ # = " \\ 保留。\n::END::\n\n' '
 ' "$PASTE_RESULT" >/dev/null || fail '多行 Prompt 或三个命名库状态保存不正确'
 PASTED_SOURCE=$(jq -r '.knowledge.libraries[2].source' "$PASTE_RESULT")
 [[ -f "$PASTED_SOURCE" && "$(stat -c '%a' "$PASTED_SOURCE")" == 600 ]] || fail '粘贴知识未受限保存'
-[[ "$(<"$PASTE_COUNT")" == 27 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
+[[ "$(<"$PASTE_COUNT")" == 28 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
+grep -Fq '知识库名称须为 1～100 个 UTF-8 字节' "$PASTE_TRANSCRIPT" || fail '超限中文库名未在向导中拒绝并重新输入'
 for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET"; do
   ! grep -Fq -- "$secret" "$PASTE_TRANSCRIPT" || fail '粘贴分支回显秘密'
 done
-pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（真实输入 27 行）'
+pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（含超限库名重试，真实输入 28 行）'
 
 RESPONSES_RESULT="${TEST_ROOT}/responses-only-result.json"
 export MOCK_PROVIDER_RESPONSES_ONLY=1

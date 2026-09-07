@@ -26,6 +26,8 @@ let modelFailure = false;
 let tagFailure = false;
 let crispFailure = false;
 let unknownSend = false;
+let sendRejection = 0;
+let sendAttempts = 0;
 let unknownSources = false;
 let miss = false;
 let low = false;
@@ -54,6 +56,13 @@ const request = async (url, options = {}) => {
     if (suffix === '/meta' && options.method === 'PATCH') { segments.set(session, options.body.segments); return { status: 200, body: { error: false } }; }
     if (suffix === '/message') {
       const body = options.body;
+      sendAttempts += 1;
+      if (sendRejection) return { status: sendRejection, body: { error: true, reason: 'invalid_data' } };
+      // 重现实机发现的拒绝：本项目旧版自定义 properties 键不满足 Crisp 的校验。
+      // 不模拟完整第三方 schema；本项目使用官方 automated + 本地 fingerprint 即可。
+      if (body.properties && ('ai_support' in body.properties || 'ai_support_version' in body.properties)) {
+        return { status: 400, body: { error: true, reason: 'invalid_data' } };
+      }
       sent.push({ ...body, session_id: session });
       history.push({ ...body, timestamp: now }); histories.set(session, history);
       await runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET }, body: { website_id: env.CRISP_WEBSITE_ID, event: 'message:received', data: { ...body, automated: undefined, properties: undefined, session_id: session }, timestamp: now } });
@@ -122,10 +131,33 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     await deliver(message('session_client-a', '我想转人工'));
     const card = sent.at(-1);
     assert.equal(card.type, 'picker'); assert.equal(card.content.required, false); assert.equal(card.content.choices[0].label, '召唤人工客服');
+    assert.equal(card.automated, true); assert.equal('properties' in card, false);
     assert.equal(state('session_client-a').mode, 'ai'); assert.equal(modelRequests.length, before);
     await deliver(message('session_client-a', '尚未点击，请回答普通问题'));
     assert.equal(state('session_client-a').mode, 'ai'); assert.equal(modelRequests.length, before + 1);
     assert.equal(sent.at(-1).type, 'text');
+  });
+  await test('C03 已确认 Crisp 拒绝只发送一次，保留脱敏状态且不自动转人工', async () => {
+    for (const status of [400, 401, 403, 404, 413]) {
+      const session = 'session_rejected-' + status;
+      sendRejection = status;
+      const attempts = sendAttempts;
+      const modelCount = modelRequests.length;
+      const result = await deliver(message(session, '虚构发送拒绝回归问题'));
+      assert.equal(result.status, 'failed');
+      assert.equal(sendAttempts, attempts + 1);
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(state(session).mode, 'ai');
+      const failed = Object.values(state(session).outgoing).at(-1);
+      assert.equal(failed.status, 'failed');
+      assert.equal(failed.failure, 'crisp_http_' + status);
+      assert.equal('body' in failed, false);
+      now += 15000;
+      await runtime.process(key(session));
+      assert.equal(sendAttempts, attempts + 1);
+      assert.equal(modelRequests.length, modelCount + 1);
+    }
+    sendRejection = 0;
   });
   await test('T19/T21 真点击缺少from/type、原fingerprint已见也只暂停A', async () => {
     const card = sent.find((entry) => entry.session_id === 'session_client-a' && entry.type === 'picker');
@@ -352,6 +384,110 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert(next.completed_at > first.completed_at);
     assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'schema_version', 'started_at']);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(state('session_permanent1').mode, 'human');
+  });
+  await test('W03/W04 生效投影隔离未完成编辑，同一会话的新问按新版本规则回答', async () => {
+    const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));
+    const file = path.join(root, 'config/materials-applied.json');
+    const originalKeyword = fs.readFileSync(path.join(root, 'config/keyword.yaml'));
+    const originalPrompt = fs.readFileSync(path.join(root, 'config/prompt.md'));
+    const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
+    const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const prompt = '完整中文提示 😀\n' + 'x'.repeat(31000) + '\nSYNTHETIC_PROMPT_TAIL';
+    const projection = { schema_version: 1, revision: 400, state: 'applied', applied_at: now,
+      source_sha256: digest('synthetic-source'), configuration,
+      prompt: { text: prompt, sha256: digest(prompt), bytes: Buffer.byteLength(prompt) },
+      knowledge: { map_sha256: fs.existsSync(mapFile) ? digest(fs.readFileSync(mapFile)) : '' } };
+    projection.configuration.runtime = { ...configuration.runtime, enabled: true, revision: 400, applied_revision: 400 };
+    projection.configuration.keyword.rules.unshift({ id: 'projection-test', enabled: true, keywords: ['资料应用测试'], match_mode: 'exact', action: 'reply', text: '已应用版本一' });
+    const publish = () => {
+      fs.writeFileSync(file + '.candidate', JSON.stringify(projection)); fs.renameSync(file + '.candidate', file);
+    };
+    try {
+      publish();
+      fs.writeFileSync(path.join(root, 'config/keyword.yaml'), '{partial');
+      fs.writeFileSync(path.join(root, 'config/prompt.md'), '');
+      await deliver(message('session_materials001', '资料应用测试'));
+      assert.equal(sent.at(-1).content, '已应用版本一');
+      assert.equal(runtime.settings().revision, 400);
+      const visualCount = providerRequests.length;
+      await deliver(message('session_materials-img', { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
+      assert.equal(providerRequests.length, visualCount + 1);
+      const visual = providerRequests.at(-1).body;
+      assert.equal(visual.messages?.[0]?.content || visual.input?.[0]?.content?.[0]?.text, prompt, '视觉协议不得截断合法已应用 Prompt');
+      projection.revision += 1; projection.configuration.runtime.revision += 1; projection.configuration.runtime.applied_revision += 1;
+      projection.configuration.keyword.rules[0].text = '已应用版本二'; publish();
+      await deliver(message('session_materials001', '资料应用测试'));
+      assert.equal(sent.at(-1).content, '已应用版本二');
+      const next = createRuntime(env, runtimeOptions);
+      assert.equal(next.settings().revision, 401);
+      fs.writeFileSync(file, '{partial');
+      assert.throws(() => next.settings(), /JSON|投影/);
+      const before = sent.length;
+      assert.equal((await receive(message('session_materials-bad', '不能采用损坏配置'))).statusCode, 503);
+      assert.equal(sent.length, before);
+    } finally {
+      fs.writeFileSync(path.join(root, 'config/keyword.yaml'), originalKeyword);
+      fs.writeFileSync(path.join(root, 'config/prompt.md'), originalPrompt);
+      fs.unlinkSync(file);
+    }
+  });
+  await test('W03/B01 应用过渡取消旧答案，保留真人控制，期间问题不补答', async () => {
+    const file = path.join(root, 'config/materials-applied.json');
+    const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
+    const originalMap = fs.existsSync(mapFile) ? fs.readFileSync(mapFile) : null;
+    const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));
+    const text = fs.readFileSync(path.join(root, 'config/prompt.md'), 'utf8');
+    const projection = { schema_version: 1, revision: 500, state: 'applied', applied_at: now, source_sha256: digest('synthetic-source'), configuration,
+      prompt: { text, sha256: digest(text), bytes: Buffer.byteLength(text) }, knowledge: { map_sha256: originalMap ? digest(originalMap) : '' } };
+    projection.configuration.runtime = { ...configuration.runtime, enabled: true, revision: 500, applied_revision: 500 };
+    const publish = () => { fs.writeFileSync(file + '.candidate', JSON.stringify(projection)); fs.renameSync(file + '.candidate', file); };
+    let finish;
+    try {
+      publish();
+      delayed = new Promise((resolve) => { finish = resolve; });
+      const entry = await receive(message('session_materials-race', '慢答案'));
+      const pending = runtime.process(entry.key, entry.jobId); await wait(20);
+      projection.state = 'applying'; projection.revision = 501;
+      projection.configuration.runtime.revision = 501; projection.configuration.runtime.applied_revision = 501; publish();
+      assert.equal(runtime.settings().enabled, false);
+      const before = sent.length;
+      await deliver(message('session_materials-during', '过渡期间问题'));
+      now += 10; await operator('session_materials-human');
+      assert.equal(state('session_materials-human').mode, 'human');
+      finish(); await pending;
+      assert.equal(sent.length, before);
+      projection.state = 'applied'; publish(); await runtime.scan();
+      assert.equal(sent.length, before);
+      await deliver(message('session_materials-during', '之后的新问题'));
+      assert.equal(sent.at(-1).session_id, 'session_materials-during');
+      fs.writeFileSync(mapFile, JSON.stringify({ synthetic: 'unapplied-map' }));
+      assert.equal(runtime.settings().enabled, false, '知识投影错代禁止普通出站');
+      now += 10; await operator('session_materials-map-human');
+      assert.equal(state('session_materials-map-human').mode, 'human');
+    } finally {
+      if (finish) finish();
+      if (originalMap) fs.writeFileSync(mapFile, originalMap); else if (fs.existsSync(mapFile)) fs.unlinkSync(mapFile);
+      fs.unlinkSync(file);
+    }
+  });
+  await test('L08 请求/解析异常落盘前采用白名单，不泄漏秘密或用户正文', async () => {
+    const injected = 'synthetic-private-text & $ # = " 引号\n第二行';
+    const variants = [injected, JSON.stringify(injected), encodeURIComponent(injected), Buffer.from(injected).toString('base64')];
+    for (const [index, variant] of variants.entries()) {
+      const isolated = createRuntime(env, { ...runtimeOptions, request: async () => { throw new SyntaxError(variant); } });
+      const body = message('session_log-private-' + index, '无敏感资料的虚构问题');
+      const entry = await isolated.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+      const result = await isolated.process(entry.key, entry.jobId);
+      assert.equal(result.status, 'failed');
+      const log = fs.readFileSync(path.join(root, 'data/analytics/events.jsonl'), 'utf8');
+      assert(log.includes('配置或协议 JSON 解析失败'));
+      for (const secret of variants) {
+        assert(!log.includes(secret), '异常正文不得进入落盘日志');
+        assert(!JSON.stringify(result).includes(secret));
+      }
+    }
     assert.equal(state('session_permanent1').mode, 'human');
   });
   process.stdout.write(JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed: 0, evidence: path.relative(project, root) }) + '\n');

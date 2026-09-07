@@ -144,7 +144,7 @@ write_mock_package() {
     scripts/provider-adapter.js n8n/workflow.json n8n/runtime.js
     config/app.yaml config/provider.yaml.example
   )
-  if [[ "$layout" == current ]]; then
+  if [[ "$layout" == current || "$layout" == v120 ]]; then
     required+=(
       .env.example get.sh
       config/Caddyfile.example config/feedback.yaml.example config/handoff.yaml.example
@@ -155,6 +155,9 @@ write_mock_package() {
       scripts/restore.sh scripts/rollback.sh scripts/snapshot.sh scripts/menu-ui.sh
       scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
     )
+    if [[ "$layout" == v120 ]]; then
+      required+=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
+    fi
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
   fi
@@ -232,6 +235,8 @@ printf 'ai-support\nstate=local-ready\ninstalled_version=%s\n' "$(<"${source_dir
 } >> "${MOCK_CAPTURE:?}"
 MOCK_UPDATE
   chmod 0755 "${package}/install.sh" "${package}/manage.sh" "${package}/update.sh"
+  cp -- "${PROJECT_ROOT}/scripts/launcher.sh" "${package}/scripts/launcher.sh"
+  cp -- "${PROJECT_ROOT}/scripts/common.sh" "${package}/scripts/common.sh"
   repack_mock_package "$release"
 }
 
@@ -250,6 +255,14 @@ repack_mock_package() {
 write_mock_package v1.1.0 legacy
 write_mock_package v1.1.1
 write_mock_package v1.1.2
+write_mock_package v1.2.0 v120
+V120_REQUIRED=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
+for entry_index in "${!V120_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 1))"
+  write_mock_package "$missing_release" v120
+  rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V120_REQUIRED[entry_index]}"
+  repack_mock_package "$missing_release"
+done
 
 # SHA 正确但缺少次级生产模块时，也必须在执行 install.sh 前拒绝。
 write_mock_package v1.1.8
@@ -412,7 +425,7 @@ REQUESTS_BEFORE=$(wc -l < "$ACCESS_LOG")
 "${TEST_ROOT}/standalone-get.sh" --version >> "$HELP_LOG"
 REQUESTS_AFTER=$(wc -l < "$ACCESS_LOG")
 [[ "$REQUESTS_AFTER" == "$REQUESTS_BEFORE" ]] || fail '--help/--version 意外访问网络'
-assert_contains "$HELP_LOG" 'v1.1.1' '--version 没有显示引导器版本'
+assert_contains "$HELP_LOG" "$(<"${PROJECT_ROOT}/VERSION")" '--version 没有显示引导器版本'
 pass '单文件 --help/--version 不依赖邻接模块、不联网且无需 TTY'
 
 INVALID_LOG="${TEST_ROOT}/invalid.log"
@@ -503,6 +516,66 @@ REQUESTS_AFTER=$(wc -l < "$ACCESS_LOG")
 assert_contains "$CAPTURE" 'action=manage' '同版本已有实例没有进入受管菜单'
 pass '已有完整实例直接打开管理菜单，不下载或重问初始化'
 
+REPAIR_DEPLOY="${TEST_ROOT}/repair-deploy"
+REPAIR_COMMAND="${TEST_ROOT}/repair-bin/crispai"
+REPAIR_CAPTURE="${TEST_ROOT}/repair.capture"
+REPAIR_LOG="${TEST_ROOT}/repair.typescript"
+mkdir -p -- "$REPAIR_DEPLOY" "$(dirname -- "$REPAIR_COMMAND")"
+cp -a -- "${BUILD_ROOT}/ai-support-v1.1.1/." "$REPAIR_DEPLOY/"
+printf 'ai-support\nstate=local-ready\ninstalled_version=v1.1.1\n' > "$REPAIR_DEPLOY/.crisp-ai-installation"
+printf '%s\n' "$REPAIR_COMMAND" > "$REPAIR_DEPLOY/config/.crispai-launcher"
+printf 'AI_API_KEY=synthetic-repair-secret\n' > "$REPAIR_DEPLOY/.env"
+printf '{"enabled":false}\n' > "$REPAIR_DEPLOY/config/runtime.yaml"
+mkdir -p -- "$REPAIR_DEPLOY/data/runtime"
+printf '{"mode":"human","resume_at":null}\n' > "$REPAIR_DEPLOY/data/runtime/session-fixture.json"
+: > "$REPAIR_CAPTURE"
+run_tty "$CALLER_DIR" "$REPAIR_LOG" "$REPAIR_CAPTURE" --repair --deploy-dir "$REPAIR_DEPLOY"
+[[ -x "$REPAIR_COMMAND" && -x "$(dirname -- "$REPAIR_COMMAND")/crisp" ]] \
+  || fail '--repair 没有从校验包恢复正式与兼容命令'
+[[ ! -s "$REPAIR_CAPTURE" ]] || fail '--repair 意外运行了安装器、更新器或菜单'
+[[ "$(<"$REPAIR_DEPLOY/.env")" == 'AI_API_KEY=synthetic-repair-secret' \
+  && "$(<"$REPAIR_DEPLOY/config/runtime.yaml")" == '{"enabled":false}' \
+  && "$(<"$REPAIR_DEPLOY/data/runtime/session-fixture.json")" == '{"mode":"human","resume_at":null}' ]] \
+  || fail '--repair 改动了凭据、总开关或人工状态'
+[[ ! -e "$REPAIR_DEPLOY/config/.online-release" ]] || fail '--repair 改写了部署包来源'
+pass '--repair 绕过已有菜单并用校验同版包仅恢复受管命令，保留业务和人工状态'
+
+REQUESTS_BEFORE=$(wc -l < "$ACCESS_LOG")
+set +e
+run_tty "$CALLER_DIR" "${TEST_ROOT}/repair-cross-version.typescript" "$REPAIR_CAPTURE" \
+  --repair --release v1.1.2 --deploy-dir "$REPAIR_DEPLOY"
+REPAIR_CROSS_STATUS=$?
+run_tty "$CALLER_DIR" "${TEST_ROOT}/repair-update.typescript" "$REPAIR_CAPTURE" \
+  --repair --update --deploy-dir "$REPAIR_DEPLOY"
+REPAIR_UPDATE_STATUS=$?
+set -e
+[[ "$REPAIR_CROSS_STATUS" != 0 && "$REPAIR_UPDATE_STATUS" == 64 \
+  && "$(wc -l < "$ACCESS_LOG")" == "$REQUESTS_BEFORE" ]] \
+  || fail '--repair 没有在网络访问前拒绝跨版本或与 --update 混用'
+pass '--repair 拒绝跨版本与 --update 混用，不进入下载或变更'
+
+mv -- "$REPAIR_DEPLOY/n8n/runtime.js" "$REPAIR_DEPLOY/n8n/runtime.saved"
+rm -f -- "$REPAIR_COMMAND"
+set +e
+run_tty "$CALLER_DIR" "${TEST_ROOT}/repair-missing-module.typescript" "$REPAIR_CAPTURE" \
+  --repair --deploy-dir "$REPAIR_DEPLOY"
+REPAIR_MISSING_STATUS=$?
+set -e
+[[ "$REPAIR_MISSING_STATUS" != 0 && ! -e "$REPAIR_COMMAND" && ! -s "$REPAIR_CAPTURE" ]] \
+  || fail '--repair 在业务程序缺失时伪装为入口修复成功'
+assert_contains "${TEST_ROOT}/repair-missing-module.typescript" 'n8n/runtime.js' '缺少程序模块时没有给出精确相对路径'
+mv -- "$REPAIR_DEPLOY/n8n/runtime.saved" "$REPAIR_DEPLOY/n8n/runtime.js"
+printf '#!/usr/bin/env bash\nprintf "foreign\\n"\n' > "$REPAIR_COMMAND"
+chmod 0755 "$REPAIR_COMMAND"
+set +e
+run_tty "$CALLER_DIR" "${TEST_ROOT}/repair-foreign-command.typescript" "$REPAIR_CAPTURE" \
+  --repair --deploy-dir "$REPAIR_DEPLOY"
+REPAIR_FOREIGN_STATUS=$?
+set -e
+[[ "$REPAIR_FOREIGN_STATUS" != 0 ]] || fail '--repair 覆盖了不属于本实例的同名命令'
+assert_contains "$REPAIR_COMMAND" foreign '--repair 损坏了外来命令'
+pass '--repair 对缺失程序和外来同名命令保守失败，不覆盖其他内容'
+
 OLD_DEPLOY="${TEST_ROOT}/old-deploy"
 mkdir -p -- "$OLD_DEPLOY/config"
 printf 'ai-support\nstate=local-ready\ninstalled_version=v1.1.0\n' \
@@ -538,6 +611,31 @@ for legacy_state in collecting uninstalled-data-kept; do
     "${legacy_state} 没有锁定原安装版本"
 done
 pass 'v1.1.0 未完成/保留资料实例按旧包能力恢复，不要求新版 get/doctor 且不混代'
+
+V120_CAPTURE="${TEST_ROOT}/v120.capture"
+: > "$V120_CAPTURE"
+run_tty "$CALLER_DIR" "${TEST_ROOT}/v120.typescript" "$V120_CAPTURE" \
+  --release v1.2.0 --deploy-dir "${TEST_ROOT}/v120-deploy"
+assert_contains "$V120_CAPTURE" 'action=install' 'v1.2.0 完整包没有进入正式安装器'
+pass 'v1.2.0 完整包满足新增资料与日志模块能力，同时保持旧版本包兼容'
+
+for entry_index in "${!V120_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 1))"
+  MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
+  MISSING_DEPLOY="${TEST_ROOT}/missing-${missing_release}.deploy"
+  MISSING_LOG="${TEST_ROOT}/missing-${missing_release}.typescript"
+  : > "$MISSING_CAPTURE"
+  set +e
+  run_tty "$CALLER_DIR" "$MISSING_LOG" "$MISSING_CAPTURE" \
+    --release "$missing_release" --deploy-dir "$MISSING_DEPLOY"
+  MISSING_STATUS=$?
+  set -e
+  [[ "$MISSING_STATUS" != 0 && ! -s "$MISSING_CAPTURE" && ! -e "$MISSING_DEPLOY" ]] \
+    || fail "${missing_release} 缺少新增生产模块时仍执行了安装器"
+  assert_contains "$MISSING_LOG" "归档缺少生产文件：${V120_REQUIRED[entry_index]}" \
+    'v1.2.0 缺少生产模块时没有在执行前明确拒绝'
+done
+pass 'v1.2.0 四个新增模块逐项缺失即使 SHA 正确也在执行包内程序前拒绝'
 
 LATEST_DEPLOY="${TEST_ROOT}/latest-deploy"
 LATEST_CAPTURE="${TEST_ROOT}/latest-capture.log"

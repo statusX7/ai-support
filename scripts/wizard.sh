@@ -640,8 +640,25 @@ wizard_probe_selected_model() {
   fi
 }
 
+wizard_validate_prompt_bytes() {
+  python3 -c '
+import sys
+maximum = int(sys.argv[1])
+raw = sys.stdin.buffer.read(maximum + 1)
+if not 0 < len(raw) <= maximum:
+    raise SystemExit(1)
+try:
+    text = raw.decode("utf-8", "strict")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+if "\x00" in text or not text.strip():
+    raise SystemExit(1)
+' "${1:-262144}"
+}
+
 wizard_read_multiline() {
   local target=$1 max_length=${2:-262144} line collected=''
+  local LC_ALL=C
   printf '请粘贴多行正文。单独一行 ::END:: 保存，::CANCEL:: 取消。\n'
   printf '正文需要结束符字面量时，在前面加反斜线，例如 \\::END::。\n'
   while true; do
@@ -650,7 +667,8 @@ wizard_read_multiline() {
     collected+="$line"$'\n'
     (( ${#collected} <= max_length )) || { wizard_warn '正文超过本步骤输入上限'; return 3; }
   done
-  [[ -n "$collected" ]] || { wizard_warn '空正文不会覆盖现有内容'; return 3; }
+  printf '%s' "$collected" | wizard_validate_prompt_bytes "$max_length" \
+    || { wizard_warn '正文须为有效 UTF-8，不能为空、全空白或包含 NUL'; return 3; }
   printf -v "$target" '%s' "$collected"
 }
 
@@ -659,11 +677,23 @@ wizard_provider_is_loopback() {
   [[ "$WIZARD_URL_HOST" == localhost || "$WIZARD_URL_HOST" == 127.* ]]
 }
 
+wizard_knowledge_inspect() {
+  local module_dir
+  module_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
+  bash "$module_dir/knowledge.sh" inspect-source "$1"
+}
+
+wizard_knowledge_name_valid() {
+  local module_dir
+  module_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
+  bash "$module_dir/knowledge.sh" validate-library-name "$1" >/dev/null
+}
+
 wizard_collect_step() {
   local step=$1
   local output_file=$2
   local work_dir=$3
-  local value normalized resolved count auth_attempt multiline_status library_name library_path library_temp
+  local value normalized resolved count auth_attempt multiline_status library_name library_path library_temp knowledge_summary
 
   case "$step" in
     1)
@@ -830,30 +860,34 @@ wizard_collect_step() {
             (( multiline_status != 2 )) || return 2
             continue
           fi
-        elif [[ -e "$value" ]]; then
+        elif [[ -e "$value" || -L "$value" ]]; then
           [[ -f "$value" && ! -L "$value" && -r "$value" ]] || {
             wizard_warn 'Prompt 路径必须是可读普通文件且不能是符号链接'
             continue
           }
-          (( $(stat -c '%s' "$value") <= 262144 )) || {
-            wizard_warn 'Prompt 文件不得超过 256 KiB'
+          if ! wizard_validate_prompt_bytes < "$value"; then
+            wizard_warn 'Prompt 文件须为 1～262144 个 UTF-8 字节，不能全空白或包含 NUL'
             continue
-          }
+          fi
           resolved=$(realpath -e -- "$value") || {
             wizard_warn '无法解析 Prompt 文件路径'
             continue
           }
+          if [[ "$value" =~ [[:cntrl:]] || "$resolved" != "$(realpath -ms -- "$value")" ]]; then
+            wizard_warn 'Prompt 来源及其父目录不能含控制字符或经符号链接跳转'
+            continue
+          fi
           WIZARD_PROMPT_MODE='file'
           WIZARD_PROMPT_SOURCE=$resolved
           WIZARD_PROMPT_CONTENT=''
           break
-        elif (( ${#value} <= 262144 )); then
+        elif printf '%s' "$value" | wizard_validate_prompt_bytes; then
           WIZARD_PROMPT_MODE=inline
           WIZARD_PROMPT_SOURCE=''
           WIZARD_PROMPT_CONTENT=$value
           break
         else
-          wizard_warn 'Prompt 内容不得超过 256 KiB'
+          wizard_warn 'Prompt 内容须为 1～262144 个 UTF-8 字节，不能全空白或包含 NUL'
         fi
       done
       wizard_write_state "$output_file" collecting 9
@@ -878,6 +912,14 @@ wizard_collect_step() {
             wizard_read_value library_name '知识库名称（回车使用默认知识库，0 完成添加）：' || return $?
             [[ "$library_name" != 0 ]] || break
             library_name=${library_name:-默认知识库}
+            if ! wizard_knowledge_name_valid "$library_name"; then
+              wizard_warn '知识库名称须为 1～100 个 UTF-8 字节，不含控制字符；尚未登记，请重新输入'
+              continue
+            fi
+            if (( $(jq 'length' <<< "$WIZARD_KNOWLEDGE_LIBRARIES") >= 100 )); then
+              wizard_warn '一次初始化最多登记 100 个命名库；输入 0 完成添加'
+              continue
+            fi
             if [[ "$value" == ::PASTE:: ]]; then library_path=::PASTE::
             else wizard_read_value library_path '文件/目录路径，或 ::PASTE:: 粘贴正文（0 完成添加）：' || return $?; fi
             [[ "$library_path" != 0 ]] || break
@@ -891,45 +933,37 @@ wizard_collect_step() {
                 continue
               fi
             fi
-            [[ -e "$library_path" && ! -L "$library_path" && -r "$library_path" ]] || { wizard_warn '知识来源不是可读的普通文件或目录'; continue; }
+            if ! knowledge_summary=$(wizard_knowledge_inspect "$library_path"); then
+              wizard_warn '知识来源未通过与管理菜单相同的递归、类型、大小和路径校验'
+              continue
+            fi
             library_path=$(realpath -e -- "$library_path") || return 1
             WIZARD_KNOWLEDGE_LIBRARIES=$(jq -cn --argjson libraries "$WIZARD_KNOWLEDGE_LIBRARIES" --arg name "$library_name" --arg source "$library_path" '$libraries+[{name:$name,source:$source}]')
-            ((WIZARD_KNOWLEDGE_FILES+=1))
+            count=$(jq -er '.supported_files' <<< "$knowledge_summary") || return 1
+            ((WIZARD_KNOWLEDGE_FILES+=count))
             wizard_write_state "$output_file" collecting 9
             [[ "$value" != ::PASTE:: ]] || break
           done
           break
         fi
-        [[ -e "$value" && ! -L "$value" && -r "$value" ]] || {
-          wizard_warn '知识路径不存在、不可读或是符号链接'
+        if ! knowledge_summary=$(wizard_knowledge_inspect "$value"); then
+          wizard_warn '知识来源未通过校验；可更正路径，或回车明确跳过知识配置'
           continue
-        }
+        fi
         resolved=$(realpath -e -- "$value") || {
           wizard_warn '无法解析知识路径'
           continue
         }
         if [[ -f "$resolved" ]]; then
-          case "${resolved,,}" in
-            *.md|*.txt|*.pdf|*.docx)
-              WIZARD_KNOWLEDGE_MODE='file'
-              WIZARD_KNOWLEDGE_SOURCE=$resolved
-              WIZARD_KNOWLEDGE_FILES=1
-              ;;
-            *) wizard_warn '知识文件只支持 Markdown、TXT、PDF 或 DOCX'; continue ;;
-          esac
+          WIZARD_KNOWLEDGE_MODE='file'
         elif [[ -d "$resolved" ]]; then
-          count=0
-          while IFS= read -r -d '' value; do
-            case "${value,,}" in *.md|*.txt|*.pdf|*.docx) ((count += 1)) ;; esac
-          done < <(find "$resolved" -maxdepth 1 -type f -print0)
           WIZARD_KNOWLEDGE_MODE=directory
-          WIZARD_KNOWLEDGE_SOURCE=$resolved
-          WIZARD_KNOWLEDGE_FILES=$count
-          (( count > 0 )) || wizard_warn '所选目录当前没有支持的知识文件；将按空知识库继续'
         else
           wizard_warn '知识路径必须是普通文件或目录'
           continue
         fi
+        WIZARD_KNOWLEDGE_SOURCE=$resolved
+        WIZARD_KNOWLEDGE_FILES=$(jq -er '.supported_files' <<< "$knowledge_summary") || return 1
         break
       done
       wizard_write_state "$output_file" collecting 10
@@ -960,7 +994,8 @@ wizard_show_summary() {
   if [[ "$WIZARD_KNOWLEDGE_MODE" == empty ]]; then
     printf '  知识库：尚未配置业务知识\n'
   elif [[ "$WIZARD_KNOWLEDGE_MODE" == libraries ]]; then
-    printf '  知识库：已选择 %s 个命名知识来源；解析和索引数量将在安装后对账。\n' "$WIZARD_KNOWLEDGE_FILES"
+    printf '  知识库：已选择 %s 个命名库、%s 个支持文件；解析和索引数量将在安装后对账。\n' \
+      "$(jq -r 'length' <<< "$WIZARD_KNOWLEDGE_LIBRARIES")" "$WIZARD_KNOWLEDGE_FILES"
   else
     printf '  知识库：已选择 %s 个支持文件\n' "$WIZARD_KNOWLEDGE_FILES"
   fi
@@ -1027,6 +1062,7 @@ quick_init_wizard() {
   wizard_require_command mktemp || return 1
   wizard_require_command curl || return 1
   wizard_require_command jq || return 1
+  wizard_require_command python3 || return 1
   wizard_require_command realpath || return 1
   wizard_require_command stat || return 1
   wizard_require_command find || return 1

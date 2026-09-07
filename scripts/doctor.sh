@@ -244,25 +244,20 @@ doctor_deadline_add() {
 # 仍可能再等待几十秒。这里用 doctor 自己拥有的临时文件和剩余截止执行同等只读协议。
 DOCTOR_EXTERNAL_STATUS=000
 doctor_crisp_api_probe() {
-  local website tier auth escaped_auth escaped_tier config response status curl_rc=0
+  local website config response status curl_rc=0
   website=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)
-  tier=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_TOKEN_TIER 2>/dev/null || true)
-  auth=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_AUTH_B64 2>/dev/null || true)
-  if [[ ! "$website" =~ ^[A-Za-z0-9-]{8,128}$ || ( "$tier" != website && "$tier" != plugin ) ]] \
-    || ! validate_env_value "$auth"; then
+  if [[ ! "$website" =~ ^[A-Za-z0-9-]{8,128}$ ]]; then
     DOCTOR_EXTERNAL_STATUS=configuration
     return 1
   fi
-  escaped_auth=$(curl_config_escape "$auth") || { DOCTOR_EXTERNAL_STATUS=configuration; return 1; }
-  escaped_tier=$(curl_config_escape "$tier") || { DOCTOR_EXTERNAL_STATUS=configuration; return 1; }
   config="${DOCTOR_TEMP_ROOT}/crisp-api.conf"
   response="${DOCTOR_TEMP_ROOT}/crisp-api-response.json"
-  {
-    printf 'header = "Authorization: Basic %s"\n' "$escaped_auth"
-    printf 'header = "X-Crisp-Tier: %s"\n' "$escaped_tier"
-  } > "$config"
-  chmod 0600 "$config" "$response" 2>/dev/null || true
-  status=$(doctor_timeout 20 curl --silent --output "$response" --write-out '%{http_code}' \
+  : > "$config"; : > "$response"; chmod 0600 "$config" "$response"
+  if ! crisp_write_auth_config "${DOCTOR_DEPLOY_DIR}/.env" "$config"; then
+    DOCTOR_EXTERNAL_STATUS=configuration
+    return 1
+  fi
+  status=$(doctor_timeout 20 curl -q --silent --output "$response" --write-out '%{http_code}' \
     --max-filesize 1048576 --connect-timeout 5 --max-time 18 --config "$config" \
     "https://api.crisp.chat/v1/website/${website}" 2>/dev/null) || curl_rc=$?
   : > "$config"
@@ -491,11 +486,12 @@ doctor_files_and_config_check() {
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
     config/app.yaml config/Caddyfile.example config/runtime.yaml config/provider.yaml config/prompt.md
     config/keyword.yaml config/menu.yaml config/handoff.yaml config/tags.yaml config/feedback.yaml
+    config/logging.yaml
     scripts/common.sh scripts/healthcheck.sh scripts/doctor.sh scripts/bootstrap.sh scripts/wizard.sh
     scripts/package-release.sh scripts/backup.sh scripts/restore.sh scripts/analytics.sh scripts/snapshot.sh
     scripts/rollback.sh scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/provider-adapter.js scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh
-    scripts/full-backup.sh scripts/archive-guard.py)
+    scripts/full-backup.sh scripts/archive-guard.py scripts/materials.sh scripts/logs.sh scripts/log-redact.py)
   start=$(doctor_now_ms)
   for relative in "${required[@]}"; do
     [[ -f "${DOCTOR_DEPLOY_DIR}/${relative}" && ! -L "${DOCTOR_DEPLOY_DIR}/${relative}" ]] || missing+=" ${relative}"
@@ -507,7 +503,7 @@ doctor_files_and_config_check() {
   fi
 
   start=$(doctor_now_ms)
-  for relative in runtime provider keyword menu handoff tags feedback; do
+  for relative in runtime provider keyword menu handoff tags feedback logging; do
     jq -e 'type == "object"' "${DOCTOR_DEPLOY_DIR}/config/${relative}.yaml" >/dev/null 2>&1 || invalid+=" ${relative}.yaml"
   done
   if [[ -n "$invalid" ]]; then
@@ -1206,10 +1202,226 @@ doctor_runtime_scheduler_check() {
   fi
 }
 
+doctor_logs_check() {
+  local start report status rc=0 configured env_match compose_state compose_wired container_state container_match
+  local n8n_state timer_available timer_owned timer_enabled timer_active unsafe managed_bytes max_size max_files
+  local -a arguments=(--deploy-dir "$DOCTOR_DEPLOY_DIR" --json audit)
+  start=$(doctor_now_ms)
+  if [[ ! -f "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" || -L "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" \
+    || ! -f "${DOCTOR_DEPLOY_DIR}/scripts/log-redact.py" || -L "${DOCTOR_DEPLOY_DIR}/scripts/log-redact.py" ]]; then
+    doctor_add logs.policy '运维日志策略' FAIL critical '日志维护或脱敏模块缺失/不安全' filesystem '从同版本完整发布包恢复日志模块' "$start"
+    doctor_skip logs.capacity '容器日志容量接线' '因日志模块缺失未检查' docker
+    doctor_skip logs.n8n_execution 'n8n execution 保留策略' '因日志模块缺失未检查' filesystem
+    doctor_skip logs.timer '日志自动清理调度' '因日志模块缺失未检查' systemd
+    doctor_skip logs.usage '受管日志占用' '因日志模块缺失未检查' filesystem
+    return
+  fi
+  if [[ "$DOCTOR_SCOPE" == offline || "$DOCTOR_DOCKER_READY" != 1 ]]; then arguments+=(--no-docker); fi
+  report="${DOCTOR_TEMP_ROOT}/logs-audit.json"
+  doctor_timeout 20 bash "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" "${arguments[@]}" > "$report" 2>/dev/null || rc=$?
+  if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null; then
+    doctor_deadline_add logs.policy '运维日志策略' filesystem "$start"
+    doctor_skip logs.capacity '容器日志容量接线' '因日志自检达到总截止未检查' docker
+    doctor_skip logs.n8n_execution 'n8n execution 保留策略' '因日志自检达到总截止未检查' filesystem
+    doctor_skip logs.timer '日志自动清理调度' '因日志自检达到总截止未检查' systemd
+    doctor_skip logs.usage '受管日志占用' '因日志自检达到总截止未检查' filesystem
+    return
+  fi
+  if (( rc != 0 && rc != 1 && rc != 2 )) \
+    || ! jq -e '.schema_version == 1 and (.policy | type == "object") and (.timer | type == "object") and (.usage | type == "object")' "$report" >/dev/null 2>&1; then
+    doctor_add logs.policy '运维日志策略' FAIL critical '日志自检没有返回有效的结构化结果' filesystem '单独运行 crispai logs status 定位日志配置或模块错误' "$start"
+    doctor_skip logs.capacity '容器日志容量接线' '因日志审计结果无效未检查' docker
+    doctor_skip logs.n8n_execution 'n8n execution 保留策略' '因日志审计结果无效未检查' filesystem
+    doctor_skip logs.timer '日志自动清理调度' '因日志审计结果无效未检查' systemd
+    doctor_skip logs.usage '受管日志占用' '因日志审计结果无效未检查' filesystem
+    return
+  fi
+
+  configured=$(jq -r '.configured' "$report"); env_match=$(jq -r '.env_projection_matched' "$report")
+  compose_state=$(jq -r '.compose.state' "$report")
+  compose_wired=$(jq -r '
+    (.compose.state == "configured") and all(.compose.services[]; .logging_wired == true) and
+    .compose.n8n.prune_wired == true and .compose.n8n.max_age_wired == true and
+    .compose.n8n.save_success_wired == true and .compose.n8n.save_error_wired == true
+  ' "$report")
+  if [[ "$configured" != true ]]; then
+    doctor_add logs.policy '运维日志策略' FAIL critical 'logging.yaml 缺失、损坏或字段越界' filesystem '从当前版本模板恢复，再使用日志菜单应用并回读' "$start"
+  elif [[ "$(jq -r '.policy.revision == .policy.applied_revision' "$report")" != true ]]; then
+    doctor_add logs.policy '运维日志策略' WARN warning '日志策略 revision 尚未完成运行时应用' filesystem '从日志菜单重新应用；不要手工只改 Compose' "$start"
+  elif [[ "$env_match" != true ]]; then
+    doctor_add logs.policy '运维日志策略' FAIL critical '权威日志配置与 .env 运行投影不一致' filesystem '从日志菜单成组重新应用配置' "$start"
+  elif [[ "$compose_state" == invalid ]]; then
+    doctor_add logs.policy '运维日志策略' FAIL critical 'Compose 无法解析日志容量或 execution 配置' filesystem '恢复同版本 Compose 后重新应用日志策略' "$start"
+  elif [[ "$compose_wired" != true ]]; then
+    doctor_add logs.policy '运维日志策略' FAIL critical 'Compose 未完整引用受管日志容量或 n8n execution 隐私字段' filesystem '从同版本正式包恢复 Compose 接线，再显式应用日志策略' "$start"
+  else
+    doctor_add logs.policy '运维日志策略' PASS critical \
+      "策略已应用：$(jq -r '.policy.retention_days' "$report") 天 / $(jq -r '.policy.max_size_mib' "$report") MiB / $(jq -r '.policy.max_files' "$report") 份" \
+      filesystem '' "$start"
+  fi
+
+  start=$(doctor_now_ms); container_state=$(jq -r '.runtime.containers.state' "$report"); container_match=$(jq -r '.runtime.containers.matched' "$report")
+  if [[ "$container_state" == checked && "$container_match" == true ]]; then
+    doctor_add logs.capacity '容器日志容量接线' PASS critical '全部运行中的本项目容器由 Docker json-file 按当前容量策略轮转' docker '' "$start"
+  elif [[ "$container_state" == checked ]]; then
+    doctor_add logs.capacity '容器日志容量接线' FAIL critical '至少一个运行中容器仍使用旧容量或非受管日志驱动' docker '从日志菜单显式应用；仅重建本项目容器，不直接操作 LogPath' "$start"
+  else
+    doctor_skip logs.capacity '容器日志容量接线' '因 Docker 不可用或离线范围未读取运行中容器' docker
+  fi
+
+  start=$(doctor_now_ms); n8n_state=$(jq -r '.runtime.n8n.state' "$report")
+  if [[ "$DOCTOR_SCOPE" == offline ]]; then
+    doctor_skip logs.n8n_execution 'n8n execution 保留策略' '离线范围已静态核对 Compose 接线，但不读取运行中 n8n' docker
+  elif [[ "$n8n_state" == checked ]] && jq -e --arg hours "$(jq -r '.policy.retention_days * 24 | tostring' "$report")" \
+    '.runtime.n8n.prune=="true" and .runtime.n8n.max_age_hours==$hours and .runtime.n8n.save_success=="none" and .runtime.n8n.save_error=="none"' "$report" >/dev/null; then
+    doctor_add logs.n8n_execution 'n8n execution 保留策略' PASS critical '运行中 n8n 不保存成功/失败正文，并由官方 pruning 清理已完成 execution' docker '' "$start"
+  elif [[ "$n8n_state" == checked ]]; then
+    doctor_add logs.n8n_execution 'n8n execution 保留策略' FAIL critical '运行中 n8n execution 保存/保留值与隐私策略不一致' docker '重新应用日志策略并重建 n8n；不要直接 SQL 删除执行表' "$start"
+  elif [[ "$compose_state" == configured ]] && jq -e \
+    '.compose.n8n.prune_wired == true and .compose.n8n.max_age_wired == true and
+     .compose.n8n.save_success_wired == true and .compose.n8n.save_error_wired == true' "$report" >/dev/null; then
+    doctor_add logs.n8n_execution 'n8n execution 保留策略' WARN warning 'Compose 隐私设置正确，但本次未从运行中 n8n 回读' filesystem '服务恢复后重跑本地自检；不会用 SQL 清理活跃执行' "$start"
+  else
+    doctor_add logs.n8n_execution 'n8n execution 保留策略' FAIL critical 'Compose 中 n8n execution 保存/保留策略缺失或不一致' filesystem '恢复固定版本的隐私设置后重建 n8n' "$start"
+  fi
+
+  start=$(doctor_now_ms); timer_available=$(jq -r '.timer.systemd_available' "$report"); timer_owned=$(jq -r '.timer.owned' "$report")
+  timer_enabled=$(jq -r '.timer.enabled' "$report"); timer_active=$(jq -r '.timer.active' "$report")
+  if [[ "$timer_available" != true ]]; then
+    doctor_add logs.timer '日志自动清理调度' WARN warning '当前环境没有运行中的 systemd，按天清理未自动调度' systemd '支持的生产系统应启用本实例 timer；不会改用临时 cron' "$start"
+  elif [[ "$timer_owned" == true && "$timer_enabled" == true && "$timer_active" == true ]]; then
+    doctor_add logs.timer '日志自动清理调度' PASS critical "本实例 timer 已启用；最近清理：$(jq -r '.timer.last_cleanup' "$report")" systemd '' "$start"
+  elif (( DOCTOR_INSTALLATION_IN_PROGRESS )); then
+    doctor_add logs.timer '日志自动清理调度' WARN warning '安装健康门禁阶段尚未完成 timer 接线' systemd '安装提交后会按受管归属启用，并在菜单中回读' "$start"
+  else
+    doctor_add logs.timer '日志自动清理调度' FAIL critical '本实例日志 timer 未启用、未运行或归属记录不一致' systemd '运行日志维护的 timer install；不得覆盖其他实例同名单元' "$start"
+  fi
+
+  start=$(doctor_now_ms); unsafe=$(jq -r '.usage.unsafe_entries' "$report"); managed_bytes=$(jq -r '.usage.managed_bytes' "$report")
+  max_size=$(jq -r '.policy.max_size_mib' "$report"); max_files=$(jq -r '.policy.max_files' "$report")
+  if (( unsafe > 0 )); then
+    doctor_add logs.usage '受管日志占用' FAIL critical "日志历史中有 ${unsafe} 个链接、硬链接或特殊条目" filesystem '移出可疑条目并核对归属；自动清理不会跟随链接' "$start"
+  elif (( managed_bytes > max_size * 1024 * 1024 * (max_files + 2) )); then
+    doctor_add logs.usage '受管日志占用' WARN warning "受管运维日志 ${managed_bytes} bytes，超过策略余量" filesystem '先用 cleanup --preview 核对，再数字确认清理过期历史' "$start"
+  else
+    doctor_add logs.usage '受管日志占用' PASS warning "受管运维日志 ${managed_bytes} bytes；Docker 逐容器占用未通过 LogPath 读取" filesystem '' "$start"
+  fi
+}
+
+doctor_materials_check() {
+  local start report rc=0 state source_valid projection_valid pending revision expected output binding_rc=0
+  start=$(doctor_now_ms)
+  if [[ ! -f "${DOCTOR_DEPLOY_DIR}/scripts/materials.sh" \
+    || -L "${DOCTOR_DEPLOY_DIR}/scripts/materials.sh" ]]; then
+    doctor_add materials.applied '资料生效投影' FAIL critical \
+      '资料应用模块缺失或不是安全普通文件' filesystem \
+      '从同版本完整发布包恢复 materials.sh；不要回退读取未验证原文' "$start"
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '因资料应用模块缺失未检查' docker
+    return
+  fi
+
+  report="${DOCTOR_TEMP_ROOT}/materials-status.json"
+  doctor_timeout 20 bash "${DOCTOR_DEPLOY_DIR}/scripts/materials.sh" \
+    --deploy-dir "$DOCTOR_DEPLOY_DIR" status > "$report" 2>/dev/null || rc=$?
+  if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null; then
+    doctor_deadline_add materials.applied '资料生效投影' filesystem "$start"
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '因资料状态检查达到总截止未检查' docker
+    return
+  fi
+  if (( rc != 0 && rc != 1 && rc != 2 )) \
+    || ! jq -e '
+      (.source_valid | type == "boolean") and (.projection_valid | type == "boolean") and
+      (.pending | type == "boolean") and (.state | type == "string") and
+      (.applied_revision | type == "number" and floor == . and . >= 0) and
+      (.source_sha256 | type == "string") and (.applied_sha256 | type == "string")
+    ' "$report" >/dev/null 2>&1; then
+    doctor_add materials.applied '资料生效投影' FAIL critical \
+      '资料状态没有返回有效的结构化结果' filesystem \
+      '运行 crispai 资料状态检查；修复原文或从上一有效资料投影恢复' "$start"
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '因资料状态结果无效未检查' docker
+    return
+  fi
+
+  state=$(jq -r '.state' "$report")
+  source_valid=$(jq -r '.source_valid' "$report")
+  projection_valid=$(jq -r '.projection_valid' "$report")
+  pending=$(jq -r '.pending' "$report")
+  revision=$(jq -r '.applied_revision' "$report")
+  # status 中的 applied_sha256 是“来源语义摘要”，用于判断原文 pending；
+  # 运行容器挂载对账必须使用投影文件本身的逐字节摘要。
+  expected=$(sha256sum -- "${DOCTOR_DEPLOY_DIR}/config/materials-applied.json" 2>/dev/null | awk '{print $1}' || true)
+  if [[ "$projection_valid" == true && "$state" == applied ]]; then
+    if [[ "$source_valid" == true && "$pending" == false ]]; then
+      doctor_add materials.applied '资料生效投影' PASS critical \
+        "当前生效资料 revision ${revision} 有效，可编辑原文与其一致" filesystem '' "$start"
+    elif [[ "$source_valid" == true ]]; then
+      doctor_add materials.applied '资料生效投影' WARN warning \
+        "当前生效资料 revision ${revision} 有效；可编辑原文有尚未应用的变更" filesystem \
+        '先预览并显式应用资料；运行时仍使用上一有效投影' "$start"
+    else
+      doctor_add materials.applied '资料生效投影' WARN warning \
+        "当前生效资料 revision ${revision} 有效；可编辑原文校验失败" filesystem \
+        '修复可编辑原文后再显式应用；运行时不会回退读取损坏原文' "$start"
+    fi
+  else
+    doctor_add materials.applied '资料生效投影' FAIL critical \
+      "当前资料投影不可用（state=${state}）" filesystem \
+      '从上一有效配置历史成套恢复或重新完成资料应用；不要强启混合代' "$start"
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '因当前资料投影不可用未检查' docker
+    return
+  fi
+
+  start=$(doctor_now_ms)
+  if [[ "$DOCTOR_SCOPE" == offline ]]; then
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '离线范围不读取运行中 n8n' docker
+    return
+  fi
+  if (( DOCTOR_DOCKER_READY == 0 || DOCTOR_N8N_READY == 0 )); then
+    doctor_skip materials.runtime_binding 'n8n 资料运行代' '因 Docker 或 n8n 不可用未检查' docker
+    return
+  fi
+  if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+    doctor_add materials.runtime_binding 'n8n 资料运行代' FAIL critical \
+      '当前有效投影缺少可核对的摘要' filesystem \
+      '从上一有效资料投影恢复；不要回退读取可编辑原文' "$start"
+    return
+  fi
+  output="${DOCTOR_TEMP_ROOT}/materials-runtime-binding"
+  # 期望摘要只经 stdin 传入，不放入 argv/日志；容器只返回 matched。
+  # shellcheck disable=SC2016
+  printf '%s' "$expected" | doctor_compose_timeout 12 exec -T n8n node -e '
+    const crypto=require("crypto"),fs=require("fs");
+    const marker="CRISPAI_EXPECTED_MATERIALS_PROJECTION";
+    const expected=fs.readFileSync(0,"utf8").trim();
+    const file=fs.readFileSync("/opt/crisp-ai/config/materials-applied.json");
+    const actual=crypto.createHash("sha256").update(file).digest("hex");
+    const a=Buffer.from(actual),b=Buffer.from(expected);
+    if(!marker || a.length!==b.length || !crypto.timingSafeEqual(a,b)) process.exit(1);
+    process.stdout.write("matched\n");
+  ' > "$output" 2>/dev/null || binding_rc=$?
+  if (( binding_rc == 0 )) && grep -Fxq matched "$output"; then
+    doctor_add materials.runtime_binding 'n8n 资料运行代' PASS critical \
+      '运行中 n8n 读取的资料投影与当前有效投影逐字节一致' docker '' "$start"
+  elif (( binding_rc == 124 || binding_rc == 137 )) || ! doctor_remaining >/dev/null; then
+    doctor_deadline_add materials.runtime_binding 'n8n 资料运行代' docker "$start"
+  else
+    doctor_add materials.runtime_binding 'n8n 资料运行代' FAIL critical \
+      '运行中 n8n 未读取当前有效资料投影' docker \
+      '重新应用已验证资料并回读；不要直接修改容器内文件' "$start"
+  fi
+}
+
 doctor_crisp_observation_check() {
   local start binding_file binding file matched=0 hook=0 conversation=0 api_base deadline_reached=0
+  local website_secret plugin_secret
   start=$(doctor_now_ms)
   binding_file="${DOCTOR_TEMP_ROOT}/binding.bin"
+  website_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
+  plugin_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+  # runtime 读取的是 Compose 运行环境；两个可选 Secret 的 `${VAR:-not-configured}`
+  # 会把宿主缺失/空值统一投影为 sentinel。observation 绑定必须逐字节同义。
+  website_secret=${website_secret:-not-configured}
+  plugin_secret=${plugin_secret:-not-configured}
   # runtime 的 connectionBinding() 使用 Array.join("\0")：字段之间有 NUL，
   # 最后一项之后没有 NUL。这里必须逐字节保持相同序列，否则当前凭据的
   # observation 也会被错误判定为旧绑定。
@@ -1218,8 +1430,8 @@ doctor_crisp_observation_check() {
       "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_ID 2>/dev/null || true)" \
       "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_AUTH_B64 2>/dev/null || true)" \
       "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_HOOK_MODE 2>/dev/null || true)" \
-      "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)" \
-      "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)" \
+      "$website_secret" \
+      "$plugin_secret" \
       "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PUBLIC_WEBHOOK_URL 2>/dev/null || true)"
     printf '%s' \
       "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_API_BASE_URL 2>/dev/null || printf 'https://api.crisp.chat/v1')"
@@ -1319,8 +1531,10 @@ doctor_run_checks() {
     doctor_n8n_check
     doctor_adapter_check
   fi
+  doctor_materials_check
   doctor_runtime_state_check
   doctor_runtime_scheduler_check
+  doctor_logs_check
   doctor_external_check
 }
 
@@ -1441,6 +1655,10 @@ doctor_build_report() {
     temporary=$(mktemp "${DOCTOR_DEPLOY_DIR}/logs/.doctor-last.XXXXXX")
     install -m 0600 -- "$output" "$temporary"
     mv -f -- "$temporary" "$cache"
+  fi
+  if [[ -f "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" && ! -L "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" ]]; then
+    doctor_timeout 8 bash "${DOCTOR_DEPLOY_DIR}/scripts/logs.sh" --deploy-dir "$DOCTOR_DEPLOY_DIR" \
+      record-doctor --input "$output" >/dev/null 2>&1 || true
   fi
 }
 

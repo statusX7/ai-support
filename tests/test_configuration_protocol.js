@@ -15,18 +15,26 @@ async function main() {
   for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','n8n','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=staged\n');
   fs.writeFileSync(path.join(deploy,'VERSION'),'v1.1.0\n');
-  for (const name of ['keyword','handoff','menu','tags','feedback','provider']) fs.copyFileSync(path.join(root,`config/${name}.yaml.example`),path.join(deploy,`config/${name}.yaml`));
+  for (const name of ['keyword','handoff','menu','tags','feedback','provider']) {
+    const target=path.join(deploy,`config/${name}.yaml`);
+    fs.copyFileSync(path.join(root,`config/${name}.yaml.example`),target);
+    fs.chmodSync(target,0o640);
+  }
   fs.copyFileSync(path.join(root,'config/prompt.md.example'),path.join(deploy,'config/prompt.md'));
+  fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
   fs.copyFileSync(path.join(root,'n8n/workflow.json'),path.join(deploy,'n8n/workflow.json'));
   fs.copyFileSync(path.join(root,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker'));
   fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
-  const documents = new Map(); let locations=[], prompt='', sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
+  const documents = new Map(); let locations=[], prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'), sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
+  let providerChatFailure=false;
   let modelEmpty=false, modelHang=false, modelCalls=0;
   const service=http.createServer(async(request,response)=>{
     let data=Buffer.alloc(0);for await(const chunk of request)data=Buffer.concat([data,chunk]);
     const send=(status,body)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(body));};
     const body = request.headers['content-type']?.includes('application/json') ? JSON.parse(data.toString('utf8') || '{}') : {};
     if(request.url === '/api/v1/auth'){send(200,{authenticated:true});return;}
+    if(request.url === '/healthz' || request.url === '/api/ping'){send(200,{ok:true});return;}
+    if(request.url.startsWith('/webhook/crisp-webhook?')){send(401,{accepted:false,reason:'Webhook 校验失败'});return;}
     if(request.url === '/api/v1/workspace/crisp-support'){send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;}
     if(request.url === '/api/v1/workspace/crisp-support/update'){prompt=body.openAiPrompt;send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;}
     if(request.url === '/api/v1/document/upload'){
@@ -48,14 +56,14 @@ async function main() {
       if(modelHang)return;
       if(modelStatus===200)send(200,{data:modelEmpty?[]:[{id:'synthetic-b'},{id:'synthetic-a'},{id:'synthetic-a'}]});else send(modelStatus,{error:{message:'fixture'}});return;
     }
-    if(request.url === '/proxy/v1/chat/completions'){lastProviderHeaders=request.headers;send(200,{choices:[{message:{content:'协议模型回答'}}]});return;}
+    if(request.url === '/proxy/v1/chat/completions'){lastProviderHeaders=request.headers;if(providerChatFailure)send(500,{error:{message:'fixture'}});else send(200,{choices:[{message:{content:'协议模型回答'}}]});return;}
     if(request.url === '/proxy/v1/responses'){lastProviderHeaders=request.headers;send(200,{output_text:'协议模型回答'});return;}
     send(404,{error:'fixture-unknown-route'});
   });
   await new Promise(resolve=>service.listen(0,'127.0.0.1',resolve));
   const port=service.address().port;
   const secret='synthetic-secret-not-for-real-use';
-  fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=${secret}\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nAI_API_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_PROBE_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_KEY=${secret}\nAI_MODEL=synthetic-a\nAI_API_MODE=chat_completions\n`);
+  fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=${secret}\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nN8N_PORT=${port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=2\nLOCAL_HEALTH_INTERVAL_SECONDS=1\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=2\nAI_API_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_PROBE_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_KEY=${secret}\nAI_MODEL=synthetic-a\nAI_API_MODE=chat_completions\n`);
   fs.chmodSync(path.join(deploy,'.env'),0o600);
   fs.writeFileSync(path.join(deploy,'config/provider.yaml'),JSON.stringify({schema_version:2,provider:{base_url:`http://127.0.0.1:${port}/proxy/v1`,model:'synthetic-a',api_mode:'chat_completions',api_key_env:'AI_API_KEY'}}));
   let count=0;
@@ -129,9 +137,29 @@ async function main() {
     const providerCandidate=path.join(work,'provider.json');fs.writeFileSync(providerCandidate,JSON.stringify({provider:{custom_headers:{'X-New':'synthetic-new'}}}));
     await ok('provider.sh',['probe',providerCandidate]);assert.equal(lastProviderHeaders['x-original'],'synthetic-original');assert.equal(lastProviderHeaders['x-new'],'synthetic-new');pass('新增高级Header保留未编辑的现有Header');
     fs.writeFileSync(providerCandidate,JSON.stringify({provider:{remove_header:'x-original'}}));await ok('provider.sh',['probe',providerCandidate]);assert.equal(lastProviderHeaders['x-original'],undefined);pass('高级Header可以安全单项删除');
+    const handoffPath=path.join(deploy,'config/handoff.yaml');
+    fs.writeFileSync(handoffPath,'handoff:\n  resume_after_seconds: 1800\n  message: "YAML 直编内容 🙂"\n',{mode:0o640});
+    await ok('configuration.sh',['materials-apply']);
+    const normalizedHandoff=JSON.parse((await ok('configuration.sh',['get','handoff'])).stdout);
+    assert.equal(normalizedHandoff.handoff.message,'YAML 直编内容 🙂');
+    pass('真实 YAML 原文应用后仍能由配置菜单规范化读取');
+    const runtimeBeforeExport=JSON.parse(fs.readFileSync(path.join(deploy,'config/runtime.yaml'),'utf8'));
+    fs.writeFileSync(path.join(deploy,'config/runtime.yaml'),`schema_version: 2\nenabled: ${runtimeBeforeExport.enabled}\nrevision: ${runtimeBeforeExport.revision}\napplied_revision: ${runtimeBeforeExport.applied_revision}\n`,{mode:0o640});
     const migration=path.join(work,'business.tar.gz');await ok('migration.sh',['export',migration]);const preview=JSON.parse((await ok('migration.sh',['import-preview',migration])).stdout);assert.equal(preview.manifest.contains_secrets,false);assert.equal(preview.libraries.length,3);
     const extracted=path.join(work,'migration-files');fs.mkdirSync(extracted);await new Promise((resolve,reject)=>{const child=spawn('tar',['-xzf',migration,'-C',extracted]);child.on('close',code=>code?reject(new Error('tar')):resolve());});
     assert.equal(fs.readFileSync(path.join(extracted,'config/prompt.md'),'utf8'),promptContent);assert.equal(fs.existsSync(path.join(extracted,'.env')),false);assert.ok(readCatalog().libraries.flatMap(library=>library.documents.map(document=>path.join(extracted,'knowledge',library.id,document.source))).every(file=>fs.existsSync(file)));pass('完整业务迁移包包含多库原文和Prompt，不含秘密');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(extracted,'config/handoff.yaml'),'utf8')).handoff.message,'YAML 直编内容 🙂');
+    const knowledgeInode=fs.statSync(path.join(deploy,'knowledge')).ino;
+    await ok('migration.sh',['import',migration]);
+    assert.equal(fs.statSync(path.join(deploy,'knowledge')).ino,knowledgeInode);
+    pass('业务导入应用真实 YAML 且替换知识内容时保持既有 bind 根目录 inode');
+    providerChatFailure=true;
+    const failedImport=await invoke('migration.sh',['import',migration]);
+    assert.notEqual(failedImport.code,0);assert.match(failedImport.stderr,/恢复未完全确认/);assert.doesNotMatch(failedImport.stderr,/已恢复原配置与知识/);
+    assert.equal(fs.statSync(path.join(deploy,'knowledge')).ino,knowledgeInode);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json'),'utf8')).state,'applying');
+    providerChatFailure=false;
+    pass('导入失败且 Provider 回读恢复失败时不再假称完整恢复，以 applying 阻止自动回复且知识 bind 根 inode 不变');
     assert.ok(!JSON.stringify(preview).includes(secret));pass('导出预览和正常输出不泄露Key');
     const unsafeSource=path.join(work,'unsafe');fs.mkdirSync(unsafeSource);fs.symlinkSync(path.join(deploy,'.env'),path.join(unsafeSource,'secret-link'));
     const unsafeArchive=path.join(work,'unsafe.tar.gz');await new Promise((resolve,reject)=>{const child=spawn('tar',['-czf',unsafeArchive,'-C',unsafeSource,'.']);child.on('close',code=>code?reject(new Error('tar')):resolve());});

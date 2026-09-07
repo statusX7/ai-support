@@ -1,6 +1,6 @@
 app:
   name: ai-support
-  version: v1.1.1
+  version: v1.2.0
 
 deployment:
   default_dir: /opt/crisp-ai

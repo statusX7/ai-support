@@ -167,6 +167,9 @@ STAGING=$(mktemp -d "${DEPLOY_DIR}/tmp/rollback-stage.XXXXXX")
 cleanup() {
   local status=$?
   trap - EXIT
+  if (( status != 0 )); then
+    record_maintenance_event "$DEPLOY_DIR" rollback failed "$status"
+  fi
   if (( status != 0 && MUTATION_STARTED == 1 )); then
     # 数据库恢复可能已部分提交；不能单独退回一个数据目录后启动混合代际服务。
     docker_compose "$DEPLOY_DIR" stop n8n anythingllm >/dev/null 2>&1 || true
@@ -258,6 +261,9 @@ for name in "${DOC_FILES[@]}"; do
 done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
+for module in materials.sh logs.sh log-redact.py; do
+  validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
+done
 
 require_docker_runtime
 docker_compose "$DEPLOY_DIR" config --quiet
@@ -282,6 +288,19 @@ if (( SAFETY_SNAPSHOT )); then
 fi
 
 MUTATION_STARTED=1
+# 新代调度和兼容入口不能悬挂在降代后的旧模块上；完整恢复后由目标版本重建。
+remove_log_maintenance "$DEPLOY_DIR" || die '回滚前无法安全停止本实例日志调度'
+if [[ -f "${DEPLOY_DIR}/scripts/launcher.sh" && ! -L "${DEPLOY_DIR}/scripts/launcher.sh" ]]; then
+  # shellcheck disable=SC2016 # 文件路径走位置参数，不解释配置或正文。
+  bash -c 'source "$1"; if declare -F remove_crisp_compat_launcher >/dev/null; then
+    launcher=/usr/local/bin/crispai
+    if [[ -f "$2/config/.crispai-launcher" && ! -L "$2/config/.crispai-launcher" ]]; then
+      IFS= read -r launcher < "$2/config/.crispai-launcher" || exit 1
+    fi
+    remove_crisp_compat_launcher "$2" "$launcher"
+  fi' rollback-launcher "${DEPLOY_DIR}/scripts/launcher.sh" "$DEPLOY_DIR"
+fi
+record_maintenance_event "$DEPLOY_DIR" rollback start
 MARKER_SOURCE=$(sed -n 's/^source=//p' "${DEPLOY_DIR}/${INSTALL_MARKER}" | head -n 1)
 write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" installing
 if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
@@ -335,6 +354,11 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
+for module in materials.sh logs.sh log-redact.py; do
+  module_mode=0750
+  [[ "$module" != log-redact.py ]] || module_mode=0640
+  sync_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "$module_mode" "scripts/${module}"
+done
 
 find "${DEPLOY_DIR}/knowledge" -maxdepth 1 -type f ! -name 'README.md' \
   \( -iname '*.md' -o -iname '*.txt' -o -iname '*.pdf' -o -iname '*.docx' \) -delete
@@ -412,6 +436,11 @@ wait_for_local_health "$DEPLOY_DIR"
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"
 wait_for_local_health "$DEPLOY_DIR"
+if [[ -f "${DEPLOY_DIR}/scripts/materials.sh" && ! -L "${DEPLOY_DIR}/scripts/materials.sh" ]]; then
+  bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
+    || die '回滚后的资料投影与实际应用不一致；未提交完成状态'
+fi
+install_log_maintenance "$DEPLOY_DIR" || die '回滚后的日志维护调度未通过回读'
 # 老快照没有统一 doctor；恢复到新版本时，在提交完成状态前核验实际运行代。
 if [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]]; then
   bash "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --application --installation-in-progress \
@@ -449,6 +478,7 @@ if [[ -f "${DEPLOY_DIR}/scripts/launcher.sh" ]]; then
     || warn "版本已恢复，但 crispai 入口存在冲突，请从 manage.sh 检查"
 fi
 rm -rf -- "$ANYTHING_PREVIOUS"
+record_maintenance_event "$DEPLOY_DIR" rollback complete
 
 trap - EXIT
 rm -rf -- "$STAGING"

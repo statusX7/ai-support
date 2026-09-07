@@ -2,9 +2,24 @@
 set -euo pipefail
 
 [[ ${CONFIGURATION_FIXTURE_READBACK_FAIL:-0} != 1 ]] || exit 1
+if [[ "$*" == *" config --quiet"* || "$*" == *" up -d "* ]]; then
+  exit 0
+fi
+if [[ "$*" == *" ps --services --filter status=running"* ]]; then
+  printf '%s\n' postgres anythingllm n8n provider-adapter
+  exit 0
+fi
+if [[ "$*" == *materials-applied.json* ]]; then
+  sha256sum -- "${CONFIGURATION_FIXTURE_DEPLOY:?}/config/materials-applied.json" | awk '{printf "%s",$1}'
+  exit 0
+fi
+if [[ "$*" == *"exec -T anythingllm node -e"* && "$*" == *"/chat/completions"* ]]; then
+  printf '{"verified":true,"environment":"fixture","path":"/chat/completions"}'
+  exit 0
+fi
 arguments=("$@")
 last=${arguments[${#arguments[@]}-1]}
-if [[ "$last" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ ]]; then
+if [[ "$last" =~ ^[a-z][a-z0-9_-]*\.(yaml|md|json)$ ]]; then
   sha256sum -- "${CONFIGURATION_FIXTURE_DEPLOY:?}/config/${last}" | awk '{printf "%s",$1}'
   exit 0
 fi

@@ -99,14 +99,15 @@ SHELL_FILES=(
   get.sh install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
-  scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh
+  scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
   scripts/launcher.sh scripts/menu-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
-  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
+  tests/test_caddy_routing.sh tests/test_logs.sh
+  tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout
 )
 for file in "${SHELL_FILES[@]}"; do
@@ -132,11 +133,20 @@ pass "依赖与 Docker 自动引导专项"
 "${SCRIPT_DIR}/test_get.sh"
 pass "独立在线入口、固定正式版校验与 TTY 专项"
 
+python3 "${SCRIPT_DIR}/test_launcher.py"
+pass "正式 crispai 与受管 crisp 兼容入口及外来命令保护专项"
+
 "${SCRIPT_DIR}/test_doctor.sh"
 pass "组件自检、故障注入、只读与显式修复专项"
 
+"${SCRIPT_DIR}/test_logs.sh"
+pass "日志保留、轮转、脱敏、受管调度与清理边界专项"
+
 "${SCRIPT_DIR}/test_public_distribution.sh"
 pass "公共分发入口与文档契约专项"
+
+python3 "${SCRIPT_DIR}/test_docs_acceptance.py"
+pass "新手文档、真实帮助入口与菜单限制独立核对专项"
 
 "${SCRIPT_DIR}/test_legacy_rollback.sh"
 pass "真实 v1.1.0 快照布局回滚与新模块代际收敛专项"
@@ -179,8 +189,10 @@ jq empty \
 PROJECT_VERSION=$(<"${PROJECT_ROOT}/VERSION")
 [[ "$PROJECT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "VERSION 格式无效"
 grep -Fq "version: ${PROJECT_VERSION}" "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
-grep -Fq "ai_support_version: '${PROJECT_VERSION}'" "${PROJECT_ROOT}/n8n/workflow.json" \
-  || fail "n8n workflow 回复版本未同步"
+jq -e --arg version "$PROJECT_VERSION" \
+  --arg runtime_hash "$(sha256sum "${PROJECT_ROOT}/n8n/runtime.js" | awk '{print $1}')" \
+  '.meta.aiSupportVersion == $version and .meta.runtimeFileSha256 == $runtime_hash' \
+  "${PROJECT_ROOT}/n8n/workflow.json" >/dev/null || fail 'n8n workflow 版本或真实运行模块 hash 未同步'
 pass "版本与 JSON/YAML 格式"
 
 grep -Fq 'no-new-privileges:true' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 缺少权限收紧"
@@ -229,6 +241,12 @@ fi
 if command -v node >/dev/null 2>&1; then
   node "${SCRIPT_DIR}/test_configuration_guards.js"
   pass "配置秘密边界、维护锁和 Crisp 响应护栏（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_crisp_auth.js"
+  pass "Crisp Website/Plugin 编码、实际请求认证与错误响应专项"
+  node "${SCRIPT_DIR}/test_materials_apply.js"
+  pass "直接编辑资料的校验、投影、真实协议回读与失败恢复专项"
+  node "${SCRIPT_DIR}/test_material_limits.js"
+  pass "Prompt、目录、命名知识库与菜单限制的边界和越界专项"
   node "${SCRIPT_DIR}/test_provider_adapter.js"
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_configuration_protocol.js"
@@ -331,6 +349,8 @@ assert_file "${DEPLOY_DIR}/config/tags.yaml"
 assert_file "${DEPLOY_DIR}/config/feedback.yaml"
 assert_file "${DEPLOY_DIR}/data/analytics/events.jsonl"
 [[ "$(stat -c '%a' "${DEPLOY_DIR}/.env")" == 600 ]] || fail ".env 权限不是 0600"
+grep -Fxq 'CRISPAI_LOG_MAX_FILES=5' "${DEPLOY_DIR}/.env" || fail '新装日志份数被旧版迁移缺省值覆盖'
+jq -e '.max_files == 5' "${DEPLOY_DIR}/config/logging.yaml" >/dev/null || fail '新装日志策略与运行环境不一致'
 grep -Fxq 'CRISP_HOOK_MODE=website' "${DEPLOY_DIR}/.env" || fail "Website Hook 模式未保存"
 grep -Fxq 'ANYTHINGLLM_CHAT_MODE=chat' "${DEPLOY_DIR}/.env" \
   || fail "AnythingLLM 未固定为保持会话的 chat 模式"
@@ -752,6 +772,23 @@ done
 tar -xOzf "$ARCHIVE" ./manifest.json | jq -e '.contains_secrets == false' >/dev/null || fail "备份清单未声明排除密钥"
 grep -Fq './config/tags.yaml' <<< "$ARCHIVE_LIST" || fail "备份未包含标签配置"
 grep -Fq './config/feedback.yaml' <<< "$ARCHIVE_LIST" || fail "备份未包含反馈配置"
+tar -xOzf "$ARCHIVE" ./manifest.json | jq -e '.format == "ai-support-business-v2" and .contains_knowledge == true' >/dev/null \
+  || fail '默认备份未采用已有的完整多库业务格式'
+while IFS= read -r relative; do
+  grep -Fxq "./knowledge/${relative}" <<< "$ARCHIVE_LIST" || fail '默认业务备份遗漏命名知识库原文'
+done < <(jq -r '.libraries[] | .id as $id | .documents[] | $id + "/" + .source' "${DEPLOY_DIR}/knowledge/catalog.json")
+grep -Fq './config/runtime.yaml' <<< "$ARCHIVE_LIST" || fail '默认业务备份遗漏客服总开关配置'
+pass '默认业务备份与菜单迁移统一，包含全部命名库原文和总开关'
+
+# 旧离线恢复契约仍用真实已发布 v1.1.1 备份器生成的 v1 包验收；不能让
+# 新备份遗漏多库来维持旧夹具，也不能删除原有的离线恢复与安全断言。
+mkdir -p -- "${TEST_ROOT}/legacy-backup-tools"
+git -C "$PROJECT_ROOT" show 'v1.1.1:scripts/backup.sh' > "${TEST_ROOT}/legacy-backup-tools/backup.sh"
+cp -- "${DEPLOY_DIR}/scripts/common.sh" "${TEST_ROOT}/legacy-backup-tools/common.sh"
+ARCHIVE="${DEPLOY_DIR}/backups/legacy-v1-compatibility.tar.gz"
+bash "${TEST_ROOT}/legacy-backup-tools/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$ARCHIVE" \
+  > "${TEST_ROOT}/legacy-backup-create.log" 2>&1
+tar -xOzf "$ARCHIVE" ./manifest.json | jq -e '.format == "ai-support-backup-v1"' >/dev/null || fail '旧格式夹具不是真实 v1 备份'
 printf '临时 Prompt，恢复后应被替换。\n' > "${DEPLOY_DIR}/config/prompt.md"
 rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md"
 if "${DEPLOY_DIR}/scripts/restore.sh" \

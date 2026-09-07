@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # CrispAI 公共发行包引导器。此文件必须能够脱离 Git 仓库和其他相邻文件独立运行。
-GET_VERSION="v1.1.1"
+GET_VERSION="v1.2.0"
 REPOSITORY="statusX7/ai-support"
 REPOSITORY_URL="https://github.com/${REPOSITORY}"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
 RELEASE_DOWNLOAD_ROOT="${REPOSITORY_URL}/releases/download"
 RELEASE_API_ROOT="https://api.github.com/repos/${REPOSITORY}/releases/tags"
-DEFAULT_DEPLOY_DIR="/opt/crisp-ai"
+GET_DEFAULT_DEPLOY_DIR="/opt/crisp-ai"
 ARCHIVE_MAX_BYTES=$((4 * 1024 * 1024 * 1024))
 ARCHIVE_DOWNLOAD_MAX_BYTES=$((512 * 1024 * 1024))
 CHECKSUM_DOWNLOAD_MAX_BYTES=$((64 * 1024))
@@ -22,6 +22,7 @@ DOWNLOAD_RETRY_DELAY=2
 RELEASE_REQUEST=""
 DEPLOY_REQUEST=""
 UPDATE_REQUEST=0
+REPAIR_REQUEST=0
 INTERNAL_CALLER_DIR=""
 WORK_DIR=""
 SELECTED_RELEASE=""
@@ -50,14 +51,16 @@ usage() {
 从公开 GitHub Release 下载并校验完整正式包，然后调用包内生产安装器。
 
 选项：
-  --release VERSION  安装指定正式版本，例如 v1.1.1
+  --release VERSION  安装指定正式版本，例如 v1.2.0
   --deploy-dir PATH  指定部署目录，默认 /opt/crisp-ai
   --update           更新一个已完成的旧版本实例
+  --repair           用已安装版本的校验包恢复受管命令入口，不启动服务或重装业务程序
   --help             显示帮助，不安装依赖或访问网络
   --version          显示引导器版本，不安装依赖或访问网络
 
 无参数运行时：新实例安装当前 Latest 正式版；已有完整实例打开 crispai 管理菜单；
 未完成的安装会下载原版本正式包并继续。回滚仍在 crispai 的更新与回滚菜单中执行。
+--repair 与 --update 互斥；发现业务程序缺失时会明确退出，请使用完整包恢复或受管更新。
 EOF
 }
 
@@ -453,6 +456,14 @@ scripts/crisp-settings.sh
 scripts/full-backup.sh
 scripts/archive-guard.py
 EOF
+  capability=$(version_compare "$release" v1.2.0)
+  (( capability >= 0 )) || return 0
+  cat <<'EOF'
+scripts/materials.sh
+scripts/logs.sh
+scripts/log-redact.py
+config/logging.yaml.example
+EOF
 }
 
 resolve_latest_release() {
@@ -629,6 +640,17 @@ inspect_existing_installation() {
   [[ -z "$installed_version" ]] || valid_release "$installed_version" \
     || die '现有安装记录的版本格式无效'
 
+  if (( REPAIR_REQUEST )); then
+    [[ "$state" == ready || "$state" == local-ready ]] \
+      || die '--repair 仅恢复已完成实例的命令入口；未完成实例请不带 --repair 继续安装'
+    valid_release "$installed_version" || die '无法确认已安装正式版本，拒绝修复入口'
+    [[ -z "$RELEASE_REQUEST" || "$RELEASE_REQUEST" == "$installed_version" ]] \
+      || die '--repair 必须使用已安装的同一正式版本；跨版本请使用 --update'
+    SELECTED_RELEASE=$installed_version
+    info "已锁定当前实例 ${installed_version}，将校验完整包并仅修复受管命令入口"
+    return 0
+  fi
+
   case "$state" in
     ready|local-ready)
       if (( UPDATE_REQUEST == 0 )); then
@@ -661,6 +683,40 @@ inspect_existing_installation() {
     *) die "现有安装状态无效：${state:-空}" ;;
   esac
 }
+
+repair_package_launcher() (
+  local package_root=$1 deploy_dir=$2 release=$3 required_file=$4 relative state
+  # Use the verified package's lock and launcher, so a damaged wrapper is never executed.
+  # shellcheck disable=SC1091
+  source "${package_root}/scripts/common.sh"
+  acquire_maintenance_lock "$deploy_dir"
+  state=$(read_marker_value "${deploy_dir}/.crisp-ai-installation" state 2>/dev/null || printf ready)
+  [[ "$state" == ready || "$state" == local-ready ]] \
+    || die '实例状态已改变，入口修复已停止'
+  [[ "$(read_marker_value "${deploy_dir}/.crisp-ai-installation" installed_version 2>/dev/null || true)" == "$release" ]] \
+    || die '实例版本已改变，入口修复已停止'
+  [[ -d "${deploy_dir}/config" && ! -L "${deploy_dir}/config" \
+    && -f "${deploy_dir}/.env" && ! -L "${deploy_dir}/.env" ]] \
+    || die '受管配置缺失或路径不安全；入口修复无法替代完整恢复'
+  while IFS= read -r relative || [[ -n "$relative" ]]; do
+    [[ -f "${deploy_dir}/${relative}" && ! -L "${deploy_dir}/${relative}" \
+      && "$(realpath -e -- "${deploy_dir}/${relative}" 2>/dev/null || true)" == "${deploy_dir}/${relative}" ]] \
+      || die "业务程序缺失或路径不安全：${relative}；请使用完整包恢复或受管更新"
+    if [[ "$relative" == *.sh ]]; then
+      bash -n "${deploy_dir}/${relative}" 2>/dev/null \
+        || die "业务程序语法损坏：${relative}；请使用完整包恢复或受管更新"
+    fi
+  done < "$required_file"
+  [[ "$(<"${deploy_dir}/VERSION")" == "$release" ]] \
+    || die '实例 VERSION 与安装记录不一致，入口修复已停止'
+  [[ ! -L "${deploy_dir}/config/.crispai-launcher" \
+    && ! -d "${deploy_dir}/config/.crispai-launcher" \
+    && ! -L "${deploy_dir}/config/.crispai-compat-launcher" \
+    && ! -d "${deploy_dir}/config/.crispai-compat-launcher" ]] \
+    || die '受管命令路径记录不安全，入口修复已停止'
+  bash "${package_root}/scripts/launcher.sh" install --deploy-dir "$deploy_dir" --non-interactive
+  info '受管命令入口已恢复；服务未重启，业务配置与会话状态保持。请运行 crispai doctor 查看服务状态'
+)
 
 write_release_metadata() {
   local deploy_dir=$1 release=$2 checksum=$3 source_url=$4
@@ -721,6 +777,10 @@ while (( $# > 0 )); do
       UPDATE_REQUEST=1
       shift
       ;;
+    --repair)
+      REPAIR_REQUEST=1
+      shift
+      ;;
     --help|-h)
       SHOW_HELP=1
       shift
@@ -740,6 +800,7 @@ done
 
 if (( SHOW_HELP )); then usage; exit 0; fi
 if (( SHOW_VERSION )); then printf '%s\n' "$GET_VERSION"; exit 0; fi
+(( UPDATE_REQUEST == 0 || REPAIR_REQUEST == 0 )) || die '--repair 与 --update 不能同时使用' 64
 [[ -z "$RELEASE_REQUEST" ]] || valid_release "$RELEASE_REQUEST" \
   || die "正式版本格式无效：${RELEASE_REQUEST}" 64
 
@@ -761,7 +822,7 @@ configure_test_endpoints
 if ! command -v realpath >/dev/null 2>&1; then
   prepare_download_tools
 fi
-DEPLOY_DIR=$(realpath -m -- "${DEPLOY_REQUEST:-$DEFAULT_DEPLOY_DIR}")
+DEPLOY_DIR=$(realpath -m -- "${DEPLOY_REQUEST:-$GET_DEFAULT_DEPLOY_DIR}")
 [[ "$DEPLOY_DIR" == /* && "$DEPLOY_DIR" != / && "$DEPLOY_DIR" != *$'\n'* \
   && "$DEPLOY_DIR" != *$'\r'* ]] || die '部署目录无效或范围过宽'
 [[ ! -L "$DEPLOY_DIR" ]] || die '部署目录不得是符号链接'
@@ -769,6 +830,9 @@ DEPLOY_DIR=$(realpath -m -- "${DEPLOY_REQUEST:-$DEFAULT_DEPLOY_DIR}")
 inspect_existing_installation "$DEPLOY_DIR"
 if (( UPDATE_REQUEST )) && [[ ! -f "${DEPLOY_DIR}/.crisp-ai-installation" ]]; then
   die '--update 只适用于已完成的受管实例'
+fi
+if (( REPAIR_REQUEST )) && [[ ! -f "${DEPLOY_DIR}/.crisp-ai-installation" ]]; then
+  die '--repair 只适用于已完成的受管实例'
 fi
 prepare_download_tools
 if [[ -z "$SELECTED_RELEASE" ]]; then
@@ -835,6 +899,11 @@ while IFS= read -r REQUIRED_ENTRY || [[ -n "$REQUIRED_ENTRY" ]]; do
   [[ -f "${PACKAGE_ROOT}/${REQUIRED_ENTRY}" && ! -L "${PACKAGE_ROOT}/${REQUIRED_ENTRY}" ]] \
     || die "正式包缺少安全生产文件：${REQUIRED_ENTRY}"
 done < "$REQUIRED_ENTRIES_FILE"
+
+if (( REPAIR_REQUEST )); then
+  repair_package_launcher "$PACKAGE_ROOT" "$DEPLOY_DIR" "$SELECTED_RELEASE" "$REQUIRED_ENTRIES_FILE"
+  exit 0
+fi
 
 printf '%s\n' '================================'
 printf ' CrispAI 在线安装 %s\n' "$SELECTED_RELEASE"

@@ -18,6 +18,75 @@ launcher_validate_path() {
   [[ ! -L "$launcher_path" && ! -d "$launcher_path" ]] || return 1
 }
 
+compat_launcher_owned_by_instance() {
+  local launcher_path=$1 deploy_dir=$2 digest
+  [[ -f "$launcher_path" && ! -L "$launcher_path" ]] || return 1
+  digest=$(printf '%s' "$deploy_dir" | sha256sum | cut -d ' ' -f 1)
+  grep -Fxq '# crispai-compat-launcher: ai-support/v1' "$launcher_path" \
+    && grep -Fxq "# crispai-target-sha256: $digest" "$launcher_path"
+}
+
+install_crisp_compat_launcher() {
+  local deploy_dir=$1 launcher_path=$2 compat_path record located temporary digest
+  [[ "$(basename -- "$launcher_path")" == crispai ]] || return 0
+  compat_path="$(dirname -- "$launcher_path")/crisp"
+  record="$deploy_dir/config/.crispai-compat-launcher"
+  if [[ -L "$record" || -d "$record" ]]; then
+    printf '警告：crisp 兼容入口记录不安全，保留现状；请使用 crispai。\n' >&2
+    return 0
+  fi
+  if ! launcher_validate_path "$compat_path"; then
+    printf '警告：crisp 兼容入口路径不安全或已被符号链接占用；请使用 crispai。\n' >&2
+    return 0
+  fi
+  if [[ -e "$compat_path" ]] && ! compat_launcher_owned_by_instance "$compat_path" "$deploy_dir"; then
+    printf '警告：已有其他程序的 crisp 命令，已保留；请使用 crispai。\n' >&2
+    return 0
+  fi
+  located=$(command -v crisp 2>/dev/null || true)
+  if [[ -n "$located" && "$located" != "$compat_path" ]] \
+    && ! compat_launcher_owned_by_instance "$located" "$deploy_dir"; then
+    printf '警告：PATH 中已有其他程序的 crisp 命令，已保留；请使用 crispai。\n' >&2
+    return 0
+  fi
+  digest=$(printf '%s' "$deploy_dir" | sha256sum | cut -d ' ' -f 1)
+  temporary=$(mktemp "$(dirname -- "$compat_path")/.crispai-compat.XXXXXX") || return 1
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf '# crispai-compat-launcher: ai-support/v1\n# crispai-target-sha256: %s\n' "$digest"
+    printf 'CRISPAI_LAUNCHER_PATH=%q\n' "$launcher_path"
+    # shellcheck disable=SC2016
+    printf '[[ -f "$CRISPAI_LAUNCHER_PATH" && ! -L "$CRISPAI_LAUNCHER_PATH" ]] || { printf "错误：正式 crispai 入口缺失，请使用在线引导的 --repair 恢复。\\n" >&2; exit 1; }\n'
+    # shellcheck disable=SC2016
+    printf 'grep -Fxq %q "$CRISPAI_LAUNCHER_PATH" && grep -Fxq %q "$CRISPAI_LAUNCHER_PATH" || { printf "错误：正式 crispai 入口归属已改变，请检查受管命令。\\n" >&2; exit 1; }\n' \
+      '# crispai-launcher: ai-support/v1' "# crispai-target-sha256: $digest"
+    # shellcheck disable=SC2016
+    printf 'exec "$CRISPAI_LAUNCHER_PATH" "$@"\n'
+  } > "$temporary"
+  chmod 0755 "$temporary"
+  bash -n "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$compat_path"
+  temporary=$(mktemp "$deploy_dir/config/.compat-launcher.XXXXXX") || return 1
+  printf '%s\n' "$compat_path" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$record"
+  printf 'crisp 兼容命令已安装，正式管理命令为 crispai。\n'
+}
+
+remove_crisp_compat_launcher() {
+  local deploy_dir=$1 launcher_path=$2 compat_path record
+  compat_path="$(dirname -- "$launcher_path")/crisp"
+  record="$deploy_dir/config/.crispai-compat-launcher"
+  if [[ -f "$record" && ! -L "$record" ]]; then
+    IFS= read -r compat_path < "$record" || return 1
+  fi
+  if launcher_validate_path "$compat_path" \
+    && compat_launcher_owned_by_instance "$compat_path" "$deploy_dir"; then
+    rm -f -- "$compat_path"
+    printf '已移除本实例的 crisp 兼容入口。\n'
+  fi
+}
+
 install_crispai_launcher() {
   local deploy_dir=$1 non_interactive=${2:-0}
   local launcher_path=${3:-} version digest temporary choice backup
@@ -52,11 +121,13 @@ install_crispai_launcher() {
     printf 'CRISPAI_MANAGED_DIR=%q\nCRISPAI_LAUNCHER_PATH=%q\n' "$deploy_dir" "$launcher_path"
     printf 'case "${1:-}" in\n'
     printf '  --version) printf "%%s\\n" %q; exit 0 ;;\n' "$version"
-    printf '  --help|-h) printf "%%s\\n" %q %q %q %q; exit 0 ;;\n' \
-      '用法：crispai [status|init|doctor|enable|disable|uninstall|--help|--version]' \
+    printf '  --help|-h) printf "%%s\\n" %q %q %q %q %q %q; exit 0 ;;\n' \
+      '用法：crispai [status|init|doctor|apply|logs|enable|disable|uninstall|--help|--version]' \
       'crispai doctor [--local|--full] [--json] [--fix]：非破坏自检或显式安全修复。' \
+      'crispai apply [--check|--force-external]：校验、应用或重新同步 Prompt 与知识原文。' \
+      'crispai logs：查看受管组件日志。' \
       '无参数打开中文管理菜单；日常配置由受管实例自动应用。' \
-      '管理操作需要 root，普通用户将通过 sudo 受控提权。'
+      '管理操作需要 root，普通用户将通过 sudo 受控提权；crisp 为可选兼容命令。'
     printf 'esac\n'
     printf 'if (( EUID != 0 )); then\n'
     printf '  if command -v sudo >/dev/null 2>&1; then\n'
@@ -75,6 +146,7 @@ install_crispai_launcher() {
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$deploy_dir/config/.crispai-launcher"
   printf 'crispai 管理命令已安装：%s\n' "$launcher_path"
+  install_crisp_compat_launcher "$deploy_dir" "$launcher_path"
 }
 
 remove_crispai_launcher() {
@@ -83,6 +155,7 @@ remove_crispai_launcher() {
   if [[ -f "$record" && ! -L "$record" ]]; then
     IFS= read -r launcher_path < "$record" || return 1
   fi
+  remove_crisp_compat_launcher "$deploy_dir" "$launcher_path"
   launcher_validate_path "$launcher_path" || { printf '警告：crispai 入口路径无法验证，保留原文件。\n' >&2; return 0; }
   if launcher_owned_by_instance "$launcher_path" "$deploy_dir"; then
     rm -f -- "$launcher_path"

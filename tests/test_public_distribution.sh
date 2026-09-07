@@ -81,8 +81,18 @@ grep -Fxq 'REPOSITORY="statusX7/ai-support"' "${PROJECT_ROOT}/get.sh" \
   || fail 'get.sh 目标仓库不正确'
 grep -Fq '# crispai-get-end' "${PROJECT_ROOT}/get.sh" \
   || fail 'get.sh 缺少完整下载结束标记'
-if grep -Eq '^[[:space:]]*(source|\.)[[:space:]]+[^#]' "${PROJECT_ROOT}/get.sh"; then
-  fail '独立 get.sh 仍 source 相邻模块'
+# 入口启动不得加载邻接模块；同版 --repair 在包下载/校验后才允许复用包内维护锁。
+# 该延迟分支另由 test_get.sh 的单文件、坏包、缺模块和入口修复真实执行验证。
+if ! awk '
+  /^repair_package_launcher\(\) \($/ { repair = 1; next }
+  /^\)$/ { repair = 0 }
+  /^[[:space:]]*(source|\.)[[:space:]]+/ {
+    if (!repair || $0 != "  source \"${package_root}/scripts/common.sh\"") invalid = 1
+    count += 1
+  }
+  END { exit (invalid || count != 1) }
+' "${PROJECT_ROOT}/get.sh"; then
+  fail '独立 get.sh 在已校验包的延迟修复分支之外加载了邻接模块'
 fi
 pass '独立 get.sh 的版本、语法、仓库和无相邻模块边界'
 

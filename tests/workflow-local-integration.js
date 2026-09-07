@@ -33,7 +33,11 @@ const administer = (...args) => JSON.parse(compose('exec', '-T', 'n8n', 'node', 
 const keyFor = (sessionId) => crypto.createHash('sha256').update(config.website_id + '\0' + sessionId).digest('hex');
 const select = (sessionId, card, index = 0) => ({ website_id: config.website_id, event: 'message:updated', timestamp: Date.now(), data: { session_id: sessionId, fingerprint: card.fingerprint, content: { ...card.content, choices: card.content.choices.map((choice, at) => ({ ...choice, selected: at === index })) } } });
 const humanReply = (sessionId, content, extra = {}) => ({ ...event(sessionId, content, { from: 'operator', automated: false, ...extra }), event: 'message:received' });
-const write = (name, value) => { const file = configPath(name); const temporary = file + '.integration.tmp'; fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o640 }); fs.chownSync(temporary, 0, 1000); fs.renameSync(temporary, file); };
+const applyMaterials = () => {
+  const module = path.join(config.deploy_dir, 'scripts/materials.sh');
+  if (fs.existsSync(module)) execFileSync('bash', [module, '--deploy-dir', config.deploy_dir, 'apply'], { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+};
+const write = (name, value, apply = true) => { const file = configPath(name); const temporary = file + '.integration.tmp'; fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o640 }); fs.chownSync(temporary, 0, 1000); fs.renameSync(temporary, file); if (apply) applyMaterials(); };
 const saved = Object.fromEntries(['runtime', 'handoff', 'menu', 'keyword'].map((name) => [name, fs.readFileSync(configPath(name), 'utf8')]));
 let passed = 0;
 const record = (name) => { passed += 1; process.stdout.write('通过 REAL-LOCAL ' + name + '\n'); };
@@ -135,5 +139,6 @@ const record = (name) => { passed += 1; process.stdout.write('通过 REAL-LOCAL 
   record('T39 真实Crisp协议发送结果未知，经历史fingerprint对账不重复发送');
   process.stdout.write(JSON.stringify({ layer: 'REAL-LOCAL', passed, failed: 0, external: 'Crisp与Provider为受控协议服务；n8n与AnythingLLM真实运行' }) + '\n');
 })().catch((error) => { process.stderr.write(error.stack + '\n'); process.exitCode = 1; }).finally(() => {
-  for (const [name, value] of Object.entries(saved)) write(name, JSON.parse(value));
+  for (const [name, value] of Object.entries(saved)) write(name, JSON.parse(value), false);
+  applyMaterials();
 });

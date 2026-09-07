@@ -35,10 +35,60 @@ function createRuntime(env = {}, options = {}) {
       throw error;
     }
   };
-  const config = (name, fallback = {}) => safeRead(root + '/config/' + name, fallback);
+  // 可编辑原文不是运行中的配置。仅在完成组件回读后发布一个原子投影。
+  const projectionPath = root + '/config/materials-applied.json';
+  const projectionLimit = 16777216;
+  let projectionCache;
+  let mapCache;
+  const identity = (stat) => [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+  const appliedMaterials = () => {
+    let stat;
+    try { stat = fs.lstatSync(projectionPath); } catch (error) {
+      if (error.code === 'ENOENT') { projectionCache = undefined; return null; }
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > projectionLimit) throw new Error('生效资料投影不安全，请使用资料应用功能恢复');
+    const signature = identity(stat);
+    if (projectionCache?.signature === signature) return projectionCache.value;
+    const value = safeRead(projectionPath, undefined, projectionLimit);
+    const current = value?.configuration?.runtime;
+    if (value?.schema_version !== 1 || !['applied', 'applying'].includes(value.state)
+      || !Number.isSafeInteger(value.revision) || value.revision < 0
+      || !/^[a-f0-9]{64}$/.test(value.source_sha256 || '')
+      || current?.revision !== value.revision || !Number.isSafeInteger(current?.applied_revision)
+      || current.applied_revision < 0 || current.applied_revision > value.revision
+      || value.state === 'applied' && current.applied_revision !== value.revision
+      || typeof current?.enabled !== 'boolean'
+      || !['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].every((name) => value.configuration[name] && typeof value.configuration[name] === 'object' && !Array.isArray(value.configuration[name]))
+      || typeof value.prompt?.text !== 'string' || !value.prompt.text.trim() || value.prompt.text.includes('\0')
+      || Buffer.byteLength(value.prompt.text) > 262144 || Buffer.byteLength(value.prompt.text) !== value.prompt.bytes
+      || hash(value.prompt.text) !== value.prompt.sha256
+      || !value.knowledge || !/^(?:[a-f0-9]{64})?$/.test(value.knowledge.map_sha256 ?? '!')) {
+      throw new Error('生效资料投影校验失败，请使用资料应用功能恢复');
+    }
+    projectionCache = { signature, value };
+    return value;
+  };
+  const mapMatches = (expected) => {
+    const file = directory + '/knowledge-map.json';
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > projectionLimit) return false;
+      const signature = identity(stat);
+      if (mapCache?.signature !== signature) mapCache = { signature, digest: hash(fs.readFileSync(file, 'utf8')) };
+      return mapCache.digest === expected;
+    } catch (error) { return error.code === 'ENOENT' && expected === ''; }
+  };
+  const config = (name, fallback = {}) => {
+    const value = name === 'provider.yaml' ? null : appliedMaterials();
+    if (value) return value.configuration[name.replace(/\.yaml$/, '')] ?? fallback;
+    return safeRead(root + '/config/' + name, fallback);
+  };
   const settings = () => {
-    const value = config('runtime.yaml', { schema_version: 2, enabled: true, revision: 0, applied_revision: 0 });
-    return { ...value, enabled: value.enabled === true, revision: bounded(value.revision, 0, Number.MAX_SAFE_INTEGER) };
+    const applied = appliedMaterials();
+    const value = applied ? applied.configuration.runtime : config('runtime.yaml', { schema_version: 2, enabled: true, revision: 0, applied_revision: 0 });
+    const ready = !applied || applied.state === 'applied' && mapMatches(applied.knowledge.map_sha256);
+    return { ...value, enabled: value.enabled === true && ready, revision: bounded(value.revision, 0, Number.MAX_SAFE_INTEGER) };
   };
   const handoff = () => config('handoff.yaml', {}).handoff || {};
   const menus = () => config('menu.yaml', { welcome: { enabled: false }, root: 'main', menus: {} });
@@ -58,6 +108,18 @@ function createRuntime(env = {}, options = {}) {
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[密钥]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[邮箱]')
     .replace(/(?:\+?\d[\d -]{6,}\d)/g, '[号码]').slice(0, limit);
+  const failureSummary = (error) => {
+    // JSON/HTTP 客户端异常可能含原文、请求 URL 或凭据；不将自由格式异常写入运维统计。
+    const message = String(error?.message || '');
+    const crispStatus = /^Crisp 请求失败（([1-5][0-9]{2})）$/.exec(message);
+    if (crispStatus) return 'Crisp 请求失败（' + crispStatus[1] + '）';
+    if (['ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'EROFS'].includes(error?.code)) return '运行文件操作失败（' + error.code + '）';
+    if (['ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNRESET'].includes(error?.code)) return '组件网络请求失败（' + error.code + '）';
+    if (error?.name === 'SyntaxError') return '配置或协议 JSON 解析失败';
+    if (message === '请求超时') return '组件请求超时';
+    if (message === '发送未获得确定回执') return message;
+    return '运行时处理失败；请使用组件自检定位';
+  };
 
   const ensureDirectory = () => {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -236,8 +298,14 @@ function createRuntime(env = {}, options = {}) {
   const crisp = async (state, suffix, method = 'GET', body) => {
     const base = String(env.CRISP_API_BASE_URL || 'https://api.crisp.chat/v1').replace(/\/+$/, '');
     const url = base + '/website/' + encodeURIComponent(state.website_id) + '/conversation/' + encodeURIComponent(state.session_id) + suffix;
-    const response = await network(url, { method, body, timeout: 7000, headers: { Authorization: 'Basic ' + String(env.CRISP_AUTH_B64 || ''), 'X-Crisp-Tier': ['website', 'plugin'].includes(env.CRISP_TOKEN_TIER) ? env.CRISP_TOKEN_TIER : 'website' } });
-    if (response.status < 200 || response.status >= 300 || !response.body || response.body.error === true) throw new Error('Crisp 请求失败（' + response.status + '）');
+    const tier = env.CRISP_TOKEN_TIER || 'website';
+    if (!['website', 'plugin'].includes(tier) || !env.CRISP_AUTH_B64 || /[\r\n]/.test(env.CRISP_AUTH_B64)) throw new Error('Crisp 认证配置无效');
+    const response = await network(url, { method, body, timeout: 7000, headers: { Authorization: 'Basic ' + String(env.CRISP_AUTH_B64), 'X-Crisp-Tier': tier } });
+    if (response.status < 200 || response.status >= 300 || !response.body || response.body.error !== false) {
+      const error = new Error('Crisp 请求失败（' + response.status + '）');
+      if (Number.isInteger(response.status)) error.crispStatus = response.status;
+      throw error;
+    }
     return response.body;
   };
   const publicOperator = (message) => message && message.from === 'operator' && !message.stealth && !message.properties?.stealth && ['text', 'file', 'audio', 'animation', 'picker', 'field', 'carousel'].includes(message.type);
@@ -530,7 +598,7 @@ function createRuntime(env = {}, options = {}) {
     const history = await messagesFor(state);
     await observeOperators(key, history);
     if (!await active(key, job)) return null;
-    const prompt = fs.readFileSync(root + '/config/prompt.md', 'utf8').slice(0, 30000);
+    const prompt = appliedMaterials()?.prompt.text ?? fs.readFileSync(root + '/config/prompt.md', 'utf8');
     const prior = transcript(history, job, readState(key));
     const text = typeof job.data.content === 'string' ? job.data.content.slice(0, 10000) : '[客户发送图片]';
     const content = job.data.content || {};
@@ -674,7 +742,7 @@ function createRuntime(env = {}, options = {}) {
     return plan;
   };
   const sourceLibraries = (paths) => {
-    const mapping = safeRead(directory + '/knowledge-map.json', {}, 2097152);
+    const mapping = safeRead(directory + '/knowledge-map.json', {}, projectionLimit);
     const entries = Array.isArray(mapping) ? mapping : Array.isArray(mapping.documents) ? mapping.documents : Array.isArray(mapping.files) ? mapping.files : Object.entries(mapping.files || {}).map(([docpath, value]) => ({ docpath, ...value }));
     return [...new Set(entries.filter((entry) => paths.some((source) => [entry.docpath, entry.location, entry.title, entry.projection].filter(Boolean).some((candidate) => source === candidate || candidate === entry.projection && source.startsWith(candidate + '-') || source.split('/').pop() === String(candidate).split('/').pop()))).map((entry) => entry.library_id || entry.kb_id || entry.id).filter(Boolean))];
   };
@@ -743,7 +811,8 @@ function createRuntime(env = {}, options = {}) {
       if (unresolved || !await active(key, job)) return 'cancelled';
     }
     const feedback = config('feedback.yaml', {}).feedback || {};
-    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true, properties: { ai_support: true, ai_support_version: 'v1.1.1' } };
+    // 官方 automated 与持久出站 fingerprint 已能标识本项目消息；不发送未经支持的属性键。
+    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
     if (plan.feedback && feedback.enabled !== false && body.type === 'text') body.content = (body.content + '\n\n' + String(feedback.prompt || '是否解决问题？\n👍 是\n👎 否')).slice(0, 8000);
     const registered = await transaction(key, (current) => {
@@ -759,8 +828,18 @@ function createRuntime(env = {}, options = {}) {
       if (result.reason !== 'dispatched' || result.data?.fingerprint !== undefined && String(result.data.fingerprint) !== String(fingerprint)) throw new Error('发送未获得确定回执');
       await rememberSent(key, job, plan, fingerprint);
       return 'sent';
-    } catch (_) {
-      await transaction(key, (current) => { current.outgoing[String(fingerprint)].status = 'unknown'; });
+    } catch (error) {
+      // 明确的请求/权限拒绝不是“发送结果未知”，不再对同一坏正文重试或反复调用模型。
+      const rejected = [400, 401, 403, 404, 405, 410, 413, 415, 422].includes(error.crispStatus);
+      await transaction(key, (current) => {
+        const record = current.outgoing[String(fingerprint)];
+        record.status = rejected ? 'failed' : 'unknown';
+        if (rejected) { record.failure = 'crisp_http_' + error.crispStatus; delete record.body; }
+      });
+      if (rejected) {
+        appendEvent('delivery_failed', { reason: 'crisp_http_' + error.crispStatus });
+        return 'failed';
+      }
       return 'retry';
     }
   };
@@ -824,7 +903,7 @@ function createRuntime(env = {}, options = {}) {
           if (state.worker?.token === token) state.worker = null;
         }); } catch (_) {}
       }
-      appendEvent('runtime_failed', { reason: redact(error.message) });
+      appendEvent('runtime_failed', { reason: failureSummary(error) });
       return { status: 'failed', reason: '处理失败，已保留受限恢复记录' };
     }
   };

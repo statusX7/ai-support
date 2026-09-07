@@ -119,6 +119,10 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 1 1; then
   SCRIPT_FILES+=(doctor.sh)
   OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh)
 fi
+if snapshot_version_at_least "$VERSION_VALUE" 1 2 0; then
+  SCRIPT_FILES+=(materials.sh logs.sh log-redact.py)
+  CONFIG_FILES+=(logging.yaml.example)
+fi
 
 snapshot_validate_file() {
   local relative=$1 label=$2 path="${DEPLOY_DIR}/${1}"

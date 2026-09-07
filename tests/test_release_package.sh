@@ -91,6 +91,8 @@ PRODUCTION_EXECUTABLES=(
   scripts/wizard.sh
   scripts/package-release.sh
   scripts/doctor.sh
+  scripts/materials.sh
+  scripts/logs.sh
 )
 for relative in "${PRODUCTION_EXECUTABLES[@]}"; do
   require_executable_file "${PROJECT_ROOT}/${relative}"
@@ -318,6 +320,7 @@ for relative in scripts/common.sh docker-compose.yml n8n/workflow.json \
   scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/knowledge.sh \
   scripts/provider.sh scripts/provider-adapter.js scripts/migration.sh scripts/full-backup.sh \
   scripts/crisp-settings.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js \
+  scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
   docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md; do
   require_regular_file "${PACKAGE_ROOT}/${relative}"
 done
