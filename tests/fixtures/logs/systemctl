@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=${LOGS_FIXTURE_SYSTEMD_STATE:?}
+mkdir -p -- "$state"
+[[ -z "${LOGS_FIXTURE_CALLS:-}" ]] || printf 'systemctl %s\n' "$*" >> "$LOGS_FIXTURE_CALLS"
+
+case "${1:-}" in
+  daemon-reload) exit 0 ;;
+  enable)
+    [[ " $* " == *' --now '* ]] || exit 2
+    : > "$state/enabled"; : > "$state/timer-active"
+    exit 0
+    ;;
+  disable)
+    [[ " $* " == *' --now '* ]] || exit 2
+    [[ "${LOGS_FIXTURE_STOP_STUCK:-0}" != 1 ]] || exit 1
+    find "$state" -maxdepth 1 -type f \( -name enabled -o -name timer-active \) -delete
+    exit 0
+    ;;
+  start)
+    [[ "${2:-}" != *.timer ]] || : > "$state/timer-active"
+    exit 0
+    ;;
+  stop)
+    [[ "${LOGS_FIXTURE_STOP_STUCK:-0}" != 1 ]] || exit 1
+    if [[ "${2:-}" == *.timer ]]; then
+      find "$state" -maxdepth 1 -type f -name timer-active -delete
+    else
+      find "$state" -maxdepth 1 -type f -name service-active -delete
+    fi
+    exit 0
+    ;;
+  is-enabled) [[ -f "$state/enabled" ]] ;;
+  is-active)
+    if [[ "${*: -1}" == *.timer ]]; then file="$state/timer-active"; else file="$state/service-active"; fi
+    [[ -f "$file" ]] && exit 0
+    exit 3
+    ;;
+  *) exit 2 ;;
+esac

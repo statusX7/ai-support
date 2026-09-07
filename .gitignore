@@ -28,6 +28,11 @@ knowledge/*
 # 运行数据与日志
 data/
 logs/
+!tests/fixtures/logs/
+tests/fixtures/logs/*
+!tests/fixtures/logs/docker
+!tests/fixtures/logs/journalctl
+!tests/fixtures/logs/systemctl
 backups/
 tmp/
 *.log

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "timer Authorization: Basic ${LOGS_FIXTURE_SECRET:-fixture-secret}"

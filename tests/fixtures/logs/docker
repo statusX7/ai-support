@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -z "${LOGS_FIXTURE_CALLS:-}" ]] || printf 'docker %s\n' "$*" >> "$LOGS_FIXTURE_CALLS"
+
+case "${1:-}" in
+  info) printf 'fixture daemon\n'; exit 0 ;;
+  inspect)
+    [[ " $* " == *'HostConfig.LogConfig'* ]] || exit 2
+    printf '{"Type":"json-file","Config":{"max-size":"%s","max-file":"%s"}}\n' \
+      "${LOGS_FIXTURE_MAX_SIZE:-10m}" "${LOGS_FIXTURE_MAX_FILES:-5}"
+    exit 0
+    ;;
+  compose) shift ;;
+  *) printf 'logs docker fixture 不支持：%s\n' "$*" >&2; exit 2 ;;
+esac
+
+if [[ "${1:-}" == version ]]; then
+  printf 'Docker Compose version v2.99.0-fixture\n'
+  exit 0
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --project-directory|--env-file|-f|--profile) shift 2 ;;
+    *) break ;;
+  esac
+done
+command=${1:-}; shift || true
+
+case "$command" in
+  config)
+    [[ " $* " == *' --quiet '* ]] || exit 2
+    [[ "${LOGS_FIXTURE_CONFIG_FAIL:-0}" != 1 ]]
+    ;;
+  ps)
+    if [[ " $* " == *' --services '* ]]; then
+      printf '%s\n' postgres anythingllm n8n provider-adapter
+    elif [[ " $* " == *' -q '* ]]; then
+      printf 'fixture-%s\n' "${!#}"
+    else
+      exit 2
+    fi
+    ;;
+  exec)
+    joined=" $* "
+    if [[ "$joined" == *' n8n '* && "$joined" == *'EXECUTIONS_DATA_PRUNE'* ]]; then
+      jq -M -cn --arg hours "${LOGS_FIXTURE_HOURS:-168}" \
+        '{prune:"true",max_age_hours:$hours,save_success:"none",save_error:"none"}'
+    else
+      exit 2
+    fi
+    ;;
+  logs)
+    service=${!#}
+    printf '%s\n' "container=${service} Authorization: Bearer ${LOGS_FIXTURE_SECRET:-fixture-secret}"
+    printf '%s\n' "request=https://logs.example.test/subscribe/${LOGS_FIXTURE_PATH_SECRET:-abcdefghijklmnop}?token=${LOGS_FIXTURE_SECRET:-fixture-secret}"
+    ;;
+  up)
+    if [[ -n "${LOGS_FIXTURE_UP_COUNT_FILE:-}" ]]; then
+      printf 'up\n' >> "$LOGS_FIXTURE_UP_COUNT_FILE"
+    fi
+    if [[ "${LOGS_FIXTURE_UP_SLEEP:-0}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+      && [[ "${LOGS_FIXTURE_UP_SLEEP:-0}" != 0 ]]; then
+      sleep "$LOGS_FIXTURE_UP_SLEEP"
+    fi
+    if [[ "${LOGS_FIXTURE_UP_FAIL_ONCE:-0}" == 1 && -n "${LOGS_FIXTURE_FAIL_MARKER:-}" \
+      && ! -e "$LOGS_FIXTURE_FAIL_MARKER" ]]; then
+      : > "$LOGS_FIXTURE_FAIL_MARKER"
+      exit 1
+    fi
+    ;;
+  *) printf 'logs docker fixture 未实现 compose：%s\n' "$command" >&2; exit 2 ;;
+esac
