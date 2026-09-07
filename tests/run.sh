@@ -871,6 +871,17 @@ bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNA
 grep -Fq '快照容量预检通过' "${TEST_ROOT}/snapshot-capacity-success.log" || fail "容量预检成功未输出依据"
 pass "版本快照容量预检"
 
+# 真实文件编辑路径允许标准 YAML；快照必须保留原文且不能只接受 JSON 子集。
+python3 - "${DEPLOY_DIR}/config/handoff.yaml" <<'PY'
+import json,pathlib,sys,yaml
+file=pathlib.Path(sys.argv[1])
+value=json.loads(file.read_text(encoding="utf-8"))
+file.write_text(yaml.safe_dump(value,allow_unicode=True,sort_keys=False),encoding="utf-8")
+PY
+if jq empty "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null 2>&1; then
+  fail "手编 YAML 回滚夹具仍是 JSON，未覆盖原始故障"
+fi
+HANDOFF_YAML_HASH=$(sha256sum "${DEPLOY_DIR}/config/handoff.yaml" | cut -d ' ' -f 1)
 SNAPSHOT_ID=$("${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason test-manual --quiet)
 SNAPSHOT_LIST=$(tar -tzf "${DEPLOY_DIR}/backups/versions/${SNAPSHOT_ID}/snapshot.tar.gz")
 grep -Eq '(^|/)\.env$' <<< "$SNAPSHOT_LIST" || fail "本机版本快照缺少内部凭据，无法一致性恢复"
@@ -892,10 +903,12 @@ grep -Fq 'pg_restore' "$MOCK_DOCKER_LOG" || fail "回滚未恢复 n8n PostgreSQL
 grep -Fq -- '--force-recreate anythingllm' "$MOCK_DOCKER_LOG" \
   || fail "回滚交换 AnythingLLM bind mount 后未重建容器"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "配置未随版本快照回滚"
+[[ "$(sha256sum "${DEPLOY_DIR}/config/handoff.yaml" | cut -d ' ' -f 1)" == "$HANDOFF_YAML_HASH" ]] \
+  || fail "手编 YAML 快照没有原样恢复"
 SNAPSHOT_HISTORY=$("${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list)
 grep -Fq "$SNAPSHOT_ID" <<< "$SNAPSHOT_HISTORY" || fail "版本历史未列出快照"
 grep -Fq '受保护快照使历史数量暂时超过保留上限' "${TEST_ROOT}/rollback.log" || fail "回滚目标未受保留策略保护"
-pass "版本快照、AnythingLLM 数据与受保护手动回滚"
+pass "版本快照、手编 YAML 原文、AnythingLLM 数据与受保护手动回滚"
 
 printf '缺失镜像时不得覆盖此配置\n' > "${DEPLOY_DIR}/config/prompt.md"
 MISSING_IMAGE_PROMPT_HASH=$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')

@@ -552,12 +552,28 @@ docker_compose() {
     "$@"
 }
 
+validate_managed_caddy_configuration() {
+  local deploy_dir=$1 mode
+  mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  [[ "$mode" == managed_https ]] || return 0
+  local -a compose_command=(docker compose --project-directory "$deploy_dir"
+    --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
+  # 必须早于可能重建 Caddy 的第一次 up，而不只在刷新旧 inode 时校验。
+  if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
+    "${compose_command[@]}" --profile managed-https run --rm --no-deps --entrypoint caddy \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    warn '受管 Caddy 候选配置验证失败；未替换正在运行的反代'
+    return 1
+  fi
+}
+
 refresh_program_file_mounts() {
   local deploy_dir=$1 mode services
   local -a compose_command=(docker compose --project-directory "$deploy_dir"
     --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
   mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
   services=$(docker_compose "$deploy_dir" config --services) || return 1
+  validate_managed_caddy_configuration "$deploy_dir" || return 1
   # install/原子替换会更换 inode；相同 Compose 路径不代表旧容器已加载新文件。
   # 只刷新本项目的单文件程序挂载，目录挂载/数据库不为此重建。
   if grep -Fxq provider-adapter <<< "$services"; then
@@ -568,13 +584,6 @@ refresh_program_file_mounts() {
     fi
   fi
   if [[ "$mode" == managed_https ]]; then
-    # 用一次性新挂载验证候选配置；验证失败时仍保留正在工作的旧反代。
-    if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
-      "${compose_command[@]}" --profile managed-https run --rm --no-deps --entrypoint caddy \
-      caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-      warn '受管 Caddy 候选配置验证失败；未替换正在运行的反代'
-      return 1
-    fi
     if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 120 \
       "${compose_command[@]}" --profile managed-https up -d --no-deps --force-recreate caddy; then
       warn '受管 Caddy 配置挂载刷新失败；请检查本实例反代'

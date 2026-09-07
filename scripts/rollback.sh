@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/common.sh"
+# 预检必须使用当前可信程序，不能执行快照中附带的脚本来验证快照自身。
+# shellcheck source=scripts/configuration.sh
+source "${SCRIPT_DIR}/configuration.sh"
 
 DEPLOY_REQUEST=""
 SNAPSHOT_ID=""
@@ -199,8 +202,12 @@ PAYLOAD="${STAGING}/payload"
 [[ -s "${PAYLOAD}/data/postgres/n8n.dump" && ! -L "${PAYLOAD}/data/postgres/n8n.dump" ]] || die "版本快照缺少 n8n 数据库备份"
 [[ "$(<"${PAYLOAD}/VERSION")" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "快照 VERSION 格式无效"
 jq empty "${PAYLOAD}/n8n/workflow.json" || die "快照 workflow 无效"
-for name in keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
-  [[ ! -f "${PAYLOAD}/config/${name}" ]] || jq empty "${PAYLOAD}/config/${name}" || die "快照配置无效：$name"
+for name in runtime.yaml keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
+  if [[ -f "${PAYLOAD}/config/${name}" ]]; then
+    # 兼容旧版本 schema，只做共用严格语法/字节检查；保留原始 YAML 不改写。
+    configuration_decode_file "${PAYLOAD}/config/${name}" "${STAGING}/validated-${name}.json" \
+      >/dev/null 2>&1 || die "快照配置不是合法的受限 JSON/YAML：$name"
+  fi
 done
 if [[ -f "${PAYLOAD}/config/provider.yaml" ]] && provider_config_has_secret_field "${PAYLOAD}/config/provider.yaml"; then
   die "快照 provider.yaml 包含疑似密钥字段"
@@ -428,6 +435,7 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
 fi
 
 docker_compose "$DEPLOY_DIR" config --quiet
+validate_managed_caddy_configuration "$DEPLOY_DIR" || die '回滚候选反代配置未通过预检；应用保持停止'
 # AnythingLLM 使用 bind mount。目录经 mv 交换后必须重建容器，确保 mount 绑定到恢复后的 inode。
 docker_compose "$DEPLOY_DIR" up -d --force-recreate anythingllm
 docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n

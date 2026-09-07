@@ -74,7 +74,12 @@ if [[ "$MANAGE_COMMAND" == doctor ]]; then
   # 默认自检不得隐式补依赖；缺失项由 doctor 报告，只有 --fix 才修复。
   exec bash "$SCRIPT_DIR/scripts/doctor.sh" --deploy-dir "$DEPLOY_DIR" "${DOCTOR_ARGS[@]}"
 fi
-bootstrap_prepare_minimal_dependencies || die '基础工具自动修复失败，请查看上方具体原因'
+if [[ "$MANAGE_COMMAND" == logs || "$MANAGE_COMMAND" == apply ]]; then
+  # 保留子命令的 JSON/结构化 stdout；依赖检查和修复进度仍供终端 stderr 阅读。
+  bootstrap_prepare_minimal_dependencies >&2 || die '基础工具自动修复失败，请查看上方具体原因'
+else
+  bootstrap_prepare_minimal_dependencies || die '基础工具自动修复失败，请查看上方具体原因'
+fi
 
 manage_reader_cleanup() {
   local interrupted=${1:-0}

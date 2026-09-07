@@ -74,4 +74,4 @@ v1.1.1 及以上使用 `crispai → 14 → 1` 匿名检查并更新正式版，�
 
 更新前一致性快照包含所需配置/数据/秘密和历史镜像身份；失败恢复完整代际并重建正确 bind mount。local-ready 外部待接入不等同本地故障。完整恢复中断后的混合数据保护不得被自检或 --fix 强行解除；按错误页恢复成套材料。卸载、保留数据重装和完整清理仍由菜单 18 数字确认执行。
 
-安装、重复安装、升级和回滚会刷新 adapter 程序及受管 Caddy 的单文件挂载；外部反代不在自动重建范围。受管 Caddy 使用新挂载先执行配置验证，再重建本实例服务。doctor 会比较容器与磁盘文件，只输出匹配结果，不输出配置正文或摘要。不能以普通 `up -d` 的成功返回证明原子替换后的文件已经加载：[Compose 重建语义](https://docs.docker.com/reference/cli/docker/compose/up/)、[Caddy 配置验证](https://caddyserver.com/docs/command-line#caddy-validate)。旧 inode 故障由本轮真容器与 TARGET-A 实测确认，不是仅从文档推测。
+安装、重复安装、升级和回滚会刷新 adapter 程序及受管 Caddy 的单文件挂载；外部反代不在自动重建范围。受管 Caddy 使用新挂载先执行配置验证，且预检早于本轮第一次 `up`，再重建本实例服务。doctor 会比较容器与磁盘文件，只输出匹配结果，不输出配置正文或摘要。不能以普通 `up -d` 的成功返回证明原子替换后的文件已经加载：[Compose 重建语义](https://docs.docker.com/reference/cli/docker/compose/up/)、[Caddy 配置验证](https://caddyserver.com/docs/command-line#caddy-validate)。旧 inode 故障由本轮真容器与 TARGET-A 实测确认，不是仅从文档推测。

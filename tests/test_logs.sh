@@ -62,6 +62,8 @@ prepare() {
   mkdir -p "$DEPLOY"/{scripts,config,logs/doctor-history,logs/diagnostics,tmp,knowledge,data/runtime,data/analytics,backups} \
     "$SYSTEMD_DIR" "$SYSTEMD_STATE"
   cp -p "$PROJECT_ROOT/scripts/common.sh" "$PROJECT_ROOT/scripts/logs.sh" "$PROJECT_ROOT/scripts/log-redact.py" "$DEPLOY/scripts/"
+  cp -p "$PROJECT_ROOT/scripts/bootstrap.sh" "$PROJECT_ROOT/scripts/wizard.sh" "$PROJECT_ROOT/scripts/menu-ui.sh" "$DEPLOY/scripts/"
+  cp -p "$PROJECT_ROOT/manage.sh" "$DEPLOY/manage.sh"
   cp -p "$PROJECT_ROOT/config/logging.yaml.example" "$DEPLOY/config/logging.yaml"
   cp -p "$PROJECT_ROOT/config/app.yaml" "$DEPLOY/config/app.yaml"
   cp -p "$PROJECT_ROOT/config/runtime.yaml.example" "$DEPLOY/config/runtime.yaml"
@@ -136,7 +138,12 @@ invoke --json sources
 jq -e '.schema_version==1 and (.sources|length)==11 and
   ([.sources[].id]|unique|length)==11 and
   all(.sources[]; has("id") and has("name") and has("type") and has("available") and has("mutable") and has("followable"))' "$OUT" >/dev/null || fail 'sources JSON 契约错误'
-pass '11 个日志/业务边界来源使用稳定结构化契约'
+fixture_env bash "$DEPLOY/manage.sh" --deploy-dir "$DEPLOY" logs --json sources > "$OUT" 2> "$ERR" \
+  || fail '生产管理入口 logs --json sources 失败'
+jq -e '.schema_version==1 and (.sources|length)==11' "$OUT" >/dev/null \
+  || fail '生产 logs JSON 被基础依赖进度污染 stdout'
+[[ "$before" == "$(business_hash)" ]] || fail '生产日志来源 CLI 修改了业务资料'
+pass '11 个日志来源结构一致，生产管理 CLI 的 JSON 不混入依赖进度'
 
 encoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=""))' "$SECRET")
 secret_b64=$(printf '%s' "$SECRET" | base64 | tr -d '\n')

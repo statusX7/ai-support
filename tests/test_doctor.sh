@@ -128,6 +128,23 @@ write_binding_state() {
   chmod 0600 "${DEPLOY}/data/runtime/session-${state_key}.json"
 }
 
+fixture_json_to_yaml() {
+  local target=$1 temporary="${1}.yaml-fixture"
+  python3 - "$target" > "$temporary" <<'PY'
+import json
+import pathlib
+import sys
+
+import yaml
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+sys.stdout.write(yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
+PY
+  chmod --reference="$target" "$temporary"
+  chown --reference="$target" "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$target"
+}
+
 prepare_fixture() {
   local name secret digest launcher doc_hash version timer_digest materials_stage
   mkdir -p "$DEPLOY"/{config,knowledge/kb_default/sources,data/runtime,data/n8n,data/anythingllm,data/analytics,backups/manual,logs,tmp,n8n,scripts} "$SYSTEMD_DIR"
@@ -348,7 +365,86 @@ assert_result runtime.scheduler PASS
 assert_result crisp.api SKIP
 ! grep -q 'https://' "$FIXTURE_LOG" || fail 'local 自检访问了外部 URL'
 [[ "$before" == "$(business_hash)" ]] || fail 'local 自检改动了配置、知识或会话状态'
-pass 'local 自检覆盖组件接线且不访问外部、不扰动业务状态'
+
+# 生产配置入口接受严格 YAML/JSON。doctor 必须复用同一安全解码器读取私有
+# 规范化副本，不能因扩展名内容不是 JSON 而在回滚健康门禁中假失败。
+yaml_saved="${TEST_ROOT}/yaml-config-saved"
+mkdir -m 0700 "$yaml_saved"
+for name in runtime provider keyword menu handoff tags feedback; do
+  cp -p -- "${DEPLOY}/config/${name}.yaml" "$yaml_saved/${name}.yaml"
+  fixture_json_to_yaml "${DEPLOY}/config/${name}.yaml"
+done
+invoke --local
+(( LAST_RC == 0 || LAST_RC == 2 )) || fail "同语义合法 YAML 被 doctor 误报为故障（${LAST_RC}）"
+assert_result config.syntax PASS
+assert_result business.settings PASS
+assert_result provider.configuration PASS
+assert_result materials.applied PASS
+assert_result anything.workspace PASS
+for name in runtime provider keyword menu handoff tags feedback; do
+  cp -p -- "$yaml_saved/${name}.yaml" "${DEPLOY}/config/${name}.yaml"
+done
+
+# v1.2 运行时以已应用投影为权威。合法 YAML 草稿可以同时改动
+# 客服开关、欢迎语和恢复秒数，但 doctor 必须继续报告旧投影的
+# 当前运行值，并将草稿只标记为待应用。
+draft_saved="${TEST_ROOT}/business-draft-saved"
+mkdir -m 0700 "$draft_saved"
+for name in runtime menu handoff; do
+  cp -p -- "${DEPLOY}/config/${name}.yaml" "$draft_saved/${name}.yaml"
+done
+applied_enabled=$(jq -r 'if .configuration.runtime.enabled then "启用" else "停用（管理员设置）" end' \
+  "${DEPLOY}/config/materials-applied.json")
+applied_welcome=$(jq -r 'if .configuration.menu.welcome.enabled then "启用" else "停用" end' \
+  "${DEPLOY}/config/materials-applied.json")
+applied_resume=$(jq -r '.configuration.handoff.handoff.resume_after_seconds' \
+  "${DEPLOY}/config/materials-applied.json")
+jq '.enabled = (.enabled | not)' "${DEPLOY}/config/runtime.yaml" > "${DEPLOY}/config/runtime.yaml.new"
+mv -f -- "${DEPLOY}/config/runtime.yaml.new" "${DEPLOY}/config/runtime.yaml"
+jq '.welcome.enabled = (.welcome.enabled | not)' "${DEPLOY}/config/menu.yaml" > "${DEPLOY}/config/menu.yaml.new"
+mv -f -- "${DEPLOY}/config/menu.yaml.new" "${DEPLOY}/config/menu.yaml"
+jq --argjson seconds "$((applied_resume == 604800 ? 604799 : applied_resume + 1))" \
+  '.handoff.resume_after_seconds = $seconds' "${DEPLOY}/config/handoff.yaml" > "${DEPLOY}/config/handoff.yaml.new"
+mv -f -- "${DEPLOY}/config/handoff.yaml.new" "${DEPLOY}/config/handoff.yaml"
+for name in runtime menu handoff; do
+  chmod --reference="$draft_saved/${name}.yaml" "${DEPLOY}/config/${name}.yaml"
+  fixture_json_to_yaml "${DEPLOY}/config/${name}.yaml"
+done
+invoke --local
+(( LAST_RC == 2 )) || fail '合法但未应用的 YAML 业务草稿应只返回警告 2'
+assert_result config.syntax PASS
+assert_result materials.applied WARN
+assert_result business.settings PASS
+jq -e --arg expected "当前生效投影：客服 ${applied_enabled}；欢迎语 ${applied_welcome}；自动恢复 ${applied_resume} 秒" \
+  'any(.results[]; .id == "business.settings" and .summary == $expected)' "$OUT" >/dev/null \
+  || fail 'business.settings 把可编辑 YAML 草稿冒充当前运行值'
+for name in runtime menu handoff; do
+  cp -p -- "$draft_saved/${name}.yaml" "${DEPLOY}/config/${name}.yaml"
+done
+
+handoff_saved="${TEST_ROOT}/handoff-before-invalid.yaml"
+cp -p -- "${DEPLOY}/config/handoff.yaml" "$handoff_saved"
+printf 'handoff:\n  resume_after_seconds: 1800\nhandoff:\n  resume_after_seconds: 0\n' \
+  > "${DEPLOY}/config/handoff.yaml"
+chmod 0640 "${DEPLOY}/config/handoff.yaml"
+invoke --local
+(( LAST_RC == 1 )) || fail '重复 YAML 键必须由严格解码器拒绝'
+assert_result config.syntax FAIL
+assert_result business.settings PASS
+jq -e 'any(.results[]; .id == "business.settings" and (.summary | startswith("当前生效投影：")))' "$OUT" >/dev/null \
+  || fail '可编辑 YAML 损坏时未继续使用已验证生效投影'
+! grep -Fq 'resume_after_seconds' "$OUT" "$ERR" || fail 'YAML 错误诊断回显了配置正文'
+cp -p -- "$handoff_saved" "${DEPLOY}/config/handoff.yaml"
+
+printf 'handoff: [\n' > "${DEPLOY}/config/handoff.yaml"
+chmod 0640 "${DEPLOY}/config/handoff.yaml"
+invoke --local
+(( LAST_RC == 1 )) || fail '损坏 YAML 必须由严格解码器拒绝'
+assert_result config.syntax FAIL
+assert_result business.settings PASS
+cp -p -- "$handoff_saved" "${DEPLOY}/config/handoff.yaml"
+[[ "$before" == "$(business_hash)" ]] || fail 'YAML 正负例未恢复原业务状态'
+pass 'local 自检兼容合法 YAML，严格拒绝坏输入，且业务摘要只读生效投影'
 
 # 离线门禁仍必须从受管 Compose 原文静态核对日志与 execution 接线；
 # 只跳过运行中容器回读，不能因 `--no-docker` 把合法配置误报为损坏。
@@ -390,6 +486,7 @@ invoke --local
 assert_result materials.applied FAIL
 assert_result materials.runtime_binding SKIP
 assert_result anything.workspace FAIL
+assert_result business.settings FAIL
 cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
 
 rm -f -- "${DEPLOY}/config/materials-applied.json"
@@ -397,6 +494,9 @@ invoke --local
 (( LAST_RC == 1 )) || fail 'legacy 无资料投影时整体资料门禁应失败，但工作区仍应按原 Prompt 准确诊断'
 assert_result anything.workspace PASS
 assert_result materials.applied FAIL
+assert_result business.settings PASS
+jq -e 'any(.results[]; .id == "business.settings" and (.summary | startswith("可编辑配置（legacy 无生效投影）：")))' "$OUT" >/dev/null \
+  || fail 'legacy 无投影时业务摘要未明确标识可编辑配置来源'
 cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
 
 export DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH=1

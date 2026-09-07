@@ -85,6 +85,15 @@ fi
 # shellcheck source=scripts/common.sh disable=SC1091
 source "${DOCTOR_DIR}/common.sh"
 
+# 配置入口接受严格 YAML/JSON；doctor 只在私有临时目录读取规范化副本，既不
+# 改写管理员原文，也不把可编辑候选误当成 shell 内容。
+DOCTOR_CONFIGURATION_DECODER_READY=0
+if [[ -f "${DOCTOR_DIR}/configuration.sh" && ! -L "${DOCTOR_DIR}/configuration.sh" ]]; then
+  # shellcheck source=scripts/configuration.sh disable=SC1091
+  source "${DOCTOR_DIR}/configuration.sh"
+  DOCTOR_CONFIGURATION_DECODER_READY=1
+fi
+
 umask 077
 DOCTOR_DEPLOY_DIR=$(resolve_deploy_dir "$DOCTOR_DEPLOY_REQUEST")
 DOCTOR_STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -210,6 +219,60 @@ doctor_timeout() {
   remaining=$(doctor_remaining) || return 124
   (( requested < remaining )) || requested=$remaining
   timeout --signal=TERM --kill-after=2s "${requested}s" "$@"
+}
+
+doctor_config_file() {
+  local name=$1
+  [[ "$name" =~ ^(runtime|provider|keyword|menu|handoff|tags|feedback|logging)$ ]] || return 1
+  printf '%s/config-normalized/%s.json\n' "$DOCTOR_TEMP_ROOT" "$name"
+}
+
+doctor_decode_config() {
+  local name=$1 output
+  (( DOCTOR_CONFIGURATION_DECODER_READY == 1 )) || return 1
+  output=$(doctor_config_file "$name") || return 1
+  mkdir -p -- "${DOCTOR_TEMP_ROOT}/config-normalized"
+  chmod 0700 "${DOCTOR_TEMP_ROOT}/config-normalized"
+  # --fix 会在同一进程复查；先删除上轮副本，防止本轮解析失败后误读旧绿灯。
+  rm -f -- "$output"
+  configuration_decode_file "${DOCTOR_DEPLOY_DIR}/config/${name}.yaml" "$output" \
+    >/dev/null 2>&1 || { rm -f -- "$output"; return 1; }
+  [[ -f "$output" && ! -L "$output" ]] || return 1
+  chmod 0600 "$output"
+}
+
+doctor_prepare_applied_business_configs() {
+  local source="${DOCTOR_DEPLOY_DIR}/config/materials-applied.json"
+  local target_root="${DOCTOR_TEMP_ROOT}/applied-business"
+  local projection="${target_root}/materials-applied.json"
+  local name
+
+  rm -rf -- "$target_root"
+  if [[ ! -e "$source" && ! -L "$source" ]]; then
+    return 2
+  fi
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  [[ $(stat -c '%s' -- "$source" 2>/dev/null || printf 0) -le 16777216 ]] || return 1
+  mkdir -m 0700 -- "$target_root"
+  install -m 0600 -- "$source" "$projection" || return 1
+
+  # 在 doctor 私有副本上复用生产投影校验器。该校验器会建立临时目录，
+  # 因此不能直接指向 config/，否则只读自检也会短暂写入管理员配置目录。
+  # shellcheck disable=SC2016
+  if ! doctor_timeout 10 bash -c '
+    set -euo pipefail
+    source "$1/materials.sh"
+    materials_projection_validate "$2"
+  ' doctor-materials "$DOCTOR_DIR" "$projection" >/dev/null 2>&1 \
+    || ! jq -e '.state == "applied"' "$projection" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  for name in runtime menu handoff; do
+    jq -M ".configuration.${name}" "$projection" > "${target_root}/${name}.json" \
+      || return 1
+    chmod 0600 "${target_root}/${name}.json"
+  done
 }
 
 # coreutils timeout 不能直接执行当前 shell 的函数；在受限子 shell 中重新加载
@@ -482,6 +545,8 @@ doctor_system_check() {
 doctor_files_and_config_check() {
   local start relative missing='' invalid='' env_mode runtime_mode secret_count=0 value launcher_path launcher_digest expected_digest backup_count=0
   local website tier hook_mode hook_secret identifier token auth expected_auth
+  local runtime_config menu_config handoff_config
+  local business_runtime_config business_menu_config business_handoff_config business_source business_projection_rc=0
   local -a required=(VERSION docker-compose.yml .env get.sh install.sh manage.sh update.sh uninstall.sh
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
     config/app.yaml config/Caddyfile.example config/runtime.yaml config/provider.yaml config/prompt.md
@@ -504,14 +569,17 @@ doctor_files_and_config_check() {
 
   start=$(doctor_now_ms)
   for relative in runtime provider keyword menu handoff tags feedback logging; do
-    jq -e 'type == "object"' "${DOCTOR_DEPLOY_DIR}/config/${relative}.yaml" >/dev/null 2>&1 || invalid+=" ${relative}.yaml"
+    doctor_decode_config "$relative" || invalid+=" ${relative}.yaml"
   done
+  runtime_config=$(doctor_config_file runtime)
+  menu_config=$(doctor_config_file menu)
+  handoff_config=$(doctor_config_file handoff)
   if [[ -n "$invalid" ]]; then
-    doctor_add config.syntax '配置格式' FAIL critical "无效 JSON 配置：${invalid# }" filesystem '从配置历史恢复后再应用；不要 source 配置文件' "$start"
+    doctor_add config.syntax '配置格式' FAIL critical "无法安全解析的 YAML/JSON 配置：${invalid# }" filesystem '从配置历史恢复后再应用；不要 source 配置文件' "$start"
   elif ! jq -e '.schema_version == 2 and (.enabled | type == "boolean") and (.revision | type == "number") and (.applied_revision | type == "number")' \
-      "${DOCTOR_DEPLOY_DIR}/config/runtime.yaml" >/dev/null 2>&1; then
+      "$runtime_config" >/dev/null 2>&1; then
     doctor_add config.syntax '配置格式' FAIL critical 'runtime.yaml schema 或字段类型无效' filesystem '从配置历史恢复有效 schema' "$start"
-  elif jq -e '.revision == .applied_revision' "${DOCTOR_DEPLOY_DIR}/config/runtime.yaml" >/dev/null 2>&1; then
+  elif jq -e '.revision == .applied_revision' "$runtime_config" >/dev/null 2>&1; then
     doctor_add config.syntax '配置格式' PASS critical '配置 schema 有效，desired/applied revision 一致' filesystem '' "$start"
   else
     doctor_add config.syntax '配置格式' WARN warning '配置 revision 尚未完成运行时应用' filesystem '使用配置菜单重新同步有效配置' "$start"
@@ -601,15 +669,44 @@ doctor_files_and_config_check() {
   fi
 
   start=$(doctor_now_ms)
-  if jq -e '.enabled | type == "boolean"' "${DOCTOR_DEPLOY_DIR}/config/runtime.yaml" >/dev/null 2>&1 \
-    && jq -e '.welcome.enabled | type == "boolean"' "${DOCTOR_DEPLOY_DIR}/config/menu.yaml" >/dev/null 2>&1 \
-    && jq -e '.handoff.resume_after_seconds | type == "number" and . >= 0' "${DOCTOR_DEPLOY_DIR}/config/handoff.yaml" >/dev/null 2>&1; then
-    value=$(jq -r 'if .enabled then "启用" else "停用（管理员设置）" end' "${DOCTOR_DEPLOY_DIR}/config/runtime.yaml")
-    runtime_mode=$(jq -r 'if .welcome.enabled then "启用" else "停用" end' "${DOCTOR_DEPLOY_DIR}/config/menu.yaml")
-    secret_count=$(jq -r '.handoff.resume_after_seconds' "${DOCTOR_DEPLOY_DIR}/config/handoff.yaml")
-    doctor_add business.settings '业务开关与恢复' PASS info "客服 ${value}；欢迎语 ${runtime_mode}；自动恢复 ${secret_count} 秒" filesystem '' "$start"
+  if doctor_prepare_applied_business_configs; then
+    business_runtime_config="${DOCTOR_TEMP_ROOT}/applied-business/runtime.json"
+    business_menu_config="${DOCTOR_TEMP_ROOT}/applied-business/menu.json"
+    business_handoff_config="${DOCTOR_TEMP_ROOT}/applied-business/handoff.json"
+    business_source='当前生效投影'
   else
-    doctor_add business.settings '业务开关与恢复' FAIL critical '业务开关或恢复参数格式无效' filesystem '从配置历史恢复有效值；自检不会自动开启客服或恢复会话' "$start"
+    business_projection_rc=$?
+    if (( business_projection_rc == 2 )); then
+      business_runtime_config=$runtime_config
+      business_menu_config=$menu_config
+      business_handoff_config=$handoff_config
+      business_source='可编辑配置（legacy 无生效投影）'
+    else
+      business_runtime_config=''
+      business_menu_config=''
+      business_handoff_config=''
+      business_source=''
+    fi
+  fi
+  if [[ -n "$business_runtime_config" && -f "$business_runtime_config" \
+      && -f "$business_menu_config" && -f "$business_handoff_config" ]] \
+    && jq -e '.enabled | type == "boolean"' "$business_runtime_config" >/dev/null 2>&1 \
+    && jq -e '.welcome.enabled | type == "boolean"' "$business_menu_config" >/dev/null 2>&1 \
+    && jq -e '.handoff.resume_after_seconds | type == "number" and floor == . and . >= 0 and . <= 604800' \
+      "$business_handoff_config" >/dev/null 2>&1; then
+    value=$(jq -r 'if .enabled then "启用" else "停用（管理员设置）" end' "$business_runtime_config")
+    runtime_mode=$(jq -r 'if .welcome.enabled then "启用" else "停用" end' "$business_menu_config")
+    secret_count=$(jq -r '.handoff.resume_after_seconds' "$business_handoff_config")
+    doctor_add business.settings '业务开关与恢复' PASS info \
+      "${business_source}：客服 ${value}；欢迎语 ${runtime_mode}；自动恢复 ${secret_count} 秒" filesystem '' "$start"
+  elif (( business_projection_rc == 1 )); then
+    doctor_add business.settings '业务开关与恢复' FAIL critical \
+      '生效资料投影不可用；未使用可编辑草稿冒充当前运行值' filesystem \
+      '从上一有效投影成套恢复或完成显式资料应用；自检不会改变业务开关' "$start"
+  else
+    doctor_add business.settings '业务开关与恢复' FAIL critical \
+      'legacy 可编辑配置中的业务开关或恢复参数格式无效' filesystem \
+      '从配置历史恢复有效值；自检不会自动开启客服或恢复会话' "$start"
   fi
 }
 
@@ -1105,11 +1202,13 @@ NODE
 
 doctor_adapter_check() {
   local start output mode configured_mode runtime_base configured_base configured_model runtime_model
-  local header_json header_names vision configured_vision mode_capability hook_secret plugin_secret remaining
+  local header_json header_names vision configured_vision mode_capability hook_secret plugin_secret remaining provider_config
   start=$(doctor_now_ms)
-  if ! jq -e '.schema_version == 2 and (.provider.base_url | type == "string" and length > 0) and
+  provider_config=$(doctor_config_file provider)
+  if [[ ! -f "$provider_config" || -L "$provider_config" ]] \
+    || ! jq -e '.schema_version == 2 and (.provider.base_url | type == "string" and length > 0) and
       (.provider.model | type == "string" and length > 0) and (.provider.api_mode == "chat_completions" or .provider.api_mode == "responses")' \
-      "${DOCTOR_DEPLOY_DIR}/config/provider.yaml" >/dev/null 2>&1; then
+      "$provider_config" >/dev/null 2>&1; then
     doctor_add provider.configuration 'Provider 配置接线' FAIL critical 'Provider 配置 schema、模型或协议无效' filesystem '从第三方 AI 菜单修复整组配置' "$start"
     doctor_skip provider.adapter 'Provider adapter' '因 Provider 配置无效未检查运行路径' docker
     doctor_skip provider.adapter_binding 'Provider adapter 运行代' '因 Provider 配置无效未核对运行容器环境' docker
@@ -1117,9 +1216,9 @@ doctor_adapter_check() {
     doctor_skip n8n.runtime_binding 'n8n AI/Crisp 运行代' '因 Provider 配置无效未核对运行容器环境' docker
     return
   fi
-  configured_mode=$(jq -r '.provider.api_mode' "${DOCTOR_DEPLOY_DIR}/config/provider.yaml")
-  configured_base=$(jq -r '.provider.base_url' "${DOCTOR_DEPLOY_DIR}/config/provider.yaml")
-  configured_model=$(jq -r '.provider.model' "${DOCTOR_DEPLOY_DIR}/config/provider.yaml")
+  configured_mode=$(jq -r '.provider.api_mode' "$provider_config")
+  configured_base=$(jq -r '.provider.base_url' "$provider_config")
+  configured_model=$(jq -r '.provider.model' "$provider_config")
   mode=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_API_MODE 2>/dev/null || true)
   runtime_base=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_ANYTHINGLLM_BASE_URL 2>/dev/null || true)
   runtime_model=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_MODEL 2>/dev/null || true)
@@ -1131,14 +1230,14 @@ doctor_adapter_check() {
       then ([.[].key] | sort) else empty end' <<< "$header_json" 2>/dev/null); then
     header_names='invalid'
   fi
-  configured_vision=$(jq -r '.provider.capabilities.vision' "${DOCTOR_DEPLOY_DIR}/config/provider.yaml")
-  mode_capability=$(jq -r --arg mode "$configured_mode" '.provider.capabilities[$mode] // false' "${DOCTOR_DEPLOY_DIR}/config/provider.yaml")
+  configured_vision=$(jq -r '.provider.capabilities.vision' "$provider_config")
+  mode_capability=$(jq -r --arg mode "$configured_mode" '.provider.capabilities[$mode] // false' "$provider_config")
   if [[ "$mode" != "$configured_mode" || "$runtime_base" != http://provider-adapter:8787/v1 \
     || "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_API_BASE_URL 2>/dev/null || true)" != "$configured_base" \
     || "$runtime_model" != "$configured_model" || "$header_names" == invalid \
     || "$vision" != "$configured_vision" || "$mode_capability" != true ]] \
     || ! jq -e --argjson names "$header_names" '((.provider.custom_header_names // []) | sort) == $names' \
-      "${DOCTOR_DEPLOY_DIR}/config/provider.yaml" >/dev/null 2>&1; then
+      "$provider_config" >/dev/null 2>&1; then
     doctor_add provider.configuration 'Provider 配置接线' FAIL critical '配置文件与运行环境的地址、模型、协议、Header 名称、视觉能力或 adapter 地址不一致' filesystem '从第三方 AI 菜单重新应用已验证的整组配置' "$start"
     doctor_skip provider.adapter 'Provider adapter' '因宿主受管配置不一致未检查运行路径' docker
     doctor_skip provider.adapter_binding 'Provider adapter 运行代' '因宿主受管配置不一致未核对运行容器环境' docker
