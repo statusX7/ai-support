@@ -885,7 +885,8 @@ if (workflow.id!==process.argv[3] || workflow.active!==true || !types.some(type=
 process.stdout.write("verified\n");
 NODE
   ' sh "$WORKFLOW_ID" "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION")" \
-    "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/runtime.js" | cut -d ' ' -f 1)" > "$workflow_output" 2>/dev/null \
+    "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/runtime.js" | cut -d ' ' -f 1)" \
+    < /dev/null > "$workflow_output" 2>/dev/null \
     && grep -Fxq verified "$workflow_output"; then
     doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，接收/处理/五秒扫描代码均存在' docker '' "$start"
   else
@@ -1064,7 +1065,7 @@ doctor_adapter_check() {
       }
       process.exitCode=1;
     })();
-  ' > "$output" 2>/dev/null && grep -Fxq ready "$output"; then
+  ' < /dev/null > "$output" 2>/dev/null && grep -Fxq ready "$output"; then
     doctor_add provider.adapter 'Provider adapter' PASS critical 'AnythingLLM 容器可访问 adapter，受管配置可加载' docker '' "$start"
   elif ! doctor_remaining >/dev/null 2>&1; then
     doctor_deadline_add provider.adapter 'Provider adapter' docker "$start"

@@ -41,15 +41,7 @@ assert_result() {
     || fail "${id} 应为 ${expected}"
 }
 
-invoke() {
-  : > "$OUT"; : > "$ERR"; : > "$FIXTURE_LOG"
-  if [[ "${DOCTOR_TEST_PRESERVE_HEARTBEAT:-0}" != 1 ]]; then
-    jq -M -n --argjson now "$(date -u '+%s%3N')" \
-      '{schema_version:1,started_at:($now - 10),completed_at:$now}' \
-      > "${DEPLOY}/data/runtime/scheduler-health.json"
-    chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
-  fi
-  LAST_RC=0
+fixture_env() {
   env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
     DOCTOR_FIXTURE_DEPLOY="$DEPLOY" DOCTOR_FIXTURE_LOG="$FIXTURE_LOG" \
     DOCTOR_FIXTURE_STOPPED_FILE="$STOPPED_FILE" \
@@ -73,7 +65,20 @@ invoke() {
     DOCTOR_FIXTURE_DELAY_N8N_SECONDS="${DOCTOR_FIXTURE_DELAY_N8N_SECONDS:-0}" \
     DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS="${DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS:-0}" \
     DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS="${DOCTOR_FIXTURE_DELAY_EXTERNAL_SECONDS:-0}" \
-    "$DOCTOR" --deploy-dir "$DEPLOY" --json "$@" > "$OUT" 2> "$ERR" || LAST_RC=$?
+    DOCTOR_FIXTURE_STDIN_PROBE="${DOCTOR_FIXTURE_STDIN_PROBE:-0}" \
+    "$@"
+}
+
+invoke() {
+  : > "$OUT"; : > "$ERR"; : > "$FIXTURE_LOG"
+  if [[ "${DOCTOR_TEST_PRESERVE_HEARTBEAT:-0}" != 1 ]]; then
+    jq -M -n --argjson now "$(date -u '+%s%3N')" \
+      '{schema_version:1,started_at:($now - 10),completed_at:$now}' \
+      > "${DEPLOY}/data/runtime/scheduler-health.json"
+    chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+  fi
+  LAST_RC=0
+  fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --json "$@" > "$OUT" 2> "$ERR" || LAST_RC=$?
 }
 
 business_hash() {
@@ -278,6 +283,29 @@ assert_result crisp.api SKIP
 ! grep -q 'https://' "$FIXTURE_LOG" || fail 'local 自检访问了外部 URL'
 [[ "$before" == "$(business_hash)" ]] || fail 'local 自检改动了配置、知识或会话状态'
 pass 'local 自检覆盖组件接线且不访问外部、不扰动业务状态'
+
+# 在线安装与管理菜单都在真实终端内调用 doctor。docker compose exec -T 仍会
+# 转发 stdin；若 timeout 将其放入后台进程组且探针未关闭 stdin，会因 SIGTTIN
+# 停住直到 25/15 秒上限。用真实 PTY 和主动读取 stdin 的夹具锁定该问题。
+command -v script >/dev/null 2>&1 || fail 'PTY 回归需要 util-linux script'
+: > "$OUT"; : > "$ERR"; : > "$FIXTURE_LOG"
+printf -v pty_command '%q ' "$DOCTOR" --deploy-dir "$DEPLOY" --local --json --timeout 30
+printf -v quoted_out '%q' "$OUT"
+printf -v quoted_err '%q' "$ERR"
+pty_command+=" >${quoted_out} 2>${quoted_err}"
+export DOCTOR_FIXTURE_STDIN_PROBE=1
+pty_started=$SECONDS
+pty_rc=0
+fixture_env script -qefc "$pty_command" /dev/null >/dev/null || pty_rc=$?
+pty_elapsed=$((SECONDS-pty_started))
+unset DOCTOR_FIXTURE_STDIN_PROBE
+(( pty_rc == 0 )) || fail "PTY 中的无输入容器探针被挂起或失败（${pty_rc}）"
+(( pty_elapsed < 10 )) || fail "PTY 中的容器探针疑似等待 stdin（${pty_elapsed} 秒）"
+assert_result n8n.workflow PASS
+assert_result provider.adapter PASS
+grep -q 'export:workflow' "$FIXTURE_LOG" || fail 'PTY 回归未执行 workflow 导出探针'
+grep -q 'provider-adapter:8787/healthz' "$FIXTURE_LOG" || fail 'PTY 回归未执行 adapter 网络探针'
+pass 'PTY 安装入口中的 workflow/adapter 探针显式关闭 stdin，不受 SIGTTIN 假故障影响'
 
 # 运行代核对遵循 Compose 对空非当前 Hook Secret 的 :- 默认展开语义。
 [[ -z "$(env_get "${DEPLOY}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)" ]] \
@@ -536,12 +564,12 @@ grep -q 'provider.example.test' "$FIXTURE_LOG" || fail 'full 没有执行受控�
 pass '只有 full 执行小样本模型请求并校验最终容器路径'
 
 # timeout 必须真正包住 docker_compose Bash function，而不是尝试执行不存在的外部命令。
-export DOCTOR_FIXTURE_DELAY_N8N_SECONDS=5
+export DOCTOR_FIXTURE_DELAY_N8N_SECONDS=12
 started=$SECONDS
-invoke --local --timeout 2
+invoke --local --timeout 8
 elapsed=$((SECONDS-started))
 (( LAST_RC == 1 )) || fail '超时场景应退出 1'
-(( elapsed < 5 )) || fail "Compose 函数超时没有生效（${elapsed} 秒）"
+(( elapsed < 12 )) || fail "Compose 函数超时没有生效（${elapsed} 秒）"
 jq -e 'any(.results[]; .id == "container.n8n" and .status != "PASS")' "$OUT" >/dev/null \
   || fail '卡住的 n8n Compose 检查被误报为 PASS'
 grep -Eq 'compose .* ps .* n8n' "$FIXTURE_LOG" || fail 'Compose 函数超时测试未到达 n8n 状态读取'

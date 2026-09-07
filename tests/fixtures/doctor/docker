@@ -103,6 +103,10 @@ if len(expected)!=len(actual) or not all(hmac.compare_digest(left,right) for lef
 ' "$service" "$DOCTOR_FIXTURE_RUNTIME_ENV_FILE"
       printf 'matched\n'
     elif [[ "$joined" == *' n8n '* && "$joined" == *'export:workflow'* ]]; then
+      # 真实 docker compose exec 会尝试转发 stdin。doctor 若在 PTY 中通过
+      # coreutils timeout 的后台进程组调用它，未显式关闭 stdin 就会收到
+      # SIGTTIN 并一直停到超时。测试夹具主动读一次，以锁定该回归。
+      if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
       [[ "${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" != 1 ]] || exit 1
       python3 - "${DOCTOR_FIXTURE_DEPLOY:?}" <<'PY'
 import hashlib
@@ -130,6 +134,7 @@ for name in ("校验并持久接收", "处理持久任务", "扫描持久会话�
 PY
       printf 'verified\n'
     elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/healthz'* ]]; then
+      if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
       [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1
       printf 'ready\n'
     elif [[ "$joined" == *' anythingllm '* && "$joined" == *'GENERIC_OPEN_AI_BASE_PATH'* ]]; then
