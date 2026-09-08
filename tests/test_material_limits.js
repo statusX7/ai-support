@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
+process.umask(0o077);
 
 const root = path.resolve(__dirname, '..');
 const evidenceRoot = path.join(root, '.work', 'v1.2.0');
@@ -49,13 +50,17 @@ try {
     permissionFixture=fs.mkdtempSync('/tmp/crispai-knowledge-permission-');
     fs.chmodSync(permissionFixture,0o755);
     const copiedScripts=path.join(permissionFixture,'scripts');fs.mkdirSync(copiedScripts,{mode:0o755});
+    fs.chmodSync(copiedScripts,0o755);
     for(const script of ['common.sh','configuration.sh','knowledge.sh']) {
       fs.copyFileSync(path.join(root,'scripts',script),path.join(copiedScripts,script));
       fs.chmodSync(path.join(copiedScripts,script),0o755);
     }
     const permissionSource=path.join(permissionFixture,'source');fs.mkdirSync(permissionSource,{mode:0o755});
+    fs.chmodSync(permissionSource,0o755);
     const denied=path.join(permissionSource,'denied');fs.mkdirSync(denied,{mode:0o700});
     fs.writeFileSync(path.join(denied,'secret.md'),'虚构内容\n',{mode:0o600});
+    assert.equal(fs.statSync(denied).mode & 0o777,0o700);
+    assert.equal(fs.statSync(path.join(denied,'secret.md')).mode & 0o777,0o600);
     if(process.getuid?.()===0) {
       result=run('python3',['-c',
         'import os,sys\nos.setgroups([])\nos.setgid(65534)\nos.setuid(65534)\nos.execv("/bin/bash",["bash",sys.argv[1],"inspect-source",sys.argv[2]])',

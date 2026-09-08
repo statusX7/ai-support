@@ -20,7 +20,7 @@ menu.welcome.enabled = false; json('menu', menu);
 const env = {CRISP_WEBSITE_ID:'fixture-website-identity', CRISP_HOOK_MODE:'website', CRISP_WEBSITE_HOOK_SECRET:'fixture-hook-identity-0123456789', CRISP_AUTH_B64:'Zml4dHVyZTpleGFtcGxl', ANYTHINGLLM_API_KEY:'fixture-internal', ANYTHINGLLM_WORKSPACE:'support'};
 let now = Date.now(), sequence = 200, runtime, sent = [], requests = 0, messageLookups = 0;
 const histories = new Map();
-let onSend = null, onModel = null;
+let onSend = null, onModel = null, sendFailure = false;
 const key = session => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
 const state = session => runtime.readState(key(session));
 const bucket = (session, fingerprint) => path.join(root, 'data/runtime', 'owned-' + key(session) + '-' + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
@@ -35,6 +35,7 @@ const request = async (url, options={}) => {
     if (suffix.startsWith('/message/')) {messageLookups++;return {status:200,body:{error:false,data:history.find(item=>String(item.fingerprint)===suffix.slice(9)) || {}}};}
     if (suffix === '/meta') return {status:200,body:{error:false,data:{segments:[]}}};
     if (suffix === '/message' && options.method === 'POST') {
+      if (sendFailure) return {status:400,body:{error:true,reason:'synthetic-rejection'}};
       const body = structuredClone(options.body);
       assert.equal('automated' in body,false);
       assert.equal('properties' in body,false);
@@ -68,8 +69,8 @@ const boundedWait = async promise => {
   try {return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('合成调用未按时进入')),2000);})]);}
   finally {clearTimeout(timer);}
 };
-const verifyImmediateOperator = async type => {
-  const session='session_identity-official-'+type, other='session_identity-peer-'+type;
+const verifyImmediateOperator = async (type, queued=0) => {
+  const session='session_identity-official-'+type+'-'+queued, other='session_identity-peer-'+type+'-'+queued;
   let reached, release;
   const started=new Promise(resolve=>{reached=resolve;});
   onModel=()=>{onModel=null;reached();return new Promise(resolve=>{release=()=>resolve({status:200,body:{textResponse:'合成迟到答复',sources:[]}});});};
@@ -78,6 +79,7 @@ const verifyImmediateOperator = async type => {
   const processing=runtime.process(accepted.key,accepted.jobId);
   try {
     await boundedWait(started);now+=1000;
+    if(queued) await seedQueue(session,queued,0,true);
     const body=operatorEvent(session,{type,...(type==='file'?{content:{name:'synthetic.pdf',url:'https://files.example.invalid/synthetic.pdf',type:'application/pdf'}}:{})});
     assert.equal(Object.hasOwn(body.data,'automated'),false);assert.equal(Object.hasOwn(body.data.user,'type'),false);
     const lookups=messageLookups, control=await receive(body);
@@ -93,6 +95,29 @@ const verifyImmediateOperator = async type => {
   }
   assert.equal(sent.filter(message=>message.session_id===session).length,0,'旧在途答案不能迟到出站');
   assert.equal(state(session).mode,'human');
+};
+
+const pendingJob = job => !['done','cancelled','failed'].includes(job.status);
+const seedQueue = async (session,ordinary,controls=0,append=false) => runtime.transaction(key(session),current=>{
+  if(!append) current.jobs=[];
+  for(let index=0;index<ordinary+controls;index++) {
+    const control=index>=ordinary;
+    current.jobs.push({id:(++sequence).toString(16).padStart(64,'0'),event:control?'message:received':'message:send',
+      event_time:now,received_at:now,sequence:++current.sequence,status:'received',attempts:0,revision:1,generation:current.generation,
+      control,...(control?{action:'operator',human_changed:false}:{data:{type:'text',from:'user',content:'合成排队问题'}})});
+  }
+},env.CRISP_WEBSITE_ID,session);
+const registeredConfirmation = async (session,expired=false) => {
+  let offer;
+  await runtime.transaction(key(session),current=>{
+    const value=(++sequence).toString(16).padStart(24,'0');
+    offer={id:'crispai_'+sequence.toString(16).padStart(32,'0'),fingerprint:++sequence,kind:'handoff',revision:1,
+      generation:current.generation,issued_at:now,expires_at:now+(expired?-1:600000),consumed_at:null,
+      choices:{[value]:{type:'confirm_handoff'}},confirm_message:'合成已登记人工确认'};
+    current.offers[offer.id]=offer;
+  },env.CRISP_WEBSITE_ID,session);
+  return {website_id:env.CRISP_WEBSITE_ID,event:'message:updated',timestamp:now,data:{session_id:session,type:'picker',from:'user',
+    fingerprint:offer.fingerprint,timestamp:now,content:{id:offer.id,choices:[{value:Object.keys(offer.choices)[0],label:'合成确认',selected:true}]}}};
 };
 
 (async()=>{
@@ -217,6 +242,134 @@ const verifyImmediateOperator = async type => {
     try {await deliver(event(session,'需要处理的合成问题'));} finally {onModel=null;}
     assert.equal(requests,before+1);assert.equal(state(session).mode,'human');
     assert.equal(state(session).pause_reason,'operator_reply');assert.equal(sent.filter(message=>message.session_id===session).length,0);
+  });
+  await test('127/128普通及普通控制混合队列，真人在接收短事务立即暂停；总关与marker不阻控制',async()=>{
+    const marker=path.join(root,'config/provider-pool-transaction.json');
+    for(const [index,[ordinary,controls,maintenance,disabled]] of [[127,0,false,false],[128,0,false,false],[96,32,false,false],[128,0,true,true]].entries()){
+      const session='session_identity-queue-'+index;now+=1000;
+      await seedQueue(session,ordinary,controls);
+      json('runtime',{schema_version:2,enabled:!disabled,revision:1,applied_revision:1});
+      if(maintenance)fs.writeFileSync(marker,JSON.stringify({phase:'applying'}),{mode:0o600});
+      try {
+        const started=Date.now(), before=messageLookups, accepted=await receive(operatorEvent(session));
+        assert.equal(accepted.accepted,true);assert(Date.now()-started<300);assert.equal(state(session).mode,'human');
+        assert.equal(state(session).generation,1);assert.equal(state(session).resume_at,now+3600000);
+        assert.equal(state(session).jobs.filter(job=>!job.control&&job.status==='cancelled').length,ordinary);
+        assert.equal(state(session).jobs.filter(pendingJob).length,controls+1);assert.equal(messageLookups,before);
+      } finally {if(maintenance)fs.unlinkSync(marker);json('runtime',{schema_version:2,enabled:true,revision:1,applied_revision:1});}
+    }
+  });
+  await test('普通第129条与未知身份满队列仍拒绝，自有回流及伪造按钮不误人工或占优先槽',async()=>{
+    const session='session_identity-capacity';now+=1000;
+    for(let index=0;index<128;index++)assert.equal((await receive(event(session,'合成排队咨询'))).accepted,true);
+    const before=state(session).jobs.length;
+    assert.equal((await receive(event(session,'第129条合成咨询'))).statusCode,503);
+    assert.equal(state(session).jobs.length,before);assert.equal(state(session).mode,'ai');
+    const unknown=operatorEvent(session);delete unknown.data.user;
+    assert.equal((await receive(unknown)).statusCode,503);assert.deepEqual(state(session).uncertain_events,[]);
+    const forged={website_id:env.CRISP_WEBSITE_ID,event:'message:updated',data:{session_id:session,type:'picker',fingerprint:++sequence,
+      priority_confirmation:true,content:{id:'crispai_not-issued',choices:[{value:'forged',selected:true}]}}};
+    assert.equal((await receive(forged)).accepted,true);assert.equal(state(session).mode,'ai');
+    assert.equal(state(session).jobs.filter(pendingJob).length,128);assert(!state(session).jobs.some(job=>job.priority_confirmation));
+    const ownSession='session_identity-full-owned';await deliver(event(ownSession,'建立合成自有记录'));
+    const own=sent.at(-1);await seedQueue(ownSession,128);const lookups=messageLookups;
+    const body=operatorEvent(ownSession,{fingerprint:own.fingerprint});
+    const accepted=await receive(body);assert.equal(accepted.accepted,true);assert.notEqual(accepted.reason,'重复事件已忽略');
+    assert.equal(state(ownSession).mode,'ai');assert.equal(state(ownSession).jobs.filter(pendingJob).length,128);
+    assert.equal(state(ownSession).jobs.find(job=>job.id===accepted.jobId).status,'done');assert.equal(messageLookups,lookups);
+  });
+  await test('纯128控制积压下连续确定真人仍立即暂停，统计去重且不删除旧控制或unknown对账',async()=>{
+    const session='session_identity-full-controls';now+=1000;await seedQueue(session,0,128);
+    const original=state(session).jobs.map(job=>job.id), oldUnknown={status:'unknown',body:{type:'text',content:'合成旧未知通知'},created_at:now,attempts:1,job_id:original[0],generation:0};
+    await runtime.transaction(key(session),current=>{current.outgoing['987654321']=structuredClone(oldUnknown);});
+    const analytics=path.join(root,'data/analytics/events.jsonl');
+    const handoffs=()=>fs.existsSync(analytics)?fs.readFileSync(analytics,'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line)).filter(item=>item.type==='handoff').length:0;
+    const countBefore=handoffs(), lookups=messageLookups;let latest;
+    for(let index=0;index<8;index++){
+      now+=1000;latest=operatorEvent(session);const accepted=await receive(latest);
+      assert.equal(accepted.accepted,true);assert.equal(accepted.route,'ignore');assert.equal(state(session).mode,'human');
+      assert.equal(state(session).generation,index+1);assert.equal(state(session).jobs.filter(pendingJob).length,128);
+      const record=state(session).jobs.find(job=>job.id===accepted.jobId);
+      assert.equal(record.status,'done');assert.equal(record.handoff_counted,true);assert.equal(record.tags_skipped,'queue_capacity');
+      assert.equal(record.data,undefined);assert.deepEqual(state(session).outgoing['987654321'],oldUnknown);
+    }
+    const generation=state(session).generation, deadline=state(session).resume_at;
+    assert.equal((await receive(latest)).reason,'重复事件已忽略');
+    const older=operatorEvent(session,{timestamp:now-1000});await receive(older);
+    assert.equal(state(session).generation,generation);assert.equal(state(session).resume_at,deadline);
+    assert.equal(handoffs()-countBefore,8);assert.equal(messageLookups,lookups);
+    assert(original.every(id=>state(session).jobs.some(job=>job.id===id&&pendingJob(job))));
+    const unresolved='session_identity-full-unresolved';now+=1000;await seedQueue(unresolved,0,128);
+    let uncertain;
+    await runtime.transaction(key(unresolved),current=>{
+      for(const job of current.jobs){job.action='resolve_operator';job.data={type:'text',from:'operator',fingerprint:++sequence,timestamp:now};}
+      uncertain=current.jobs.map(job=>job.id);current.uncertain_events=[...uncertain];
+    });
+    const accepted=await receive(operatorEvent(unresolved));assert.equal(accepted.accepted,true);assert.equal(accepted.route,'ignore');
+    assert.equal(state(unresolved).mode,'human');assert.equal(state(unresolved).generation,1);
+    assert.deepEqual(state(unresolved).uncertain_events,uncertain);assert.equal(state(unresolved).jobs.filter(pendingJob).length,128);
+    assert(uncertain.every(id=>state(unresolved).jobs.some(job=>job.id===id&&job.action==='resolve_operator'&&pendingJob(job))));
+    assert.equal(messageLookups,lookups);
+  });
+  await test('有效人工确认在纯满控制队列使用唯一第129优先槽，跨会话/过期/重复不占槽且通知优先发送',async()=>{
+    const session='session_identity-priority-confirm';now+=1000;await seedQueue(session,0,128);
+    const click=await registeredConfirmation(session), other='session_identity-cross-confirm';await seedQueue(other,0,128);
+    const crossed=structuredClone(click);crossed.data.session_id=other;
+    assert.equal((await receive(crossed)).accepted,true);assert.equal(state(other).mode,'ai');assert.equal(state(other).jobs.filter(pendingJob).length,128);
+    const expiredSession='session_identity-expired-confirm';await seedQueue(expiredSession,0,128);
+    assert.equal((await receive(await registeredConfirmation(expiredSession,true))).accepted,true);assert.equal(state(expiredSession).mode,'ai');
+    const marker=path.join(root,'config/provider-pool-transaction.json');fs.writeFileSync(marker,JSON.stringify({phase:'applying'}),{mode:0o600});
+    let accepted;
+    try {accepted=await receive(click);assert.equal(accepted.accepted,true);assert.equal(state(session).mode,'human');}
+    finally {fs.unlinkSync(marker);}
+    const reserved=state(session).jobs.find(job=>job.id===accepted.jobId);
+    assert.equal(reserved.priority_confirmation,true);assert.equal(state(session).jobs.filter(pendingJob).length,129);
+    assert.equal((await receive(click)).reason,'重复事件已忽略');assert.equal(state(session).jobs.filter(pendingJob).length,129);
+    const before=sent.length;await runtime.process(key(session));
+    assert.equal(sent.length,before+1);assert.equal(sent.at(-1).session_id,session);assert.equal(sent.at(-1).content,'合成已登记人工确认');
+    assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,'done');assert.equal(state(session).jobs.filter(pendingJob).length,128);
+    const disabled='session_identity-disabled-confirm';await seedQueue(disabled,128);const offClick=await registeredConfirmation(disabled);
+    json('runtime',{schema_version:2,enabled:false,revision:1,applied_revision:1});
+    try {assert.equal((await receive(offClick)).accepted,true);assert.equal(state(disabled).mode,'human');assert.equal(state(disabled).jobs.filter(pendingJob).length,0);}
+    finally {json('runtime',{schema_version:2,enabled:true,revision:1,applied_revision:1});}
+    const fullSlot='session_identity-priority-human';now+=1000;await seedQueue(fullSlot,0,128);
+    const reservedClick=await receive(await registeredConfirmation(fullSlot));assert.equal(reservedClick.accepted,true);
+    const unknown={status:'unknown',body:{type:'text',content:'合成旧通知仍待对账'},created_at:now,attempts:1,job_id:reservedClick.jobId,generation:1};
+    await runtime.transaction(key(fullSlot),current=>{current.outgoing['987654323']=structuredClone(unknown);});
+    now+=1000;const control=await receive(operatorEvent(fullSlot));assert.equal(control.accepted,true);assert.equal(control.route,'ignore');
+    assert.equal(state(fullSlot).generation,2);assert.equal(state(fullSlot).mode,'human');assert.equal(state(fullSlot).jobs.filter(pendingJob).length,129);
+    assert.equal(state(fullSlot).jobs.filter(job=>pendingJob(job)&&job.priority_confirmation).length,1);
+    assert.deepEqual(state(fullSlot).outgoing['987654323'],unknown);
+  });
+  await test('优先确认未终态时手动恢复也不新增handoff offer；sent/failed/cancelled后可再次提供确认',async()=>{
+    const blocked='session_identity-priority-backpressure';now+=1000;await seedQueue(blocked,0,128);
+    const received=await receive(await registeredConfirmation(blocked));assert.equal(received.accepted,true);
+    const unknown={status:'unknown',body:{type:'text',content:'合成正在对账的人工通知'},created_at:now,attempts:1,job_id:received.jobId,generation:1};
+    await runtime.transaction(key(blocked),current=>{
+      for(const job of current.jobs)if(job.id!==received.jobId)job.status='done';
+      const slot=current.jobs.find(job=>job.id===received.jobId);slot.status='processing';slot.lease_until=now+300000;
+      current.outgoing['987654322']=structuredClone(unknown);
+    });
+    now+=1000;await runtime.resume(key(blocked));now+=1000;
+    const before=sent.length;await deliver(event(blocked,'人工'));
+    assert.equal(sent.length,before);assert.equal(Object.values(state(blocked).offers).filter(offer=>offer.kind==='handoff').length,0);
+    assert.equal(state(blocked).jobs.filter(job=>pendingJob(job)&&job.priority_confirmation).length,1);
+    assert.deepEqual(state(blocked).outgoing['987654322'],unknown);
+    for(const outcome of ['sent','failed','cancelled']){
+      const session='session_identity-slot-'+outcome;now+=1000;await seedQueue(session,0,128);
+      const accepted=await receive(await registeredConfirmation(session));assert.equal(accepted.accepted,true);
+      if(outcome==='cancelled'){now+=1000;await runtime.resume(key(session));}
+      sendFailure=outcome==='failed';
+      try {await runtime.process(key(session));} finally {sendFailure=false;}
+      assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,outcome==='sent'?'done':outcome);
+      await runtime.transaction(key(session),current=>{for(const job of current.jobs)if(job.id!==accepted.jobId)job.status='done';});
+      now+=1000;await runtime.resume(key(session));now+=1000;
+      const prior=sent.length;await deliver(event(session,'人工'));
+      assert.equal(sent.length,prior+1);assert.equal(sent.at(-1).type,'picker');
+    }
+  });
+  await test('满128任务时文字/文件真人控制不等待在途模型、A旧答零出站且B独立',async()=>{
+    await verifyImmediateOperator('text',127);await verifyImmediateOperator('file',127);
   });
   console.log('中性显示与持久出站身份专项：'+passed+'组通过；Crisp实际徽标显示仍由目标SDK验收。');
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(root,{recursive:true,force:true}));

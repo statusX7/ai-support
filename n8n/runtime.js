@@ -234,6 +234,8 @@ function createRuntime(env = {}, options = {}) {
     welcome_sent: false, menu_node: null, offers: {}, cooldowns: {}, jobs: [], outgoing: {},
     worker: null, uncertain_events: [], pending_feedback: null, updated_at: clock(),
   });
+  const priorityConfirmation = (job) => job.control === true && job.action === 'confirm_handoff'
+    && job.priority_confirmation === true && !['done', 'cancelled', 'failed'].includes(job.status);
   const feedbackPurpose = (value) => ['feedback', 'feedback_invite', 'feedback_prompt', 'feedback_offer', 'feedback_ack',
     'feedback_response', 'feedback_thanks', 'feedback_clarification', 'feedback_positive', 'feedback_negative'].includes(value);
   const feedbackOnly = (value) => Boolean(value && (['purpose', 'kind', 'action', 'type'].some((field) => feedbackPurpose(value[field]))
@@ -510,7 +512,6 @@ function createRuntime(env = {}, options = {}) {
     try {
       result = await transaction(key, (state) => {
         if (state.jobs.some((job) => job.id === id) || (event !== 'message:updated' && state.legacy_fingerprints?.includes(hash(data.fingerprint || '')))) return { duplicate: true };
-        if (state.jobs.filter((job) => !['done', 'cancelled', 'failed'].includes(job.status)).length >= 128) throw new Error('会话处理队列已满');
         const global = settings();
         if (state.observations?.binding !== connectionBinding()) state.observations = { binding: connectionBinding() };
         if (!state.observations.hook_received_at) state.observations.hook_received_at = clock();
@@ -531,7 +532,8 @@ function createRuntime(env = {}, options = {}) {
           const offer = state.offers[String(content.id || '')];
           const choices = Array.isArray(content.choices) ? content.choices.filter((choice) => choice.selected === true) : [];
           const validFingerprint = event !== 'message:updated' || String(data.fingerprint) === String(offer?.fingerprint);
-          if (!offer || !validFingerprint || choices.length !== 1 || offer.consumed_at || offer.expires_at <= clock() || offer.generation !== state.generation || offer.revision !== global.revision || !Object.prototype.hasOwnProperty.call(offer.choices, choices[0].value)) {
+          if (!offer || !validFingerprint || choices.length !== 1 || offer.consumed_at || offer.expires_at <= clock() || offer.generation !== state.generation || offer.revision !== global.revision || !Object.prototype.hasOwnProperty.call(offer.choices, choices[0].value)
+            || offer.choices[choices[0].value]?.type === 'confirm_handoff' && state.jobs.some(priorityConfirmation)) {
             job.status = 'done'; job.action = 'invalid_choice';
           } else {
             const action = offer.choices[choices[0].value];
@@ -551,6 +553,20 @@ function createRuntime(env = {}, options = {}) {
         } else if (!global.enabled || state.mode !== 'ai') job.status = 'done';
         if (!global.enabled && job.action !== 'resolve_operator' && job.action !== 'operator') job.status = 'done';
         if (job.status === 'received' && (!job.control || job.action === 'menu_action') && !providerConfigurationReady()) job.status = 'cancelled';
+        const pending = state.jobs.filter((entry) => !['done', 'cancelled', 'failed'].includes(entry.status)).length;
+        if (job.status === 'received' && pending >= 128) {
+          if (job.action === 'operator') {
+            // 确定真人已在短事务中暂停；满控制队列只省略非关键标签后处理。
+            job.status = 'done'; job.tags_skipped = 'queue_capacity';
+          } else if (job.action === 'confirm_handoff' && job.human_changed && pending === 128) {
+            // 仅服务器验证过的确认可占唯一第129槽；未终态时不再发新人工offer。
+            job.priority_confirmation = true;
+          } else throw new Error('会话处理队列已满');
+        }
+        if (job.human_changed && job.status === 'done') {
+          job.handoff_counted = true;
+          appendEvent('handoff', { reason: job.action === 'operator' ? 'operator_reply' : 'confirmed_handoff' });
+        }
         if (['done', 'cancelled'].includes(job.status)) delete job.data;
         state.jobs.push(job);
         return { jobId: id, pending: job.status === 'received' };
@@ -614,6 +630,7 @@ function createRuntime(env = {}, options = {}) {
     if (existing) return existing;
     const current = settings();
     if (!current.enabled || current.revision !== job.revision || state.mode !== 'ai' || state.generation !== job.generation) return null;
+    if (kind === 'handoff' && state.jobs.some(priorityConfirmation)) return null;
     const id = 'crispai_' + crypto.randomBytes(16).toString('hex');
     const fingerprint = Number.parseInt(hash(id).slice(0, 12), 16);
     const confirmValue = crypto.randomBytes(12).toString('hex');
@@ -1006,7 +1023,8 @@ function createRuntime(env = {}, options = {}) {
       job = await transaction(key, (state) => {
         const candidates = state.jobs.filter((entry) => ['received', 'processing'].includes(entry.status) && (!entry.retry_at || entry.retry_at <= clock()));
         const controls = candidates.filter((entry) => entry.control && entry.id === requestedId);
-        const selected = controls[0] || candidates.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence)[0] || candidates[0];
+        const priority = candidates.find((entry) => priorityConfirmation(entry) && !(entry.lease_until > clock()));
+        const selected = priority || controls[0] || candidates.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence)[0] || candidates[0];
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
         if (!selected.control && state.worker && state.worker.until > clock()) return null;

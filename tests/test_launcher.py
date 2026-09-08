@@ -18,6 +18,8 @@ def main():
     if os.geteuid() != 0:
         print("跳过：受管命令生命周期专项需要 root 测试权限。")
         return
+    # 明确验证受限维护环境；仅模拟 /usr/local/bin 的目录允许普通用户穿越。
+    os.umask(0o077)
     with tempfile.TemporaryDirectory(prefix="crispai-launcher-test-") as temporary:
         base = Path(temporary)
         base.chmod(0o755)
@@ -30,6 +32,9 @@ def main():
         (deploy / "manage.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\"\n")
         directory = base / "bin"
         directory.mkdir(mode=0o755)
+        directory.chmod(0o755)
+        assert deploy.stat().st_mode & 0o777 == 0o700
+        assert (deploy / ".env").stat().st_mode & 0o777 == 0o600
         launcher = directory / "crispai"
         alias = directory / "crisp"
         install = ["bash", str(ROOT / "scripts/launcher.sh"), "install", "--deploy-dir", str(deploy), "--command-path", str(launcher), "--non-interactive"]
