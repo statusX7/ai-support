@@ -112,6 +112,13 @@ function retryAfterMilliseconds(value, now = Date.now()) {
   const time = Date.parse(value); return Number.isFinite(time) ? Math.max(0,time-now) : 0;
 }
 
+function cooldownMilliseconds(policy, failures, retryAfter = 0, randomFraction = Math.random()) {
+  const base = Math.min(policy.cooldown_max_ms,policy.cooldown_initial_ms * 2 ** Math.min(failures-1,20));
+  // 只增加0～5%，普通退避受上限约束；Retry-After独立取最大值，绝不截短。
+  const jitter = Math.floor(base * 0.05 * Math.max(0,Math.min(1,randomFraction)));
+  return Math.max(Math.min(policy.cooldown_max_ms,base+jitter),retryAfter || 0);
+}
+
 function classifyFailure(status, body, headers = {}) {
   const detail = body?.error || {};
   const code = String(detail.code || detail.type || '').toLowerCase();
@@ -190,7 +197,7 @@ function createRouter(environment, invoke) {
     const key = entry[failure.scope || 'entryScope'];
     const health = state.health[key] || {failures:0};
     health.failures += 1; health.successes = 0; health.last_error = failure.kind;
-    health.until = Date.now() + Math.max(Math.min(policy.cooldown_max_ms,policy.cooldown_initial_ms * 2 ** Math.min(health.failures-1,20)),failure.retryAfter || 0);
+    health.until = Date.now() + cooldownMilliseconds(policy,health.failures,failure.retryAfter);
     state.health[key] = health; save();
   };
   const assertCurrent = (envelope, revision, deadline) => {
@@ -335,4 +342,4 @@ function createRouter(environment, invoke) {
   return {route,status,recent:() => ({ok:true,records:state.recent.slice().reverse()}),loadPool:currentPool,clearHealth:entry => { for (const key of scopes(entry,true)) delete state.health[key]; state.pool_until = 0; save(); }};
 }
 
-module.exports = {createRouter,loadPool,validateEntry,validatePolicy,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,readJson,estimateTextTokens};
+module.exports = {createRouter,loadPool,validateEntry,validatePolicy,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};

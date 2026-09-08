@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 const {signEnvelope,envelopeMarker} = require('../scripts/provider-envelope.js');
-const {DEFAULT_POLICY,retryAfterMilliseconds,classifyFailure,estimateTextTokens} = require('../scripts/provider-router.js');
+const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
 async function until(condition,message,timeout=3000) {
@@ -83,7 +83,35 @@ async function fixture(count=1,policy={}) {
 let count=0;
 async function test(name,work) { await work();count++;process.stdout.write('通过 UNIT/PROTOCOL：'+name+'\n'); }
 
+function testCooldownJitter() {
+  const nearLimit={cooldown_initial_ms:295000,cooldown_max_ms:300000};
+  const atLimit={cooldown_initial_ms:1000,cooldown_max_ms:1000};
+  const rounding={cooldown_initial_ms:1001,cooldown_max_ms:2000};
+  const cases=[
+    [DEFAULT_POLICY,1,0,0,60000],[DEFAULT_POLICY,1,0,0.5,61500],[DEFAULT_POLICY,1,0,1,63000],
+    [DEFAULT_POLICY,2,0,0,120000],[DEFAULT_POLICY,2,0,1,126000],[DEFAULT_POLICY,3,0,1,252000],
+    [DEFAULT_POLICY,4,0,0,300000],[DEFAULT_POLICY,4,0,1,300000],[DEFAULT_POLICY,99,0,1,300000],
+    [nearLimit,1,0,0,295000],[nearLimit,1,0,0.25,298687],[nearLimit,1,0,1,300000],
+    [atLimit,1,0,0,1000],[atLimit,1,0,1,1000],[rounding,1,0,1,1051],
+    [DEFAULT_POLICY,1,0,-1,60000],[DEFAULT_POLICY,1,0,2,63000],
+    [DEFAULT_POLICY,1,62000,0,62000],[DEFAULT_POLICY,1,62000,1,63000],
+    [DEFAULT_POLICY,1,900000,0,900000],[DEFAULT_POLICY,1,900000,1,900000],[DEFAULT_POLICY,99,900000,1,900000]
+  ];
+  for(const [policy,failures,retry,fraction,expected] of cases)assert.equal(cooldownMilliseconds(policy,failures,retry,fraction),expected);
+  for(let failures=1;failures<=24;failures++)for(const fraction of [0,0.125,0.5,0.875,1]) {
+    const base=Math.min(300000,60000*2**(failures-1)),delay=cooldownMilliseconds(DEFAULT_POLICY,failures,0,fraction);
+    assert.ok(Number.isSafeInteger(delay));assert.ok(delay>=base);assert.ok(delay<=Math.min(300000,base*1.05));
+  }
+  const now=Date.UTC(2026,0,1);
+  for(const header of ['900',new Date(now+900000).toUTCString()]) {
+    const retry=retryAfterMilliseconds(header,now);assert.equal(retry,900000);
+    assert.equal(cooldownMilliseconds(DEFAULT_POLICY,1,retry,0),retry);assert.equal(cooldownMilliseconds(DEFAULT_POLICY,99,retry,1),retry);
+  }
+  process.stdout.write('通过 UNIT：冷却0～5%正向抖动的首次、指数递增、近上限、上限、取整及长Retry-After确定性边界（1组，不计入HTTP协议组数）\n');
+}
+
 async function main() {
+  testCooldownJitter();
   await test('幂等单接口迁移、独立内部Key、非敏感池与同代秘密',async()=>{
     const f=await fixture();try {
       const before=fs.readFileSync(f.poolFile,'utf8');const result=await f.cli(['migrate']);assert.equal(result.code,0);assert.equal(fs.readFileSync(f.poolFile,'utf8'),before);
@@ -113,7 +141,8 @@ async function main() {
   await test('20条失败后最后1条成功、21总次数、模型/Header按候选切换、SSE只包装整答',async()=>{
     const f=await fixture(21);try {
       f.behavior=async(call,response)=>{if(call.index<20){response.writeHead(503);response.end(JSON.stringify({error:{message:'不可输出的上游正文 fixture-key-0'}}));return true;}return false;};
-      const envelope=f.envelope(), result=await f.post({...sample,stream:true},envelope);assert.equal(result.status,200,result.text);assert.match(result.text,/data: \[DONE\]/);assert.equal(f.calls.length,21);
+      const envelope=f.envelope(),started=Date.now(),result=await f.post({...sample,stream:true},envelope),ended=Date.now();assert.equal(result.status,200,result.text);assert.match(result.text,/data: \[DONE\]/);assert.equal(f.calls.length,21);
+      const cooling=(await f.get('status')).entries[0].cooldown_until;assert.ok(cooling>=started+60000);assert.ok(cooling<=ended+63000);
       assert.equal(f.calls[20].body.model,'fixture-model-20');assert.equal(f.calls[20].headers.authorization,'Bearer fixture-key-20');assert.equal(f.calls[20].headers['x-fixture'],'value');assert.ok(!result.text.includes('fixture-key'));
       assert.equal((await f.post(sample,envelope)).status,200);assert.equal(f.calls.length,21);
       const recent=await f.get('recent');assert.equal(recent.records.length,21);assert.ok(!JSON.stringify(recent).includes('fixture-key'));assert.ok(!JSON.stringify(recent).includes('http:'));
