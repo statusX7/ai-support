@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -19,13 +20,17 @@ done
 git -C "$PROJECT_ROOT" rev-parse --verify 'v1.1.0^{commit}' >/dev/null 2>&1 \
   || fail '缺少真实 v1.1.0 tag，无法构造旧版快照'
 
-TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.legacy-rollback-test.XXXXXX")
+[[ ! -L "${PROJECT_ROOT}/.work" ]] || fail '测试工作区不得为符号链接'
+mkdir -p -- "${PROJECT_ROOT}/.work"
+TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.work/legacy-rollback-test.XXXXXX")
+git -C "$PROJECT_ROOT" check-ignore -q -- "$TEST_ROOT" \
+  || fail '测试工作区未被 Git 忽略，拒绝生成运行资料'
 cleanup() {
   if [[ "${AI_SUPPORT_TEST_KEEP_TMP:-0}" == 1 ]]; then
     printf '调试目录已保留：%s\n' "$TEST_ROOT" >&2
     return
   fi
-  if [[ "$TEST_ROOT" == "${PROJECT_ROOT}"/.legacy-rollback-test.* && -d "$TEST_ROOT" ]]; then
+  if [[ "$TEST_ROOT" == "${PROJECT_ROOT}"/.work/legacy-rollback-test.* && -d "$TEST_ROOT" ]]; then
     rm -rf -- "$TEST_ROOT"
   fi
 }
