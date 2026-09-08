@@ -2,6 +2,49 @@
 set -euo pipefail
 
 [[ ${CONFIGURATION_FIXTURE_READBACK_FAIL:-0} != 1 ]] || exit 1
+fixture_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+[[ ${CONFIGURATION_FIXTURE_DEPLOY:?} == "$fixture_dir" && -f "$fixture_dir/.crisp-ai-installation" ]] || exit 64
+fixture_container=feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface
+fixture_running="$fixture_dir/tmp/configuration-rag-running.json"
+fixture_compose_owned() {
+  [[ $# -ge 8 && "$1" == compose && "$2" == --project-directory && "$3" == "$fixture_dir" \
+    && "$4" == --env-file && "$5" == "$fixture_dir/.env" && "$6" == -f && "$7" == "$fixture_dir/docker-compose.yml" \
+    && -f "$fixture_dir/docker-compose.yml" && ! -L "$fixture_dir/.env" && ! -L "$fixture_running" ]]
+}
+if [[ $# -eq 4 && "$1" == context && "$2" == inspect && "$3" == --format && "$4" == '{{(index .Endpoints "docker").Host}}' ]]; then
+  printf 'unix:///var/run/docker.sock\n'
+  exit 0
+fi
+if [[ $# -eq 4 && "$1" == inspect && "$2" == --format && "$4" == "$fixture_container" \
+  && "$3" == '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}' ]]; then
+  printf '%s|anythingllm\n' "$fixture_dir"
+  exit 0
+fi
+if [[ "${*:8}" == 'ps --all --quiet anythingllm' ]]; then
+  fixture_compose_owned "$@" || exit 64
+  printf '%s\n' "$fixture_container"
+  exit 0
+fi
+if [[ "${*:8}" == 'up -d --no-deps --force-recreate anythingllm' ]]; then
+  fixture_compose_owned "$@" || exit 64
+  fixture_window=$(awk -F= '$1=="PROVIDER_RAG_CONTEXT_WINDOW" {value=substr($0,index($0,"=")+1); gsub(/[\047\042]/,"",value); print value}' "$fixture_dir/.env")
+  [[ "$fixture_window" =~ ^[1-9][0-9]{2,6}$ ]] && (( fixture_window >= 256 && fixture_window <= 2097152 )) || exit 64
+  fixture_recreates=0
+  if [[ -f "$fixture_running" ]]; then fixture_recreates=$(jq -M -er '.recreates | select(type=="number" and floor==. and .>=0)' "$fixture_running"); fi
+  fixture_temporary=$(mktemp "$fixture_dir/tmp/rag-running.XXXXXXXX")
+  jq -M -n --argjson window "$fixture_window" --argjson recreates "$((fixture_recreates+1))" \
+    '{context_window:$window,recreates:$recreates,service:"anythingllm",scope:"synthetic-docker-protocol"}' > "$fixture_temporary"
+  chmod 600 "$fixture_temporary"
+  mv -f -- "$fixture_temporary" "$fixture_running"
+  exit 0
+fi
+if [[ "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == anythingllm && "${11:-}" == node && "${12:-}" == -e \
+  && "${13:-}" == 'process.stdout.write(String(process.env.GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT || ""))' && $# -eq 13 ]]; then
+  fixture_compose_owned "$@" || exit 64
+  # 独立的运行值只在上述精确重建命令后变化；不能将编辑 .env 冒充生效。
+  jq -M -er '.context_window' "$fixture_running"
+  exit 0
+fi
 if [[ "$*" == *" config --quiet"* || "$*" == *" up -d "* ]]; then
   exit 0
 fi

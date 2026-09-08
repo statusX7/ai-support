@@ -1409,6 +1409,83 @@ anythingllm_validate_api_key() {
   rm -f -- "$response_file"
 }
 
+provider_rag_context_apply() (
+  # Only explicit provider configuration changes use this path. Inference and
+  # failover must never recreate a service or mutate a workspace.
+  local deploy_dir=${1:-} expected=${2:-} configured aggregate endpoint container ownership command_name
+  local response_dir='' port key observed status remaining deadline
+  if [[ ! "$expected" =~ ^[1-9][0-9]{2,6}$ ]] || (( expected < 256 || expected > 2097152 )); then
+    warn 'RAG 上下文预算无效，未修改组件'; return 1
+  fi
+  deploy_dir=$(validate_deploy_dir "$deploy_dir") || return 1
+  assert_managed_installation "$deploy_dir" || return 1
+  case "$(installation_state "$deploy_dir")" in
+    ready|local-ready) ;;
+    *) warn '实例尚在安装或恢复阶段，不能单独重建 RAG 组件'; return 1 ;;
+  esac
+  for command_name in docker timeout jq curl; do require_command "$command_name"; done
+  [[ -d "${deploy_dir}/tmp" && ! -L "${deploy_dir}/tmp" \
+    && -f "${deploy_dir}/config/provider-pool-applied.json" \
+    && ! -L "${deploy_dir}/config/provider-pool-applied.json" ]] || return 1
+  configured=$(env_get "${deploy_dir}/.env" PROVIDER_RAG_CONTEXT_WINDOW 2>/dev/null) || return 1
+  aggregate=$(jq -er '[.entries[] | . as $entry | select(.enabled == true and .draft != true
+    and $entry.capabilities[$entry.api_mode] == true) | .context_window] | max' \
+    "${deploy_dir}/config/provider-pool-applied.json" 2>/dev/null) || return 1
+  [[ "$configured" == "$expected" && "$aggregate" == "$expected" ]] \
+    || { warn 'RAG 预算与当前接口池不一致，未修改组件'; return 1; }
+  # Never use a remote daemon with local bind paths, or let inherited Compose
+  # interpolation select another deployment or override the committed budget.
+  [[ -z "${DOCKER_HOST:-}" || "$DOCKER_HOST" == unix://* ]] \
+    || { warn 'RAG 维护需要当前服务器的 Docker socket'; return 1; }
+  endpoint=$(timeout --signal=TERM --kill-after=2s 5 docker context inspect \
+    --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null) || return 1
+  [[ "$endpoint" == unix://* ]] || { warn '无法确认本机 Docker context，未重建组件'; return 1; }
+  local -a compose=(env --unset=COMPOSE_PROJECT_NAME --unset=PROVIDER_RAG_CONTEXT_WINDOW --unset=AI_MODEL_TOKEN_LIMIT
+    --unset=GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT "DEPLOY_DIR=$deploy_dir" COMPOSE_PROGRESS=plain docker compose
+    --project-directory "$deploy_dir" --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
+  container=$(timeout --signal=TERM --kill-after=2s 5 "${compose[@]}" ps --all --quiet anythingllm 2>/dev/null) || return 1
+  [[ "$container" =~ ^[a-f0-9]{12,64}$ ]] || { warn '未找到唯一受管 AnythingLLM 容器，未创建新实例'; return 1; }
+  ownership=$(timeout --signal=TERM --kill-after=2s 5 docker inspect --format \
+    '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$container" 2>/dev/null) || return 1
+  [[ "$ownership" == "${deploy_dir}|anythingllm" ]] || { warn 'AnythingLLM 容器归属不符，未修改其他实例'; return 1; }
+  port=$(env_get "${deploy_dir}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')
+  validate_port "$port" || return 1
+  key=$(env_get "${deploy_dir}/.env" ANYTHINGLLM_API_KEY 2>/dev/null) || return 1
+  is_placeholder "$key" && { warn '缺少现有 AnythingLLM 鉴权，未重建组件'; return 1; }
+  response_dir=$(mktemp -d "${deploy_dir}/tmp/rag-context.XXXXXXXX") || return 1
+  chmod 0700 "$response_dir"
+  trap 'rm -f -- "${response_dir}/system.json"; rmdir -- "$response_dir" 2>/dev/null || :' EXIT
+  : > "${response_dir}/system.json"
+  chmod 0600 "${response_dir}/system.json"
+  deadline=$((SECONDS + 110))
+  if ! timeout --signal=TERM --kill-after=5s 60 "${compose[@]}" up -d --no-deps --force-recreate anythingllm \
+    >/dev/null 2>&1; then
+    warn 'AnythingLLM 上下文配置应用失败，需恢复上一配置；未重建知识或其他组件'
+    return 1
+  fi
+  while (( SECONDS < deadline )); do
+    observed=$(timeout --signal=TERM --kill-after=1s 5 "${compose[@]}" exec -T anythingllm node -e \
+      'process.stdout.write(String(process.env.GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT || ""))' \
+      </dev/null 2>/dev/null) || observed=''
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    (( remaining <= 5 )) || remaining=5
+    if [[ "$observed" == "$expected" ]]; then
+      status=$(anythingllm_secure_request "$deploy_dir" GET "http://127.0.0.1:${port}/api/v1/system" \
+        "$key" '' "${response_dir}/system.json" "$remaining") || status=000
+      if [[ "$status" == 2?? ]] && jq -e --arg expected "$expected" \
+        '.settings.GenericOpenAiTokenLimit | tostring == $expected' "${response_dir}/system.json" >/dev/null 2>&1; then
+        printf '{"ok":true,"state":"applied","context_window":%s}\n' "$expected"
+        return 0
+      fi
+    fi
+    (( SECONDS < deadline )) && sleep 1
+  done
+  warn 'AnythingLLM 上下文预算未在时限内完成运行回读；不能将已保存当成已应用'
+  return 1
+)
+
 bootstrap_anythingllm_api_key() {
   local deploy_dir=$1
   local env_file="${deploy_dir}/.env"

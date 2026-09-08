@@ -39,14 +39,14 @@ mv -- "${RUNTIME_ENV_FILE}.new" "$RUNTIME_ENV_FILE"
 revision=$(jq .revision "${DEPLOY}/config/provider-pool-applied.json")
 write_health() {
   jq --arg state "$1" \
-    '{ok:true,revision,entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \
+    '{ok:true,configuration_state:"applied",revision,entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \
     "${DEPLOY}/config/provider-pool-applied.json" > "${DEPLOY}/tmp/fixture-pool-status.json"
 }
 write_health unknown
 before=$(business_hash)
 invoke --local
 (( LAST_RC == 2 )) || fail '单主未检测应警告，不假绿、不认定接口故障'
-for id in provider.configuration provider.pending provider.secret_permissions provider.adapter provider.router_code_binding provider.envelope_code_binding anything.provider_binding n8n.runtime_binding runtime.feedback; do assert_result "$id" PASS; done
+for id in provider.configuration provider.pending provider.rag_transaction provider.rag_configuration provider.secret_permissions provider.adapter provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
 ! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '主备默认doctor执行付费推理'
@@ -57,6 +57,45 @@ invoke --local
 (( LAST_RC == 0 )) || fail '当前健康证据及全部本地组件正常应退出0'
 assert_result provider.pool_health PASS
 pass '当前代主接口真实成功证据与未检测状态区分'
+
+env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 16384
+invoke --local
+assert_result provider.rag_configuration FAIL
+assert_result anything.rag_context SKIP
+(( LAST_RC == 1 )) || fail '池与知识预算投影不一致必须失败'
+env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 8192
+pass '接口池预算未投影到知识组件时不能假通过'
+
+DOCTOR_FIXTURE_RAG_CONTEXT=4096 invoke --local
+assert_result provider.rag_configuration PASS
+assert_result anything.rag_context FAIL
+(( LAST_RC == 1 )) || fail 'AnythingLLM仍运行旧预算必须失败'
+pass '容器实际上下文预算漂移可定位'
+
+DOCTOR_FIXTURE_RAG_API_CONTEXT=4096 invoke --local
+assert_result anything.rag_context FAIL
+(( LAST_RC == 1 )) || fail 'API实际知识预算漂移必须失败'
+pass '环境正确但API实际预算不同仍然拒绝通过'
+
+DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL=1 invoke --local
+assert_result anything.rag_context FAIL
+(( LAST_RC == 1 )) || fail '鉴权失败不能凭环境值宣称RAG正常'
+pass '知识预算检查必须取得当前鉴权API证据'
+
+printf '%s\n' '{"schema_version":1,"phase":"restore_failed"}' > "${DEPLOY}/config/provider-pool-transaction.json"
+jq '.configuration_state="applying"' "${DEPLOY}/tmp/fixture-pool-status.json" > "${TEST_ROOT}/health.new"
+mv -- "${TEST_ROOT}/health.new" "${DEPLOY}/tmp/fixture-pool-status.json"
+before=$(business_hash)
+invoke --local
+assert_result provider.rag_transaction FAIL
+assert_result provider.adapter FAIL
+assert_result provider.pool_health SKIP
+[[ "$before" == "$(business_hash)" ]] || fail '自检不能删除事务标记或解除人工'
+rm -- "${DEPLOY}/config/provider-pool-transaction.json"
+write_health healthy
+pass '未完成配置事务明确失败且默认自检不解除保护'
+invoke --local
+(( LAST_RC == 0 )) || fail '恢复原合成状态后的本次检查应正常，不能沿用旧缓存'
 
 text_status=0
 fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --last > "${TEST_ROOT}/text-last.out" 2> "${TEST_ROOT}/text-last.err" || text_status=$?

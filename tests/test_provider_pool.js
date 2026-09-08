@@ -31,6 +31,7 @@ async function fixture(count=1,policy={}) {
   fs.mkdirSync(path.join(root,'.work'),{recursive:true});
   const directory = fs.mkdtempSync(path.join(root,'.work/provider-pool-contract-'));
   for (const name of ['config','data/runtime']) fs.mkdirSync(path.join(directory,name),{recursive:true});
+  fs.writeFileSync(path.join(directory,'config/prompt.md'),sample.messages[0].content,{mode:0o600});
   const f = {directory,calls:[],behavior:null};
   f.upstream = http.createServer(async (request,response) => {
     let raw=''; for await (const data of request) raw+=data;
@@ -110,8 +111,337 @@ function testCooldownJitter() {
   process.stdout.write('通过 UNIT：冷却0～5%正向抖动的首次、指数递增、近上限、上限、取整及长Retry-After确定性边界（1组，不计入HTTP协议组数）\n');
 }
 
+async function testRagContextTransactions() {
+  const f=await fixture(3);
+  const run=script=>new Promise(resolve=>{
+    const child=spawn('python3',['-B','-c',script,path.join(root,'scripts/provider-pool.py'),f.directory],{env:{...process.env,PROVIDER_ADAPTER_MANAGEMENT_URL:f.base}});
+    let stdout='',stderr='';child.stdout.on('data',value=>stdout+=value);child.stderr.on('data',value=>stderr+=value);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+  const imports=`import copy, fcntl, importlib.util, json, os, stat, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('tested_provider_pool',sys.argv[1])
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+manager=module.Manager(sys.argv[2])
+calls=[]
+def apply_window(window):
+    with open(manager.root/'config/provider-pool.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    pool,secret=manager.load()
+    assert module.rag_context_window(pool)==window
+    assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']==str(window)
+    assert manager.transaction.exists()
+    assert stat.S_IMODE(manager.transaction.stat().st_mode)==0o600
+    pending=module.read(manager.transaction)
+    assert (pending['owner_boot_id'],pending['owner_start_ticks'])==module.process_identity(os.getpid())
+    calls.append(window)
+    return {'ok':True,'state':'applied','context_window':window}
+manager.apply_rag_window=apply_window
+`;
+  try {
+    const before=f.envelope();
+    const first=await run(imports+`
+pool,secret=manager.load()
+primary=pool['primary_id']
+assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='8192'
+pool['entries'][1]['context_window']=32768
+result=manager.commit(pool,secret,pool['revision'])
+assert calls==[32768] and result['rag_context']=={'context_window':32768,'state':'applied'}
+env=module.read_env(manager.env)
+assert env['AI_MODEL_TOKEN_LIMIT']=='8192' and env['AI_MAX_OUTPUT_TOKENS']=='1200'
+pool,secret=manager.load()
+assert not manager.transaction.exists()
+pool['entries'][0]['name']='同容量改名'
+pool['entries'][0]['model']='same-window-model'
+secret[primary]['api_key']='synthetic-same-window-new-key'
+manager.commit(pool,secret,pool['revision'])
+assert calls==[32768]
+pool,secret=manager.load()
+pool['entries'][0],pool['entries'][1]=pool['entries'][1],pool['entries'][0]
+pool['primary_id']=pool['entries'][0]['id']
+for index,item in enumerate(pool['entries']): item.update(order=index,role='primary' if index==0 else 'backup')
+manager.commit(pool,secret,pool['revision'])
+assert calls==[32768] and module.read_env(manager.env)['AI_MODEL_TOKEN_LIMIT']=='32768'
+pool,secret=manager.load()
+probe=copy.deepcopy(pool)
+probe['entries'][2].update(context_window=2097152,enabled=False,draft=True)
+assert module.rag_context_window(probe)==32768
+probe['entries'][0]['capabilities'][probe['entries'][0]['api_mode']]=False
+assert module.rag_context_window(probe)==8192
+pool['entries'][0]['context_window']=16384
+manager.commit(pool,secret,pool['revision'])
+assert calls==[32768,16384]
+pool,secret=manager.load()
+original=copy.deepcopy(pool)
+def reject_candidate(window):
+    apply_window(window)
+    concurrent,current_secret=manager.load()
+    try: manager.commit(concurrent,current_secret,concurrent['revision'])
+    except module.PoolError as failure: assert failure.code=='configuration_applying'
+    else: raise AssertionError('concurrent commit was accepted')
+    if window==65536: raise module.PoolError('rag_context_apply_failed','synthetic candidate refusal')
+    return {'ok':True,'state':'applied','context_window':window}
+manager.apply_rag_window=reject_candidate
+pool['entries'][0]['context_window']=65536
+try: manager.commit(pool,secret,pool['revision'])
+except module.PoolError as failure: assert failure.code=='rag_context_apply_failed'
+else: raise AssertionError('failed application was accepted')
+restored,restored_secret=manager.load()
+assert restored['entries']==original['entries'] and restored_secret==secret
+assert restored['revision']==original['revision']+2 and calls[-2:]==[65536,16384]
+assert not manager.transaction.exists()
+assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='16384'
+# 旧版已迁池缺少新投影，即使聚合数值未变化也必须同步一次。
+manager.apply_rag_window=apply_window
+module.atomic(manager.env,'\\n'.join(line for line in manager.env.read_text().splitlines() if not line.startswith('PROVIDER_RAG_CONTEXT_WINDOW='))+'\\n',0o600)
+manager.migrate()
+assert calls[-1]==16384 and len(calls)==5
+pool,secret=manager.load()
+def reject_all(window):
+    apply_window(window)
+    raise module.PoolError('rag_context_apply_failed','synthetic component unavailable')
+manager.apply_rag_window=reject_all
+pool['entries'][0]['context_window']=65536
+try: manager.commit(pool,secret,pool['revision'])
+except module.PoolError as failure: assert failure.code=='rag_context_restore_failed'
+else: raise AssertionError('failed restoration was accepted')
+pending=module.read(manager.transaction)
+assert pending['phase']=='restore_failed'
+assert stat.S_IMODE(manager.transaction.stat().st_mode)==0o600
+assert module.rag_context_window(manager.load()[0])==16384
+print(json.dumps({'ok':True,'helper_calls':calls,'phase':pending['phase']}))
+`);
+    assert.equal(first.code,0,first.stderr+first.stdout);
+    assert.deepEqual(JSON.parse(first.stdout).helper_calls,[32768,16384,65536,16384,16384,65536,16384]);
+    assert.equal((await f.get('status')).configuration_state,'applying');
+    assert.equal((await fetch(f.base+'/healthz')).status,503);
+    const blocked=await f.post();assert.equal(blocked.status,400);assert.equal(blocked.value.error.code,'configuration_applying');assert.equal(f.calls.length,0);
+    const second=await run(imports+`
+import time
+pending=module.read(manager.transaction)
+boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+fields=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()
+start_ticks=int(fields[19])
+pending.update(owner_pid=os.getpid(),owner_boot_id=boot,owner_start_ticks=start_ticks,started_at=int(time.time()*1000)-150000)
+module.atomic(manager.transaction,pending,0o600)
+try: manager.recover_rag_context()
+except module.PoolError as failure: assert failure.code=='configuration_applying'
+else: raise AssertionError('live transaction owner was bypassed')
+assert calls==[]
+for changed in ({'owner_boot_id':'00000000-0000-0000-0000-000000000000'},{'owner_start_ticks':start_ticks+1}):
+    stale=dict(pending,phase='applying',started_at=int(time.time()*1000),**changed)
+    module.atomic(manager.transaction,stale,0o600)
+    try: manager.recover_rag_context()
+    except module.PoolError as failure: assert failure.code=='configuration_applying'
+    else: raise AssertionError('140 second helper safety interval was bypassed')
+    assert module.read(manager.transaction)==stale
+    stale['started_at']-=150000
+    module.atomic(manager.transaction,stale,0o600)
+    result=manager.recover_rag_context()
+    assert result['rag_context']=={'context_window':16384,'state':'applied'}
+    assert not manager.transaction.exists()
+assert calls==[16384,16384]
+# 身份字段缺失或不可核对时仍闭锁，不能用坏记录绕过真实存活helper。
+malformed=dict(pending)
+del malformed['owner_boot_id']
+module.atomic(manager.transaction,malformed,0o600)
+try: manager.recover_rag_context()
+except module.PoolError as failure: assert failure.code=='invalid_configuration'
+else: raise AssertionError('missing owner identity was accepted')
+assert module.read(manager.transaction)==malformed and calls==[16384,16384]
+manager.transaction.unlink()
+print(json.dumps({'ok':True,'recovered':True,'stale_owner_identity_cases':2}))
+`);
+    assert.equal(second.code,0,second.stderr+second.stdout);f.reload();
+    assert.equal((await f.get('status')).configuration_state,'applied');
+    assert.equal((await f.post(sample,before)).status,400);assert.equal(f.calls.length,0);
+    assert.equal((await f.post()).status,200);assert.equal(f.calls.length,1);
+    const recoveredRevision=read(f.poolFile).revision;
+    const noRecovery=await f.cli(['recover-rag-context']);assert.equal(noRecovery.code,0,noRecovery.stdout);
+    assert.deepEqual(noRecovery.value,{ok:true,restored:false,message:'没有待恢复的知识上下文配置，未修改组件。'});
+    assert.equal(read(f.poolFile).revision,recoveredRevision);assert.equal(f.calls.length,1);
+    const acknowledgements=await run(imports+`
+from types import SimpleNamespace
+actual_run=module.subprocess.run
+for payload,status in [({'ok':True,'state':'deferred','context_window':16384},0),({'ok':True,'state':'applied','context_window':8192},0),({'ok':True,'state':'applied','context_window':'16384'},0),({'ok':True,'state':'applied','context_window':16384},1)]:
+    def returned(command,**options):
+        assert command[-2:]==['internal-rag-context-apply','16384'] and options['timeout']==135
+        return SimpleNamespace(returncode=status,stdout=json.dumps(payload))
+    module.subprocess.run=returned
+    try: module.Manager.apply_rag_window(manager,16384)
+    except module.PoolError as failure: assert failure.code=='rag_context_apply_failed'
+    else: raise AssertionError('invalid helper acknowledgement was accepted')
+module.subprocess.run=actual_run
+print(json.dumps({'ok':True,'invalid_acknowledgements_rejected':4}))
+`);
+    assert.equal(acknowledgements.code,0,acknowledgements.stderr+acknowledgements.stdout);
+    const marker=path.join(f.directory,'.crisp-ai-installation'),envFile=path.join(f.directory,'.env');
+    for(const state of ['ready','local-ready']) {
+      fs.writeFileSync(marker,'ai-support\nstate='+state+'\n',{mode:0o600});
+      assert.equal((await f.cli(['migrate','--defer-runtime'])).value.error.code,'invalid_installation_state');
+    }
+    for(const state of ['collecting','installing','staged']) {
+      fs.writeFileSync(marker,'ai-support\nstate='+state+'\n',{mode:0o600});
+      fs.writeFileSync(envFile,fs.readFileSync(envFile,'utf8').split('\n').filter(line=>!line.startsWith('PROVIDER_RAG_CONTEXT_WINDOW=')).join('\n'),{mode:0o600});
+      const deferred=await f.cli(['migrate','--defer-runtime']);assert.equal(deferred.code,0,deferred.stdout);
+      assert.deepEqual(deferred.value.rag_context,{context_window:16384,state:'deferred'});assert.equal(f.calls.length,1);
+    }
+    assert.equal((await f.cli(['list','--defer-runtime'])).value.error.code,'invalid_action');
+    const pendingFile=path.join(f.directory,'config/provider-pool-transaction.json');
+    json(pendingFile,{schema_version:1,phase:'restore_failed'});
+    assert.equal((await f.cli(['migrate','--defer-runtime'])).value.error.code,'configuration_applying');assert.ok(fs.existsSync(pendingFile));fs.unlinkSync(pendingFile);
+    fs.symlinkSync(path.join(f.directory,'missing-transaction'),pendingFile);
+    assert.notEqual((await f.cli(['recover-rag-context'])).code,0);assert.ok(fs.lstatSync(pendingFile).isSymbolicLink());fs.unlinkSync(pendingFile);
+    process.stdout.write('通过 UNIT/CONFIG：有限聚合窗口、仅变化时同步、锁外回读、并发拒绝、新代次回滚、失败闭锁恢复与仅安装可延后（helper为受控替身，不计入HTTP协议组数）\n');
+  } finally {await f.close();}
+}
+
+async function testMaintenanceTransactions() {
+  const f=await fixture(2);
+  const script=`import copy, fcntl, importlib.util, json, os, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('tested_provider_pool',sys.argv[1])
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+manager=module.Manager(sys.argv[2])
+calls=[]
+def apply_window(window):
+    assert module.inherited_maintenance_descriptor(manager.root/'tmp/maintenance.lock') is not None
+    with (manager.root/'tmp/maintenance.lock').open('a') as observer:
+        try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise AssertionError('helper was outside the maintenance transaction')
+    calls.append(window)
+    return {'ok':True,'state':'applied','context_window':window}
+manager.apply_rag_window=apply_window
+pool,secret=manager.load()
+candidate=copy.deepcopy(pool)
+candidate['entries'][1]['context_window']=16384
+temporary=manager.root/'tmp'
+temporary.mkdir(exist_ok=True)
+lock_path=temporary/'maintenance.lock'
+with lock_path.open('a') as held:
+    fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    try: manager.commit(candidate,secret,pool['revision'])
+    except module.PoolError as failure: assert failure.code=='maintenance_busy'
+    else: raise AssertionError('window commit and helper ran while a real maintenance lock was held')
+    assert manager.load()[0]==pool and calls==[]
+    assert manager.main('list',[])['revision']==pool['revision']
+    assert manager.main('status',[])['revision']==pool['revision']
+    assert manager.recover_rag_context()['restored'] is False
+    candidate_file=manager.root/'fixture-window-edit.json'
+    module.atomic(candidate_file,{'provider':{'context_window':16384}},0o600)
+    try: manager.main('edit',[pool['entries'][1]['id'],str(candidate_file)])
+    except module.PoolError as failure: assert failure.code=='maintenance_busy'
+    else: raise AssertionError('CLI mutation bypassed the maintenance gate')
+    module.atomic(manager.transaction,{'phase':'restore_failed'},0o600)
+    try: manager.recover_rag_context()
+    except module.PoolError as failure: assert failure.code=='maintenance_busy'
+    else: raise AssertionError('pending recovery bypassed the maintenance gate')
+    assert manager.transaction.exists()
+    manager.transaction.unlink()
+    values={'CRISP_AI_MAINTENANCE_LOCK_HELD':'1','MAINTENANCE_LOCK_FD':str(held.fileno()),'CRISP_AI_MAINTENANCE_LOCK_PATH':str(lock_path)}
+    previous={key:os.environ.get(key) for key in values}
+    try:
+        os.environ.update(values)
+        manager.commit(candidate,secret,pool['revision'])
+        assert calls==[16384]
+        with lock_path.open('a') as observer:
+            try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError: pass
+            else: raise AssertionError('successful child released the inherited parent lock')
+        try: manager.commit(candidate,secret,pool['revision'])
+        except module.PoolError as failure: assert failure.code=='revision_conflict'
+        else: raise AssertionError('old revision was accepted')
+        with (temporary/'fixture-unrelated.lock').open('a') as unrelated:
+            os.environ['MAINTENANCE_LOCK_FD']=str(unrelated.fileno())
+            try: manager.commit(candidate,secret,pool['revision'])
+            except module.PoolError as failure: assert failure.code=='maintenance_busy'
+            else: raise AssertionError('unrelated inherited fd bypassed the real lock')
+            os.fstat(unrelated.fileno())
+        with lock_path.open('a') as observer:
+            try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError: pass
+            else: raise AssertionError('failed child released the inherited parent lock')
+    finally:
+        for key,value in previous.items():
+            if value is None: os.environ.pop(key,None)
+            else: os.environ[key]=value
+with lock_path.open('a') as observer:
+    fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+# 实际Bash父维护锁经exec传给Python；内部helper再经pass_fds承接同一个锁。
+child_code='''import fcntl,importlib.util,json,os,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('child_pool',sys.argv[1]); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+manager=module.Manager(sys.argv[2])
+actual_run=module.subprocess.run
+def helper_run(command,**options):
+    assert command[-2:]==['internal-rag-context-apply','32768']
+    descriptor=module.inherited_maintenance_descriptor(manager.root/'tmp/maintenance.lock')
+    assert descriptor is not None and options['pass_fds']==(descriptor,)
+    return actual_run([sys.executable,'-c',sys.argv[3],sys.argv[2]],**options)
+module.subprocess.run=helper_run
+pool,secret=manager.load(); pool['entries'][1]['context_window']=32768
+manager.commit(pool,secret,pool['revision'])
+'''
+helper_code='''import fcntl,json,os,sys
+from pathlib import Path
+fd=int(os.environ['MAINTENANCE_LOCK_FD']); opened=os.fstat(fd); source=(Path(sys.argv[1])/'tmp/maintenance.lock').stat()
+assert (opened.st_dev,opened.st_ino)==(source.st_dev,source.st_ino)
+with (Path(sys.argv[1])/'tmp/maintenance.lock').open('a') as observer:
+    try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: pass
+    else: raise AssertionError('helper did not retain parent maintenance lock')
+print(json.dumps({'ok':True,'state':'applied','context_window':32768}))
+'''
+parent_check='''import fcntl,sys
+from pathlib import Path
+with (Path(sys.argv[1])/'tmp/maintenance.lock').open('a') as observer:
+    try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: pass
+    else: raise AssertionError('Python operation unlocked the parent Bash transaction')
+print('parent-lock-retained')
+'''
+completed=module.subprocess.run(['bash','-c','set -euo pipefail; source "$1"; acquire_maintenance_lock "$2"; python3 -B -c "$3" "$4" "$2" "$5"; python3 -B -c "$6" "$2"','--',str(Path(sys.argv[1]).with_name('common.sh')),str(manager.root),child_code,sys.argv[1],helper_code,parent_check],stdout=module.subprocess.PIPE,stderr=module.subprocess.PIPE,text=True,timeout=8)
+assert completed.returncode==0,completed.stderr+completed.stdout
+assert completed.stdout.strip()=='parent-lock-retained'
+assert module.rag_context_window(manager.load()[0])==32768
+with lock_path.open('a') as observer:
+    fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
+# 异常锁类型必须快速拒绝，不能在FIFO打开阶段阻塞维护入口。
+import time
+lock_path.unlink()
+for kind in ('fifo','symlink'):
+    if kind=='fifo': os.mkfifo(lock_path)
+    else: lock_path.symlink_to(temporary/'fixture-missing-lock')
+    try:
+        before=manager.load()[0]
+        started=time.monotonic()
+        try: manager.commit(copy.deepcopy(before),secret,before['revision'])
+        except (module.PoolError,OSError): pass
+        else: raise AssertionError('unsafe maintenance lock type was accepted')
+        assert time.monotonic()-started<1
+        assert manager.load()[0]==before and calls==[16384]
+    finally: lock_path.unlink()
+print(json.dumps({'ok':True,'maintenance_conflict_rejected':True,'inherited_parent_and_helper_verified':True}))
+`;
+  try {
+    const result=await new Promise(resolve=>{
+      const child=spawn('python3',['-B','-c',script,path.join(root,'scripts/provider-pool.py'),f.directory],{env:{...process.env,PROVIDER_ADAPTER_MANAGEMENT_URL:f.base}});
+      let stdout='',stderr='';child.stdout.on('data',value=>stdout+=value);child.stderr.on('data',value=>stderr+=value);
+      child.on('close',code=>resolve({code,stdout,stderr}));
+    });
+    assert.equal(result.code,0,result.stderr+result.stdout);
+    assert.equal(f.calls.length,0);
+    process.stdout.write('通过 UNIT/CONFIG：真实维护锁拒绝写入/恢复、只读可用、Bash父锁与helper继承及异常不解锁（helper为受控替身，不计入HTTP协议组数）\n');
+  } finally {await f.close();}
+}
+
 async function main() {
   testCooldownJitter();
+  await testMaintenanceTransactions();
+  await testRagContextTransactions();
   await test('幂等单接口迁移、独立内部Key、非敏感池与同代秘密',async()=>{
     const f=await fixture();try {
       const before=fs.readFileSync(f.poolFile,'utf8');const result=await f.cli(['migrate']);assert.equal(result.code,0);assert.equal(fs.readFileSync(f.poolFile,'utf8'),before);
@@ -121,6 +451,51 @@ async function main() {
       assert.equal((await f.post(sample,null)).status,400);assert.equal(f.calls.length,0);
       assert.equal((await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer fixture-key-0'},body:JSON.stringify(sample)})).status,401);
     }finally{await f.close();}
+  });
+  await test('RAG system须完整保留有效Prompt，截断/用户段替代零推理且显式短probe不受影响',async()=>{
+    const f=await fixture(3);try {
+      const prompt='首端合成业务规则。\n'+'中段不可丢失的规则。'.repeat(50)+'\n末端合成业务规则。';
+      fs.writeFileSync(path.join(f.directory,'config/prompt.md'),prompt,{mode:0o600});
+      const truncated=prompt.slice(0,20)+'\n--prompt truncated for brevity--\n'+prompt.slice(-20);
+      for(const messages of [
+        [{role:'system',content:truncated},{role:'user',content:'合成问题'}],
+        [{role:'user',content:prompt+'\n合成问题'}],
+        [{role:'system',content:truncated},{role:'user',content:prompt}],
+        [{role:'system',content:prompt.slice(0,100)},{role:'system',content:prompt.slice(100)},{role:'user',content:'合成问题'}]
+      ]) {
+        const envelope=f.envelope(),result=await f.post({messages},envelope);
+        assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,'context_preparation_incomplete');
+        assert.ok(!result.text.includes('中段不可丢失'));assert.equal(f.calls.length,0);
+        assert.equal((await f.post({messages},envelope)).value.error.code,'context_preparation_incomplete');assert.equal(f.calls.length,0);
+      }
+      assert.equal((await f.get('recent')).records.length,0);
+      const complete={messages:[{role:'system',content:prompt+'\nContext: 合成知识内容。'},{role:'user',content:'合成问题'}]};
+      assert.equal((await f.post(complete)).status,200);assert.equal(f.calls.length,1);assert.ok(f.calls[0].body.messages[0].content.includes(prompt));
+      const projection={schema_version:1,state:'applied',revision:1,configuration:{runtime:{revision:1,enabled:true}},prompt:{text:prompt,bytes:Buffer.byteLength(prompt),sha256:crypto.createHash('sha256').update(prompt).digest('hex')}};
+      json(path.join(f.directory,'config/materials-applied.json'),projection);
+      fs.writeFileSync(path.join(f.directory,'config/prompt.md'),'尚未应用的编辑稿',{mode:0o600});
+      assert.equal((await f.post(complete)).status,200);assert.equal(f.calls.length,2);
+      projection.prompt.sha256='0'.repeat(64);json(path.join(f.directory,'config/materials-applied.json'),projection);
+      assert.equal((await f.post(complete)).value.error.code,'context_preparation_incomplete');assert.equal(f.calls.length,2);
+      const probe=await f.cli(['test']);assert.equal(probe.code,0,probe.stdout);assert.equal(f.calls.length,3);assert.ok(!JSON.stringify(f.calls[2].body).includes(prompt));
+    }finally{await f.close();}
+  });
+  await test('窗口事务期间新请求不推理，原在途结果不出站或续备且不记上游故障',async()=>{
+    const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
+    const pendingFile=path.join(f.directory,'config/provider-pool-transaction.json');
+    try {
+      f.behavior=async()=>{await gate;return false;};
+      const envelope=f.envelope(),waiting=f.post(sample,envelope);
+      await until(()=>f.calls.length===1,'原请求未进入合成上游');
+      json(pendingFile,{schema_version:1,token:'a'.repeat(32),phase:'applying'});
+      assert.equal((await f.post()).value.error.code,'configuration_applying');assert.equal(f.calls.length,1);
+      assert.equal((await f.get('status')).configuration_state,'applying');assert.equal((await fetch(f.base+'/healthz')).status,503);
+      release();const result=await waiting;assert.equal(result.status,400);assert.equal(result.value.error.code,'configuration_applying');assert.ok(!result.text.includes('验证回答'));assert.equal(f.calls.length,1);
+      assert.equal((await f.get('recent')).records.length,0);
+      fs.unlinkSync(pendingFile);f.behavior=null;
+      assert.equal((await f.post(sample,envelope)).status,400);assert.equal(f.calls.length,1);
+      assert.equal((await f.post()).status,200);assert.equal(f.calls.length,2);
+    }finally{release();await f.close();}
   });
   await test('管理添加20备、停用仍占21容量、原子设主排序删除与每接口模型列表',async()=>{
     const f=await fixture();try {
@@ -277,7 +652,7 @@ async function main() {
   await test('每接口上下文与图片能力筛选、Responses图片实际出站不丢图',async()=>{
     const f=await fixture(2);try {
       f.publish(pool=>{pool.entries[0].context_window=512;pool.entries[0].max_output_tokens=64;pool.entries[0].capabilities.vision=false;pool.entries[1].api_mode='responses';pool.entries[1].capabilities.responses=true;});
-      assert.equal((await f.post({messages:[{role:'user',content:'x'.repeat(1000)}]})).status,200);assert.deepEqual(f.calls.map(call=>call.index),[1]);
+      assert.equal((await f.post({messages:[sample.messages[0],{role:'user',content:'x'.repeat(1000)}]})).status,200);assert.deepEqual(f.calls.map(call=>call.index),[1]);
       const result=await f.post({messages:[{role:'user',content:[{type:'text',text:'合成图片'},{type:'image_url',image_url:{url:image}}]}]},f.envelope('vision'));
       assert.equal(result.status,200);assert.equal(f.calls.at(-1).body.input[0].content[1].image_url,image);assert.equal(f.calls.length,2);
     }finally{await f.close();}
@@ -329,7 +704,7 @@ async function main() {
     const f=await fixture(2);try {
       const content='正常中文资料😀'.repeat(50)+'document content '.repeat(700);
       assert.ok(Buffer.byteLength(content)>8192);assert.ok(estimateTextTokens(content)+1200+272<8192);
-      assert.equal((await f.post({messages:[{role:'user',content}]})).status,200);assert.equal(f.calls.length,1);
+      assert.equal((await f.post({messages:[sample.messages[0],{role:'user',content}]})).status,200);assert.equal(f.calls.length,1);
       f.behavior=async(call,response)=>{response.writeHead(400);response.end(JSON.stringify({error:{code:'context_length_exceeded'}}));return true;};
       assert.equal((await f.post()).status,400);assert.equal(f.calls.length,2);
     }finally{await f.close();}
@@ -430,12 +805,12 @@ async function main() {
         if(call.index===1){backupEntered=true;await backupGate;response.end(JSON.stringify(chat('旧问题仅由原备用完整回答')));return true;}
         response.end(JSON.stringify(chat('恢复主接口只回答新问题')));return true;
       };
-      const oldEnvelope=f.envelope(),oldBody={messages:[{role:'user',content:'原问题等待备用'}]};
+      const oldEnvelope=f.envelope(),oldBody={messages:[sample.messages[0],{role:'user',content:'原问题等待备用'}]};
       const pending=f.post(oldBody,oldEnvelope).then(result=>{oldSettled=true;return result;});
       await until(()=>backupEntered,'原问题未进入慢备用');
       const cooling=(await f.get('status')).entries[0];assert.equal(cooling.health,'cooling');assert.equal(oldSettled,false);
       await sleep(Math.max(0,cooling.cooldown_until-Date.now())+40);
-      const newEnvelope=f.envelope(),newBody={messages:[{role:'user',content:'冷却到期后的独立新问题'}]};
+      const newEnvelope=f.envelope(),newBody={messages:[sample.messages[0],{role:'user',content:'冷却到期后的独立新问题'}]};
       const current=await f.post(newBody,newEnvelope);assert.equal(current.status,200,current.text);assert.equal(current.value.choices[0].message.content,'恢复主接口只回答新问题');
       assert.equal(oldSettled,false);assert.deepEqual(f.calls.map(call=>call.index),[0,1,0]);assert.equal((await f.get('status')).entries[0].health,'unknown');
       releaseBackup();const previous=await pending;assert.equal(previous.status,200,previous.text);assert.equal(previous.value.choices[0].message.content,'旧问题仅由原备用完整回答');assert.equal(previous.value.model,'fixture-model-1');

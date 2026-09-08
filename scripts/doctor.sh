@@ -358,9 +358,9 @@ doctor_webhook_probe() {
 
 # AnythingLLM 的工作区回读包含 Developer API Key，不能把 Key 放进受限子进程
 # 的 argv。使用仅 doctor 可读的 curl config，并由统一剩余预算包住整个请求。
-doctor_anything_workspace_probe() {
-  local port=$1 key=$2 workspace=$3 response=$4 config status curl_rc=0 escaped_key
-  if [[ ! "$port" =~ ^[0-9]{1,5}$ || ! "$workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]] \
+doctor_anything_read_probe() {
+  local port=$1 key=$2 route=$3 response=$4 config status curl_rc=0 escaped_key
+  if [[ ! "$port" =~ ^[0-9]{1,5}$ || ! "$route" =~ ^(system|workspace/[A-Za-z0-9_-]{1,128})$ ]] \
     || is_placeholder "$key"; then
     printf '000\n'
     return
@@ -374,9 +374,13 @@ doctor_anything_workspace_probe() {
   chmod 0600 "$config" "$response" 2>/dev/null || true
   status=$(doctor_timeout 12 curl --silent --output "$response" --write-out '%{http_code}' \
     --connect-timeout 3 --max-time 10 --config "$config" \
-    "http://127.0.0.1:${port}/api/v1/workspace/${workspace}" 2>/dev/null) || curl_rc=$?
+    "http://127.0.0.1:${port}/api/v1/${route}" 2>/dev/null) || curl_rc=$?
   : > "$config"
   if (( curl_rc == 124 || curl_rc == 137 )); then printf '000\n'; else printf '%s\n' "${status:-000}"; fi
+}
+
+doctor_anything_workspace_probe() {
+  doctor_anything_read_probe "$1" "$2" "workspace/$3" "$4"
 }
 
 doctor_container_env_binding() {
@@ -1220,8 +1224,9 @@ NODE
 }
 
 doctor_provider_pool_files() {
-  local start count desired actual internal valid_files=false
+  local start count desired actual internal aggregate configured valid_files=false
   DOCTOR_POOL_READY=0
+  DOCTOR_RAG_CONTEXT_WINDOW=''
   (( DOCTOR_POOL_ENABLED )) || return 0
   start=$(doctor_now_ms)
   if doctor_timeout 6 python3 "${DOCTOR_DIR}/provider-pool.py" --deploy-dir "$DOCTOR_DEPLOY_DIR" list \
@@ -1241,6 +1246,25 @@ doctor_provider_pool_files() {
       doctor_add provider.configuration 'AI 主备配置与秘密引用' FAIL critical '接口池有效投影、数量、主角色、秘密代次或内部认证无效' filesystem '从菜单 3 恢复有效接口配置；不要把 Key 写进可分享文件' "$start"
     fi
     return
+  fi
+  start=$(doctor_now_ms)
+  if [[ -e "${DOCTOR_DEPLOY_DIR}/config/provider-pool-transaction.json" \
+    || -L "${DOCTOR_DEPLOY_DIR}/config/provider-pool-transaction.json" ]]; then
+    doctor_add provider.rag_transaction '主备配置应用事务' FAIL critical '存在尚未完成的接口池应用，推理保持受保护状态；不能沿用旧健康结果' filesystem '若操作已中断，从菜单 3 → 10 → 12 恢复；不要手动删除事务文件' "$start"
+  else
+    doctor_add provider.rag_transaction '主备配置应用事务' PASS critical '无未完成的接口池应用事务' filesystem '' "$start"
+  fi
+  start=$(doctor_now_ms)
+  aggregate=$(jq -er '[.entries[] | . as $entry | select(.enabled == true and .draft != true
+    and $entry.capabilities[$entry.api_mode] == true) | .context_window] | max' \
+    "${DOCTOR_TEMP_ROOT}/provider-pool.json" 2>/dev/null || true)
+  configured=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_RAG_CONTEXT_WINDOW 2>/dev/null || true)
+  if [[ "$aggregate" =~ ^[1-9][0-9]{2,6}$ && "$configured" == "$aggregate" ]] \
+    && (( aggregate >= 256 && aggregate <= 2097152 )); then
+    DOCTOR_RAG_CONTEXT_WINDOW=$aggregate
+    doctor_add provider.rag_configuration '主备知识上下文预算' PASS critical '有效接口池聚合预算与受管环境一致；它不是服务商官方容量证明' filesystem '' "$start"
+  else
+    doctor_add provider.rag_configuration '主备知识上下文预算' FAIL critical '有效接口池与知识组件预算投影不一致或缺失' filesystem '从菜单 3 校验并应用接口配置；不要单独修改容器环境或重建知识索引' "$start"
   fi
   start=$(doctor_now_ms)
   if doctor_timeout 5 python3 "${DOCTOR_DIR}/provider-pool.py" --deploy-dir "$DOCTOR_DEPLOY_DIR" validate-file \
@@ -1278,9 +1302,49 @@ PY
   fi
 }
 
+doctor_pool_rag_context_check() {
+  local start port key response status output
+  start=$(doctor_now_ms)
+  if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )) \
+    || [[ -z "$DOCTOR_RAG_CONTEXT_WINDOW" ]]; then
+    doctor_skip anything.rag_context 'AnythingLLM 实际上下文预算' '因有效接口池、预算投影或 Docker 不可验证，本次未检查' docker
+    return
+  fi
+  output="${DOCTOR_TEMP_ROOT}/rag-context-binding.txt"
+  if ! printf '%s' "$DOCTOR_RAG_CONTEXT_WINDOW" | doctor_compose_timeout 8 exec -T anythingllm node -e '
+    const marker="CRISPAI_EXPECTED_RAG_CONTEXT",fs=require("fs");
+    const expected=fs.readFileSync(0,"utf8");
+    if(!marker||expected!==process.env.GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT)process.exit(1);
+    process.stdout.write("matched\n");
+  ' > "$output" 2>/dev/null || ! grep -Fxq matched "$output"; then
+    if ! doctor_remaining >/dev/null 2>&1; then
+      doctor_deadline_add anything.rag_context 'AnythingLLM 实际上下文预算' docker "$start"
+    else
+      doctor_add anything.rag_context 'AnythingLLM 实际上下文预算' FAIL critical '运行容器未使用当前主备知识预算' docker '通过菜单 3 重新应用上下文配置；不必重新导入知识' "$start"
+    fi
+    return
+  fi
+  port=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_PORT 2>/dev/null || printf 3001)
+  key=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)
+  response="${DOCTOR_TEMP_ROOT}/anything-system.json"
+  status=$(doctor_anything_read_probe "$port" "$key" system "$response")
+  if [[ "$status" == 2?? ]] && jq -e --arg expected "$DOCTOR_RAG_CONTEXT_WINDOW" \
+    '.settings.GenericOpenAiTokenLimit | tostring == $expected' "$response" >/dev/null 2>&1; then
+    doctor_add anything.rag_context 'AnythingLLM 实际上下文预算' PASS critical '容器环境与鉴权 API 回读一致；未调用模型，具体问题仍经逐接口预算和 Prompt 完整性检查' local-api '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add anything.rag_context 'AnythingLLM 实际上下文预算' local-api "$start"
+  else
+    doctor_add anything.rag_context 'AnythingLLM 实际上下文预算' FAIL critical "应用实际预算未通过鉴权回读（HTTP ${status:-000}）" local-api '检查 AnythingLLM 鉴权与当前配置事务，不把环境值存在当成已生效' "$start"
+  fi
+  # The system endpoint can include settings unrelated to diagnostics. Keep
+  # only the white-listed result, not the raw authenticated response.
+  : > "$response"
+}
+
 doctor_pool_adapter_check() {
   local start output count healthy cooling unknown hook_secret plugin_secret vision_count vision_cooling vision_unknown
   start=$(doctor_now_ms)
+  doctor_pool_rag_context_check
   if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )); then
     for output in provider.adapter provider.adapter_binding anything.provider_binding n8n.runtime_binding provider.pool_health provider.pool_vision; do
       doctor_skip "$output" '主备接口运行检查' '因接口池或 Docker 上游故障未检查' docker
@@ -1334,7 +1398,7 @@ doctor_pool_adapter_check() {
       .catch(()=>{process.exitCode=1;});
   ' < /dev/null > "$output" 2>/dev/null \
     && jq -e --slurpfile expected "${DOCTOR_TEMP_ROOT}/provider-pool.json" \
-      '.ok == true and .revision == $expected[0].revision and (.entries | type == "array" and length > 0) and
+      '.ok == true and .configuration_state == "applied" and .revision == $expected[0].revision and (.entries | type == "array" and length > 0) and
        ([.entries[]|{id,enabled}]|sort_by(.id)) == ([$expected[0].entries[]|{id,enabled}]|sort_by(.id)) and
        all(.entries[]; (.health == "healthy" or .health == "cooling" or .health == "unknown" or .health == "half_open" or (.enabled == false and .health == "disabled")))' "$output" >/dev/null 2>&1; then
     doctor_add provider.adapter '主备 adapter 实际读取' PASS critical 'AnythingLLM 网络通过内部认证读取当前接口池，配置应用代次一致；未调用模型' docker '' "$start"

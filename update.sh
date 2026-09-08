@@ -177,7 +177,7 @@ bash "${DEPLOY_DIR}/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" initialize
 record_maintenance_event "$DEPLOY_DIR" update start
 migrate_config_files "$DEPLOY_DIR"
 bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate
-python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" migrate >/dev/null \
+python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" migrate --defer-runtime >/dev/null \
   || die '主备接口迁移未完成，升级将按原快照恢复'
 [[ ! -L "${DEPLOY_DIR}/data/analytics/events.jsonl" ]] || die "统计事件文件不得是符号链接"
 touch -- "${DEPLOY_DIR}/data/analytics/events.jsonl"

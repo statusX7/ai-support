@@ -38,4 +38,12 @@ function extractEnvelope(body, header, key, required) {
   return tokens.size ? verifyEnvelope([...tokens][0], key) : null;
 }
 
-module.exports = {signEnvelope, envelopeMarker, verifyEnvelope, extractEnvelope};
+function promptRetained(body, prompt) {
+  if (typeof prompt !== 'string' || !prompt.trim()) return false;
+  // 只接受单个 system 正文中的完整原文，用户引用或跨消息拼接不能替代系统规则。
+  return (body.messages || []).some(message => message.role === 'system'
+    && (typeof message.content === 'string' ? message.content.includes(prompt)
+      : Array.isArray(message.content) && message.content.some(part => part.type === 'text' && typeof part.text === 'string' && part.text.includes(prompt))));
+}
+
+module.exports = {signEnvelope, envelopeMarker, verifyEnvelope, extractEnvelope, promptRetained};

@@ -7,11 +7,11 @@
       "enabled": true
     },
     "message": "您的人工协助请求已收到，请稍候。",
-    "resume_after_seconds": 1800,
+    "resume_after_seconds": 3600,
     "while_active": "人工客服正在接管此会话，请稍候。",
-    "no_answer_message": "知识库暂时没有足够信息，请换一种方式描述问题。",
-    "low_confidence_message": "当前答案可信度不足，请补充更多问题细节。",
-    "failure_message": "暂时无法回复，请稍后再试。",
+    "no_answer_message": "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。",
+    "low_confidence_message": "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。",
+    "failure_message": "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。",
     "low_confidence": {
       "require_sources": true,
       "minimum_score": 0.25

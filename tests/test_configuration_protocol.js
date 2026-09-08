@@ -24,17 +24,25 @@ async function main() {
   fs.copyFileSync(path.join(root,'config/prompt.md.example'),path.join(deploy,'config/prompt.md'));
   fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
   fs.copyFileSync(path.join(root,'n8n/workflow.json'),path.join(deploy,'n8n/workflow.json'));
+  fs.copyFileSync(path.join(root,'docker-compose.yml'),path.join(deploy,'docker-compose.yml'));
   for (const name of ['provider-adapter.js','provider-router.js','provider-envelope.js','provider-pool.py']) fs.copyFileSync(path.join(root,'scripts',name),path.join(deploy,'scripts',name));
   fs.copyFileSync(path.join(root,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker'));
   fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
   const documents = new Map(); let locations=[], prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'), sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
   let providerChatFailure=false;
-  let modelEmpty=false, modelHang=false, modelCalls=0;
+  let modelEmpty=false, modelHang=false, modelCalls=0, systemWindowReads=0;
   const service=http.createServer(async(request,response)=>{
     let data=Buffer.alloc(0);for await(const chunk of request)data=Buffer.concat([data,chunk]);
     const send=(status,body)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(body));};
     const body = request.headers['content-type']?.includes('application/json') ? JSON.parse(data.toString('utf8') || '{}') : {};
     if(request.url === '/api/v1/auth'){send(200,{authenticated:true});return;}
+    if(request.url === '/api/v1/system'){
+      assert.equal(request.method,'GET');assert.equal(request.headers.authorization,'Bearer '+secret);
+      const running=path.join(deploy,'tmp/configuration-rag-running.json');
+      if(!fs.existsSync(running)){send(503,{error:'synthetic-component-not-recreated'});return;}
+      systemWindowReads++;
+      send(200,{settings:{GenericOpenAiTokenLimit:String(JSON.parse(fs.readFileSync(running)).context_window)}});return;
+    }
     if(request.url === '/healthz' || request.url === '/api/ping'){send(200,{ok:true});return;}
     if(request.url.startsWith('/webhook/crisp-webhook?')){send(401,{accepted:false,reason:'Webhook 校验失败'});return;}
     if(request.url === '/api/v1/workspace/crisp-support'){send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;}
@@ -87,6 +95,26 @@ async function main() {
   try {
     await ok('provider.sh',['migrate']);
     await startAdapter();
+    const installationFile=path.join(deploy,'.crisp-ai-installation'), installationBefore=fs.readFileSync(installationFile);
+    fs.writeFileSync(installationFile,'ai-support\nstate=local-ready\n');
+    const initialPool=JSON.parse(fs.readFileSync(path.join(deploy,'config/provider-pool-applied.json')));
+    const initialWindow=initialPool.entries.find(entry=>entry.id===initialPool.primary_id).context_window;
+    const windowCandidate=path.join(work,'rag-window-candidate.json');
+    fs.writeFileSync(windowCandidate,JSON.stringify({provider:{context_window:initialWindow*2}}));
+    const windowApplied=JSON.parse((await ok('provider.sh',['edit',initialPool.primary_id,windowCandidate])).stdout);
+    assert.deepEqual(windowApplied.rag_context,{context_window:initialWindow*2,state:'applied'});
+    const runningWindow=()=>JSON.parse(fs.readFileSync(path.join(deploy,'tmp/configuration-rag-running.json')));
+    assert.equal(runningWindow().context_window,initialWindow*2);
+    fs.writeFileSync(windowCandidate,JSON.stringify({provider:{context_window:initialWindow}}));
+    const windowRestored=JSON.parse((await ok('provider.sh',['edit',initialPool.primary_id,windowCandidate])).stdout);
+    assert.deepEqual(windowRestored.rag_context,{context_window:initialWindow,state:'applied'});
+    assert.equal(runningWindow().context_window,initialWindow);
+    assert.equal(runningWindow().recreates,2);
+    assert.equal(systemWindowReads,2,'两次受控重建都必须经过官方API运行回读');
+    assert.equal(runningWindow().service,'anythingllm');
+    assert.equal(fs.existsSync(path.join(deploy,'config/provider-pool-transaction.json')),false);
+    fs.writeFileSync(installationFile,installationBefore);
+    pass('实际接口池窗口编辑触发受管AnythingLLM单组件重建并双回读，恢复原窗口且不跳过生产helper');
     fs.writeFileSync(path.join(deploy,'knowledge/原先资料.md'),'# 原先资料\n虚构内容，流程标记为蓝色。\n');
     const legacyFeedback=JSON.parse(fs.readFileSync(path.join(deploy,'config/feedback.yaml')));
     legacyFeedback.feedback.enabled=true;
@@ -116,7 +144,7 @@ async function main() {
     assert.equal(neutralKeyword.rules[0].confirm_message,'您的人工协助请求已收到，请稍候。');
     assert.deepEqual(neutralKeyword.rules[1],legacyKeyword.rules[1]);
     assert.equal(neutralHandoff.handoff.message,'您的人工协助请求已收到，请稍候。');
-    assert.equal(neutralHandoff.handoff.failure_message,'暂时无法回复，请稍后再试。');
+    assert.equal(neutralHandoff.handoff.failure_message,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');
     assert.equal(neutralHandoff.handoff.resume_after_seconds,37);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'backups/config-history/keyword.display.pre-v1.2.1.yaml'))),legacyKeyword);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'backups/config-history/handoff.display.pre-v1.2.1.yaml'))),legacyHandoff);

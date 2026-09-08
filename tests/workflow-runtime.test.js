@@ -259,7 +259,7 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal(providerRequests.at(-1).path, '/proxy/v1/responses');
     assert.match(modelRequests.at(-1).message, /不可信客户资料/);
     assert.equal(modelRequests.at(-1).sessionId, 'session_image002');
-    for (const mode of ['expired', 'wrong', 'huge']) { imageMode = mode; await deliver(message('session_badimage-' + mode, image, { type: 'file' })); assert.match(sent.at(-1).content, /补充|重新上传/); assert.equal(state('session_badimage-' + mode).mode, 'ai'); }
+    for (const mode of ['expired', 'wrong', 'huge']) { imageMode = mode; await deliver(message('session_badimage-' + mode, image, { type: 'file' })); assert.equal(sent.at(-1).content, '请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。'); assert.equal(state('session_badimage-' + mode).mode, 'ai'); }
     imageMode = 'valid'; const unsafe = createRuntime(env, { ...runtimeOptions, lookup: (_host, _options, callback) => callback(null, [{ address: '127.0.0.1', family: 4 }]) }); await assert.rejects(unsafe.imageContent(image), /受限网络/);
     await assert.rejects(runtime.imageContent({ ...image, url: 'https://evil.invalid/image.png' }), /安全校验/);
   });

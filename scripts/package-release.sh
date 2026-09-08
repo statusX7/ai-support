@@ -92,6 +92,7 @@ RELEASE_FILES=(
   tests/test_configuration_guards.js tests/test_configuration_protocol.js
   tests/test_feedback_runtime.js tests/test_provider_pool.js tests/test_runtime_provider_pool.js tests/test_provider_lifecycle.js
   tests/test_outgoing_identity.js tests/owned_outgoing.py tests/test_provider_log_redaction.py
+  tests/test_rag_context.py tests/test_snapshot_live.py
   tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
   tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
   tests/test_get.sh tests/test_doctor.sh tests/test_doctor_pool.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh

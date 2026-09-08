@@ -62,6 +62,7 @@ LABELS = {
     "cleared_files": "已清理统计文件数", "remaining_seconds": "剩余恢复秒数", "last_human_at": "最近真人接管时间",
     "provider_pool": "主备接口资料", "current_valid": "当前有效接口校验",
     "business_applied": "业务资料已应用", "provider_pool_applied": "主备接口池已应用", "missing_credentials": "待补全凭据的接口",
+    "rag_context": "知识上下文配置", "configuration_state": "配置应用状态",
 }
 VALUES = {
     True: "是", False: "否", None: "无", "chat_completions": "聊天接口", "responses": "响应接口",
@@ -88,6 +89,11 @@ VALUES = {
     "invalid_response": "上游返回格式无效", "model_not_found": "模型不存在", "safety_refusal": "模型安全拒绝",
     "question_cancelled": "控制状态变化，问题已取消", "question_budget_exhausted": "本题调用预算已用尽",
     "vision_unsupported": "此模型暂不支持图片", "upstream_unavailable": "上游暂不可用", "model_unavailable": "模型暂不可用",
+    "rag_context_apply_failed": "知识上下文配置未能应用，请检查本地组件；已尝试恢复上一份配置",
+    "rag_context_restore_failed": "知识上下文恢复未完成，自动推理保持保护状态；从菜单 3 → 10 → 12 恢复",
+    "configuration_applying": "配置正在应用，请等待当前操作结束，不要同时修改",
+    "context_preparation_incomplete": "知识组件没有保留完整提示词，已阻止不完整请求；请核对接口上下文预算",
+    "unchanged": "保持原值，无需重建", "deferred": "将在安装阶段启动组件后验证",
 }
 TECHNICAL = re.compile(r'\b(?:schema_version|applied_revision|revision|Traceback|traceback)\b|(?:kb_|rule_|menu_|p_)[a-f0-9]{8,}|session-[a-f0-9]{64}|\b[0-9a-f]{64}\b')
 
@@ -145,6 +151,8 @@ def provider_snapshot(arguments):
             return None, VALUES.get(error.get('code'), reason) if isinstance(error, dict) else reason
         if not isinstance(result.get(field), list):
             return None, '适配器结果格式无效'
+        if field == 'entries' and result.get('configuration_state') == 'applying':
+            return None, '接口配置尚未完成应用，自动推理保持保护状态；请核对当前操作或从菜单 3 → 10 → 12 恢复'
         if field == 'entries' and result.get('revision') != revision or field == 'records' and result.get('revision', revision) != revision:
             return None, '读取期间接口配置已变化，请重新打开列表'
         return result, ''
@@ -286,6 +294,8 @@ def render(kind, value):
             print('草稿接口数量：' + scalar(entries)); return
         print(f'接口共 {len(entries)} 个；备用 {max(0, len(entries)-1)} 个。')
         if len(entries) == 1 and not is_draft: print('当前是合法的单接口配置；无需额外配置备用。')
+        if 'rag_context' in value:
+            detail({'rag_context': value['rag_context']})
         for number, entry in enumerate(entries, 1):
             role = '主接口' if entry.get('id') == value.get('primary_id') or entry.get('role') == 'primary' else '备用接口'
             print(f'{number}. {safe(entry.get("name") or "未命名接口")}（{role}，' + ('启用' if entry.get('enabled') else '停用') + '）')

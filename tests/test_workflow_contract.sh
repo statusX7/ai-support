@@ -46,7 +46,7 @@ assert.equal(menus.welcome.enabled, true);
 assert.equal(menus.welcome.auto_open, false);
 assert.equal(menus.welcome.trigger, 'first_message');
 const handoff = JSON.parse(fs.readFileSync(path.join(root, 'config/handoff.yaml.example'), 'utf8'));
-assert.equal(handoff.handoff.resume_after_seconds, 1800);
+assert.equal(handoff.handoff.resume_after_seconds, 3600);
 assert(!handoff.handoff.on_no_answer && !handoff.handoff.on_low_confidence);
 assert.equal(byName.get('公开欢迎配置').parameters.httpMethod, 'GET');
 assert.equal(byName.get('公开欢迎配置').parameters.path, 'crispai-public-config');

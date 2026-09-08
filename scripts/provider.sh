@@ -24,6 +24,7 @@ provider_main() {
           '迁移：migrate（幂等迁移原单接口，不调用上游）' \
           '完整池：validate-file FILE | apply-file FILE | import FILE；管理员测试签名：admin-marker [MILLISECONDS]' \
           '导入草稿：draft | draft-entry ID | edit-draft ID FILE | apply-draft' \
+          '异常恢复：recover-rag-context（恢复未完成的知识窗口事务）' \
           '候选文件：{provider:{name,base_url,model,api_mode,custom_headers,remove_header,capabilities,context_window,max_output_tokens},api_key}。空 Key 保留；新增必须填写。' \
           '输出为一份 JSON；普通交互由管理菜单提供中文呈现。'
         return ;;
@@ -34,6 +35,10 @@ provider_main() {
   if (( $# )); then shift; fi
   deploy_dir=$(resolve_deploy_dir "$deploy_request")
   assert_managed_installation "$deploy_dir"
+  if [[ "$action" == internal-rag-context-apply ]]; then
+    provider_rag_context_apply "$deploy_dir" "${1:?}"
+    return
+  fi
   python3 "${PROVIDER_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" "$action" "$@"
 }
 

@@ -7,7 +7,7 @@
 | Crisp | 访客聊天框、公开消息、真人界面与事件 |
 | n8n | 已鉴权持久接收、短事务控制、规则/欢迎、发送与恢复扫描 |
 | AnythingLLM | 文档解析、Embedding、workspace 向量检索和聊天编排 |
-| Provider 适配器 | 同一项目的 Chat 转发或 Chat→Responses 最小兼容，不自建 RAG |
+| Provider 适配器 | 同一项目的主备路由、跨阶段预算与 Chat→Responses 最小兼容，不自建 RAG |
 | 第三方 AI | 实际文本与可选视觉推理 |
 | PostgreSQL | n8n 配置、工作流与其必要数据库 |
 | 可选 Caddy | 受管 HTTPS，仅开放指定 Hook/SDK/UI 路由 |
@@ -38,10 +38,10 @@ Crisp Webhook
   → Secret/签名、website/session、大小与事件去重
   → 持久保存任务；人工/合法按钮控制短事务优先提交
   → HTTP 确认
-  → 持久任务处理：总开关 → 会话模式/到期 → 反馈/菜单/关键词
+  → 持久任务处理：总开关 → 会话模式/到期 → 旧评价退役/菜单/关键词
   → 公开上下文 + AnythingLLM 检索/模型（或已验证视觉路径）
   → 全局 revision + 会话 generation + 当前人工状态再次检查
-  → 统一 automated sender / 预登记 fingerprint
+  → 统一受管发送 / 预登记 fingerprint
   → 发送确认后统计、可选标签；超时未知先对账
 ```
 
@@ -51,7 +51,7 @@ Crisp Webhook
 
 v1.2.1 的访客昵称与内部身份分离：Crisp POST 前在同一会话短锁内，将本项目 fingerprint 登记到 `data/runtime/owned-<会话摘要>-<分桶>.json`，再记录发送任务。使用官方可选中性昵称，不请求自动消息徽标；识别自回流不依赖昵称、正文或该徽标。索引只含 schema 和指纹，不含消息正文；每会话按低 8 位分为最多 256 桶，每桶最多 50000 条、读取上限 1 MiB。详细出站记录清理不删除身份索引，它随完整快照保存，不进入业务迁移包、日志清理或公开报告；损坏/超限时拒绝相关出站，而不猜测真人身份。历史 `automated=true` 继续兼容，未登记的真人公开回复照常优先暂停该会话。
 
-关键词只发 offer，仍处 AI；有效点击先暂停再确认，真人公开回复无需按钮立即暂停。倒计时从最近有效真人/首次确认开始，0 永久，用户消息不延长；到期只允许新问题，不补历史、不发恢复提示。自己的 automated operator、note、在线、输入和后台 opened 均不当真人。
+关键词只发 offer，仍处 AI；有效点击先暂停再确认，真人公开回复无需按钮立即暂停。倒计时从最近有效真人/首次确认开始，新装及缺省为 3600 秒，0 永久，已有合法显式值保持，用户消息不延长；到期只允许新问题，不补历史、不发恢复提示。自己的自动出站、note、在线、输入和后台 opened 均不当真人。
 
 ## Prompt、知识与上下文
 
@@ -59,13 +59,15 @@ v1.2.1 的访客昵称与内部身份分离：Crisp POST 前在同一会话短�
 
 公开 Crisp 历史是上下文来源，按当前会话限定与截断；人工回复显式加入，内部 note 和控件不当业务问题。AnythingLLM stable sessionId + reset 避免重复内部聊天记录。当前 Prompt 写入 workspace，图片请求读取同一生效投影中的完整正文，不再独自截成 30000 字符。文件上限不等于模型 token 上限，过长请求仍受当前模型/应用预算限制。Provider 协议和容器访问地址必须通过实际调用；第三方缺失时协议服务只能证明格式接线，不证明真实模型语义。
 
+AnythingLLM 的受管预处理窗口由已启用、非草稿且协议已确认条目的最大配置窗口派生，每个上游仍执行各自上限。配置变更仅在该聚合值变化时重建本实例 AnythingLLM，核对实际容器环境和鉴权 API；正常主备故障切换不重建。窗口事务及失败恢复期间保护普通推理和旧输出，人工控制继续持久接收。最终文本请求按当前资料代次核对完整 Prompt，不能用 workspace 已保存全文代替真正上游载荷的保真证明。
+
 ## 欢迎网页边界
 
 first_message 无需网页变更。widget_load/chat_open 模式用一次性无密钥 SDK：session:loaded/chat:opened → session:event → Crisp session:sync:events Hook → 后端受控欢迎。chat:open 独立控制展开；公开配置仅白名单字段并结合会话人工状态，不能匿名接管或向别的会话发送。
 
 ## 配置和维护
 
-业务 YAML/JSON、Prompt 与多库原文是权威源，秘密单独 `.env`。`materials.sh` 统一菜单与直接编辑的应用：严格 UTF-8/大小/schema/引用校验→有效版本备份→规范化候选→实际 API 同步→组件回读→发布 `config/materials-applied.json`。用户无需编辑 manifest 或 Code。Prompt/索引慢同步先发布 `applying` 代次，使旧 AI 结果失效；失败恢复上一份有效资料和外部应用，回退未确认则保持保护状态。配置/知识根目录原 inode 保留，避免容器仍绑定被挪走的旧目录。
+业务 YAML/JSON、Prompt 与多库原文是权威源，实例秘密在 `.env`，多接口秘密在受限 `secrets/provider/` 分代保存。`materials.sh` 统一菜单与直接编辑的应用：严格 UTF-8/大小/schema/引用校验→有效版本备份→规范化候选→实际 API 同步→组件回读→发布 `config/materials-applied.json`。用户无需编辑 manifest 或 Code。Prompt/索引慢同步先发布 `applying` 代次，使旧 AI 结果失效；失败恢复上一份有效资料和外部应用，回退未确认则保持保护状态。配置/知识根目录原 inode 保留，避免容器仍绑定被挪走的旧目录。
 
 | 内容 | 稳定位置 | 修改方式/消费者 |
 | --- | --- | --- |
@@ -74,7 +76,9 @@ first_message 无需网页变更。widget_load/chat_open 模式用一次性无�
 | 库定义 | `knowledge/catalog.json` | 可编辑已登记库名/启用状态；稳定 ID/source/projection 由管理程序维护 |
 | 索引关系 | `data/knowledge-manifest.json` | 实际索引对账，由程序维护，不手改 |
 | 生效资料 / 检索来源映射 | `config/materials-applied.json`、`data/runtime/knowledge-map.json` | 应用后原子发布，运行时验证映射代次 |
-| 秘密 / 会话控制与任务 | `.env`、`data/runtime/` | 受限解析/短事务；不是日志清理对象 |
+| 接口池及生效投影 | `config/provider-pool.yaml`、`config/provider-pool-applied.json` | 单一池源，成套候选验证、秘密引用及热加载 |
+| 窗口维护事务 | `config/provider-pool-transaction.json` | 程序维护的受限保护记录；只从显式恢复入口处理，不手删 |
+| 秘密 / 会话控制与任务 | `.env`、`secrets/provider/`、`data/runtime/`、`data/provider-router/` | 受限解析/短事务；不是日志清理对象 |
 | 维护事件 / 诊断历史 | `logs/` | 白名单事件、脱敏导出与系统级 timer |
 | 恢复资料 | `backups/` | 完整敏感快照与业务迁移包分开，不上传 |
 

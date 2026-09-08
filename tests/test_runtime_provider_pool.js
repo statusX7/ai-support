@@ -74,7 +74,7 @@ async function fixture(label) {
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);tasks.push(body);
     // 协议 fixture 仅模拟 RAG 附加知识的消息布局，信封仍由生产 runtime 签名。
     if(f.beforeAnswer)await f.beforeAnswer(body);
-    const response=await postAdapter({model:'anythingllm-compat-model',messages:[{role:'system',content:prompt+'\n启用知识：合成处理码是蓝色。'},{role:'user',content:body.message}]});
+    const response=await postAdapter({model:'anythingllm-compat-model',messages:[{role:'system',content:f.ragSystem ?? prompt+'\n启用知识：合成处理码是蓝色。'},{role:'user',content:body.message}]});
     f.answerResponses.push(response);
     res.writeHead(response.status,{'content-type':'application/json'});res.end(JSON.stringify(response.status===200?{textResponse:response.body.choices[0].message.content,sources:[{docpath:'synthetic/blue.json',score:0.9}]}:{error:'controlled-inference-failure'}));
   });
@@ -127,6 +127,19 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.calls[2].body.model,'synthetic-backup-2');assert(!JSON.stringify(f.calls).includes('CRISPAI_PROVIDER_CONTEXT'));assert(!f.sent[0].content.includes('是否解决'));
     await f.deliver(f.event('session_pool_text1','是'));assert.equal(f.sent.length,2);assert.equal(f.tasks.length,2);assert(f.tasks[1].message.includes('保存操作'));assert(f.tasks[1].message.includes('访客当前问题：是'));
   });
+  await test('RAG丢失业务Prompt时不推理或遍历备用，仅自然澄清且重启不重识图',async f=>{
+    f.ragSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
+    const event=f.event('session_pool_prompt1','合成普通问题');
+    assert.equal((await f.deliver(event)).status,'sent');assert.equal(f.calls.length,0);assert.equal(f.sent.length,1);
+    assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'context_preparation_incomplete');
+    assert.equal(f.sent[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');assert.equal(f.state(event.data.session_id).mode,'ai');
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
+    const imageEvent=f.event('session_pool_promptimage',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
+    assert.equal((await f.deliver(imageEvent)).status,'sent');assert.equal(f.calls.length,1);assert.equal(f.calls[0].visual,true);
+    assert.equal(f.answerResponses[1].body.error.code,'context_preparation_incomplete');assert.equal(f.sent.length,2);assert.equal(f.state(imageEvent.data.session_id).image_context.length,1);
+    assert.equal(f.state(imageEvent.data.session_id).mode,'ai');f.restart();await f.deliver(imageEvent);
+    assert.equal(f.calls.length,1);assert.equal(f.sent.length,2);assert.equal(f.tasks.length,2);
+  });
   await test('视觉与RAG回答共享三次上限、重启不重复识图或重放答案',async f=>{
     f.publish(pool=>{pool.policy.max_attempts=3;});f.failed=new Set([0]);f.failAnswer=true;
     const event=f.event('session_pool_image1',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
@@ -169,7 +182,7 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.deepEqual(f.calls.map(call=>call.index),[0,1,1,2]);assert.equal(f.calls.filter(call=>call.visual).length,2);assert.equal(f.tasks.length,1);assert.match(f.tasks[0].message,/蓝色保存按钮/);
     assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'question_timeout');assert.equal(stored.terminal.code,'question_timeout');assert.equal(stored.stages.answer.result,undefined);
     assert.ok(ended>=stored.deadline);assert.ok(ended-stored.deadline<700);assert.ok(ended-f.calls[0].at<3700);assert.ok(ended-f.calls.at(-1).at<2200);assert.equal(answerClosed,true);
-    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'暂时无法回复，请稍后再试。');assert.equal(f.state(event.data.session_id).mode,'ai');
+    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。');assert.equal(f.state(event.data.session_id).mode,'ai');
     f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
   });
   await test('A21 全池失败后多个新会话得到单次安全提示，保护期及重启不重复轰击上游',async f=>{
@@ -182,7 +195,7 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.calls.length,3);assert.equal(f.tasks.length,6);assert.equal(f.sent.length,6);
     for(const event of [initial,...events]) {
       const messages=f.sent.filter(item=>item.session_id===event.data.session_id);assert.equal(messages.length,1);
-      assert.equal(messages[0].content,'暂时无法回复，请稍后再试。');assert.equal(f.state(event.data.session_id).mode,'ai');
+      assert.equal(messages[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');assert.equal(f.state(event.data.session_id).mode,'ai');
       assert.equal((await f.receive(event)).reason,'重复事件已忽略');
     }
     assert.equal(f.calls.length,3);assert.equal(f.sent.length,6);

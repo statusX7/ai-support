@@ -14,6 +14,9 @@ fs.mkdirSync(work, { recursive: true });
 const evidence = fs.mkdtempSync(path.join(work, 'feedback-runtime-'));
 const digest = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const invitation = '此回答是否解决问题？\n👍 是\n👎 否';
+const clarification = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
+const imageClarification = '请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。';
+const legacyFailure = '暂时无法回复，请稍后再试。';
 const makeFixture = (name) => {
   const root = path.join(evidence, name);
   for (const directory of ['config', 'data/runtime', 'data/analytics']) fs.mkdirSync(path.join(root, directory), { recursive: true });
@@ -60,11 +63,15 @@ const makeFixture = (name) => {
     }
     if (parsed.hostname === 'anythingllm') {
       modelRequests.push(structuredClone(options.body));
+      if (modes.onModelResponse) await modes.onModelResponse();
+      if (modes.modelThrow) throw Object.assign(new Error('synthetic-timeout'), { code: 'ETIMEDOUT' });
+      if (modes.modelPayload !== undefined) return { status: 200, body: modes.modelPayload };
       return { status: modes.modelFailure ? 503 : 200, body: modes.modelFailure ? { error: 'synthetic-failure' } : { textResponse: modes.answer, sources: [{ docpath: 'synthetic/document.json', score: 0.9 }] } };
     }
     if (parsed.hostname === 'provider.invalid') {
       visionRequests.push(structuredClone(options.body));
-      return { status: 200, body: { choices: [{ message: { content: '截图显示保存设置按钮。' } }] } };
+      if (modes.visionFailure) return { status: 503, body: { error: { code: 'synthetic-vision-error' } } };
+      return { status: 200, body: { choices: [{ message: { content: modes.visionAnswer ?? '截图显示保存设置按钮。' } }] } };
     }
     if (parsed.hostname === 'storage.crisp.chat') return { status: modes.imageFailure ? 404 : 200, headers: { 'content-type': 'image/png' }, body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64') };
     throw new Error('禁止非 synthetic 网络请求');
@@ -233,9 +240,9 @@ const test = async (name, action) => {
     assert.equal(f.visionRequests.length, 1); assert.equal(f.sent.at(-1).content, f.modes.answer);
     f.modes.imageFailure = true;
     await f.deliver(f.event('session_badimage1', { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
-    assert.match(f.sent.at(-1).content, /补充报错文字/); assert.equal(f.state('session_badimage1').mode, 'ai');
+    assert.equal(f.sent.at(-1).content, imageClarification); assert.equal(f.state('session_badimage1').mode, 'ai');
     f.modes.modelFailure = true; await f.deliver(f.event('session_badmodel1', '模型错误的普通问题'));
-    assert.equal(f.sent.at(-1).content, '暂时无法回复，请稍后再试。'); assert.equal(f.state('session_badmodel1').mode, 'ai');
+    assert.equal(f.sent.at(-1).content, clarification); assert.equal(f.state('session_badmodel1').mode, 'ai');
     const count = f.sent.length; const inferenceCount = f.modelRequests.length;
     f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 2, applied_revision: 2 });
     await f.deliver(f.event('session_disable01', '否'));
@@ -317,6 +324,359 @@ const test = async (name, action) => {
     } finally { fs.readFileSync = originalRead; }
     assert(poolReads >= 3); assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
     assert.equal(Object.keys(f.rawState(session).outgoing).length, 0);
+  });
+
+  await test('F14 所有已知系统错误出口使用受控澄清，不消费旧自定义失败句或误计成功', async () => {
+    for (const kind of ['http', 'throw', 'payload-error', 'missing-payload', 'expired', 'image-download', 'image-disabled', 'image-provider', 'image-rag']) {
+      const f = makeFixture('natural-error-' + kind); const session = 'session_natural-' + kind;
+      const policy = f.readConfig('handoff');
+      policy.handoff.failure_message = '系统忙，请稍后再试；后台正在检查。';
+      f.writeConfig('handoff', policy);
+      if (kind === 'http' || kind === 'image-rag') f.modes.modelFailure = true;
+      if (kind === 'throw') f.modes.modelThrow = true;
+      if (kind === 'payload-error') f.modes.modelPayload = { error: 'synthetic-provider-error' };
+      if (kind === 'missing-payload') f.modes.modelPayload = null;
+      if (kind === 'image-download') f.modes.imageFailure = true;
+      if (kind === 'image-provider') f.modes.visionFailure = true;
+      if (kind === 'image-disabled') {
+        f.env.AI_SUPPORTS_VISION = 'false';
+        f.writeConfig('provider', { provider: { supports_vision: false } });
+      }
+      if (kind === 'expired') {
+        const job = f.makeJob(session, 'expired-error', null, { inference: { pool_revision: null, deadline_at: f.now() - 1 } });
+        await f.seed(session, state => state.jobs.push(job));
+        await f.runtime().process(f.key(session));
+        assert.equal(f.modelRequests.length, 0);
+      } else {
+        const data = kind.startsWith('image-') ? { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' } : '合成问题';
+        await f.deliver(f.event(session, data, { type: kind.startsWith('image-') ? 'file' : 'text' }));
+      }
+      assert.equal(f.sent.length, 1, kind);
+      assert.equal(f.sent[0].content, kind.startsWith('image-') ? imageClarification : clarification, kind);
+      assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
+      assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
+      assert.deepEqual(f.readConfig('handoff'), policy, '兼容原配置但不直接消费其系统错误文案');
+      assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt);
+      f.noFeedback();
+    }
+  });
+
+  await test('F15 旧已计划 safe_error 重启与排队恢复统一自然文案，且不重新推理', async () => {
+    for (const kind of ['text', 'image']) for (const outgoingStatus of ['none', 'queued']) {
+      const f = makeFixture('natural-cached-' + kind + '-' + outgoingStatus); const session = 'session_cached-error';
+      const plan = { type: 'text', purpose: 'safe_error', ordinary: true, content: '旧欢迎语\n\n' + legacyFailure, fingerprint: 78001 };
+      const job = f.makeJob(session, 'cached-safe-error', plan);
+      if (kind === 'image') job.data = f.event(session, { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }).data;
+      await f.seed(session, state => {
+        state.jobs.push(job);
+        if (outgoingStatus !== 'none') state.outgoing['78001'] = f.makeOutgoing(job, plan.content, outgoingStatus);
+      });
+      f.restart(); await f.runtime().scan();
+      assert.equal(f.rawState(session).jobs[0].plan.content, kind === 'image' ? imageClarification : clarification);
+      if (outgoingStatus !== 'none') assert.equal(f.rawState(session).outgoing['78001'].body.content, kind === 'image' ? imageClarification : clarification);
+      assert.equal((await f.runtime().process(f.key(session))).status, 'sent');
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, kind === 'image' ? imageClarification : clarification);
+      assert.equal(f.modelRequests.length, 0); assert.equal(f.visionRequests.length, 0);
+      assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
+    }
+  });
+
+  await test('F16 旧系统错误发送未知先对账，已送历史不改、未送才按同指纹发送自然句', async () => {
+    for (const status of ['unknown', 'sending']) for (const found of [false, true]) {
+      const f = makeFixture('natural-uncertain-' + status + '-' + found); const session = 'session_uncertain-error';
+      const job = f.makeJob(session, 'uncertain-safe-error', { type: 'text', purpose: 'safe_error', ordinary: true, content: legacyFailure, fingerprint: 79001 });
+      const record = f.makeOutgoing(job, legacyFailure, status);
+      await f.seed(session, state => { state.jobs.push(job); state.outgoing['79001'] = record; });
+      const historical = [{ ...record.body, timestamp: f.now() - 1000 }];
+      if (found) f.histories.set(session, structuredClone(historical));
+      f.restart(); await f.runtime().scan();
+      assert.equal(f.rawState(session).outgoing['79001'].body.content, legacyFailure, '未知回执正文在核实前保留');
+      assert.equal((await f.runtime().process(f.key(session))).status, 'sent');
+      assert.equal(f.sent.length, found ? 0 : 1);
+      if (found) assert.deepEqual(f.histories.get(session), historical);
+      else { assert.equal(f.sent[0].content, clarification); assert.equal(f.sent[0].fingerprint, 79001); }
+      assert.equal(f.modelRequests.length, 0); assert.equal(f.state(session).mode, 'ai');
+      assert.equal(f.rawState(session).outgoing['79001'].status, 'sent');
+    }
+  });
+
+  await test('F17 自然错误计划仍服从全局停用与人工状态，未发送时不创建身份记录', async () => {
+    for (const mode of ['disabled', 'human']) {
+      const f = makeFixture('natural-cancel-' + mode); const session = 'session_cancel-error';
+      const job = f.makeJob(session, 'cancel-safe-error', { type: 'text', purpose: 'safe_error', ordinary: true, content: legacyFailure, fingerprint: 80001 });
+      await f.seed(session, state => { state.jobs.push(job); if (mode === 'human') { state.mode = 'human'; state.resume_at = null; } });
+      if (mode === 'disabled') f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 1, applied_revision: 1 });
+      f.restart(); assert.equal((await f.runtime().process(f.key(session))).status, 'cancelled');
+      assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
+      assert.equal(fs.readdirSync(path.join(f.root, 'data/runtime')).filter(name => name.startsWith('owned-')).length, 0);
+      assert.equal(f.state(session).mode, mode === 'human' ? 'human' : 'ai');
+    }
+  });
+
+  await test('F18 不按文字相似度删除普通问答或业务引用，内部约束独立加入且原 Prompt 不变', async () => {
+    const f = makeFixture('natural-ownership'); const session = 'session_error-quotation';
+    const quoted = '网站显示“' + legacyFailure + '”时，应该怎样检查网络？';
+    f.modes.answer = '请先记录网页中的“' + legacyFailure + '”，再核对网络设置。';
+    await f.deliver(f.event(session, quoted));
+    assert.equal(f.sent.at(-1).content, f.modes.answer);
+    assert(f.modelRequests.at(-1).message.includes('访客当前问题：' + quoted));
+    assert(f.modelRequests.at(-1).message.includes('不得使用“暂时无法回复，请稍后再试。”及同类系统忙、稍后再试的机械话术'));
+    await f.deliver(f.event('session_error-image-rule', { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
+    assert.equal(f.visionRequests[0].messages[0].content, f.prompt);
+    assert(f.visionRequests[0].messages[1].content.includes('不得使用“暂时无法回复，请稍后再试。”及同类系统忙、稍后再试的机械话术'));
+    const business = f.makeJob(session, 'business-quote', { type: 'text', purpose: 'keyword_reply', ordinary: true, content: legacyFailure, fingerprint: 81001 });
+    await f.seed(session, state => state.jobs.push(business));
+    await f.runtime().process(f.key(session));
+    assert.equal(f.sent.at(-1).content, legacyFailure, '普通业务固定回复不按系统错误来源处理');
+    assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt);
+  });
+
+  await test('F19 人工公开回复始终接管，缺省3600秒，显式秒数和0仍有效且访客不刷新计时', async () => {
+    for (const duration of ['template', 'missing', 42, 1800, 0]) {
+      const f = makeFixture('human-default-' + duration); const session = 'session_human-default';
+      const policy = f.readConfig('handoff');
+      if (duration === 'missing') delete policy.handoff.resume_after_seconds;
+      else if (typeof duration === 'number') policy.handoff.resume_after_seconds = duration;
+      policy.handoff.enabled = false; policy.handoff.disable_ai = false;
+      f.writeConfig('handoff', policy);
+      const event = f.event(session, '纯合成人工公开说明', { from: 'operator', user: { nickname: '合成操作者', user_id: 'b21e3759-21a4-4b3a-8c7a-379e803af142' } });
+      event.event = 'message:received';
+      await f.receive(event);
+      const seconds = typeof duration === 'number' ? duration : 3600;
+      assert.equal(f.state(session).mode, 'human');
+      assert.equal(f.state(session).pause_reason, 'operator_reply');
+      const deadline = seconds === 0 ? null : f.now() + seconds * 1000;
+      assert.equal(f.state(session).resume_at, deadline, String(duration));
+      f.advance(1000); await f.deliver(f.event(session, '是，我补充了信息。'));
+      assert.equal(f.state(session).resume_at, deadline); assert.equal(f.state(session).mode, 'human');
+      assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
+      if (seconds > 0) {
+        f.advance(seconds * 1000 - 1001); await f.deliver(f.event(session, '到期前仍由人工处理'));
+        assert.equal(f.state(session).mode, 'human'); assert.equal(f.sent.length, 0);
+        f.advance(1); await f.deliver(f.event(session, '到期后新的合成问题'));
+        assert.equal(f.state(session).mode, 'ai'); assert.equal(f.sent.length, 1);
+      } else {
+        f.advance(7200000); await f.deliver(f.event(session, '永久人工不自动恢复'));
+        assert.equal(f.state(session).mode, 'human'); assert.equal(f.sent.length, 0);
+      }
+    }
+  });
+
+  await test('F20 配置迁移精确更新旧失败默认和缺省秒数，保留显式1800、自定义及0且重复不变', async () => {
+    const variants = [
+      { failure: legacyFailure, seconds: 'missing' },
+      { failure: '当前自动客服暂时不可用，请稍后再试。', seconds: 1800 },
+      { failure: '自动客服暂时无法回答，请稍后再试。', seconds: 0 },
+      { failure: '自定义历史故障原文：系统忙，请稍后再试。', seconds: 37 },
+    ];
+    for (const [index, variant] of variants.entries()) {
+      const f = makeFixture('natural-config-' + index), input = path.join(f.root, 'config/handoff.yaml');
+      const policy = f.readConfig('handoff'); policy.handoff.failure_message = variant.failure;
+      if (variant.seconds === 'missing') delete policy.handoff.resume_after_seconds;
+      else policy.handoff.resume_after_seconds = variant.seconds;
+      f.writeConfig('handoff', policy);
+      const before = fs.readFileSync(input);
+      const migrate = () => {
+        const result = spawnSync('bash', ['-c', 'source "$1"; configuration_migrate "$2"', 'synthetic-configuration-migrate', path.join(project, 'scripts/configuration.sh'), f.root], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr);
+      };
+      migrate();
+      const expected = structuredClone(policy);
+      expected.handoff.resume_after_seconds = variant.seconds === 'missing' ? 3600 : variant.seconds;
+      if (index < 3) expected.handoff.failure_message = clarification;
+      assert.deepEqual(f.readConfig('handoff'), expected);
+      const applied = fs.readFileSync(input); migrate();
+      assert.deepEqual(fs.readFileSync(input), applied, '再次迁移不改变当前合法选择');
+      if (index < 3) {
+        const backup = path.join(f.root, 'backups/config-history/handoff.display.pre-v1.2.1.yaml');
+        assert.deepEqual(fs.readFileSync(backup), before); assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+      }
+      assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt);
+    }
+  });
+
+  await test('F21 缺知识与低置信度真实出口使用自然默认，旧已应用投影同样受控且自定义保留', async () => {
+    const legacy = {
+      no_answer_message: ['知识库暂时没有足够信息，请换一种方式描述问题。', '目前知识还不足以确认，请补充您遇到的具体情况。'],
+      low_confidence_message: ['当前答案可信度不足，请补充更多问题细节。', '现有资料还不足以确定答案，请补充更多细节。'],
+    };
+    for (const field of Object.keys(legacy)) for (const storage of ['raw', 'applied']) for (const variant of ['example', 0, 1, 'missing', 'custom']) {
+      const f = makeFixture('natural-default-' + field + '-' + storage + '-' + variant), session = 'session_natural-default';
+      const policy = f.readConfig('handoff'), custom = '请告诉我你使用的设备型号与发生问题的具体步骤。';
+      if (typeof variant === 'number') policy.handoff[field] = legacy[field][variant];
+      if (variant === 'missing') delete policy.handoff[field];
+      if (variant === 'custom') policy.handoff[field] = custom;
+      f.writeConfig('handoff', policy);
+      if (storage === 'applied') {
+        const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map(name => [name, f.readConfig(name)]));
+        const projection = { schema_version: 1, state: 'applied', revision: 1, source_sha256: digest('synthetic-materials-source'), configuration,
+          prompt: { text: f.prompt, bytes: Buffer.byteLength(f.prompt), sha256: digest(f.prompt) }, knowledge: { map_sha256: '' } };
+        fs.writeFileSync(path.join(f.root, 'config/materials-applied.json'), JSON.stringify(projection));
+        f.writeConfig('handoff', { handoff: { ...policy.handoff, [field]: '未应用编辑不应生效' } });
+      }
+      f.modes.modelPayload = field === 'no_answer_message' ? { textResponse: '', sources: [] }
+        : { textResponse: '合成低分候选答案', sources: [{ docpath: 'synthetic-low-score.json', score: 0.01 }] };
+      await f.deliver(f.event(session, '请帮我确认这个具体问题。'));
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.sent[0].content, variant === 'custom' ? custom : clarification, [field, storage, variant].join('/'));
+      assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
+      assert.equal(f.modelRequests.length, 1); f.noFeedback();
+      assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt);
+    }
+  });
+
+  await test('F22 资料归一化精确迁移两类旧澄清默认，缺省补齐而自定义原文不改', async () => {
+    for (const [index, messages] of [
+      ['知识库暂时没有足够信息，请换一种方式描述问题。', '当前答案可信度不足，请补充更多问题细节。'],
+      ['目前知识还不足以确认，请补充您遇到的具体情况。', '现有资料还不足以确定答案，请补充更多细节。'],
+      [undefined, undefined], ['自定义缺知识原文。', '自定义低置信度原文。'],
+    ].entries()) {
+      const f = makeFixture('natural-normalize-' + index), policy = f.readConfig('handoff');
+      for (const [position, field] of ['no_answer_message', 'low_confidence_message'].entries()) {
+        if (messages[position] === undefined) delete policy.handoff[field];
+        else policy.handoff[field] = messages[position];
+      }
+      f.writeConfig('handoff', policy);
+      const output = path.join(f.root, 'normalized-handoff.json');
+      const result = spawnSync('bash', ['-c', 'source "$1"; configuration_normalize_file handoff "$2" "$3"', 'synthetic-normalize', path.join(project, 'scripts/configuration.sh'), path.join(f.root, 'config/handoff.yaml'), output], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      const normalized = JSON.parse(fs.readFileSync(output));
+      assert.equal(normalized.handoff.no_answer_message, index === 3 ? messages[0] : clarification);
+      assert.equal(normalized.handoff.low_confidence_message, index === 3 ? messages[1] : clarification);
+      assert.deepEqual(f.readConfig('handoff'), policy, '归一化候选不改可编辑原文');
+    }
+  });
+
+  await test('F23 窗口事务存在或不安全时接收即取消普通任务，不读受限marker且清除后旧消息不复活', async () => {
+    for (const kind of ['applying', 'restore_failed', 'malformed', 'directory', 'symlink', 'permission']) {
+      const f = makeFixture('window-marker-' + kind), session = 'session_window-marker';
+      const marker = path.join(f.root, 'config/provider-pool-transaction.json');
+      if (kind === 'directory') fs.mkdirSync(marker);
+      else if (kind === 'symlink') fs.symlinkSync(path.join(f.root, 'missing-marker-target'), marker);
+      else if (kind !== 'permission') fs.writeFileSync(marker, kind === 'malformed' ? 'invalid-synthetic-json' : JSON.stringify({ phase: kind }), { mode: 0o600 });
+      const read = fs.readFileSync, lstat = fs.lstatSync; let markerReads = 0;
+      const input = f.event(session, '窗口应用期间的普通合成问题'); let received;
+      try {
+        fs.readFileSync = (file, ...args) => { if (file === marker) { markerReads += 1; throw new Error('不能读取窗口marker正文'); } return read(file, ...args); };
+        if (kind === 'permission') fs.lstatSync = (file, ...args) => { if (file === marker) throw Object.assign(new Error('synthetic-permission'), { code: 'EACCES' }); return lstat(file, ...args); };
+        received = await f.receive(input);
+        assert.equal(received.accepted, true); assert.equal(received.route, 'ignore', kind);
+        const job = f.rawState(session).jobs.find(item => item.id === received.jobId);
+        assert.equal(job.status, 'cancelled'); assert.equal(job.data, undefined);
+        assert.equal(markerReads, 0); assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
+      } finally { fs.readFileSync = read; fs.lstatSync = lstat; }
+      if (kind === 'directory') fs.rmdirSync(marker);
+      else if (kind !== 'permission') fs.unlinkSync(marker);
+      f.restart(); assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
+      assert.equal((await f.receive(input)).route, 'ignore'); assert.equal(f.modelRequests.length, 0);
+      await f.deliver(f.event(session, '事务完成后的新合成问题'));
+      assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, 1); assert.equal(f.state(session).mode, 'ai');
+    }
+  });
+
+  await test('F24 窗口维护拦截缓存答案、错误澄清及最后注册竞态，不新增模型调用或自有指纹', async () => {
+    for (const kind of ['cached-answer', 'cached-error', 'model-error', 'register-race']) {
+      const f = makeFixture('window-send-' + kind), session = 'session_window-send';
+      const marker = path.join(f.root, 'config/provider-pool-transaction.json');
+      const createMarker = () => fs.writeFileSync(marker, JSON.stringify({ phase: 'restore_failed' }), { mode: 0o600 });
+      let result;
+      if (kind === 'model-error') {
+        f.modes.onModelResponse = createMarker; f.modes.modelFailure = true;
+        result = await f.deliver(f.event(session, '窗口事务在网络返回前开始'));
+      } else {
+        const job = f.makeJob(session, kind, { type: 'text', purpose: kind === 'cached-error' ? 'safe_error' : 'ai_text', ordinary: true, content: legacyFailure, fingerprint: 82001 });
+        await f.seed(session, state => state.jobs.push(job));
+        if (kind === 'register-race') {
+          const lstat = fs.lstatSync; let checks = 0;
+          try {
+            fs.lstatSync = (file, ...args) => {
+              if (file === marker && ++checks === 2) { createMarker(); throw Object.assign(new Error('synthetic-previous-missing'), { code: 'ENOENT' }); }
+              return lstat(file, ...args);
+            };
+            result = await f.runtime().process(f.key(session));
+            assert(checks >= 3, '最终注册必须再次检查维护标记');
+          } finally { fs.lstatSync = lstat; }
+        } else { createMarker(); result = await f.runtime().process(f.key(session)); }
+      }
+      assert.equal(result.status, 'cancelled', kind);
+      assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, kind === 'model-error' ? 1 : 0);
+      assert.equal(fs.readdirSync(path.join(f.root, 'data/runtime')).filter(name => name.startsWith('owned-')).length, 0);
+      assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
+      fs.unlinkSync(marker); f.modes.onModelResponse = null; f.modes.modelFailure = false;
+      assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
+    }
+  });
+
+  await test('F25 窗口事务仍立即接收A人工控制，B自有回流与人工offer不受混淆', async () => {
+    const f = makeFixture('window-control'), sessionA = 'session_window-human', sessionB = 'session_window-own';
+    await f.deliver(f.event(sessionB, '建立真实合成自有发送记录'));
+    const own = structuredClone(f.sent[0]);
+    const pending = f.makeJob(sessionA, 'pending-before-human', { type: 'text', purpose: 'ai_text', ordinary: true, content: '旧A答案' });
+    await f.seed(sessionA, state => state.jobs.push(pending));
+    const offer = { id: 'synthetic-manual-offer', kind: 'handoff', expires_at: f.now() + 600000, choices: { yes: { type: 'confirm_handoff' } } };
+    await f.seed(sessionB, state => { state.offers[offer.id] = offer; });
+    const marker = path.join(f.root, 'config/provider-pool-transaction.json');
+    fs.writeFileSync(marker, JSON.stringify({ phase: 'applying' }), { mode: 0o600 });
+    f.advance(1000);
+    const operator = f.event(sessionA, '合成人工公开回复', { from: 'operator', user: { nickname: '合成操作者', user_id: 'b21e3759-21a4-4b3a-8c7a-379e803af142' } });
+    operator.event = 'message:received'; await f.receive(operator);
+    assert.equal(f.state(sessionA).mode, 'human'); assert.equal(f.state(sessionA).generation, 1);
+    assert.equal(f.rawState(sessionA).jobs.find(job => job.id === pending.id).status, 'cancelled');
+    await f.receive({ website_id: f.env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: f.now(), data: { ...own, automated: false, timestamp: f.now() } });
+    assert.equal(f.state(sessionB).mode, 'ai'); assert.equal(f.state(sessionB).generation, 0);
+    assert.deepEqual(f.state(sessionB).offers[offer.id], offer);
+    await f.deliver(f.event(sessionB, '维护期间不能补发这条问题'));
+    assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, 1);
+    fs.unlinkSync(marker); f.restart();
+    await f.deliver(f.event(sessionA, '人工期间的新访客消息'));
+    await f.deliver(f.event(sessionB, '维护完成后B的独立新消息'));
+    assert.equal(f.sent.filter(message => message.session_id === sessionA).length, 0);
+    assert.equal(f.sent.filter(message => message.session_id === sessionB).length, 2);
+    assert.equal(f.state(sessionA).mode, 'human'); assert.equal(f.state(sessionB).mode, 'ai');
+  });
+
+  await test('F26 上游200完整答案恰为已知旧系统失败句时硬性自然澄清，不能计AI成功', async () => {
+    for (const [index, content] of [legacyFailure, '当前自动客服暂时不可用，请稍后再试。', '自动客服暂时无法回答，请稍后再试。'].entries()) {
+      const f = makeFixture('natural-exact-model-failure-' + index), session = 'session_exact-failure';
+      f.modes.answer = content;
+      await f.deliver(f.event(session, '真实query出口的合成问题'));
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+      assert.equal(f.modelRequests.length, 1); assert.equal(f.state(session).mode, 'ai');
+      assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'knowledge_hit').length, 0);
+      f.noFeedback();
+    }
+  });
+
+  await test('F27 已发业务菜单指向失效节点时直接请求具体问题，不暴露内部不可用话术', async () => {
+    const f = makeFixture('natural-missing-menu'), session = 'session_missing-menu';
+    await f.deliver(f.event(session, '菜单'));
+    const card = f.sent[0]; assert.equal(card.type, 'picker');
+    const menu = f.readConfig('menu');
+    delete menu.menus.computer; delete menu.menus.main.options['1'];
+    f.writeConfig('menu', menu);
+    const click = f.event(session, { ...card.content, choices: card.content.choices.map((choice, index) => ({ ...choice, selected: index === 0 })) }, { type: 'picker', fingerprint: card.fingerprint });
+    click.event = 'message:updated'; await f.deliver(click);
+    assert.equal(f.sent.length, 2); assert.equal(f.sent[1].type, 'text');
+    assert.equal(f.sent[1].content, '请描述你遇到的问题和正在进行的操作。');
+    assert.equal(f.modelRequests.length, 0); assert.equal(f.visionRequests.length, 0);
+    assert.equal(f.state(session).mode, 'ai');
+    assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
+    assert.deepEqual(f.readConfig('menu'), menu, '不改管理员的当前菜单原文');
+    f.noFeedback();
+  });
+
+  await test('F28 视觉200完整旧系统失败句不写图片记忆且不续RAG，只发送一次图片澄清', async () => {
+    for (const [index, content] of [legacyFailure, '当前自动客服暂时不可用，请稍后再试。', '自动客服暂时无法回答，请稍后再试。'].entries()) {
+      const f = makeFixture('natural-exact-vision-failure-' + index), session = 'session_exact-vision-failure';
+      f.modes.visionAnswer = content;
+      await f.deliver(f.event(session, { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
+      assert.equal(f.visionRequests.length, 1); assert.equal(f.modelRequests.length, 0, '旧系统失败句不是可供RAG使用的识图结果');
+      assert.equal(Object.hasOwn(f.rawState(session), 'image_context'), false, '失败句不能记为图片上下文');
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, imageClarification);
+      assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
+      assert.equal(f.events().filter(event => ['ai_reply', 'knowledge_hit', 'handoff'].includes(event.type)).length, 0);
+      f.noFeedback();
+    }
   });
 
   fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed, synthetic_only: true }, null, 2));

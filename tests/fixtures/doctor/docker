@@ -137,6 +137,10 @@ case "$command" in
         "${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" >> "$DOCTOR_FIXTURE_LOG"
       [[ "$expected" == "$actual" ]] || exit 1
       printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_RAG_CONTEXT'* ]]; then
+      expected=$(cat)
+      [[ "$expected" == "${DOCTOR_FIXTURE_RAG_CONTEXT:-8192}" ]] || exit 1
+      printf 'matched\n'
     elif [[ "$joined" == *'CRISPAI_EXPECTED_ENV_BINDING'* ]]; then
       service=''
       for candidate in provider-adapter anythingllm n8n; do

@@ -68,6 +68,13 @@ case "$url" in
       body='{"authenticated":true}'
     fi
     ;;
+  http://127.0.0.1:*/api/v1/system)
+    if [[ "${DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL:-0}" == 1 ]]; then
+      status=401; body='{"error":true}'
+    else
+      body=$(jq -cn --arg window "${DOCTOR_FIXTURE_RAG_API_CONTEXT:-8192}" '{settings:{GenericOpenAiTokenLimit:$window}}')
+    fi
+    ;;
   http://127.0.0.1:*/webhook/crisp-webhook\?key=ai-support-healthcheck-invalid)
     if [[ "${DOCTOR_FIXTURE_N8N_CODE_FAIL:-0}" == 1 ]]; then
       status=401; body='{"error":"generic proxy rejection"}'

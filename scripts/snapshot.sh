@@ -65,8 +65,9 @@ require_command jq
 require_command sha256sum
 require_command openssl
 require_command df
-require_command du
+require_command find
 require_command awk
+require_command python3
 REASON=${REASON//$'\n'/ }
 REASON=${REASON//$'\r'/ }
 REASON=${REASON//$'\t'/ }
@@ -140,20 +141,111 @@ snapshot_validate_optional_file() {
   fi
 }
 
+snapshot_scan_sources() {
+  # GNU find的目录打开分支并不总受-ignore_readdir_race保护。只容忍子成员
+  # 在列举/stat/open间明确ENOENT；根缺失、权限及其他I/O错误一律失败。
+  python3 - "$@" <<'PY'
+import os
+import stat
+import sys
+
+mode, *roots = sys.argv[1:]
+seen = set()
+total = 0
+
+def identity(value):
+    return value.st_dev, value.st_ino
+
+def visit(name, parent=None, required=False):
+    global total
+    if any(character in name for character in "\\\n\r\t"):
+        raise ValueError("name")
+    try:
+        value = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        if required:
+            raise
+        return
+    directory = stat.S_ISDIR(value.st_mode)
+    if not directory and not stat.S_ISREG(value.st_mode):
+        raise ValueError("kind")
+    if required and mode == "tree" and not directory:
+        raise ValueError("root")
+    key = identity(value)
+    if key not in seen:
+        seen.add(key)
+        total += (value.st_blocks + 1) // 2
+    if directory:
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            if required:
+                raise
+            return
+        try:
+            opened = os.fstat(descriptor)
+            if required and identity(opened) != key:
+                raise ValueError("root")
+            if identity(opened) not in seen:
+                seen.add(identity(opened))
+                total += (opened.st_blocks + 1) // 2
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    visit(entry.name, descriptor)
+        finally:
+            os.close(descriptor)
+    if required:
+        current = os.stat(name, follow_symlinks=False)
+        if identity(current) != key or stat.S_IFMT(current.st_mode) != stat.S_IFMT(value.st_mode):
+            raise ValueError("root")
+
+try:
+    for root in roots:
+        visit(root, required=True)
+except ValueError as error:
+    messages = {"name": "快照源包含不安全文件名", "kind": "快照源包含链接或特殊文件"}
+    print(messages.get(str(error), "快照源目录在预检时发生不安全变化"), file=sys.stderr)
+    sys.exit(1)
+except OSError:
+    print("快照源目录无法完整读取", file=sys.stderr)
+    sys.exit(1)
+if mode == "capacity":
+    print(total)
+PY
+}
+
 snapshot_validate_tree() {
-  local relative=$1 item name source="${DEPLOY_DIR}/${1}"
-  [[ -d "$source" && ! -L "$source" ]] || die "快照源目录缺失或不安全：$relative"
-  while IFS= read -r -d '' item; do
-    name=${item#"$source"/}
-    [[ "$name" != *\\* && "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] \
-      || die "快照源包含不安全文件名：$relative"
-    [[ ! -L "$item" && ( -f "$item" || -d "$item" ) ]] \
-      || die "快照源包含链接或特殊文件：$relative"
-  done < <(find "$source" -mindepth 1 -print0)
+  local relative=$1 source="${DEPLOY_DIR}/${1}"
+  snapshot_scan_sources tree "$source" || die "快照源目录预检失败：$relative"
+}
+
+snapshot_assert_provider_settled() {
+  local pending="${DEPLOY_DIR}/config/provider-pool-transaction.json"
+  [[ ! -e "$pending" && ! -L "$pending" ]] \
+    || die "接口窗口存在未完成事务，暂不能创建一致快照；请等待应用完成，或使用菜单 3→10→12 恢复后重试"
+}
+
+SNAPSHOT_POOL_LOCK_FD=''
+snapshot_acquire_provider_lock() {
+  local lock="${DEPLOY_DIR}/config/provider-pool.lock"
+  [[ -e "${DEPLOY_DIR}/config/provider-pool-applied.json" || -L "${DEPLOY_DIR}/config/provider-pool-applied.json" ]] || return 0
+  [[ ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || die "接口池快照锁不安全"
+  exec {SNAPSHOT_POOL_LOCK_FD}>>"$lock"
+  chmod 0600 "$lock"
+  flock --shared --wait 10 "$SNAPSHOT_POOL_LOCK_FD" || die "接口池仍在提交配置，暂不能创建一致快照"
+}
+
+snapshot_release_provider_lock() {
+  if [[ ${SNAPSHOT_POOL_LOCK_FD:-} =~ ^[0-9]+$ ]]; then
+    flock --unlock "$SNAPSHOT_POOL_LOCK_FD"
+    exec {SNAPSHOT_POOL_LOCK_FD}>&-
+    SNAPSHOT_POOL_LOCK_FD=''
+  fi
 }
 
 # 在容量检查及停服务之前完成源代际和树结构检查。这样 --check-capacity 不会
 # 对缺模块的部署给出假绿灯，正式快照也不会先暂停服务才发现源文件损坏。
+snapshot_assert_provider_settled
 for name in "${ROOT_FILES[@]}"; do
   snapshot_validate_file "$name" '快照源文件'
 done
@@ -208,8 +300,18 @@ if [[ -f "${DEPLOY_DIR}/data/knowledge-manifest.json" ]]; then
 fi
 
 snapshot_capacity_check() {
-  local reserve_kib required_kib
-  SNAPSHOT_SOURCE_KIB=$(du -sk -- "${SNAPSHOT_SOURCE_PATHS[@]}" | awk '{ total += $1 } END { print total + 0 }')
+  local reserve_kib required_kib source
+  for source in "${SNAPSHOT_SOURCE_PATHS[@]}"; do
+    [[ ! -L "$source" && ( -f "$source" || -d "$source" ) ]] || die "快照容量预检源缺失或不安全"
+  done
+  # du遇到短命锁消失也会失败。仍按实际分配的512字节块计量，并按设备/inode
+  # 跨根去重硬链接；每个inode向上取KiB，保留原两倍容量与管理员预留。
+  if ! SNAPSHOT_SOURCE_KIB=$(snapshot_scan_sources capacity "${SNAPSHOT_SOURCE_PATHS[@]}"); then
+    die "无法完整读取版本快照容量；请检查源目录权限或磁盘状态"
+  fi
+  for source in "${SNAPSHOT_SOURCE_PATHS[@]}"; do
+    [[ ! -L "$source" && ( -f "$source" || -d "$source" ) ]] || die "快照容量预检源缺失或不安全"
+  done
   SNAPSHOT_FREE_KIB=$(df -Pk -- "$VERSIONS_DIR" | awk 'NR == 2 { print $4 }')
   [[ "$SNAPSHOT_SOURCE_KIB" =~ ^[0-9]+$ && "$SNAPSHOT_FREE_KIB" =~ ^[0-9]+$ ]] \
     || die "无法计算版本快照容量"
@@ -241,6 +343,7 @@ TARGET_TEMP=$(mktemp -d "${VERSIONS_DIR}/.snapshot.XXXXXX")
 SERVICES_PAUSED=0
 PAUSED_SERVICES=()
 cleanup() {
+  snapshot_release_provider_lock
   if (( SERVICES_PAUSED == 1 )); then
     docker_compose "$DEPLOY_DIR" up -d "${PAUSED_SERVICES[@]}" >/dev/null 2>&1 \
       || warn "快照失败后重新启动 n8n 或 AnythingLLM 失败"
@@ -271,6 +374,10 @@ restart_paused_services() {
     SERVICES_PAUSED=0
   fi
 }
+
+# 服务停止后才锁定短配置提交；锁内只复制.env、配置及其秘密代次。
+snapshot_acquire_provider_lock
+snapshot_assert_provider_settled
 
 for name in "${ROOT_FILES[@]}"; do
   [[ -f "${DEPLOY_DIR}/${name}" && ! -L "${DEPLOY_DIR}/${name}" ]] || die "快照源文件缺失或不安全：$name"
@@ -308,23 +415,31 @@ done
 install -m 0600 -- "${DEPLOY_DIR}/n8n/workflow.json" "$STAGING/payload/n8n/workflow.json"
 
 copy_snapshot_tree() {
-  local relative=$1 item name source="${DEPLOY_DIR}/$1" target="$STAGING/payload/$1"
+  local relative=$1 item name scan_fd scan_pid source="${DEPLOY_DIR}/$1" target="$STAGING/payload/$1"
   [[ -d "$source" && ! -L "$source" ]] || die "快照源目录不安全：$relative"
+  exec {scan_fd}< <(find "$source" -mindepth 1 -print0)
+  scan_pid=$!
   while IFS= read -r -d '' item; do
     name=${item#"$source"/}
     [[ "$name" != *\\* && "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] \
       || die "快照源包含不安全文件名：$relative"
     [[ ! -L "$item" && ( -f "$item" || -d "$item" ) ]] || die "快照源包含链接或特殊文件：$relative"
-  done < <(find "$source" -mindepth 1 -print0)
+  done <&"$scan_fd"
+  exec {scan_fd}<&-
+  wait "$scan_pid" || die "快照源目录无法完整读取：$relative"
   mkdir -p -- "$target"
   cp -a -- "$source/." "$target/"
 }
 
 # 新模块、所有命名知识库及其映射均属于本机恢复范围，不再只备份根目录文档。
-for directory in config knowledge n8n scripts docs; do
+copy_snapshot_tree config
+[[ ! -d "${DEPLOY_DIR}/secrets" ]] || copy_snapshot_tree secrets
+snapshot_release_provider_lock
+
+for directory in knowledge n8n scripts docs; do
   copy_snapshot_tree "$directory"
 done
-for directory in data/n8n data/runtime data/provider-router secrets; do
+for directory in data/n8n data/runtime data/provider-router; do
   [[ ! -d "${DEPLOY_DIR}/${directory}" ]] || copy_snapshot_tree "$directory"
 done
 

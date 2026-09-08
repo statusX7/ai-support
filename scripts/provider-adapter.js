@@ -6,10 +6,33 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const {createRouter,loadPool,validateEntry,parseHeaders,RouterError,terminal,classifyFailure} = require('./provider-router.js');
-const {extractEnvelope} = require('./provider-envelope.js');
+const {extractEnvelope,promptRetained} = require('./provider-envelope.js');
 
 const MAX_INPUT_BYTES = 12 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+function appliedPrompt(root, revision) {
+  const read = (file, maximum) => {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > maximum) throw new Error('invalid prompt source');
+    return fs.readFileSync(file,'utf8');
+  };
+  const projectionPath = path.join(root,'config/materials-applied.json');
+  let source;
+  try { source = read(projectionPath,16777216); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  let prompt;
+  if (source !== undefined) {
+    const projection = JSON.parse(source);
+    prompt = projection.prompt?.text;
+    if (projection.schema_version !== 1 || projection.state !== 'applied' || projection.revision !== revision
+      || projection.configuration?.runtime?.revision !== revision || typeof prompt !== 'string'
+      || Buffer.byteLength(prompt) !== projection.prompt.bytes
+      || crypto.createHash('sha256').update(prompt).digest('hex') !== projection.prompt.sha256) throw new Error('invalid applied prompt');
+  } else prompt = read(path.join(root,'config/prompt.md'),262144);
+  if (!prompt.trim() || prompt.includes('\0') || Buffer.byteLength(prompt) > 262144) throw new Error('invalid prompt');
+  return prompt;
+}
 
 function providerSettings(environment = process.env) {
   let provider;
@@ -143,8 +166,15 @@ function writeChatStream(response,result) {
 
 function createAdapter(environment = process.env, fetchFunction) {
   let router;
+  const root = environment.PROVIDER_ROOT || '/opt/crisp-ai';
   const pooled = () => environment.PROVIDER_POOL_REQUIRED === 'true' || !!environment.PROVIDER_POOL_PATH || fs.existsSync(path.join(environment.PROVIDER_ROOT || '/opt/crisp-ai','config/provider-pool-applied.json'));
+  const configurationPending = () => {
+    try { fs.lstatSync(path.join(root,'config/provider-pool-transaction.json')); return true; }
+    catch (error) { return error.code !== 'ENOENT'; }
+  };
+  const requireApplied = () => { if (configurationPending()) throw terminal('configuration_applying','接口窗口配置正在应用或等待恢复，暂不能开始推理'); };
   const invoke = async (body,settings,signal) => {
+    if (pooled()) requireApplied();
     const converted = chatToResponses(body,settings);
     // 只构造受支持字段，不复用不同供应商的 previous_response_id、file、thread 或工具状态。
     const outbound = settings.mode === 'responses' ? converted : {model:settings.model,messages:body.messages,stream:false,
@@ -152,6 +182,7 @@ function createAdapter(environment = process.env, fetchFunction) {
     const base = new URL(settings.base);
     if (environment.PROVIDER_HOST_GATEWAY && ['127.0.0.1','localhost'].includes(base.hostname)) base.hostname = environment.PROVIDER_HOST_GATEWAY;
     const result = await requestUpstream(base.href.replace(/\/$/,'') + '/' + (settings.mode === 'responses' ? 'responses':'chat/completions'),settings,outbound,signal,fetchFunction);
+    if (pooled()) requireApplied();
     return settings.mode === 'responses' ? responseToChat(result,settings.model):validChat(result,settings.model);
   };
   const getRouter = () => { if (!router) router = createRouter(environment,invoke); return router; };
@@ -163,6 +194,7 @@ function createAdapter(environment = process.env, fetchFunction) {
       isPool = pooled();
       if (request.url === '/healthz' && request.method === 'GET') {
         if (isPool) {
+          requireApplied();
           const pool = loadPool(environment);
           if (!environment.PROVIDER_ADAPTER_KEY || pool.entries.some(entry => entry.key === environment.PROVIDER_ADAPTER_KEY)) throw terminal('internal_key_missing','内部认证缺失或与上游认证混用');
           sendJson(response,200,{ready:true,health:'unknown',revision:getRouter().status().revision});
@@ -175,7 +207,7 @@ function createAdapter(environment = process.env, fetchFunction) {
       if (!key) throw terminal('internal_key_missing','内部认证尚未配置');
       const provided = Buffer.from(request.headers.authorization || ''), expected = Buffer.from(`Bearer ${key}`);
       if (provided.length !== expected.length || !crypto.timingSafeEqual(provided,expected)) { sendJson(response,401,{error:{message:'内部认证失败',code:'authentication_failed'}}); return; }
-      if (isPool && request.method === 'GET' && request.url === '/internal/provider/status') { sendJson(response,200,getRouter().status()); return; }
+      if (isPool && request.method === 'GET' && request.url === '/internal/provider/status') { sendJson(response,200,{...getRouter().status(),configuration_state:configurationPending() ? 'applying':'applied'}); return; }
       if (isPool && request.method === 'GET' && request.url === '/internal/provider/recent') { sendJson(response,200,getRouter().recent()); return; }
       if (request.method !== 'POST') { sendJson(response,404,{error:{message:'不支持的协议路由'}}); return; }
       const body = JSON.parse(await readLimited(request,MAX_INPUT_BYTES));
@@ -214,7 +246,13 @@ function createAdapter(environment = process.env, fetchFunction) {
         let envelope;
         try { envelope = extractEnvelope(body,request.headers['x-crispai-question'],key,environment.PROVIDER_REQUIRE_ENVELOPE === 'true'); }
         catch (_) { throw terminal('invalid_envelope','受管问题信封缺失或无效'); }
+        requireApplied();
+        if (envelope?.stage === 'answer') {
+          try { if (!promptRetained(body,appliedPrompt(root,envelope.runtime_revision))) throw new Error('prompt not retained'); }
+          catch (_) { throw terminal('context_preparation_incomplete','知识上下文准备未完整保留已应用的业务规则，本次未执行模型推理'); }
+        }
         result = await getRouter().route(body,envelope,controller.signal);
+        requireApplied();
       } else result = await invoke(body,legacy,controller.signal);
       if (body.stream) writeChatStream(response,result); else sendJson(response,200,result);
     } catch (error) {

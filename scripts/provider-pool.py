@@ -4,6 +4,7 @@
 import argparse
 import base64
 import copy
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import hmac
@@ -40,6 +41,82 @@ class PoolError(Exception):
 def require(condition, code, message):
     if not condition:
         raise PoolError(code, message)
+
+
+def process_identity(pid):
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    require(bool(re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", boot)),
+            "invalid_configuration", "无法核对窗口操作的系统启动标识")
+    try:
+        process = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # comm可包含空格及右括号；最后一个右括号后才是从字段3开始的固定字段。
+    fields = process.rsplit(")", 1)[-1].split()
+    require(")" in process and len(fields) > 19 and fields[19].isdigit(),
+            "invalid_configuration", "无法核对窗口操作的进程启动标识")
+    return boot, int(fields[19])
+
+
+def transaction_owner():
+    pid = os.getpid()
+    identity = process_identity(pid)
+    require(identity is not None, "invalid_configuration", "无法记录窗口操作的进程身份")
+    return {"owner_pid": pid, "owner_boot_id": identity[0], "owner_start_ticks": identity[1]}
+
+
+def inherited_maintenance_descriptor(lock_path):
+    descriptor = os.environ.get("MAINTENANCE_LOCK_FD", "")
+    if (os.environ.get("CRISP_AI_MAINTENANCE_LOCK_HELD") != "1"
+            or os.environ.get("CRISP_AI_MAINTENANCE_LOCK_PATH") != str(lock_path)
+            or not re.fullmatch(r"[0-9]{1,9}", descriptor) or int(descriptor) < 3):
+        return None
+    descriptor = int(descriptor)
+    try:
+        opened, current = os.fstat(descriptor), lock_path.lstat()
+        if (stat.S_ISREG(opened.st_mode) and stat.S_ISREG(current.st_mode)
+                and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+                and os.readlink(f"/proc/self/fd/{descriptor}") == str(lock_path)):
+            return descriptor
+    except OSError:
+        pass
+    return None
+
+
+@contextmanager
+def maintenance_lock(root):
+    temporary = root / "tmp"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    require(temporary.is_dir() and not temporary.is_symlink(), "unsafe_file", "维护锁目录不安全")
+    lock_path = temporary / "maintenance.lock"
+    descriptor = inherited_maintenance_descriptor(lock_path)
+    inherited = descriptor is not None
+    previous = None
+    try:
+        if not inherited:
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        opened, current = os.fstat(descriptor), lock_path.lstat()
+        require(stat.S_ISREG(opened.st_mode) and stat.S_ISREG(current.st_mode)
+                and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino), "unsafe_file", "维护锁文件不安全")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise PoolError("maintenance_busy", "另一个安装、更新、备份或恢复任务正在运行；接口配置未提交") from None
+        values = {"CRISP_AI_MAINTENANCE_LOCK_HELD": "1", "MAINTENANCE_LOCK_FD": str(descriptor),
+                  "CRISP_AI_MAINTENANCE_LOCK_PATH": str(lock_path)}
+        previous = {key: os.environ.get(key) for key in values}
+        os.environ.update(values)
+        yield descriptor
+    finally:
+        if previous is not None:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        # 不显式unlock：继承FD属于父维护事务；新FD关闭时按内核引用计数释放。
+        if descriptor is not None and not inherited:
+            os.close(descriptor)
 
 
 def regular(file, maximum=1048576):
@@ -193,6 +270,13 @@ def source_schema(value):
     return value
 
 
+def rag_context_window(value):
+    windows = [item["context_window"] for item in value["entries"] if item["enabled"] and not item.get("draft")
+               and item["capabilities"].get(item["api_mode"]) is True]
+    require(bool(windows), "no_capable_provider", "至少需要一个启用且协议有效的文字接口")
+    return max(windows)
+
+
 class Manager:
     def __init__(self, root):
         self.root = Path(root).absolute()
@@ -200,6 +284,7 @@ class Manager:
         self.applied = self.root / "config/provider-pool-applied.json"
         self.secrets = self.root / "secrets/provider/generations"
         self.env = self.root / ".env"
+        self.transaction = self.root / "config/provider-pool-transaction.json"
 
     def save_draft(self, value, secret):
         generation = secrets.token_hex(16)
@@ -258,7 +343,9 @@ class Manager:
         values = {"PROVIDER_ADAPTER_KEY": internal, "PROVIDER_POOL_REQUIRED": "true", "PROVIDER_REQUIRE_ENVELOPE": "true",
                   "AI_API_BASE_URL": runtime_base, "AI_API_PROBE_BASE_URL": primary["base_url"], "AI_API_KEY": credentials["api_key"],
                   "AI_MODEL": primary["model"], "AI_API_MODE": primary["api_mode"], "AI_CUSTOM_HEADERS_JSON": json.dumps(credentials["custom_headers"], ensure_ascii=False, separators=(",", ":")),
-                  "AI_SUPPORTS_VISION": str(primary["capabilities"]["vision"]).lower(), "AI_ANYTHINGLLM_BASE_URL": "http://provider-adapter:8787/v1"}
+                  "AI_SUPPORTS_VISION": str(primary["capabilities"]["vision"]).lower(), "AI_ANYTHINGLLM_BASE_URL": "http://provider-adapter:8787/v1",
+                  "AI_MODEL_TOKEN_LIMIT": primary["context_window"], "AI_MAX_OUTPUT_TOKENS": primary["max_output_tokens"],
+                  "PROVIDER_RAG_CONTEXT_WINDOW": rag_context_window(value)}
         atomic(self.env, env_text(self.env, values), 0o600)
         projection = dict(primary, type="openai-compatible", base_url=runtime_base, api_key_env="AI_API_KEY")
         for key in ("id", "role", "order", "enabled", "name"):
@@ -267,15 +354,55 @@ class Manager:
 
     def restore_previous(self, saved, failed_revision, internal):
         restored = json.loads(saved[self.applied])
-        restored_secret = read(self.secrets / (restored["secrets_generation"] + ".json"), 16777216)["entries"]
+        require(restored.get("schema_version") == 1 and type(restored.get("revision")) is int and restored["revision"] > 0
+                and re.fullmatch(r"[a-f0-9]{32}", restored.get("secrets_generation", "")), "invalid_pool", "历史接口池引用无效，不能执行恢复")
+        generation = read(self.secrets / (restored["secrets_generation"] + ".json"), 16777216)
+        require(generation.get("generation") == restored["secrets_generation"] and generation.get("revision") == restored["revision"], "invalid_pool", "历史接口池与秘密代次不一致")
+        restored_secret = generation["entries"]
+        self.validate(restored, restored_secret)
         restored["revision"] = failed_revision + 1
         restored["secrets_generation"] = secrets.token_hex(16)
         atomic(self.secrets / (restored["secrets_generation"] + ".json"), {"schema_version": 1, "generation": restored["secrets_generation"], "revision": restored["revision"], "entries": restored_secret})
         atomic(self.source, {key: content for key, content in restored.items() if key != "secrets_generation"})
         self.compatibility(restored, restored_secret, internal)
         atomic(self.applied, restored)
+        return restored
+
+    def apply_rag_window(self, window):
+        command = ["bash", str(Path(__file__).resolve().with_name("provider.sh")), "--deploy-dir", str(self.root),
+                   "internal-rag-context-apply", str(window)]
+        try:
+            descriptor = inherited_maintenance_descriptor(self.root / "tmp/maintenance.lock")
+            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=135, check=False,
+                                       pass_fds=() if descriptor is None else (descriptor,))
+            result = json.loads(completed.stdout)
+            require(completed.returncode == 0 and isinstance(result, dict) and result.get("ok") is True
+                    and result.get("state") == "applied" and type(result.get("context_window")) is int
+                    and result["context_window"] == window, "rag_context_apply_failed", "知识预处理窗口应用或回读未通过")
+            return result
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise PoolError("rag_context_apply_failed", "知识预处理窗口未能在限定时间内完成应用与回读") from None
+
+    def transaction_update(self, transaction, **changes):
+        observed = read(self.transaction)
+        require(observed.get("token") == transaction["token"], "revision_conflict", "接口窗口事务已变更，不能覆盖其他操作")
+        transaction.update(changes)
+        atomic(self.transaction, transaction, 0o600)
+
+    def transaction_clear(self, transaction):
+        require(read(self.transaction).get("token") == transaction["token"], "revision_conflict", "接口窗口事务已变更，不能清理其他操作")
+        self.transaction.unlink()
+        descriptor = os.open(self.transaction.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def commit(self, value, secret, previous_revision, verify=True):
+        with maintenance_lock(self.root):
+            return self._commit(value, secret, previous_revision, verify)
+
+    def _commit(self, value, secret, previous_revision, verify=True):
         directory(self.root / "config")
         directory(self.root / "secrets")
         directory(self.root / "secrets/provider")
@@ -286,11 +413,13 @@ class Manager:
             os.chown(self.root / "data/provider-router", 1000, 1000)
         lock_path = self.root / "config/provider-pool.lock"
         require(not lock_path.is_symlink(), "unsafe_file", "接口池锁不安全")
+        window, transaction = rag_context_window(value), None
         with open(lock_path, "a", encoding="utf-8") as lock:
             os.chmod(lock_path, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX)
             current = read(self.applied)["revision"] if self.applied.exists() else 0
             require(current == previous_revision, "revision_conflict", "接口池已被其他操作修改，请刷新后重试")
+            require(not self.transaction.exists() and not self.transaction.is_symlink(), "configuration_applying", "接口窗口正在应用或等待恢复，请先恢复该事务")
             self.validate(value, secret)
             value["revision"] = current + 1
             generation = secrets.token_hex(16)
@@ -299,13 +428,20 @@ class Manager:
             if saved[self.applied] is not None:
                 previous = json.loads(saved[self.applied])
                 atomic(self.root / "backups/config-history/provider-pool" / (str(previous["revision"]) + ".json"), previous)
-            internal = read_env(self.env).get("PROVIDER_ADAPTER_KEY", "")
+            previous_env = read_env(self.env)
+            internal = previous_env.get("PROVIDER_ADAPTER_KEY", "")
             require(current == 0 or internal not in [item["api_key"] for item in secret.values()], "invalid_key", "上游 Key 必须区别于受管内部认证")
             if not internal or re.match(r"^(replace-|change-me|not-configured)", internal, re.I) or internal in [item["api_key"] for item in secret.values()]:
                 internal = secrets.token_hex(32)
             secret_path = self.secrets / (generation + ".json")
             publishing = False
             try:
+                if verify and previous_env.get("PROVIDER_RAG_CONTEXT_WINDOW") != str(window):
+                    require(current > 0, "invalid_configuration", "首次接口初始化应由完整安装流程启动组件")
+                    transaction = {"schema_version": 1, "token": secrets.token_hex(16), "previous_revision": current,
+                                   "revision": value["revision"], "previous_context_window": rag_context_window(previous),
+                                   "context_window": window, "phase": "applying", "started_at": int(time.time() * 1000), **transaction_owner()}
+                    atomic(self.transaction, transaction, 0o600)
                 atomic(secret_path, {"schema_version": 1, "generation": generation, "revision": value["revision"], "entries": secret})
                 source = {key: copy.deepcopy(content) for key, content in value.items() if key != "secrets_generation"}
                 atomic(self.source, source)
@@ -325,28 +461,104 @@ class Manager:
                             file.unlink()
                     if secret_path.exists():
                         secret_path.unlink()
+                if transaction:
+                    self.transaction_clear(transaction)
                 raise
         # 锁外执行组件回读；配置事务从不持锁等待模型或网络。
         if verify:
             try:
+                if transaction:
+                    self.apply_rag_window(window)
                 observed = self.adapter("status")
                 require(observed.get("revision") == value["revision"], "readback_failed", "运行适配器未读取到新接口池")
-            except Exception:
+            except Exception as failure:
                 with open(lock_path, "a", encoding="utf-8") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
-                    if read(self.applied)["revision"] == value["revision"]:
-                        self.restore_previous(saved, value["revision"], internal)
-                        raise PoolError("readback_failed", "运行适配器回读失败；原接口配置已以新代次恢复，旧请求保持取消")
-                raise PoolError("revision_conflict", "运行回读期间接口池另有修改，请刷新检查当前配置")
-        return self.public(value)
+                    require(read(self.applied)["revision"] == value["revision"], "revision_conflict", "运行回读期间接口池另有修改，请刷新检查当前配置")
+                    restored = self.restore_previous(saved, value["revision"], internal)
+                    if transaction:
+                        self.transaction_update(transaction, phase="restoring", revision=restored["revision"], context_window=transaction["previous_context_window"], started_at=int(time.time() * 1000))
+                if transaction:
+                    try:
+                        self.apply_rag_window(transaction["previous_context_window"])
+                        require(self.adapter("status").get("revision") == restored["revision"], "readback_failed", "恢复后的接口池回读未通过")
+                    except Exception:
+                        with open(lock_path, "a", encoding="utf-8") as lock:
+                            fcntl.flock(lock, fcntl.LOCK_EX)
+                            self.transaction_update(transaction, phase="restore_failed")
+                        raise PoolError("rag_context_restore_failed", "原接口配置已恢复，但知识窗口尚未确认恢复；推理保持暂停，请执行 recover-rag-context") from None
+                    with open(lock_path, "a", encoding="utf-8") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        self.transaction_clear(transaction)
+                code = failure.code if isinstance(failure, PoolError) else "readback_failed"
+                raise PoolError(code, "组件应用或回读失败；原接口配置已以新代次恢复，旧请求保持取消") from None
+            if transaction:
+                with open(lock_path, "a", encoding="utf-8") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    require(read(self.applied)["revision"] == value["revision"], "revision_conflict", "接口窗口回读期间配置已变更")
+                    self.transaction_clear(transaction)
+        return dict(self.public(value), rag_context={"context_window": window, "state": "applied" if transaction else "unchanged" if verify else "deferred"})
 
-    def migrate(self):
+    def recover_rag_context(self):
+        if not self.transaction.exists() and not self.transaction.is_symlink():
+            return {"ok": True, "restored": False, "message": "没有待恢复的知识上下文配置，未修改组件。"}
+        with maintenance_lock(self.root):
+            return self._recover_rag_context()
+
+    def _recover_rag_context(self):
+        lock_path = self.root / "config/provider-pool.lock"
+        require(not lock_path.is_symlink(), "unsafe_file", "接口池锁不安全")
+        with open(lock_path, "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            pending = read(self.transaction)
+            require(pending.get("schema_version") == 1 and re.fullmatch(r"[a-f0-9]{32}", pending.get("token", ""))
+                    and type(pending.get("previous_revision")) is int and pending["previous_revision"] > 0
+                    and type(pending.get("owner_pid")) is int and pending["owner_pid"] > 0
+                    and isinstance(pending.get("owner_boot_id"), str)
+                    and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", pending["owner_boot_id"])
+                    and type(pending.get("owner_start_ticks")) is int and pending["owner_start_ticks"] > 0,
+                    "invalid_configuration", "窗口恢复记录缺少可核对的进程身份")
+            if process_identity(pending["owner_pid"]) == (pending["owner_boot_id"], pending["owner_start_ticks"]):
+                raise PoolError("configuration_applying", "原窗口操作尚未结束，请等待其有界退出")
+            require(pending.get("phase") == "restore_failed" or int(time.time() * 1000) >= pending.get("started_at", 0) + 140000,
+                    "configuration_applying", "原窗口操作异常退出，仍需等待组件有界操作结束后恢复")
+            old_file = self.root / "backups/config-history/provider-pool" / (str(pending["previous_revision"]) + ".json")
+            regular(old_file)
+            restored = self.restore_previous({self.applied: old_file.read_bytes()}, read(self.applied)["revision"], read_env(self.env)["PROVIDER_ADAPTER_KEY"])
+            window = rag_context_window(restored)
+            self.transaction_update(pending, phase="restoring", revision=restored["revision"], context_window=window, started_at=int(time.time() * 1000), **transaction_owner())
+        try:
+            self.apply_rag_window(window)
+            require(self.adapter("status").get("revision") == restored["revision"], "readback_failed", "恢复后的接口池回读未通过")
+        except Exception:
+            with open(lock_path, "a", encoding="utf-8") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.transaction_update(pending, phase="restore_failed")
+            raise PoolError("rag_context_restore_failed", "窗口恢复尚未完成，推理继续暂停；可稍后再次执行 recover-rag-context") from None
+        with open(lock_path, "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.transaction_clear(pending)
+        return dict(self.public(restored), rag_context={"context_window": window, "state": "applied"})
+
+    def migrate(self, defer_runtime=False):
+        if defer_runtime:
+            require(self.root.is_dir() and not self.root.is_symlink() and self.root.resolve() == self.root,
+                    "unsafe_file", "受管安装目录必须是规范的实际目录")
+            marker = self.root / ".crisp-ai-installation"
+            regular(marker)
+            lines = marker.read_text(encoding="utf-8").splitlines()
+            states = [line.split("=", 1)[1] for line in lines if line.startswith("state=")]
+            require(lines and lines[0] == "ai-support" and len(states) == 1 and states[0] in ("collecting", "installing", "staged"),
+                    "invalid_installation_state", "仅受管安装或待启动阶段可延后知识窗口运行应用")
         if self.applied.exists():
+            require(not self.transaction.exists() and not self.transaction.is_symlink(), "configuration_applying", "接口窗口存在未完成事务，请先执行 recover-rag-context")
             value, secret = self.load()
             # 已迁移的池为权威，不从可能陈旧的 AI_* 再生成或覆盖。
             internal = read_env(self.env).get("PROVIDER_ADAPTER_KEY", "")
             require(internal and internal not in [item["api_key"] for item in secret.values()], "internal_key_missing", "已迁移接口池缺少独立内部认证，请恢复受限环境配置")
-            return self.public(value)
+            if read_env(self.env).get("PROVIDER_RAG_CONTEXT_WINDOW") != str(rag_context_window(value)):
+                return self.commit(value, secret, value["revision"], verify=not defer_runtime)
+            return dict(self.public(value), rag_context={"context_window": rag_context_window(value), "state": "deferred"}) if defer_runtime else self.public(value)
         require(not self.source.exists(), "invalid_pool", "已有主备池源但有效投影缺失，请恢复有效投影；不会用旧单接口覆盖")
         values = read_env(self.env)
         provider_file = self.root / "config/provider.yaml"
@@ -458,12 +670,23 @@ class Manager:
                     time.sleep(max(delay / 1000, 0.2 * (2 ** attempt)))
         raise last
 
-    def main(self, action, arguments):
+    def main(self, action, arguments, defer_runtime=False):
+        readonly = {"list", "get", "show", "entry", "status", "recent", "models", "probe", "test", "vision-test",
+                    "validate-file", "admin-marker", "draft", "draft-entry", "recover-rag-context"}
+        if action in readonly or action == "policy" and not arguments:
+            return self._main(action, arguments, defer_runtime)
+        with maintenance_lock(self.root):
+            return self._main(action, arguments, defer_runtime)
+
+    def _main(self, action, arguments, defer_runtime=False):
+        require(not defer_runtime or action == "migrate", "invalid_action", "延后组件应用仅用于受管安装迁移")
+        if action == "recover-rag-context":
+            return self.recover_rag_context()
         if action == "validate-file":
             checked = source_schema(read(Path(arguments[0])))
             return {"ok": True, "valid": True, "entries": len(checked["entries"]), "primary_id": checked["primary_id"]}
         if action == "migrate":
-            return self.migrate()
+            return self.migrate(defer_runtime=defer_runtime)
         value, secret = self.load()
         if action in ("draft", "draft-entry", "edit-draft", "apply-draft"):
             draft, draft_secret = self.load_draft()
@@ -616,11 +839,12 @@ class Manager:
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--deploy-dir", required=True)
+    parser.add_argument("--defer-runtime", action="store_true")
     parser.add_argument("action", nargs="?", default="list")
     parser.add_argument("arguments", nargs="*")
     options = parser.parse_args()
     try:
-        result = Manager(options.deploy_dir).main(options.action, options.arguments)
+        result = Manager(options.deploy_dir).main(options.action, options.arguments, defer_runtime=options.defer_runtime)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except PoolError as error:

@@ -185,7 +185,7 @@ provider_policy_menu() {
   manager_tool provider policy > "$candidate" || return 1
   jq -M '.policy' "$candidate" > "$candidate.new" || return 1
   mv -f -- "$candidate.new" "$candidate"
-  printf '\n1. 问题总期限（1000～180000 毫秒）\n2. 单次请求期限（1000～60000 毫秒）\n3. 连接期限（100～10000 毫秒）\n4. 每问题最多调用次数（1～21）\n5. 初始冷却（1000～300000 毫秒）\n6. 最长冷却（1000～3600000 毫秒）\n7. 全池冷却（100～60000 毫秒）\n8. 查看主备资料文件路径\n9. 校验并应用已编辑的主备资料\n10. 导入不含密钥的主备结构\n11. 查看、补全或应用导入草稿\n0. 返回\n连接期限不能超过单次期限，单次不能超过问题总期限；初始冷却不能超过最长冷却。\n'
+  printf '\n1. 问题总期限（1000～180000 毫秒）\n2. 单次请求期限（1000～60000 毫秒）\n3. 连接期限（100～10000 毫秒）\n4. 每问题最多调用次数（1～21）\n5. 初始冷却（1000～300000 毫秒）\n6. 最长冷却（1000～3600000 毫秒）\n7. 全池冷却（100～60000 毫秒）\n8. 查看主备资料文件路径\n9. 校验并应用已编辑的主备资料\n10. 导入不含密钥的主备结构\n11. 查看、补全或应用导入草稿\n12. 恢复中断的知识上下文配置\n0. 返回\n连接期限不能超过单次期限，单次不能超过问题总期限；初始冷却不能超过最长冷却。\n'
   python3 "$SCRIPT_DIR/scripts/menu-display.py" detail "$candidate" /dev/null 0
   menu_read choice '修改哪一项：' || return 1
   case "$choice" in
@@ -206,6 +206,12 @@ provider_policy_menu() {
       if menu_confirm '导入这份主备结构？'; then manager_action manager_tool provider import "$file"; fi
       return 0 ;;
     11) provider_draft_menu; return $? ;;
+    12)
+      printf '仅恢复已中断的主备知识预算事务；可能重建本实例 AnythingLLM，不清空知识和人工状态。正在运行的应用操作不会被强行覆盖。\n'
+      if menu_confirm '恢复上一份成套主备配置并核对运行状态？'; then
+        manager_action manager_tool provider recover-rag-context
+      fi
+      return 0 ;;
   esac
   [[ "$choice" =~ ^[1-7]$ ]] || return 0; field=${fields[choice-1]}
   menu_read value '新的正整数（0 或回车取消）：' || return 1

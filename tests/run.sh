@@ -234,6 +234,10 @@ fi
 pass "Webhook、图片、关键词、菜单、上下文与人工接管契约"
 
 TEST_LAYER=UNIT/CONTRACT
+python3 "${SCRIPT_DIR}/test_rag_context.py"
+pass "RAG 上下文预算的受管应用及失败边界（内部子项单列）"
+python3 "${SCRIPT_DIR}/test_snapshot_live.py"
+pass "在线快照预检的短命锁、容量与严格文件类型边界（内部子项单列）"
 if "${SCRIPT_DIR}/test_workflow_runtime.sh"; then
   pass "n8n Code node 行为"
 else

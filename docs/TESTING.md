@@ -38,6 +38,8 @@ node tests/test_feedback_runtime.js
 node tests/test_crisp_auth.js
 python3 tests/test_launcher.py
 python3 tests/test_docs_acceptance.py
+python3 tests/test_rag_context.py
+python3 tests/test_snapshot_live.py
 node tests/test_materials_apply.js
 node tests/test_material_limits.js
 bash tests/test_logs.sh
@@ -52,6 +54,8 @@ ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服
 `test_provider_log_redaction.py` 只用虚构秘密核对有效/历史/草稿代次的原文与编码、持续查看轮换、读取上限及异常失败关闭；`test_logs.sh` 通过生产导出路径验证诊断包排除秘密，并在隔离副本故意关闭首道过滤，确认二次扫描独立拒绝。它们不是实机日志或真实凭据泄漏测试。
 
 消息外观须用专用 SDK 实际 DOM 核对中性昵称、正文与平台徽标，截图原件受限保存。新出站省略可选 automated 字段后，仍须验证发送前自有指纹落盘、重启/详细记录清理后的自回流识别、跨会话隔离以及真正后台人工回复；不能把旧带徽标消息的观察当作新发消息已去标识。
+
+追加回归覆盖缺省 automated/type 的真实操作者结构、即时暂停、默认 3600 秒与显式旧值/0 秒保护；网站级 REST 写入不冒充后台真人。旧错误计划和有效响应中的精确旧默认整句均不能作为答案出站；图片失败不写入成功识图记忆。窗口事务测试包含原文/有效投影、组件实际预算、失败恢复、暂停期间不补发旧问，以及全文 Prompt 保真；上述 helper 合成测试不代替真实 AnythingLLM 回读。在线快照测试验证消失的临时锁与权限/链接/特殊文件错误的区别，真正停写后的复制仍须严格检查。
 
 发布模式必须指定隔离真实部署，不能把本地集成缺失当外部豁免：
 

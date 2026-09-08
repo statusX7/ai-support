@@ -539,7 +539,7 @@ def provider_status_menu_cases():
                                          headers={"Content-Type": "application/json", "Authorization": "Bearer " + internal_key})
         with urllib.request.urlopen(request, timeout=10) as response:
             assert response.status == 200
-    observation = {"calls": [], "old_records": False, "unknown": False, "mismatch": False, "failure": False, "hang": False}
+    observation = {"calls": [], "old_records": False, "unknown": False, "mismatch": False, "failure": False, "hang": False, "applying": False}
     class ObservationFixture(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -556,6 +556,8 @@ def provider_status_menu_cases():
                 with urllib.request.urlopen(request, timeout=5) as response:
                     value = json.load(response)
                 if self.path.endswith("/status"):
+                    if observation["applying"]:
+                        value["configuration_state"] = "applying"
                     if observation["unknown"]:
                         for entry in value["entries"]:
                             entry["health"] = "unknown"
@@ -610,6 +612,15 @@ def provider_status_menu_cases():
         assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
         passing("生产PTY未知不冒称健康、旧记录不冒称当前成功、状态与列表换代不混用")
 
+        observation["applying"] = True
+        terminal = enter_provider("pool-health-applying", extra); terminal.send("1")
+        terminal.expect("接口配置尚未完成应用"); terminal.expect("文本健康：未检测")
+        terminal.expect("下一请求优先候选（文本）：未检测"); output = leave_provider(terminal)
+        assert "文本健康：健康" not in output
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+        observation["applying"] = False
+        passing("生产PTY配置事务未完成时不使用旧健康给绿灯，只读展示明确恢复入口")
+
         observation["failure"] = True
         terminal = enter_provider("pool-health-unavailable", extra); terminal.send("1")
         terminal.expect("文本健康：未检测"); terminal.expect("接口暂时不可用")
@@ -640,6 +651,17 @@ def provider_file_menu_cases():
 
     def policy(terminal, action):
         terminal.send("10"); terminal.expect("修改哪一项："); terminal.send(str(action))
+
+    before = provider_snapshot(); calls = MODEL_LIST["chat_calls"]
+    terminal = enter_provider("pool-recovery-cancel")
+    policy(terminal, 12); terminal.expect("恢复上一份成套主备配置")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("0"); leave_provider(terminal)
+    assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+    terminal = enter_provider("pool-recovery-no-transaction")
+    policy(terminal, 12); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("没有待恢复的知识上下文配置，未修改组件"); leave_provider(terminal)
+    assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+    passing("生产PTY恢复入口数字取消不改动；无事务确认是幂等只读而非重启或强制清标记")
 
     changed = json.loads(source.read_text())
     changed["entries"][0]["name"] = "文件编辑后的主接口"

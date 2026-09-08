@@ -37,7 +37,7 @@ configuration_validate() {
     runtime)
       jq -M -e '.enabled | type == "boolean"' "$input" >/dev/null ;;
     handoff)
-      jq -M -e '.handoff | type == "object" and (.resume_after_seconds | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and utf8bytelength <= 10000)' "$input" >/dev/null ;;
+      jq -M -e '.handoff | type == "object" and ((if has("resume_after_seconds") then .resume_after_seconds else 3600 end) | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and utf8bytelength <= 10000)' "$input" >/dev/null ;;
     keyword)
       jq -M -e '
         .schema_version == 2 and (.rules | type == "array" and length <= 200) and
@@ -157,7 +157,7 @@ configuration_normalize_file() {
   if [[ "$name" == keyword || "$name" == handoff ]]; then
     policy_output=$(mktemp "${output}.display.XXXXXXXX") || return 1
     # 只迁移项目曾提供的精确缺省文案，不扫描/改写用户 Prompt、知识或自定义句子。
-    jq -M --arg name "$name" '
+    jq -M --arg name "$name" --arg clarification '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。' '
       def confirmation:
         if . == "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"
         then "您的人工协助请求已收到，请稍候。" else . end;
@@ -166,10 +166,18 @@ configuration_normalize_file() {
           (if .cancel_label == "继续 AI 客服" then .cancel_label="继续咨询" else . end) |
           (if has("confirm_message") then .confirm_message |= confirmation else . end))
       else
+        (if .handoff | has("resume_after_seconds") then . else .handoff.resume_after_seconds=3600 end) |
         (if .handoff | has("message") then .handoff.message |= confirmation else . end) |
+        (.handoff.no_answer_message |=
+          if . == null or . == "" or . == "知识库暂时没有足够信息，请换一种方式描述问题。"
+             or . == "目前知识还不足以确认，请补充您遇到的具体情况。" then $clarification else . end) |
+        (.handoff.low_confidence_message |=
+          if . == null or . == "" or . == "当前答案可信度不足，请补充更多问题细节。"
+             or . == "现有资料还不足以确定答案，请补充更多细节。" then $clarification else . end) |
         (if .handoff.failure_message == "当前自动客服暂时不可用，请稍后再试。"
          or .handoff.failure_message == "自动客服暂时无法回答，请稍后再试。"
-         then .handoff.failure_message="暂时无法回复，请稍后再试。" else . end)
+         or .handoff.failure_message == "暂时无法回复，请稍后再试。"
+         then .handoff.failure_message=$clarification else . end)
       end' "$output" > "$policy_output" || { rm -f -- "$policy_output"; return 1; }
     mv -f -- "$policy_output" "$output"
   fi
