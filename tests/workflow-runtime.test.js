@@ -59,7 +59,7 @@ const request = async (url, options = {}) => {
       sendAttempts += 1;
       if (sendRejection) return { status: sendRejection, body: { error: true, reason: 'invalid_data' } };
       // 重现实机发现的拒绝：本项目旧版自定义 properties 键不满足 Crisp 的校验。
-      // 不模拟完整第三方 schema；本项目使用官方 automated + 本地 fingerprint 即可。
+      // 不模拟完整第三方 schema；本项目使用官方昵称字段和本地持久 fingerprint。
       if (body.properties && ('ai_support' in body.properties || 'ai_support_version' in body.properties)) {
         return { status: 400, body: { error: true, reason: 'invalid_data' } };
       }
@@ -131,7 +131,8 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     await deliver(message('session_client-a', '我想转人工'));
     const card = sent.at(-1);
     assert.equal(card.type, 'picker'); assert.equal(card.content.required, false); assert.equal(card.content.choices[0].label, '召唤人工客服');
-    assert.equal(card.automated, true); assert.equal('properties' in card, false);
+    assert.equal('automated' in card, false); assert.equal('properties' in card, false);
+    assert.deepEqual(card.user, {type: 'website', nickname: '在线客服'});
     assert.equal(state('session_client-a').mode, 'ai'); assert.equal(modelRequests.length, before);
     await deliver(message('session_client-a', '尚未点击，请回答普通问题'));
     assert.equal(state('session_client-a').mode, 'ai'); assert.equal(modelRequests.length, before + 1);
@@ -163,7 +164,7 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const card = sent.find((entry) => entry.session_id === 'session_client-a' && entry.type === 'picker');
     await deliver(click('session_client-a', card));
     assert.equal(state('session_client-a').mode, 'human');
-    assert.match(sent.at(-1).content, /已暂停/);
+    assert.equal(sent.at(-1).content, '您的人工协助请求已收到，请稍候。');
     await deliver(message('session_client-b', 'B 的正常问题'));
     assert.equal(state('session_client-b').mode, 'ai'); assert.equal(sent.at(-1).session_id, 'session_client-b');
     const before = sent.length; await deliver(message('session_client-a', '人工期间的新问题')); assert.equal(sent.length, before);

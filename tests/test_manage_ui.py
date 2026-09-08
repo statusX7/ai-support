@@ -20,6 +20,8 @@ import tempfile
 import termios
 import threading
 import time
+import urllib.error
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 (ROOT / ".work").mkdir(mode=0o700, exist_ok=True)
@@ -147,6 +149,12 @@ class ApplicationFixture(http.server.BaseHTTPRequestHandler):
             vision = isinstance(content, list) and any(
                 item.get("type") in ("image_url", "input_image") for item in content)
             MODEL_LIST["probes"].append((self.path, body.get("model"), vision))
+            override = MODEL_LIST.get("response_override")
+            if override:
+                result = override(body, vision)
+                if result is not None:
+                    self.answer(*result)
+                    return
             if MODEL_LIST["post_status"] != 200:
                 self.answer({"error": {"code": "invalid_api_key", "message": "虚构候选验证失败"}}, MODEL_LIST["post_status"])
                 return
@@ -510,6 +518,118 @@ def provider_pool_menu_cases():
         assert identifier not in [item["id"] for item in provider_pool()["entries"]]
     assert provider_pool()["entries"] == [original]
     passing("数字删除仅所选备用，恢复为合法零备用且原主凭据配置保持")
+
+
+def provider_status_menu_cases():
+    original = copy.deepcopy(provider_pool())
+    actual_adapter = ENV["PROVIDER_ADAPTER_MANAGEMENT_URL"]
+    internal_key = next(line.split("=", 1)[1] for line in (DEPLOY / ".env").read_text().splitlines()
+                        if line.startswith("PROVIDER_ADAPTER_KEY="))
+    candidate = WORK / "pool-health-candidate.json"
+    current_primary = original["entries"][0]
+    def call(*arguments):
+        result = invoke(["bash", str(DEPLOY / "scripts/provider.sh"), "--deploy-dir", str(DEPLOY), *arguments])
+        assert result.returncode == 0, result.stdout
+        return json.loads(result.stdout)
+    def model_request(vision=False):
+        content = "合成健康记录"
+        if vision:
+            content = [{"type": "text", "text": content}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}]
+        request = urllib.request.Request(actual_adapter + "/v1/chat/completions", data=json.dumps({"messages": [{"role": "user", "content": content}]}).encode(),
+                                         headers={"Content-Type": "application/json", "Authorization": "Bearer " + internal_key})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+    observation = {"calls": [], "old_records": False, "unknown": False, "mismatch": False, "failure": False, "hang": False}
+    class ObservationFixture(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_GET(self):
+            observation["calls"].append(self.path)
+            if observation["hang"] and self.path.endswith("/status"):
+                time.sleep(9)
+            code = 200
+            if observation["failure"]:
+                value = {"ok": False, "error": {"code": "temporarily_unavailable", "message": "Traceback synthetic-hidden-secret {bad json}"}}
+                code = 503
+            else:
+                request = urllib.request.Request(actual_adapter + self.path, headers={"Authorization": self.headers.get("Authorization", "")})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    value = json.load(response)
+                if self.path.endswith("/status"):
+                    if observation["unknown"]:
+                        for entry in value["entries"]:
+                            entry["health"] = "unknown"
+                    if observation["mismatch"]:
+                        value["revision"] -= 1
+                if self.path.endswith("/recent") and observation["old_records"]:
+                    for record in value["records"]:
+                        record.pop("pool_revision", None)
+            payload = json.dumps(value).encode()
+            self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ObservationFixture)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    extra = {"PROVIDER_ADAPTER_MANAGEMENT_URL": f"http://127.0.0.1:{proxy.server_address[1]}"}
+    try:
+        candidate.write_text(json.dumps({"provider": {"capabilities": {"chat_completions": True, "responses": False, "vision": True}}})); candidate.chmod(0o600)
+        call("edit", original["primary_id"], str(candidate))
+        candidate.write_text(json.dumps({"provider": {"name": "视觉后备", "base_url": current_primary["base_url"], "model": "health-backup",
+                                                   "api_mode": "chat_completions", "capabilities": {"chat_completions": True, "responses": False, "vision": True}}, "api_key": "synthetic-health-backup-key"}))
+        call("add", str(candidate))
+        MODEL_LIST["response_override"] = lambda body, vision: ({"error": {"code": "image_not_supported", "message": "This model does not support image input."}}, 400) if vision and body.get("model") == current_primary["model"] else None
+        model_request(); model_request(); model_request(True)
+        before = provider_snapshot(); calls = MODEL_LIST["chat_calls"]
+        terminal = enter_provider("pool-health-observation", extra)
+        assert observation["calls"] == [], "进入主备菜单不能自行读取适配器"
+        terminal.send("1"); terminal.expect("文本健康：健康"); terminal.expect("视觉健康：冷却中")
+        terminal.expect("当前配置下最近成功："); terminal.expect("下一请求优先候选（文本）：" + current_primary["name"])
+        terminal.expect("下一请求优先候选（视觉）：视觉后备（尚未确认）")
+        output = leave_provider(terminal)
+        assert re.search(r"视觉健康：冷却中；冷却剩余：[1-9][0-9]* 秒", output)
+        assert "此模型暂不支持图片" in output and "当前供应商" not in output
+        assert observation["calls"] == ["/internal/provider/status", "/internal/provider/recent"]
+        plain = call("list")
+        assert "provider_view" not in plain and all("health" not in entry for entry in plain["entries"])
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+        passing("生产PTY菜单3→1只读合并真实文本/视觉健康、冷却、当前配置成功和分阶段优先候选，主菜单刷新不联网且list机器接口不变")
+
+        observation["old_records"] = True; observation["unknown"] = True
+        terminal = enter_provider("pool-health-unknown", extra); terminal.send("1")
+        terminal.expect("文本健康：尚未确认"); terminal.expect("当前配置下暂无可核对成功记录")
+        terminal.expect("下一请求优先候选（文本）：" + current_primary["name"] + "（尚未确认）")
+        output = leave_provider(terminal)
+        assert "文本健康：健康" not in output
+        observation["mismatch"] = True
+        terminal = enter_provider("pool-health-generation-change", extra); terminal.send("1")
+        terminal.expect("文本健康：未检测"); terminal.expect("读取期间接口配置已变化")
+        terminal.expect("下一请求优先候选（文本）：未检测，暂无法确认"); leave_provider(terminal)
+        observation["mismatch"] = False
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+        passing("生产PTY未知不冒称健康、旧记录不冒称当前成功、状态与列表换代不混用")
+
+        observation["failure"] = True
+        terminal = enter_provider("pool-health-unavailable", extra); terminal.send("1")
+        terminal.expect("文本健康：未检测"); terminal.expect("接口暂时不可用")
+        terminal.expect("当前配置下最近成功：未检测"); output = leave_provider(terminal)
+        assert "synthetic-hidden-secret" not in output and '"ok"' not in output
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+        passing("生产PTY适配器状态或记录读取失败给中文未检测及原因，不泄原始JSON/异常/秘密，不触发推理")
+
+        observation["failure"] = False; observation["hang"] = True
+        terminal = enter_provider("pool-health-timeout", extra); started = time.monotonic(); terminal.send("1")
+        terminal.expect("读取超过 8 秒，已停止等待"); terminal.expect("下一请求优先候选（文本）：未检测")
+        assert time.monotonic() - started < 13
+        leave_provider(terminal)
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+        passing("生产PTY状态读取8秒有界退出并继续返回菜单，不等待模型或触发自动探测")
+    finally:
+        MODEL_LIST.pop("response_override", None)
+        source = {key: value for key, value in original.items() if key != "secrets_generation"}
+        candidate.write_text(json.dumps(source)); call("apply-file", str(candidate))
+        proxy.shutdown(); proxy.server_close()
 
 
 def provider_file_menu_cases():
@@ -947,6 +1067,10 @@ def main():
             provider_retry_cases()
             provider_pool_menu_cases()
             provider_file_menu_cases()
+            provider_status_menu_cases()
+            return
+        if os.environ.get("MENU_TEST_FOCUS") == "provider-status":
+            provider_status_menu_cases()
             return
         if os.environ.get("MENU_TEST_FOCUS") == "presentation":
             material_menu_cases()
@@ -1000,6 +1124,7 @@ def main():
         provider_retry_cases()
         provider_pool_menu_cases()
         provider_file_menu_cases()
+        provider_status_menu_cases()
         prompt = '## 中文 🙂 Prompt\n\n$ # = " \\ `touch should-not-execute`\n::END::\n\n'
         terminal = Terminal("prompt-paste")
         for prompt_token, answer in (("请选择：", "4"), ("请选择：", "2")):

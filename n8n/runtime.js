@@ -93,7 +93,7 @@ function createRuntime(env = {}, options = {}) {
   const handoff = () => config('handoff.yaml', {}).handoff || {};
   const menus = () => config('menu.yaml', { welcome: { enabled: false }, root: 'main', menus: {} });
   const provider = () => config('provider.yaml', {}).provider || {};
-  const noRatingInstruction = '不得主动邀请用户评价、评分、点赞或确认满意度；不要在答案末尾例行询问是否解决问题。仅在完成当前咨询确实缺少必要信息时提出具体澄清问题。';
+  const noRatingInstruction = '不得主动邀请用户评价、评分、点赞或确认满意度；不要在答案末尾例行询问是否解决问题。仅在完成当前咨询确实缺少必要信息时提出具体澄清问题。直接处理咨询，不例行添加机器人或 AI 自我介绍、署名和标签；不得虚构真人身份，被明确问及身份时如实说明。';
   const providerPool = () => {
     const value = safeRead(root + '/config/provider-pool-applied.json', null, 1048576);
     if (!value) {
@@ -170,6 +170,33 @@ function createRuntime(env = {}, options = {}) {
   const statePath = (key) => {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('会话标识无效');
     return directory + '/session-' + key + '.json';
+  };
+  // 可见显示与内部身份分开：只保存自有指纹，不保存正文。按会话、低8位分桶，
+  // 不随详细出站记录的7天清理丢失；完整备份/恢复随 data/runtime 原位保留。
+  const ownedBucket = (state, fingerprint) => {
+    const value = String(fingerprint ?? '');
+    if (!/^(?:0|[1-9][0-9]{0,15})$/.test(value) || !Number.isSafeInteger(Number(value))) return null;
+    const key = stateKey(state.website_id, state.session_id);
+    return directory + '/owned-' + key + '-' + (Number(value) % 256).toString(16).padStart(2, '0') + '.json';
+  };
+  const ownedFingerprints = (file) => {
+    const value = safeRead(file, { schema_version: 1, fingerprints: [] }, 1048576);
+    if (value.schema_version !== 1 || !Array.isArray(value.fingerprints) || value.fingerprints.length > 50000
+      || !value.fingerprints.every((item) => typeof item === 'string' && /^(?:0|[1-9][0-9]{0,15})$/.test(item) && Number.isSafeInteger(Number(item)))) throw new Error('本项目出站身份索引无效');
+    return value;
+  };
+  const ownedMessage = (state, fingerprint) => {
+    const file = ownedBucket(state, fingerprint);
+    return file !== null && ownedFingerprints(file).fingerprints.includes(String(fingerprint));
+  };
+  const registerOwnedMessage = (state, fingerprint) => {
+    const file = ownedBucket(state, fingerprint);
+    if (!file) throw new Error('本项目出站指纹无效');
+    const value = ownedFingerprints(file);
+    if (value.fingerprints.includes(String(fingerprint))) return;
+    if (value.fingerprints.length >= 50000) throw new Error('本项目出站身份索引需要维护，未发送消息');
+    value.fingerprints.push(String(fingerprint));
+    atomic(file, value);
   };
   const emptyState = (website, session) => ({
     schema_version: 2, website_id: website, session_id: session,
@@ -389,6 +416,7 @@ function createRuntime(env = {}, options = {}) {
   const automation = (message, state) => {
     if (message.automated === true || message.properties?.ai_support === true || message.properties?.ai_support_version) return true;
     if (Object.prototype.hasOwnProperty.call(state.outgoing || {}, String(message.fingerprint || ''))) return true;
+    if (ownedMessage(state, message.fingerprint)) return true;
     if (message.automated === false) return false;
     return null;
   };
@@ -475,7 +503,7 @@ function createRuntime(env = {}, options = {}) {
             job.choice_action = action;
             if (action.type === 'confirm_handoff') {
               job.human_changed = pause(state, id, Math.max(eventTime, clock()), 'confirmed_handoff');
-              job.confirm_message = offer.confirm_message || handoff().message || '已暂停本次对话的 AI 回复，您的人工协助请求已收到。';
+              job.confirm_message = offer.confirm_message || handoff().message || '您的人工协助请求已收到，请稍候。';
               job.generation = state.generation;
             } else if (action.type === 'cancel_handoff') job.status = 'done';
             else if (!global.enabled || state.mode !== 'ai') job.status = 'done';
@@ -555,7 +583,7 @@ function createRuntime(env = {}, options = {}) {
     let choices;
     let bindings;
     if (kind === 'handoff') {
-      choices = [{ value: confirmValue, label: definition.confirm_label || '召唤人工客服', selected: false }, { value: cancelValue, label: definition.cancel_label || '继续 AI 客服', selected: false }];
+      choices = [{ value: confirmValue, label: definition.confirm_label || '召唤人工客服', selected: false }, { value: cancelValue, label: definition.cancel_label || '继续咨询', selected: false }];
       bindings = { [confirmValue]: { type: 'confirm_handoff' }, [cancelValue]: { type: 'cancel_handoff' } };
     } else {
       choices = []; bindings = {};
@@ -697,7 +725,7 @@ function createRuntime(env = {}, options = {}) {
     const content = job.data.content || {};
     const isImage = ['file', 'animation'].includes(job.data.type) && String(content.type || '').startsWith('image/');
     const fail = (message) => ({ type: 'text', content: message, ordinary: true, purpose: 'safe_error', tags: ['low_confidence'] });
-    if (!inferenceRemaining(job)) return fail('自动客服暂时无法回答，请稍后再试。');
+    if (!inferenceRemaining(job)) return fail('暂时无法回复，请稍后再试。');
     if (isImage) {
       const pool = providerPool();
       const visionSupported = pool ? pool.entries.some((entry) => entry.enabled && entry.capabilities?.vision === true)
@@ -749,11 +777,11 @@ function createRuntime(env = {}, options = {}) {
     const base = String(env.ANYTHINGLLM_INTERNAL_URL || 'http://anythingllm:3001').replace(/\/+$/, '');
     let response;
     try {
-      if (!inferenceRemaining(job)) return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。');
+      if (!inferenceRemaining(job)) return fail(policy.failure_message || '暂时无法回复，请稍后再试。');
       response = await network(base + '/api/v1/workspace/' + encodeURIComponent(env.ANYTHINGLLM_WORKSPACE || 'crisp-support') + '/chat', { method: 'POST', timeout: inferenceRemaining(job) + 5000, headers: { Authorization: 'Bearer ' + String(env.ANYTHINGLLM_API_KEY || '') }, body: { message, mode: 'chat', sessionId: state.session_id, reset: true } });
-    } catch (_) { return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。'); }
+    } catch (_) { return fail(policy.failure_message || '暂时无法回复，请稍后再试。'); }
     const payload = response.body?.data && typeof response.body.data === 'object' ? response.body.data : response.body;
-    if (response.status >= 300 || !payload || payload.error || response.body?.error) return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。');
+    if (response.status >= 300 || !payload || payload.error || response.body?.error) return fail(policy.failure_message || '暂时无法回复，请稍后再试。');
     const answer = String(payload.textResponse || payload.text || payload.response || '').trim();
     const observed = Array.isArray(payload.sources);
     const sources = observed ? payload.sources : [];
@@ -898,12 +926,14 @@ function createRuntime(env = {}, options = {}) {
       const unresolved = history.filter(publicOperator).some((message) => timestamp(message.timestamp) > job.event_time && automation(message, readState(key)) === null);
       if (unresolved || !await active(key, job)) return 'cancelled';
     }
-    // 官方 automated 与持久出站 fingerprint 已能标识本项目消息；不发送未经支持的属性键。
-    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true };
+    // 使用官方可选昵称，不请求自动消息徽标；自回流识别在POST前持久登记，
+    // 不伪造真人账号，也不依赖昵称或可见标签判断是否为本项目出站。
+    const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, user: { type: 'website', nickname: '在线客服' } };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
     const registered = await transaction(key, (current) => {
       const global = settings();
       if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai' || !providerGenerationCurrent(job)) return false;
+      registerOwnedMessage(current, fingerprint);
       const previous = current.outgoing[String(fingerprint)];
       current.outgoing[String(fingerprint)] = { status: 'sending', body, created_at: previous?.created_at || clock(), attempts: (previous?.attempts || 0) + 1, job_id: job.id, generation: current.generation };
       return true;

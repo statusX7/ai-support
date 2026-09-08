@@ -3,8 +3,11 @@
 
 import json
 import contextlib
+import math
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -84,6 +87,7 @@ VALUES = {
     "quota_exhausted": "额度已用尽", "connection_failed": "连接失败", "upstream_timeout": "上游超时",
     "invalid_response": "上游返回格式无效", "model_not_found": "模型不存在", "safety_refusal": "模型安全拒绝",
     "question_cancelled": "控制状态变化，问题已取消", "question_budget_exhausted": "本题调用预算已用尽",
+    "vision_unsupported": "此模型暂不支持图片", "upstream_unavailable": "上游暂不可用", "model_unavailable": "模型暂不可用",
 }
 TECHNICAL = re.compile(r'\b(?:schema_version|applied_revision|revision|Traceback|traceback)\b|(?:kb_|rule_|menu_|p_)[a-f0-9]{8,}|session-[a-f0-9]{64}|\b[0-9a-f]{64}\b')
 
@@ -124,6 +128,116 @@ def objects(raw):
     return values, lines
 
 
+def provider_snapshot(arguments):
+    source, status_file, status_code, recent_file, recent_code = arguments
+    pool = json.loads(Path(source).read_text(encoding='utf-8'))
+    if not isinstance(pool, dict) or pool.get('ok') is not True or not isinstance(pool.get('entries'), list):
+        raise ValueError('接口列表无效')
+    revision = pool.get('revision')
+    def observed(file, code, field):
+        reason = '读取超过 8 秒，已停止等待' if int(code) in (124, 137) else '本地适配器暂时不可用'
+        try:
+            result = json.loads(Path(file).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None, reason if int(code) else '适配器结果格式无效'
+        if int(code) or not isinstance(result, dict) or result.get('ok') is not True:
+            error = result.get('error', {}) if isinstance(result, dict) else {}
+            return None, VALUES.get(error.get('code'), reason) if isinstance(error, dict) else reason
+        if not isinstance(result.get(field), list):
+            return None, '适配器结果格式无效'
+        if field == 'entries' and result.get('revision') != revision or field == 'records' and result.get('revision', revision) != revision:
+            return None, '读取期间接口配置已变化，请重新打开列表'
+        return result, ''
+    status, status_reason = observed(status_file, status_code, 'entries')
+    recent, recent_reason = observed(recent_file, recent_code, 'records')
+    health = {}
+    keys = ('id', 'health', 'cooldown_until', 'last_error', 'vision_health', 'vision_cooldown_until', 'vision_last_error')
+    if status:
+        for item in status['entries']:
+            if isinstance(item, dict) and isinstance(item.get('id'), str):
+                health[item['id']] = {key: item[key] for key in keys if key in item}
+    successes = {}
+    if recent:
+        for item in recent['records']:
+            if not isinstance(item, dict) or item.get('pool_revision') != revision or item.get('outcome') != 'success' or item.get('stage') not in ('vision', 'answer'):
+                continue
+            identifier, at = item.get('entry_id'), item.get('at')
+            if not isinstance(identifier, str) or type(at) not in (int, float) or not math.isfinite(at) or at <= 0:
+                continue
+            if at > successes.get(identifier, {}).get('at', 0):
+                successes[identifier] = {'at': at, 'stage': item['stage']}
+    pool['provider_view'] = {'checked_at': int(time.time() * 1000), 'status_ok': status is not None,
+                             'status_reason': status_reason, 'recent_reason': recent_reason, 'health': health, 'successes': successes,
+                             'pool_cooldown_until': status.get('pool_cooldown_until', 0) if status else 0}
+    return pool
+
+
+def provider_health(view, entry, vision=False):
+    if not entry.get('enabled'):
+        return '已停用', 0, '', False
+    if vision and not entry.get('capabilities', {}).get('vision'):
+        return '未启用图片能力', 0, '', False
+    if not entry.get('capabilities', {}).get(entry.get('api_mode')):
+        return '当前协议能力未确认', 0, '', False
+    observed = view['health'].get(entry.get('id'))
+    if not view['status_ok'] or not observed:
+        return '未检测', 0, view['status_reason'] or '适配器未返回此接口状态', False
+    prefix = 'vision_' if vision else ''
+    health = observed.get(prefix + 'health')
+    until = observed.get(prefix + 'cooldown_until')
+    if health not in ('healthy', 'unknown', 'cooling', 'half_open', 'disabled') or type(until) not in (int, float) or not math.isfinite(until) or until < 0:
+        return '未检测', 0, '适配器健康或冷却数据无效', False
+    remaining = math.ceil(max(0, until - view['checked_at']) / 1000)
+    reason = VALUES.get(observed.get(prefix + 'last_error'), '已记录接口故障') if observed.get(prefix + 'last_error') else ''
+    if remaining:
+        return '冷却中', remaining, reason, False
+    if health == 'half_open':
+        return '恢复验证中', 0, reason, False
+    if health == 'disabled':
+        return '已停用', 0, reason, False
+    if health == 'healthy':
+        return '健康', 0, '', True
+    return '尚未确认', 0, reason, True
+
+
+def provider_time(milliseconds):
+    try:
+        return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (ValueError, OverflowError, OSError):
+        return '时间未能确认'
+
+
+def provider_entry_status(view, entry):
+    for vision, label in ((False, '文本健康'), (True, '视觉健康')):
+        health, remaining, reason, _ = provider_health(view, entry, vision)
+        cooling = '未检测' if health == '未检测' else f'{remaining} 秒'
+        print('  ' + label + '：' + health + '；冷却剩余：' + cooling + ('；原因：' + safe(reason) if reason else ''))
+    success = view['successes'].get(entry.get('id'))
+    if view['recent_reason']:
+        print('  当前配置下最近成功：未检测；原因：' + safe(view['recent_reason']))
+    elif success:
+        print('  当前配置下最近成功：' + provider_time(success['at']) + '（' + scalar(success['stage']) + '）')
+    else:
+        print('  当前配置下暂无可核对成功记录。')
+
+
+def provider_next_candidates(view, entries):
+    until = view.get('pool_cooldown_until', 0)
+    cooling = type(until) in (int, float) and math.isfinite(until) and until > view['checked_at']
+    for vision, label in ((False, '文本'), (True, '视觉')):
+        selected = next((entry for entry in entries if provider_health(view, entry, vision)[3]), None)
+        if not view['status_ok']:
+            result = '未检测，暂无法确认'
+        elif cooling:
+            result = '接口池保护中，剩余 ' + str(math.ceil((until-view['checked_at'])/1000)) + ' 秒'
+        elif selected:
+            result = safe(selected.get('name') or '未命名接口') + '（' + provider_health(view, selected, vision)[0] + '）'
+        else:
+            result = '当前无可尝试候选'
+        print('下一请求优先候选（' + label + '）：' + result)
+    print('候选按当前顺序、启用状态、能力和冷却推算；实际请求还受上下文与本题共享预算约束。')
+
+
 def detail(value, indent=''):
     if isinstance(value, list):
         if not value:
@@ -159,7 +273,10 @@ def render(kind, value):
         print('业务资料已应用，但主备接口仅为待补凭据草稿；原有效接口池继续工作。请到菜单 3 → 10 → 11 补全并明确应用。')
         detail({key: value[key] for key in ('missing_credentials', 'message') if key in value})
         return
-    if kind == 'pool' and isinstance(value, dict):
+    if kind in ('pool', 'pool-status') and isinstance(value, dict):
+        view = value.get('provider_view') if kind == 'pool-status' else None
+        if view:
+            print('只读状态回读：' + provider_time(view['checked_at']) + '；本次未调用模型。')
         is_draft = value.get('draft') is True or value.get('applied') is False
         if is_draft:
             print('仅保存草稿，尚未应用；原有效主备接口继续工作。')
@@ -173,6 +290,10 @@ def render(kind, value):
             role = '主接口' if entry.get('id') == value.get('primary_id') or entry.get('role') == 'primary' else '备用接口'
             print(f'{number}. {safe(entry.get("name") or "未命名接口")}（{role}，' + ('启用' if entry.get('enabled') else '停用') + '）')
             detail({key: entry[key] for key in ('base_url', 'model', 'api_mode', 'key_status', 'custom_header_names') if key in entry}, '  ')
+            if view:
+                provider_entry_status(view, entry)
+        if view:
+            provider_next_candidates(view, entries)
         return
     if kind == 'welcome' and isinstance(value, dict):
         welcome = value.get('welcome', value.get('configuration', {}).get('menu', {}).get('welcome', {}))
@@ -251,6 +372,9 @@ def human_lines(lines):
 
 
 def main():
+    if sys.argv[1:2] == ['--provider-snapshot']:
+        print(json.dumps(provider_snapshot(sys.argv[2:]), ensure_ascii=False))
+        return 0
     if len(sys.argv) == 3 and sys.argv[1] == '--snapshot-options':
         choices = []
         for line in Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():

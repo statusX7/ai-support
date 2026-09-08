@@ -9,6 +9,17 @@ provider_pool_read() {
   jq -M -e '.ok==true and (.entries|type=="array") and (.primary_id|type=="string")' "$PROVIDER_POOL" >/dev/null
 }
 
+provider_status_view() {
+  local pool status recent result status_code=0 recent_code=0
+  manager_temporary || return 1; pool=$MANAGE_FILE
+  if manager_tool provider list > "$pool"; then :; else result=$?; cat -- "$pool"; return "$result"; fi
+  manager_temporary || return 1; status=$MANAGE_FILE
+  manager_temporary || return 1; recent=$MANAGE_FILE
+  if timeout --signal=TERM --kill-after=1s 8s bash "$DEPLOY_DIR/scripts/provider.sh" --deploy-dir "$DEPLOY_DIR" status > "$status" 2> "$status.stderr"; then :; else status_code=$?; fi
+  if timeout --signal=TERM --kill-after=1s 8s bash "$DEPLOY_DIR/scripts/provider.sh" --deploy-dir "$DEPLOY_DIR" recent > "$recent" 2> "$recent.stderr"; then :; else recent_code=$?; fi
+  python3 "$SCRIPT_DIR/scripts/menu-display.py" --provider-snapshot "$pool" "$status" "$status_code" "$recent" "$recent_code"
+}
+
 provider_select() {
   local filter=${1:-all} source=${2:-list}
   provider_pool_read "$source" || { warn '接口列表读取失败，可能尚无导入草稿；请查看主备状态或运行自检'; return 1; }
@@ -229,7 +240,7 @@ ai_config_menu() {
     printf '\n1. 查看主备接口列表\n2. 配置主接口\n3. 添加备用接口\n4. 编辑接口或模型\n5. 调整备用顺序\n6. 启用或停用备用接口\n7. 设置主接口（原主自动转备用）\n8. 删除备用接口\n9. 显式测试指定接口\n10. 主备切换策略\n11. 查看近期切换记录\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) manager_action manager_tool provider list ;;
+      1) manager_action provider_status_view ;;
       2)
         provider_pool_read || continue; id=$(jq -M -r '.primary_id' "$PROVIDER_POOL")
         manager_action provider_edit_menu "$id" ;;

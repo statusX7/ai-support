@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-WORK_ROOT="${PROJECT_ROOT}/.work/v1.2.0"
+WORK_ROOT="${PROJECT_ROOT}/.work/v1.2.1"
 mkdir -p -- "$WORK_ROOT"
 WORK=$(mktemp -d "$WORK_ROOT/logs-test.XXXXXXXX")
 DEPLOY="$WORK/deploy"
@@ -62,7 +62,8 @@ prepare() {
   mkdir -p "$DEPLOY"/{scripts,config,logs/doctor-history,logs/diagnostics,tmp,knowledge,data/runtime,data/analytics,backups} \
     "$SYSTEMD_DIR" "$SYSTEMD_STATE"
   cp -p "$PROJECT_ROOT/scripts/common.sh" "$PROJECT_ROOT/scripts/logs.sh" "$PROJECT_ROOT/scripts/log-redact.py" "$DEPLOY/scripts/"
-  cp -p "$PROJECT_ROOT/scripts/bootstrap.sh" "$PROJECT_ROOT/scripts/wizard.sh" "$PROJECT_ROOT/scripts/menu-ui.sh" "$DEPLOY/scripts/"
+  cp -p "$PROJECT_ROOT/scripts/bootstrap.sh" "$PROJECT_ROOT/scripts/wizard.sh" "$PROJECT_ROOT/scripts/menu-ui.sh" \
+    "$PROJECT_ROOT/scripts/menu-provider-ui.sh" "$PROJECT_ROOT/scripts/menu-display.py" "$DEPLOY/scripts/"
   cp -p "$PROJECT_ROOT/manage.sh" "$DEPLOY/manage.sh"
   cp -p "$PROJECT_ROOT/config/logging.yaml.example" "$DEPLOY/config/logging.yaml"
   cp -p "$PROJECT_ROOT/config/app.yaml" "$DEPLOY/config/app.yaml"
@@ -81,7 +82,7 @@ prepare() {
   env_set "$DEPLOY/.env" CRISPAI_LOG_MAX_FILES 5
   env_set "$DEPLOY/.env" AI_API_KEY "$SECRET"
   env_set "$DEPLOY/.env" CRISP_AUTH_B64 "$BASIC_SECRET"
-  env_set "$DEPLOY/.env" AI_CUSTOM_HEADERS_JSON "{\"X-Demo\":\"$HEADER_SECRET\"}"
+  env_set "$DEPLOY/.env" AI_CUSTOM_HEADERS_JSON "$(jq -cn --arg value "$HEADER_SECRET" '{"X-Demo":$value}')"
   # 非生产 fixture：覆盖 JSON 转义换行的脱敏边界；不会由运行时 source。
   printf 'MULTILINE_SECRET="line-one\\nline-two"\n' >> "$DEPLOY/.env"
   chmod 0600 "$DEPLOY/.env" "$DEPLOY/.crisp-ai-installation"
@@ -499,6 +500,27 @@ grep -Fq 'request>headers>Authorization delete' "$PROJECT_ROOT/config/Caddyfile.
   || fail '受管 Caddy 缺少认证头过滤'
 pass '受管 Caddy 模板对运行时错误 URI 与认证头设置字段级过滤'
 
+# 三类池代次不在 .env 中；使用裸值和编码，不能靠字段名通用脱敏掩盖遗漏。
+python3 - "$SCRIPT_DIR" "$DEPLOY" "$WORK/pool-originals.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import test_provider_log_redaction as fixture
+
+deploy = Path(sys.argv[2])
+files = fixture.write_pool_fixture(deploy)
+Path(sys.argv[3]).write_text(json.dumps({file.name: hashlib.sha256(file.read_bytes()).hexdigest() for file in files}))
+with (deploy / "logs/maintenance.jsonl").open("a", encoding="utf-8") as stream:
+    stream.write("pool-export-fixture-present\n")
+    for index, value in enumerate(fixture.pool_values()):
+        generation = ("active", "history", "draft")[index // 2]
+        for variant in sorted(fixture.encoded_variants(value)):
+            stream.write("probe " + generation + " " + variant + "\n")
+PY
+
 archive="$WORK/diagnostic.tar.gz"
 invoke export --output "$archive"
 if (( LAST_RC != 0 )) || [[ ! -f "$archive" ]]; then fail 'export 失败'; fi
@@ -507,10 +529,84 @@ find "$WORK/extracted" -type f -exec chmod 0600 {} +
 for value in "$SECRET" "$HEADER_SECRET" "$BASIC_SECRET" "$PATH_SECRET"; do
   ! grep -R -Fq -- "$value" "$WORK/extracted" || fail '诊断包泄漏真实秘密或 URL secret'
 done
-! find "$WORK/extracted" -type f \( -name .env -o -path '*/runtime/*' -o -path '*/analytics/*' -o -path '*/knowledge/*' \) -print -quit | grep -q . \
+! find "$WORK/extracted" -type f \( -name .env -o -path '*/secrets/*' -o -name 'provider-pool*.json' -o -name provider-pool.yaml \
+  -o -path '*/runtime/*' -o -path '*/analytics/*' -o -path '*/knowledge/*' \) -print -quit | grep -q . \
   || fail '诊断包包含被禁止的业务/秘密文件'
 jq -e '.contains_secrets==false and .contains_prompt_or_knowledge==false and .contains_customer_transcript==false' "$WORK/extracted/manifest.json" >/dev/null || fail '诊断包 manifest 边界缺失'
+python3 - "$SCRIPT_DIR" "$DEPLOY" "$WORK/pool-originals.json" "$WORK/extracted" "$OUT" "$ERR" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import test_provider_log_redaction as fixture
+
+deploy, originals, extracted, out, err = map(Path, sys.argv[2:])
+files = [file for file in extracted.rglob("*") if file.is_file()] + [out, err]
+variants = [value.encode() for value in fixture.all_pool_variants()]
+if any(any(value in file.read_bytes() for value in variants) for file in files):
+    raise SystemExit("诊断包或导出终端遗留池凭据编码")
+maintenance = (extracted / "maintenance.jsonl").read_text()
+if "pool-export-fixture-present" not in maintenance or "[已脱敏]" not in maintenance:
+    raise SystemExit("导出未实际覆盖含池凭据的维护日志样例")
+expected = json.loads(originals.read_text())
+directory = deploy / "secrets/provider/generations"
+if any(hashlib.sha256((directory / name).read_bytes()).hexdigest() != digest for name, digest in expected.items()):
+    raise SystemExit("导出改写了受限池凭据原件")
+PY
 pass '诊断包仅含脱敏白名单资料，二次秘密扫描通过'
+
+# 仅在隔离部署副本中分别放行三类虚构池记录；其它日志照常过滤，
+# 防止因 .env 旧秘密先命中而误称第二道扫描覆盖了所有池代次。
+cp -p "$DEPLOY/scripts/log-redact.py" "$WORK/log-redact.original.py"
+for generation in active history draft; do
+  cp -p "$WORK/log-redact.original.py" "$DEPLOY/scripts/log-redact.py"
+  python3 - "$DEPLOY/scripts/log-redact.py" "$generation" <<'PY'
+from pathlib import Path
+import sys
+
+file = Path(sys.argv[1])
+text = file.read_text(encoding="utf-8")
+old = "print(redact_line(text, secrets, args.mode), flush=True)"
+if text.count(old) != 1:
+    raise SystemExit("首道过滤故障注入的唯一源码锚点失效")
+new = 'print(text if text.startswith("probe ' + sys.argv[2] + ' ") else redact_line(text, secrets, args.mode), flush=True)'
+file.write_text(text.replace(old, new), encoding="utf-8")
+PY
+  invoke export --output "$WORK/diagnostic-unsafe-${generation}.tar.gz"
+  (( LAST_RC != 0 )) || fail '首道过滤失效时第二道秘密扫描未拒绝'
+  [[ ! -e "$WORK/diagnostic-unsafe-${generation}.tar.gz" ]] || fail '二次扫描失败仍生成了诊断包'
+  grep -Fq '二次秘密扫描未通过' "$ERR" || fail '首道过滤负例未抵达二次秘密扫描'
+  grep -Fq 'maintenance.jsonl' "$ERR" || fail '二次扫描未在指定池记录中发现秘密'
+done
+cp -p "$WORK/log-redact.original.py" "$DEPLOY/scripts/log-redact.py"
+pass '独立二次扫描在首道过滤故障时拒绝有效、历史及草稿池秘密'
+
+python3 - "$DEPLOY" <<'PY'
+from pathlib import Path
+import sys
+
+directory = Path(sys.argv[1]) / "secrets/provider/generations"
+(directory / ("f" * 32 + ".json")).symlink_to(directory / ("a" * 32 + ".json"))
+PY
+invoke export --output "$WORK/diagnostic-invalid-secrets.tar.gz"
+(( LAST_RC != 0 )) || fail '不安全秘密文件未阻止实际导出'
+[[ ! -e "$WORK/diagnostic-invalid-secrets.tar.gz" ]] || fail '秘密清单异常仍生成诊断包'
+python3 - "$DEPLOY" "$SCRIPT_DIR" "$OUT" "$ERR" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[2])
+import test_provider_log_redaction as fixture
+
+text = Path(sys.argv[3]).read_text() + Path(sys.argv[4]).read_text()
+if "Traceback" in text or any(value in text for value in fixture.all_pool_variants()):
+    raise SystemExit("导出异常说明包含调用栈或虚构凭据原文")
+(Path(sys.argv[1]) / "secrets/provider/generations" / ("f" * 32 + ".json")).unlink()
+PY
+[[ "$before" == "$(business_hash)" ]] || fail '正常/失败导出改变业务状态'
+pass '秘密清单异常时生产导出失败关闭，不生成归档也不改变业务状态'
 
 invoke configure --max-files 21 --preview
 (( LAST_RC == 64 )) || fail 'max_files 21 应拒绝'

@@ -169,7 +169,7 @@ const test = async (name, action) => {
     const card = f.sent.at(-1); assert.equal(card.type, 'picker'); assert.equal(f.state(session).mode, 'ai');
     const click = f.event(session, { ...card.content, choices: card.content.choices.map((choice, index) => ({ ...choice, selected: index === 0 })) }, { type: 'picker', fingerprint: card.fingerprint });
     click.event = 'message:updated'; await f.deliver(click); assert.equal(f.state(session).mode, 'human');
-    assert.match(f.sent.at(-1).content, /已暂停/);
+    assert.equal(f.sent.at(-1).content, '您的人工协助请求已收到，请稍候。');
   });
 
   await test('F05 旧 unknown 普通答案已送达时仅对账，原历史及统计保留', async () => {
@@ -235,7 +235,7 @@ const test = async (name, action) => {
     await f.deliver(f.event('session_badimage1', { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
     assert.match(f.sent.at(-1).content, /补充报错文字/); assert.equal(f.state('session_badimage1').mode, 'ai');
     f.modes.modelFailure = true; await f.deliver(f.event('session_badmodel1', '模型错误的普通问题'));
-    assert.match(f.sent.at(-1).content, /暂时不可用/); assert.equal(f.state('session_badmodel1').mode, 'ai');
+    assert.equal(f.sent.at(-1).content, '暂时无法回复，请稍后再试。'); assert.equal(f.state('session_badmodel1').mode, 'ai');
     const count = f.sent.length; const inferenceCount = f.modelRequests.length;
     f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 2, applied_revision: 2 });
     await f.deliver(f.event('session_disable01', '否'));

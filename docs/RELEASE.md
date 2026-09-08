@@ -48,9 +48,12 @@ main/get.sh 是公共入口，默认解析一次 Latest 正式 tag，再固定�
 
 ## 推送、组装与发布
 
-仅在核对远端无冲突且门禁完成后执行。以下是维护者流程：
+仅在核对远端无冲突且门禁完成后执行。唯一远程操作者在受限工作区生成 0600 的脱敏验收回执，字段与 `scripts/release-gate.py` 一致；每个检查项必须来自实际验收。门禁核对当前干净提交、完整包 SHA、get 审计副本及 7 天内的同包 TARGET-A 回执。它不是数字签名，也不能代替真实测试。缺失、失败、身份不符或源码改动时必须阻止后续动作，不能伪造回执或绕过检查。以下是维护者流程：
 
 ```bash
+set -euo pipefail
+python3 scripts/release-gate.py --artifacts dist \
+  --target-receipt .work/v1.2.1-private/target-release-gate.json
 git tag -a v1.2.1 -m "v1.2.1: add bounded provider failover and remove automatic rating invitations"
 git push --atomic origin main v1.2.1
 gh release create v1.2.1 \

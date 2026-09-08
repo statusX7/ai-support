@@ -80,7 +80,7 @@ RELEASE_FILES=(
   config/logging.yaml.example
   knowledge/README.md n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
   scripts/analytics.sh scripts/backup.sh scripts/bootstrap.sh scripts/common.sh
-  scripts/healthcheck.sh scripts/doctor.sh scripts/package-release.sh scripts/restore.sh
+  scripts/healthcheck.sh scripts/doctor.sh scripts/package-release.sh scripts/release-gate.py scripts/restore.sh
   scripts/rollback.sh scripts/snapshot.sh scripts/wizard.sh scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh
   scripts/configuration.sh scripts/provider.sh scripts/provider-adapter.js scripts/knowledge.sh
   scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py
@@ -91,12 +91,13 @@ RELEASE_FILES=(
   tests/run.sh tests/test_archive_security.sh tests/test_bootstrap.sh
   tests/test_configuration_guards.js tests/test_configuration_protocol.js
   tests/test_feedback_runtime.js tests/test_provider_pool.js tests/test_runtime_provider_pool.js tests/test_provider_lifecycle.js
+  tests/test_outgoing_identity.js tests/owned_outgoing.py tests/test_provider_log_redaction.py
   tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
   tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
   tests/test_get.sh tests/test_doctor.sh tests/test_doctor_pool.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
   tests/test_crisp_auth.js tests/test_caddy_routing.sh tests/fixtures/caddy-order-v111.conf
   tests/test_launcher.py tests/test_materials_apply.js tests/test_material_limits.js tests/test_logs.sh tests/test_docs_acceptance.py
-  tests/test_provider_adapter.js tests/test_release_package.sh tests/test_static_security.sh tests/test_web_chat_browser.js
+  tests/test_provider_adapter.js tests/test_release_package.sh tests/test_release_gate.py tests/test_static_security.sh tests/test_web_chat_browser.js
   tests/test_wizard.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
   tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker

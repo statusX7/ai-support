@@ -149,6 +149,12 @@ pass "公共分发入口与文档契约专项"
 python3 "${SCRIPT_DIR}/test_docs_acceptance.py"
 pass "新手文档、真实帮助入口与菜单限制独立核对专项"
 
+python3 "${SCRIPT_DIR}/test_release_gate.py"
+pass "同包实机回执、源码身份和发布前阻断专项"
+
+python3 "${SCRIPT_DIR}/test_provider_log_redaction.py"
+pass "当前、历史与草稿接口秘密的落盘/跟踪脱敏专项"
+
 "${SCRIPT_DIR}/test_legacy_rollback.sh"
 pass "真实 v1.1.0 快照布局回滚与新模块代际收敛专项"
 
@@ -255,6 +261,8 @@ if command -v node >/dev/null 2>&1; then
   pass "主备池生产协议与管理专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_feedback_runtime.js"
   pass "取消评价与历史出站恢复专项（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_outgoing_identity.js"
+  pass "中性客服显示与持久出站归属隔离专项"
   node "${SCRIPT_DIR}/test_configuration_protocol.js"
   node "${SCRIPT_DIR}/test_provider_lifecycle.js"
   pass "配置与多知识库生产 CLI 协议专项（内部子项单列，不重复计入总数）"

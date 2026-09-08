@@ -252,6 +252,7 @@ manager_result() {
     return "$status"
   fi
   case "${1:-}: ${2:-}: ${3:-}" in
+    'provider_status_view: : ') kind='pool-status' ;;
     'manager_tool: configuration: prompt-show') "$@"; return $? ;;
     'manager_tool: configuration: get'|'manager_tool: configuration: status')
       kind=${4:-runtime}; [[ "$kind" != menu ]] || kind=welcome ;;

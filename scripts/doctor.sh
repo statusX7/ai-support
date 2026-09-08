@@ -1279,10 +1279,10 @@ PY
 }
 
 doctor_pool_adapter_check() {
-  local start output count healthy cooling unknown hook_secret plugin_secret
+  local start output count healthy cooling unknown hook_secret plugin_secret vision_count vision_cooling vision_unknown
   start=$(doctor_now_ms)
   if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )); then
-    for output in provider.adapter provider.adapter_binding anything.provider_binding n8n.runtime_binding provider.pool_health; do
+    for output in provider.adapter provider.adapter_binding anything.provider_binding n8n.runtime_binding provider.pool_health provider.pool_vision; do
       doctor_skip "$output" '主备接口运行检查' '因接口池或 Docker 上游故障未检查' docker
     done
     return
@@ -1349,14 +1349,28 @@ doctor_pool_adapter_check() {
     elif (( unknown > 0 )); then
       doctor_add provider.pool_health 'AI 接口可用性' WARN warning "${unknown} 个启用接口尚未检测或恢复待确认；默认自检不会付费轮询" docker '按需显式测试指定接口，或等待正常问题产生当前成功证据' "$start"
     else
-      doctor_add provider.pool_health 'AI 接口可用性' PASS warning '已启用接口均有当前配置的健康证据' docker '' "$start"
+      doctor_add provider.pool_health 'AI 接口可用性' PASS warning '已启用接口均有当前配置的文本健康证据；图片能力另列' docker '' "$start"
+    fi
+    vision_count=$(jq '[.entries[]|select(.enabled and .vision_health != null and .vision_health != "disabled")]|length' "$output")
+    vision_cooling=$(jq '[.entries[]|select(.enabled and .vision_health == "cooling")]|length' "$output")
+    vision_unknown=$(jq '[.entries[]|select(.enabled and (.vision_health == "unknown" or .vision_health == "half_open"))]|length' "$output")
+    if (( vision_cooling > 0 )); then
+      doctor_add provider.pool_vision '接口图片能力' WARN warning "${vision_cooling} 个接口图片能力暂时冷却；文字健康与图片能力分别判断，不能丢图冒充成功" docker '从菜单 3 查看视觉候选；只在需要时显式测试图片，默认不调用模型' "$start"
+    elif (( vision_unknown > 0 )); then
+      doctor_add provider.pool_vision '接口图片能力' WARN warning "${vision_unknown} 个接口尚无当前图片成功证据或恢复待确认；文本成功不等于支持图片" docker '正常图片问题或显式图片测试可产生当前证据，不默认轮询' "$start"
+    elif (( vision_count > 0 )); then
+      doctor_add provider.pool_vision '接口图片能力' PASS warning '已启用图片候选有当前配置的成功证据' docker '' "$start"
+    else
+      doctor_skip provider.pool_vision '接口图片能力' '当前没有已启用的图片能力候选或此次未取得图片状态，不能据文本结果推断视觉可用' docker
     fi
   elif ! doctor_remaining >/dev/null 2>&1; then
     doctor_deadline_add provider.adapter '主备 adapter 实际读取' docker "$start"
     doctor_skip provider.pool_health 'AI 接口可用性' '因自检总截止时间已到未检查' docker
+    doctor_skip provider.pool_vision '接口图片能力' '因自检总截止时间已到未检查' docker
   else
     doctor_add provider.adapter '主备 adapter 实际读取' FAIL critical '容器网络、认证或 adapter 已应用代次未通过核对' docker '使用菜单 2 检查组件和受限秘密挂载，再从菜单 3 重新应用' "$start"
     doctor_skip provider.pool_health 'AI 接口可用性' '因本地 adapter 不可验证，未推断上游是否健康' docker
+    doctor_skip provider.pool_vision '接口图片能力' '因本地 adapter 不可验证，未推断图片能力' docker
   fi
 }
 

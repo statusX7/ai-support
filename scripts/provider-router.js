@@ -64,8 +64,9 @@ function validateEntry(entry, secret) {
   if (!secret || typeof secret.api_key !== 'string' || !secret.api_key && entry.draft !== true || secret.api_key.length > 16384 || /[\x00-\x1f\x7f]/.test(secret.api_key)) throw terminal('invalid_pool','接口秘密缺失或无效');
   const headers = parseHeaders(secret.custom_headers || {});
   const authScope = hash(base.origin + '\0' + secret.api_key + '\0' + JSON.stringify(Object.entries(headers).sort()));
+  const entryIdentity = hash(entry.id + '\0' + entry.base_url + '\0' + entry.api_mode + '\0' + entry.model + '\0' + authScope);
   return {...entry, base:base.href.replace(/\/$/,''), model:entry.model, mode:entry.api_mode, key:secret.api_key, headers,
-    authScope:'auth:' + authScope, modelScope:'model:' + hash(authScope + '\0' + entry.model), entryScope:'entry:' + hash(entry.id + '\0' + entry.base_url + '\0' + entry.api_mode + '\0' + entry.model + '\0' + authScope)};
+    authScope:'auth:' + authScope, modelScope:'model:' + hash(authScope + '\0' + entry.model), entryScope:'entry:' + entryIdentity, visionScope:'vision:' + entryIdentity};
 }
 
 function readJson(file, maximum = 16777216) {
@@ -114,13 +115,19 @@ function retryAfterMilliseconds(value, now = Date.now()) {
 function classifyFailure(status, body, headers = {}) {
   const detail = body?.error || {};
   const code = String(detail.code || detail.type || '').toLowerCase();
+  const category = String(detail.type || '').toLowerCase();
   const message = String(detail.message || '').toLowerCase();
   const retryAfter = retryAfterMilliseconds(typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']);
-  if (/content_filter|content_policy|safety|moderation|policy_violation/.test(code) || /safety system|content policy/.test(message)) return {kind:'safety_refusal',fallback:false,status:400};
+  if (/content_filter|content_policy|safety|moderation|policy_violation/.test(code + ' ' + category) || /safety system|content policy/.test(message)) return {kind:'safety_refusal',fallback:false,status:400};
   if (/model_not_found|invalid_model|model_not_exist|model_not_available/.test(code) || /model.*(?:does not exist|not found|not available)/.test(message)) return {kind:'model_unavailable',fallback:true,scope:'modelScope',retryAfter,status};
   if (status === 401 || status === 403 || /invalid_api_key|authentication_error|invalid_authentication/.test(code)) return {kind:'authentication_failed',fallback:true,scope:'authScope',retryAfter,status};
   if (status === 429 || /insufficient_quota|billing_hard_limit|quota_exceeded|billing_not_active|usage_limit|credit_balance_exhausted|spend_limit_exceeded/.test(code)) return {kind:/insufficient_quota|billing|quota_exceeded|usage_limit|credit_balance_exhausted|spend_limit_exceeded/.test(code) ? 'quota_exhausted' : 'rate_limited',fallback:true,scope:'authScope',retryAfter,status};
   if (status >= 500 || status === 408 || status === 409) return {kind:'upstream_unavailable',fallback:true,scope:'entryScope',retryAfter,status};
+  // 仅接受明确模型能力错误；unsupported_image 的格式/坏数据含义仍是输入终态。
+  const modelVisionUnsupported = /^(?:this|the(?: selected)?) model does not support (?:images?|image inputs?|vision)[.!]?$/.test(message.trim())
+    || /^(?:image inputs?|images?|vision) (?:is|are) not supported by (?:this|the(?: selected)?) model[.!]?$/.test(message.trim());
+  const explicitVisionCode = ['image_not_supported','unsupported_image','vision_not_supported','image_input_not_supported','unsupported_vision'].includes(code);
+  if ([400,422].includes(status) && modelVisionUnsupported && (explicitVisionCode || code === 'invalid_request_error')) return {kind:'vision_unsupported',fallback:true,scope:'visionScope',retryAfter,status};
   if (/invalid_request_error|context_length_exceeded|invalid_argument/.test(code)) return {kind:'invalid_request',fallback:false,status:400};
   if (status >= 400 && status < 500) return {kind:'invalid_request',fallback:false,status};
   return {kind:'invalid_response',fallback:true,scope:'entryScope',retryAfter,status};
@@ -143,7 +150,7 @@ function createRouter(environment, invoke) {
   const currentPool = () => {
     const pool = loadPool(environment);
     if (loadedRevision !== pool.revision) {
-      const active = new Set(pool.entries.flatMap(entry => [entry.authScope,entry.modelScope,entry.entryScope]));
+      const active = new Set(pool.entries.flatMap(entry => [entry.authScope,entry.modelScope,entry.entryScope,entry.visionScope]));
       for (const key of Object.keys(state.health)) if (!active.has(key)) delete state.health[key];
       if (loadedRevision !== undefined) state.pool_until = 0;
       loadedRevision = pool.revision; save();
@@ -153,24 +160,24 @@ function createRouter(environment, invoke) {
   const record = value => {
     state.recent.push(value); state.recent = state.recent.slice(-200); save();
   };
-  const scopes = entry => [entry.authScope,entry.modelScope,entry.entryScope];
-  const allowed = (entry, now) => scopes(entry).every(key => {
+  const scopes = (entry, visual = false) => [entry.authScope,entry.modelScope,entry.entryScope,...(visual ? [entry.visionScope] : [])];
+  const allowed = (entry, now, visual = false) => scopes(entry,visual).every(key => {
     const health = state.health[key];
     return !health || health.until <= now && (!health.lease || health.lease.until <= now);
   });
-  const reserve = (entry, policy, now) => {
-    if (!allowed(entry,now)) return false;
-    for (const key of scopes(entry)) {
+  const reserve = (entry, policy, now, visual = false) => {
+    if (!allowed(entry,now,visual)) return false;
+    for (const key of scopes(entry,visual)) {
       const health = state.health[key];
       if (health && health.failures > 0 && health.successes < 2) health.lease = {owner:boot,until:now + policy.call_timeout_ms + 1000};
     }
     save(); return true;
   };
-  const release = entry => {
-    for (const key of scopes(entry)) if (state.health[key]?.lease?.owner === boot) delete state.health[key].lease;
+  const release = (entry, visual = false) => {
+    for (const key of scopes(entry,visual)) if (state.health[key]?.lease?.owner === boot) delete state.health[key].lease;
   };
-  const success = entry => {
-    for (const key of scopes(entry)) {
+  const success = (entry, visual = false) => {
+    for (const key of scopes(entry,visual)) {
       const health = state.health[key] || {failures:0,successes:0,until:0};
       health.successes = Math.min(2,health.successes+1); health.until = 0; delete health.lease;
       if (health.successes >= 2) { health.failures = 0; health.last_error = ''; }
@@ -178,8 +185,8 @@ function createRouter(environment, invoke) {
     }
     state.pool_until = 0; save();
   };
-  const fault = (entry, failure, policy) => {
-    release(entry);
+  const fault = (entry, failure, policy, visual = false) => {
+    release(entry,visual);
     const key = entry[failure.scope || 'entryScope'];
     const health = state.health[key] || {failures:0};
     health.failures += 1; health.successes = 0; health.last_error = failure.kind;
@@ -270,7 +277,7 @@ function createRouter(environment, invoke) {
         const maxOutput = Math.min(entry.max_output_tokens,Math.max(1,requestedOutput));
         if (inputTokens + maxOutput > entry.context_window) continue;
         candidates += 1;
-        if (!reserve(entry,pool.policy,Date.now())) continue;
+        if (!reserve(entry,pool.policy,Date.now(),visual)) continue;
         phase.tried.push(entry.id); question.attempts += 1; persistQuestion(question);
         const start = Date.now();
         const controller = new AbortController();
@@ -282,19 +289,19 @@ function createRouter(environment, invoke) {
           const result = await invoke(body,{...entry,maxOutput,timeout:Math.min(pool.policy.call_timeout_ms,question.deadline-Date.now()),connectTimeout:pool.policy.connect_timeout_ms},controller.signal);
           check();
           if (cancelError) throw cancelError;
-          success(entry);
+          success(entry,visual);
           phase.result = result; delete phase.owner;
           if (result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter') question.terminal = {code:'safety_refusal',message:'模型已拒绝该内容，本次问题已终止'};
           persistQuestion(question);
-          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,outcome:result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter' ? 'refused':'success',attempt:question.attempts,duration_ms:Date.now()-start});
+          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),outcome:result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter' ? 'refused':'success',attempt:question.attempts,duration_ms:Date.now()-start});
           return result;
         } catch (error) {
           if (!cancelError) { try { check(); } catch (currentError) { cancelError = currentError; } }
-          if (cancelError || error.terminal || signal?.aborted) { release(entry); save(); throw cancelError || error; }
+          if (cancelError || error.terminal || signal?.aborted) { release(entry,visual); save(); throw cancelError || error; }
           const failure = error.failure || {kind:error.name === 'AbortError' ? 'upstream_timeout':'connection_failed',fallback:true,scope:'entryScope',status:0};
-          if (!failure.fallback) { release(entry); save(); throw terminal(failure.kind,failure.kind === 'safety_refusal' ? '模型拒绝处理该内容':'模型拒绝本次请求的输入格式'); }
-          fault(entry,failure,pool.policy);
-          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,attempt:question.attempts,duration_ms:Date.now()-start});
+          if (!failure.fallback || failure.scope === 'visionScope' && !visual) { release(entry,visual); save(); throw terminal(failure.kind === 'vision_unsupported' ? 'invalid_request' : failure.kind,failure.kind === 'safety_refusal' ? '模型拒绝处理该内容':'模型拒绝本次请求的输入格式'); }
+          fault(entry,failure,pool.policy,visual);
+          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,attempt:question.attempts,duration_ms:Date.now()-start});
         } finally { clearInterval(monitor); signal?.removeEventListener('abort',cancel); }
       }
       if (candidates && !pool.entries.some(entry => entry.enabled && allowed(entry,Date.now()))) { state.pool_until = Date.now() + pool.policy.pool_cooldown_ms; save(); }
@@ -319,10 +326,13 @@ function createRouter(environment, invoke) {
     return {ok:true,revision:pool.revision,pool_cooldown_until:state.pool_until,entries:pool.entries.map(entry => {
       const values = scopes(entry).map(key => state.health[key]).filter(Boolean);
       const until = Math.max(0,...values.map(value => value.until || 0));
-      return {id:entry.id,enabled:entry.enabled,health:!entry.enabled ? 'disabled' : until > now ? 'cooling' : values.some(value => value.lease?.until > now) ? 'half_open' : values.length && values.every(value => value.successes >= 2) ? 'healthy' : 'unknown',cooldown_until:until,last_error:values.find(value => value.last_error)?.last_error || ''};
+      const visionValues = scopes(entry,true).map(key => state.health[key]).filter(Boolean);
+      const visionUntil = Math.max(0,...visionValues.map(value => value.until || 0));
+      return {id:entry.id,enabled:entry.enabled,health:!entry.enabled ? 'disabled' : until > now ? 'cooling' : values.some(value => value.lease?.until > now) ? 'half_open' : values.length && values.every(value => value.successes >= 2) ? 'healthy' : 'unknown',cooldown_until:until,last_error:values.find(value => value.last_error)?.last_error || '',
+        vision_health:!entry.enabled || !entry.capabilities.vision ? 'disabled' : visionUntil > now ? 'cooling' : visionValues.some(value => value.lease?.until > now) ? 'half_open' : state.health[entry.visionScope] && visionValues.every(value => value.successes >= 2) ? 'healthy' : 'unknown',vision_cooldown_until:visionUntil,vision_last_error:visionValues.find(value => value.last_error)?.last_error || ''};
     })};
   };
-  return {route,status,recent:() => ({ok:true,records:state.recent.slice().reverse()}),loadPool:currentPool,clearHealth:entry => { for (const key of scopes(entry)) delete state.health[key]; state.pool_until = 0; save(); }};
+  return {route,status,recent:() => ({ok:true,records:state.recent.slice().reverse()}),loadPool:currentPool,clearHealth:entry => { for (const key of scopes(entry,true)) delete state.health[key]; state.pool_until = 0; save(); }};
 }
 
 module.exports = {createRouter,loadPool,validateEntry,validatePolicy,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,readJson,estimateTextTokens};

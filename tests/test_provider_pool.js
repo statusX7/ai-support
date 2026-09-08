@@ -110,6 +110,7 @@ async function main() {
       assert.equal(f.calls[20].body.model,'fixture-model-20');assert.equal(f.calls[20].headers.authorization,'Bearer fixture-key-20');assert.equal(f.calls[20].headers['x-fixture'],'value');assert.ok(!result.text.includes('fixture-key'));
       assert.equal((await f.post(sample,envelope)).status,200);assert.equal(f.calls.length,21);
       const recent=await f.get('recent');assert.equal(recent.records.length,21);assert.ok(!JSON.stringify(recent).includes('fixture-key'));assert.ok(!JSON.stringify(recent).includes('http:'));
+      assert.ok(recent.records.every(record=>record.pool_revision===f.pool.revision && Number.isSafeInteger(record.remaining_budget_ms) && record.remaining_budget_ms>=0 && record.remaining_budget_ms<=f.pool.policy.question_timeout_ms));
     }finally{await f.close();}
   });
   await test('401共享认证范围、429额度/Retry-After不截短、模型不存在仅影响同模型',async()=>{
@@ -272,6 +273,63 @@ async function main() {
       assert.equal((await f.post({messages:[{role:'user',content}]})).status,200);assert.equal(f.calls.length,1);
       f.behavior=async(call,response)=>{response.writeHead(400);response.end(JSON.stringify({error:{code:'context_length_exceeded'}}));return true;};
       assert.equal((await f.post()).status,400);assert.equal(f.calls.length,2);
+    }finally{await f.close();}
+  });
+  await test('明确模型不支持图片时只冷却视觉并切备用，文字仍用主且共享问题预算',async()=>{
+    const failures=[
+      {code:'image_not_supported',message:'This model does not support image input.'},
+      {code:'unsupported_image',message:'The selected model does not support images.'},
+      {type:'invalid_request_error',message:'Image input is not supported by this model.'}
+    ];
+    for(const failure of failures) {
+      const f=await fixture(2,{max_attempts:3});try {
+        const visual={messages:[{role:'user',content:[{type:'text',text:'合成图片问题'},{type:'image_url',image_url:{url:image}}]}]};
+        f.behavior=async(call,response)=>{if(call.index===0&&Array.isArray(call.body.messages?.[0]?.content)){response.writeHead(400);response.end(JSON.stringify({error:failure}));return true;}return false;};
+        const envelope=f.envelope('vision');const first=await f.post(visual,envelope);assert.equal(first.status,200,first.text);assert.deepEqual(f.calls.map(call=>call.index),[0,1]);
+        assert.equal(f.calls[1].body.messages[0].content[1].image_url.url,image);
+        const status=await f.get('status');assert.equal(status.entries[0].vision_health,'cooling');assert.notEqual(status.entries[0].health,'cooling');
+        const until=status.entries[0].vision_cooldown_until;
+        assert.equal((await f.post(sample,{...envelope,stage:'answer'})).status,200);assert.deepEqual(f.calls.map(call=>call.index),[0,1,0]);
+        assert.equal(read(path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json')).attempts,3);
+        assert.equal((await f.get('status')).entries[0].vision_cooldown_until,until);
+        await f.post(visual,f.envelope('vision'));assert.equal(f.calls.at(-1).index,1);
+        await f.restart();await f.post(visual,f.envelope('vision'));assert.equal(f.calls.at(-1).index,1);assert.equal(f.calls.filter(call=>call.index===0).length,2);
+        assert.equal((await f.get('recent')).records.find(record=>record.outcome==='failed').error_class,'vision_unsupported');
+      }finally{await f.close();}
+    }
+  });
+  await test('视觉备用不绕过坏图、一般输入错误、安全拒绝或无图请求',async()=>{
+    const failures=[
+      {error:{code:'invalid_image',message:'The image data is malformed.'}},
+      {error:{code:'unsupported_image',message:'Unsupported image format. Use PNG or JPEG.'}},
+      {error:{code:'unsupported_image'}},
+      {error:{type:'invalid_request_error',message:'Invalid image URL.'}},
+      {error:{code:'image_not_supported',type:'content_policy_violation',message:'The selected model does not support images.'}},
+      {error:{code:'unsupported_image',message:'The selected model does not support images.'},text:true},
+      {refusal:true}
+    ];
+    for(const failure of failures) {
+      const f=await fixture(2);try {
+        const visual={messages:[{role:'user',content:[{type:'text',text:'合成图片问题'},{type:'image_url',image_url:{url:image}}]}]};
+        f.behavior=async(call,response)=>{response.writeHead(failure.refusal?200:400);response.end(JSON.stringify(failure.refusal?{choices:[{message:{role:'assistant',content:null,refusal:'不能协助此请求'},finish_reason:'stop'}]}:{error:failure.error}));return true;};
+        const envelope=f.envelope(failure.text?'answer':'vision'),body=failure.text?sample:visual;
+        const result=await f.post(body,envelope);assert.equal(result.status,failure.refusal?200:400,result.text);assert.equal(f.calls.length,1);
+        if(failure.refusal)assert.equal(result.value.choices[0].message.refusal,'不能协助此请求');
+        await f.post(body,envelope);assert.equal(f.calls.length,1);
+        const status=await f.get('status');assert.notEqual(status.entries[0].health,'cooling');assert.notEqual(status.entries[0].vision_health,'cooling');
+      }finally{await f.close();}
+    }
+  });
+  await test('视觉能力冷却半开仅允许一次并发恢复，连续两次视觉成功才恢复健康',async()=>{
+    const f=await fixture(2,{cooldown_initial_ms:1000,cooldown_max_ms:1000});try {
+      const visual={messages:[{role:'user',content:[{type:'text',text:'合成图片问题'},{type:'image_url',image_url:{url:image}}]}]};
+      let failed=false;
+      f.behavior=async(call,response)=>{if(call.index===0&&Array.isArray(call.body.messages?.[0]?.content)){if(!failed){failed=true;response.writeHead(400);response.end(JSON.stringify({error:{code:'image_not_supported',message:'This model does not support image input.'}}));return true;}await sleep(180);}return false;};
+      assert.equal((await f.post(visual,f.envelope('vision'))).status,200);
+      await f.post();await f.post();assert.equal((await f.get('status')).entries[0].vision_health,'cooling');
+      await sleep(1100);const before=f.calls.length;await Promise.all([f.post(visual,f.envelope('vision')),f.post(visual,f.envelope('vision'))]);
+      assert.equal(f.calls.slice(before).filter(call=>call.index===0).length,1);assert.equal((await f.get('status')).entries[0].vision_health,'unknown');
+      await f.post(visual,f.envelope('vision'));assert.equal((await f.get('status')).entries[0].vision_health,'healthy');
     }finally{await f.close();}
   });
   process.stdout.write(`UNIT/PROTOCOL 主备协议合计 ${count} 组通过，0 失败\n`);

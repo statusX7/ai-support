@@ -66,6 +66,18 @@ grep -Fq '缓存' "${TEST_ROOT}/text-last.out" || fail '缓存自检未标注来
 ! grep -Eq 'schema_version|revision|jq: error|compile error' "${TEST_ROOT}/text-last.out" "${TEST_ROOT}/text-last.err" || fail '普通自检暴露内部结构或展示解析错误'
 pass '普通自检中文渲染真实执行，JSON读取与缓存范围均保持'
 
+jq '.entries[0].vision_health="cooling" | .entries[1].vision_health="healthy"' \
+  "${DEPLOY}/tmp/fixture-pool-status.json" > "${TEST_ROOT}/health.new"
+mv -- "${TEST_ROOT}/health.new" "${DEPLOY}/tmp/fixture-pool-status.json"
+before=$(business_hash)
+invoke --local
+assert_result provider.pool_health PASS
+assert_result provider.pool_vision WARN
+(( LAST_RC == 2 )) || fail '图片能力退化必须警告，文字健康不能掩盖'
+[[ "$before" == "$(business_hash)" ]] || fail '图片能力自检偷偷改变配置或会话'
+write_health healthy
+pass '图片专属冷却单列警告，默认只读且不误判文本故障'
+
 jq '.entries[0].health="cooling"' \
   "${DEPLOY}/tmp/fixture-pool-status.json" > "${TEST_ROOT}/health.new"
 mv -- "${TEST_ROOT}/health.new" "${DEPLOY}/tmp/fixture-pool-status.json"

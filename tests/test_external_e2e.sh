@@ -224,12 +224,14 @@ crisp_message_snapshot() {
   expect_success "读取 Crisp conversation 消息"
   jq -e '(.data | type) == "array"' <<< "$HTTP_BODY" >/dev/null \
     || fail "Crisp 消息响应格式无效"
+  HTTP_BODY=$(python3 "${SCRIPT_DIR}/owned_outgoing.py" "$DEPLOY_DIR" "$CRISP_WEBSITE_ID" "$session_id" <<< "$HTTP_BODY") \
+    || fail "无法核对本项目出站身份"
 }
 
 ai_reply_count() {
   local session_id=$1
   crisp_message_snapshot "$session_id"
-  jq '[.data[]? | select(.from == "operator" and ((.automated == true) or (.properties.ai_support == true) or ((.properties.ai_support_version // "") != "")))] | length' \
+  jq '[.data[]? | select(.from == "operator" and .__crispai_owned == true)] | length' \
     <<< "$HTTP_BODY"
   unset HTTP_BODY
 }
@@ -258,8 +260,7 @@ latest_ai_reply_contains() {
   jq -e --arg expected "$expected_text" --argjson minimum "$minimum_count" '
     [.data[]? | select(
       .from == "operator" and
-      ((.automated == true) or (.properties.ai_support == true) or
-       ((.properties.ai_support_version // "") != "")))] as $replies
+      .__crispai_owned == true)] as $replies
     | ($replies | length) >= $minimum and
       (($replies
         | sort_by(((.timestamp | tonumber?) // 0), ((.fingerprint // "") | tostring))
@@ -293,8 +294,7 @@ latest_ai_reply_is_safe() {
     --argjson minimum "$minimum_count" '
     [.data[]? | select(
       .from == "operator" and
-      ((.automated == true) or (.properties.ai_support == true) or
-       ((.properties.ai_support_version // "") != "")))] as $replies
+      .__crispai_owned == true)] as $replies
     | ($replies | length) >= $minimum and
       (($replies
         | sort_by(((.timestamp | tonumber?) // 0), ((.fingerprint // "") | tostring))
@@ -614,7 +614,7 @@ wait_for_ai_count "$HANDOFF_SESSION" "$((HANDOFF_BASELINE + 1))"
 crisp_message_snapshot "$HANDOFF_SESSION"
 OFFER_MESSAGE=$(jq -ce --arg label "$(jq -r '.confirm_label // "召唤人工客服"' <<< "$HANDOFF_RULE")" '
   [.data[] | select(.type == "picker" and .from == "operator" and
-    ((.automated == true) or (.properties.ai_support == true)) and
+    .__crispai_owned == true and
     any(.content.choices[]?; .label == $label))] | sort_by(.timestamp) | last // error("picker")
 ' <<< "$HTTP_BODY") || fail "未收到本项目原生 picker"
 unset HTTP_BODY

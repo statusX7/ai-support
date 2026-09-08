@@ -154,6 +154,25 @@ configuration_normalize_file() {
       || { rm -f -- "$policy_output"; return 1; }
     mv -f -- "$policy_output" "$output"
   fi
+  if [[ "$name" == keyword || "$name" == handoff ]]; then
+    policy_output=$(mktemp "${output}.display.XXXXXXXX") || return 1
+    # 只迁移项目曾提供的精确缺省文案，不扫描/改写用户 Prompt、知识或自定义句子。
+    jq -M --arg name "$name" '
+      def confirmation:
+        if . == "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"
+        then "您的人工协助请求已收到，请稍候。" else . end;
+      if $name == "keyword" then
+        .rules |= map(
+          (if .cancel_label == "继续 AI 客服" then .cancel_label="继续咨询" else . end) |
+          (if has("confirm_message") then .confirm_message |= confirmation else . end))
+      else
+        (if .handoff | has("message") then .handoff.message |= confirmation else . end) |
+        (if .handoff.failure_message == "当前自动客服暂时不可用，请稍后再试。"
+         or .handoff.failure_message == "自动客服暂时无法回答，请稍后再试。"
+         then .handoff.failure_message="暂时无法回复，请稍后再试。" else . end)
+      end' "$output" > "$policy_output" || { rm -f -- "$policy_output"; return 1; }
+    mv -f -- "$policy_output" "$output"
+  fi
 }
 
 configuration_revision() {
@@ -365,6 +384,32 @@ configuration_query() {
   rm -f -- "$response"
 }
 
+configuration_migrate_display_defaults() {
+  local deploy_dir=$1 name target decoded normalized backup
+  for name in keyword handoff; do
+    target="${deploy_dir}/config/${name}.yaml"
+    [[ -e "$target" || -L "$target" ]] || continue
+    decoded=$(mktemp "${deploy_dir}/tmp/display-original.XXXXXXXX") || return 1
+    normalized=$(mktemp "${deploy_dir}/tmp/display-normalized.XXXXXXXX") \
+      || { rm -f -- "$decoded"; return 1; }
+    if ! configuration_decode_file "$target" "$decoded" || ! configuration_normalize_file "$name" "$target" "$normalized"; then
+      rm -f -- "$decoded" "$normalized"
+      return 1
+    fi
+    if [[ "$(jq -M -cS . "$decoded")" != "$(jq -M -cS . "$normalized")" ]]; then
+      backup="${deploy_dir}/backups/config-history/${name}.display.pre-v1.2.1.yaml"
+      if [[ ! -e "$backup" ]]; then
+        install -m 600 -- "$target" "$backup" \
+          || { rm -f -- "$decoded" "$normalized"; return 1; }
+      fi
+      chmod 640 "$normalized"
+      chown root:1000 "$normalized" 2>/dev/null || true
+      mv -f -- "$normalized" "$target"
+    fi
+    rm -f -- "$decoded" "$normalized"
+  done
+}
+
 configuration_migrate() {
   local deploy_dir=$1 target temporary decoded handoff_decoded
   configuration_runtime_init "$deploy_dir"
@@ -439,6 +484,7 @@ json.dump(value,sys.stdout,ensure_ascii=False,indent=2)
     rm -f -- "$handoff_decoded"
   fi
   rm -f -- "${decoded:-}"
+  configuration_migrate_display_defaults "$deploy_dir" || return 1
   target="${deploy_dir}/config/menu.yaml"
   if [[ -f "$target" ]]; then
     decoded=$(mktemp "${deploy_dir}/tmp/menu-migrate.XXXXXX")

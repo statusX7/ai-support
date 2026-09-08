@@ -59,27 +59,32 @@ PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d .()-]{6,}\d)(?!\w)")
 
 def parse_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    try:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > 1024 * 1024:
-            return values
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return values
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024 * 1024:
+        raise ValueError("unsafe environment file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024 * 1024:
+            raise ValueError("unsafe environment file")
+        text = stream.read()
     for raw in text.splitlines():
-        if not raw or raw.lstrip().startswith("#") or "=" not in raw:
+        if not raw.strip() or raw.lstrip().startswith("#"):
             continue
+        if "=" not in raw:
+            raise ValueError("invalid environment line")
         key, value = raw.split("=", 1)
-        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
-            continue
-        try:
-            if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
-                value = json.loads(value.replace("$$", "$"))
-            elif len(value) >= 2 and value.startswith("'") and value.endswith("'"):
-                value = value[1:-1]
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(value, str):
-            values[key] = value
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or key in values:
+            raise ValueError("invalid environment key")
+        if value.startswith('"'):
+            value = json.loads(value.replace("$$", "$"))
+        elif value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise ValueError("invalid quoted value")
+            value = value[1:-1]
+        if not isinstance(value, str):
+            raise ValueError("invalid environment value")
+        values[key] = value
     return values
 
 
@@ -89,14 +94,10 @@ def collect_secrets(values: dict[str, str], extra: set[str] | None = None) -> li
         if value and key not in NON_SECRET_ENV and (SENSITIVE_ENV.search(key) or key == "CRISP_WEBSITE_ID"):
             secrets.add(value)
         if key == "AI_CUSTOM_HEADERS_JSON" and value:
-            try:
-                headers = json.loads(value)
-            except json.JSONDecodeError:
-                headers = None
-            if isinstance(headers, dict):
-                for header_value in headers.values():
-                    if isinstance(header_value, str) and header_value:
-                        secrets.add(header_value)
+            headers = json.loads(value)
+            if not isinstance(headers, dict) or any(not isinstance(item, str) for item in headers.values()):
+                raise ValueError("invalid environment headers")
+            secrets.update(headers.values())
     if values.get("CRISP_TOKEN_IDENTIFIER") and values.get("CRISP_TOKEN_KEY"):
         secrets.add(values["CRISP_TOKEN_IDENTIFIER"] + ":" + values["CRISP_TOKEN_KEY"])
     expanded: set[str] = set()
@@ -108,9 +109,16 @@ def collect_secrets(values: dict[str, str], extra: set[str] | None = None) -> li
         # 内存中构造，不写入诊断文件。
         expanded.add(json.dumps(secret, ensure_ascii=False)[1:-1])
         expanded.add(json.dumps(secret, ensure_ascii=True)[1:-1])
-        expanded.add(urllib.parse.quote(secret, safe=""))
-        expanded.add(urllib.parse.quote(urllib.parse.quote(secret, safe=""), safe=""))
-        expanded.add(urllib.parse.quote_plus(secret, safe=""))
+        encoded = urllib.parse.quote(secret, safe="")
+        lowercase = lambda text: re.sub(r"%[0-9A-Fa-f]{2}", lambda match: match.group(0).lower(), text)
+        plus_encoded = urllib.parse.quote_plus(secret, safe="")
+        for value in (encoded, lowercase(encoded), plus_encoded, lowercase(plus_encoded)):
+            expanded.add(value)
+            expanded.add(lowercase(value))
+            # 双重编码中第二层与第一层的十六进制大小写可分别变化。
+            doubled = urllib.parse.quote(value, safe="")
+            expanded.add(doubled)
+            expanded.add(lowercase(doubled))
         raw = secret.encode("utf-8")
         expanded.add(base64.b64encode(raw).decode("ascii"))
         expanded.add(base64.urlsafe_b64encode(raw).decode("ascii"))
@@ -149,13 +157,13 @@ def provider_secret_files(env: Path) -> list[Path]:
 
 def instance_fingerprint(env: Path) -> tuple:
     files = provider_secret_files(env)
-    return tuple((str(file), file.stat().st_mtime_ns, file.stat().st_size) for file in [env, *sorted(files)] if file.exists())
+    return tuple((str(file), file.stat().st_ino, file.stat().st_mtime_ns, file.stat().st_ctime_ns, file.stat().st_size) for file in [env, *sorted(files)] if file.exists())
 
 
 def collect_instance_secrets(env: Path) -> list[str]:
     extra: set[str] = set()
     for file in provider_secret_files(env):
-        fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, encoding="utf-8") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16 * 1024 * 1024:
