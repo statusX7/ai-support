@@ -157,6 +157,48 @@ def test_legacy_without_pool() -> None:
         require(not (root / "secrets").exists(), "只读日志创建了池或秘密目录")
 
 
+def test_token_limits_and_numeric_secrets() -> None:
+    module = load_redactor()
+    with tempfile.TemporaryDirectory(prefix="crispai-token-limit-redact-") as temporary:
+        root = Path(temporary)
+        env = root / ".env"
+        values = {
+            "AI_MODEL_TOKEN_LIMIT": "8192",
+            "AI_MAX_OUTPUT_TOKENS": "1200",
+            "AI_API_KEY": "5739",
+            "UNKNOWN_TOKEN": "6847",
+            "CUSTOM_TOKEN_LIMIT": "7953",
+        }
+        env.write_text("".join(key + "=" + json.dumps(value) + "\n" for key, value in values.items()), encoding="utf-8")
+        env.chmod(0o600)
+        directory = root / "secrets/provider/generations"
+        directory.mkdir(parents=True)
+        file = directory / GENERATION_NAMES[0]
+        write_generation(file, "9164", "8275")
+        collected = set(module.collect_instance_secrets(env))
+        limits = (values["AI_MODEL_TOKEN_LIMIT"], values["AI_MAX_OUTPUT_TOKENS"])
+        require(not any(encoded_variants(value) & collected for value in limits), "非秘密 token 数量被误收为凭据")
+        numeric_secrets = (values["AI_API_KEY"], values["UNKNOWN_TOKEN"], values["CUSTOM_TOKEN_LIMIT"], "9164", "8275")
+        variants = {variant for value in numeric_secrets for variant in encoded_variants(value)}
+        require(variants <= collected, "数字 Key、未知 TOKEN 或池秘密遗漏原文/编码")
+        safe_line = "capacity context=" + limits[0] + " output=" + limits[1] + "\n"
+        payload = safe_line + "".join("probe " + value + "\n" for value in sorted(variants))
+        for mode in ("display", "export"):
+            result = run_filter(env, payload, mode)
+            require(result.returncode == 0 and not result.stderr, f"{mode} 数值边界过滤失败")
+            require(result.stdout.startswith(safe_line), f"{mode} 非秘密 token 数量未保持")
+            require(not any(value in result.stdout for value in variants), f"{mode} 数字秘密未脱敏")
+        # 同一数值一旦也属于真正 Key，仍必须按秘密处理；排除仅针对两个键名。
+        values["AI_API_KEY"] = limits[0]
+        env.write_text("".join(key + "=" + json.dumps(value) + "\n" for key, value in values.items()), encoding="utf-8")
+        write_generation(file, limits[1])
+        require(all(encoded_variants(value) <= set(module.collect_instance_secrets(env)) for value in limits),
+                "与容量数值相同的真实 env/pool Key 被错误放行")
+        result = run_filter(env, "probe " + limits[0] + " " + limits[1] + "\n", "export")
+        require(result.returncode == 0 and not any(value in result.stdout for value in limits),
+                "与容量相同的真实数字 Key 未脱敏")
+
+
 class Follow:
     def __init__(self, env: Path):
         environment = dict(os.environ)
@@ -398,6 +440,7 @@ def main() -> int:
     tests = (
         ("有效、历史及草稿 Key/Header 原文和常见编码，含旧范围负对照", test_generations_and_encodings),
         ("无池旧实例兼容且不创建配置", test_legacy_without_pool),
+        ("仅豁免已知 token 数量，数字 env/pool 凭据与未知 TOKEN 仍脱敏", test_token_limits_and_numeric_secrets),
         ("非 TTY 跟踪即时刷新、新代次及同 mtime 原子轮换", test_follow_rotation),
         ("11 类无效代次结构失败关闭", test_pool_invalid_documents),
         ("池文件与三层目录的链接、类型及大小拒绝", test_pool_unsafe_files),

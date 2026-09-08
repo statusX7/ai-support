@@ -18,9 +18,9 @@ json('runtime', {schema_version:2, enabled:true, revision:1, applied_revision:1}
 const menu = JSON.parse(fs.readFileSync(path.join(root, 'config/menu.yaml')));
 menu.welcome.enabled = false; json('menu', menu);
 const env = {CRISP_WEBSITE_ID:'fixture-website-identity', CRISP_HOOK_MODE:'website', CRISP_WEBSITE_HOOK_SECRET:'fixture-hook-identity-0123456789', CRISP_AUTH_B64:'Zml4dHVyZTpleGFtcGxl', ANYTHINGLLM_API_KEY:'fixture-internal', ANYTHINGLLM_WORKSPACE:'support'};
-let now = Date.now(), sequence = 200, runtime, sent = [], requests = 0;
+let now = Date.now(), sequence = 200, runtime, sent = [], requests = 0, messageLookups = 0;
 const histories = new Map();
-let onSend = null;
+let onSend = null, onModel = null;
 const key = session => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
 const state = session => runtime.readState(key(session));
 const bucket = (session, fingerprint) => path.join(root, 'data/runtime', 'owned-' + key(session) + '-' + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
@@ -32,7 +32,7 @@ const request = async (url, options={}) => {
   if (match) {
     const session = decodeURIComponent(match[1]), suffix = match[2], history = histories.get(session) || [];
     if (suffix === '/messages') return {status:200,body:{error:false,data:history}};
-    if (suffix.startsWith('/message/')) return {status:200,body:{error:false,data:history.find(item=>String(item.fingerprint)===suffix.slice(9)) || {}}};
+    if (suffix.startsWith('/message/')) {messageLookups++;return {status:200,body:{error:false,data:history.find(item=>String(item.fingerprint)===suffix.slice(9)) || {}}};}
     if (suffix === '/meta') return {status:200,body:{error:false,data:{segments:[]}}};
     if (suffix === '/message' && options.method === 'POST') {
       const body = structuredClone(options.body);
@@ -49,13 +49,51 @@ const request = async (url, options={}) => {
     }
     throw Error('未知合成路径');
   }
-  if (parsed.hostname === 'anythingllm') {requests++;return {status:200,body:{textResponse:'合成问题处理结果。',sources:[]}};}
+  if (parsed.hostname === 'anythingllm') {requests++;if(onModel)return onModel(options);return {status:200,body:{textResponse:'合成问题处理结果。',sources:[]}};}
   throw Error('禁止外部网络');
 };
 const restart = () => {runtime=createRuntime(env,{root,clock:()=>now,request});};
 restart();
 let passed = 0;
 const test = async (name, work) => {await work();passed++;console.log('通过 UNIT/CONTRACT：'+name);};
+// 官方 message:received 的 text/file 结构；身份及内容全部另造，不使用官方样例真人身份。
+// https://docs.crisp.chat/references/web-hooks/v1/#message-received
+const operatorId = 'e24b5d87-a1c2-4a90-8b6d-c7e8f9012345';
+const operatorEvent = (session, extra={}) => JSON.parse(JSON.stringify({website_id:env.CRISP_WEBSITE_ID,
+  event:'message:received',timestamp:now,data:{website_id:env.CRISP_WEBSITE_ID,session_id:session,inbox_id:null,
+    type:'text',from:'operator',origin:'chat',content:'合成操作者公开答复',fingerprint:++sequence,
+    user:{nickname:'合成操作者',user_id:operatorId},mentions:[],timestamp:now,stamped:true,...extra}}));
+const boundedWait = async promise => {
+  let timer;
+  try {return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('合成调用未按时进入')),2000);})]);}
+  finally {clearTimeout(timer);}
+};
+const verifyImmediateOperator = async type => {
+  const session='session_identity-official-'+type, other='session_identity-peer-'+type;
+  let reached, release;
+  const started=new Promise(resolve=>{reached=resolve;});
+  onModel=()=>{onModel=null;reached();return new Promise(resolve=>{release=()=>resolve({status:200,body:{textResponse:'合成迟到答复',sources:[]}});});};
+  const accepted=await receive(event(session,'合成在途咨询'));
+  assert.equal(accepted.route,'process');
+  const processing=runtime.process(accepted.key,accepted.jobId);
+  try {
+    await boundedWait(started);now+=1000;
+    const body=operatorEvent(session,{type,...(type==='file'?{content:{name:'synthetic.pdf',url:'https://files.example.invalid/synthetic.pdf',type:'application/pdf'}}:{})});
+    assert.equal(Object.hasOwn(body.data,'automated'),false);assert.equal(Object.hasOwn(body.data.user,'type'),false);
+    const lookups=messageLookups, control=await receive(body);
+    assert.equal(control.accepted,true);assert.equal(state(session).mode,'human','可信官方结构必须在接收事务内立即暂停');
+    assert.equal(state(session).pause_reason,'operator_reply');
+    assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,'cancelled');
+    assert.equal(messageLookups,lookups,'明确官方身份不应等待 REST 回查');
+    await deliver(event(other,'另一会话继续合成咨询'));
+    assert.equal(state(other).mode,'ai');assert.equal(sent.filter(message=>message.session_id===other).length,1);
+    await runtime.process(control.key,control.jobId);
+  } finally {
+    onModel=null;if(release)release();await processing;
+  }
+  assert.equal(sent.filter(message=>message.session_id===session).length,0,'旧在途答案不能迟到出站');
+  assert.equal(state(session).mode,'human');
+};
 
 (async()=>{
   await test('中性官方昵称、不请求徽标；POST前自有指纹落盘，false回流不暂停',async()=>{
@@ -110,6 +148,75 @@ const test = async (name, work) => {await work();passed++;console.log('通过 UN
     const broken=invoke('session_identity-a',{data:[message]});
     assert.equal(broken.status,1);assert.equal(broken.stdout,'');
     fs.writeFileSync(file,saved);
+  });
+  await test('官方省略automated/type的UUID公共文字立即人工、取消A且B正常',()=>verifyImmediateOperator('text'));
+  await test('官方省略automated/type的UUID公共文件立即人工、取消A且B正常',()=>verifyImmediateOperator('file'));
+  await test('Hook缺用户身份时，REST单条回查的同一官方结构确认人工',async()=>{
+    const session='session_identity-rest-operator';now+=1000;
+    const full=operatorEvent(session);histories.set(session,[full.data]);
+    const partial=structuredClone(full);delete partial.data.user;
+    const before=messageLookups, accepted=await receive(partial);
+    assert.equal(state(session).mode,'ai');assert.equal(accepted.route,'process');
+    await runtime.process(accepted.key,accepted.jobId);
+    assert.equal(messageLookups,before+1);assert.equal(state(session).mode,'human');
+    assert.equal(state(session).pause_reason,'operator_reply');assert.deepEqual(state(session).uncertain_events,[]);
+  });
+  await test('note/typing/未知actor/坏UUID/网站UUID别名及未认证Hook均不能误判人工',async()=>{
+    const cases=[{type:'note'},{type:'typed'},{stealth:true},{properties:{stealth:true}},
+      ...['website','participant','operator','unknown','',null].map(type=>({user:{nickname:'同名合成用户',user_id:operatorId,type}})),
+      ...['website','participant','not-a-uuid','00000000-0000-0000-0000-000000000000',
+        'e24b5d87-a1c2-0a90-8b6d-c7e8f9012345','e24b5d87-a1c2-4a90-7b6d-c7e8f9012345',123].map(user_id=>({user:{nickname:'同名合成用户',user_id}})),
+      {user:{nickname:'同名合成用户'}},{user:[]},{automated:null},{automated:'false'}];
+    const before=sent.length;
+    for(const [index,extra] of cases.entries()){
+      const session='session_identity-nonhuman-'+index;now+=1000;
+      const body=operatorEvent(session,extra);histories.set(session,[body.data]);await deliver(body);
+      assert.equal(state(session).mode,'ai','非人工边界 '+index);assert.notEqual(state(session).pause_reason,'operator_reply');
+    }
+    const typing=operatorEvent('session_identity-typing');typing.event='message:compose:receive';
+    assert.equal((await receive(typing)).route,'ignore');assert.equal(state(typing.data.session_id).mode,'ai');
+    const untrusted=operatorEvent('session_identity-untrusted');
+    assert.equal((await runtime.receive({body:untrusted,query:{key:'invalid-synthetic-hook'}})).accepted,false);
+    assert.equal(state(untrusted.data.session_id).mode,'ai');
+    const website='a8b1c2d3-e4f5-4678-9abc-0123456789de';
+    const siteRuntime=createRuntime({...env,CRISP_WEBSITE_ID:website},{root,clock:()=>now,request});
+    for(const [index,user_id] of [website,website.toUpperCase()].entries()){
+      const session='session_identity-site-alias-'+index, body=operatorEvent(session,{website_id:website,user:{nickname:'站点不是操作者',user_id}});
+      body.website_id=website;histories.set(session,[body.data]);
+      const accepted=await siteRuntime.receive({body,query:{key:env.CRISP_WEBSITE_HOOK_SECRET}});
+      assert.equal(accepted.accepted,true);if(accepted.route==='process')await siteRuntime.process(accepted.key,accepted.jobId);
+      assert.equal(siteRuntime.readState(siteRuntime.stateKey(website,session)).mode,'ai');
+    }
+    assert.equal(sent.length,before);
+  });
+  await test('自有指纹与automated优先于官方UUID，均不触发人工或REST回查',async()=>{
+    now+=1000;const before=messageLookups, session='session_identity-fresh-owned';let echoObserved=false;
+    onSend=async (current,body)=>{
+      assert.equal(current,session);assert(fs.existsSync(bucket(session,body.fingerprint)));
+      const own=operatorEvent(session,{fingerprint:body.fingerprint});
+      assert.equal(Object.hasOwn(own.data,'automated'),false);assert.equal(Object.hasOwn(own.data.user,'type'),false);
+      const accepted=await receive(own);
+      assert.equal(accepted.accepted,true);assert.notEqual(accepted.reason,'重复事件已忽略');
+      assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,'done');
+      assert.equal(state(session).mode,'ai');assert.equal(state(session).generation,0);
+      assert.equal(messageLookups,before);echoObserved=true;
+    };
+    try {await deliver(event(session,'新自有身份的合成咨询'));} finally {onSend=null;}
+    assert.equal(echoObserved,true);assert.equal(state(session).mode,'ai');assert.equal(state(session).generation,0);
+    assert.equal(state(session).jobs.filter(job=>job.event==='message:received').length,1,'默认echo只能去重，不能改变先前归属判定');
+    for(const [index,extra] of [{automated:true},{properties:{ai_support:true}},{properties:{ai_support_version:'v1.2.0'}}].entries()){
+      const peer='session_identity-auto-priority-'+index;await deliver(operatorEvent(peer,extra));
+      assert.equal(state(peer).mode,'ai');assert.equal(state(peer).generation,0);
+    }
+    assert.equal(messageLookups,before);
+  });
+  await test('无真人Hook但发前REST历史出现官方UUID，人工接管且旧答案零出站',async()=>{
+    const session='session_identity-history-only';now+=1000;const before=requests;
+    onModel=()=>{onModel=null;now+=1000;histories.set(session,[operatorEvent(session).data]);
+      return {status:200,body:{textResponse:'不应发送的合成旧答案',sources:[]}};};
+    try {await deliver(event(session,'需要处理的合成问题'));} finally {onModel=null;}
+    assert.equal(requests,before+1);assert.equal(state(session).mode,'human');
+    assert.equal(state(session).pause_reason,'operator_reply');assert.equal(sent.filter(message=>message.session_id===session).length,0);
   });
   console.log('中性显示与持久出站身份专项：'+passed+'组通过；Crisp实际徽标显示仍由目标SDK验收。');
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(root,{recursive:true,force:true}));

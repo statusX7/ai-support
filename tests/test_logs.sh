@@ -521,11 +521,17 @@ with (deploy / "logs/maintenance.jsonl").open("a", encoding="utf-8") as stream:
             stream.write("probe " + generation + " " + variant + "\n")
 PY
 
+# 合法 token 数量与清单年份确定性碰撞，不能依赖随机 timer digest 才暴露误分类。
+metadata_token_limit=$(date -u '+%Y')
+env_set "$DEPLOY/.env" AI_MODEL_TOKEN_LIMIT "$metadata_token_limit"
 archive="$WORK/diagnostic.tar.gz"
 invoke export --output "$archive"
 if (( LAST_RC != 0 )) || [[ ! -f "$archive" ]]; then fail 'export 失败'; fi
 mkdir "$WORK/extracted"; tar -C "$WORK/extracted" -xzf "$archive"
 find "$WORK/extracted" -type f -exec chmod 0600 {} +
+jq -e --arg year "$metadata_token_limit" '.created_at | startswith($year + "-")' \
+  "$WORK/extracted/manifest.json" >/dev/null || fail '非秘密 token 数量与清单年份碰撞样例失效'
+pass '非秘密 token 数量即使命中清单时间仍可导出，保留原始诊断元数据'
 for value in "$SECRET" "$HEADER_SECRET" "$BASIC_SECRET" "$PATH_SECRET"; do
   ! grep -R -Fq -- "$value" "$WORK/extracted" || fail '诊断包泄漏真实秘密或 URL secret'
 done

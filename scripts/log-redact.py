@@ -21,7 +21,8 @@ from pathlib import Path
 SENSITIVE_ENV = re.compile(
     r"(?:KEY|TOKEN|SECRET|PASSWORD|AUTH|COOKIE|CREDENTIAL|SIGNATURE)", re.I
 )
-NON_SECRET_ENV = {"CRISP_TOKEN_TIER", "N8N_SECURE_COOKIE"}
+# 模型 token 数量不是认证 Token；仅排除已知配置键，不豁免数字凭据。
+NON_SECRET_ENV = {"CRISP_TOKEN_TIER", "N8N_SECURE_COOKIE", "AI_MODEL_TOKEN_LIMIT", "AI_MAX_OUTPUT_TOKENS"}
 SENSITIVE_KEY = re.compile(
     r"(?:api[_-]?key|token|secret|password|authorization|cookie|credential|signature|"
     r"session[_-]?id|website[_-]?id|fingerprint|visitor|email|phone)$",

@@ -418,6 +418,13 @@ function createRuntime(env = {}, options = {}) {
     if (Object.prototype.hasOwnProperty.call(state.outgoing || {}, String(message.fingerprint || ''))) return true;
     if (ownedMessage(state, message.fingerprint)) return true;
     if (message.automated === false) return false;
+    // 官方人工 Hook/REST 结构可省略 automated 与 user.type；仅接受明确账号 UUID。
+    const user = message.user;
+    if (!Object.prototype.hasOwnProperty.call(message, 'automated') && user && typeof user === 'object' && !Array.isArray(user)
+      && !Object.prototype.hasOwnProperty.call(user, 'type') && Object.prototype.hasOwnProperty.call(user, 'user_id')
+      && typeof user.user_id === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(user.user_id)
+      && user.user_id.toLowerCase() !== String(state.website_id || '').toLowerCase()
+      && user.user_id.toLowerCase() !== String(state.session_id || '').toLowerCase()) return false;
     return null;
   };
   const resolveOperator = async (state, message) => {
