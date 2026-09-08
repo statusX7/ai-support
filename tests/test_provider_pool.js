@@ -11,6 +11,11 @@ const {signEnvelope,envelopeMarker} = require('../scripts/provider-envelope.js')
 const {DEFAULT_POLICY,retryAfterMilliseconds,classifyFailure,estimateTextTokens} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
+async function until(condition,message,timeout=3000) {
+  const end=Date.now()+timeout;
+  while(!condition()&&Date.now()<end)await sleep(5);
+  assert.ok(condition(),message);
+}
 const json = (file,value) => fs.writeFileSync(file,JSON.stringify(value),{mode:0o600});
 const read = file => JSON.parse(fs.readFileSync(file,'utf8'));
 const sample = {messages:[{role:'system',content:'请用中文回答。'},{role:'user',content:'合成问题'}]};
@@ -30,7 +35,7 @@ async function fixture(count=1,policy={}) {
   f.upstream = http.createServer(async (request,response) => {
     let raw=''; for await (const data of request) raw+=data;
     const body = JSON.parse(raw || '{}'), index = Number(/^\/p(\d+)\//.exec(request.url)?.[1] || 0);
-    const call={index,path:request.url,headers:request.headers,body}; f.calls.push(call);
+    const call={index,path:request.url,method:request.method,headers:request.headers,body}; f.calls.push(call);
     if (f.behavior && await f.behavior(call,response) === true) return;
     response.setHeader('content-type','application/json');
     response.end(JSON.stringify(request.url.endsWith('/models') ? {data:[{id:'fixture-b'},{id:'fixture-a'},{id:'fixture-b'}]} : request.url.endsWith('/responses') ? {status:'completed',output:[{type:'message',content:[{type:'output_text',text:'Responses 回答'}]}],usage:{input_tokens:3,output_tokens:2}}:chat()));
@@ -82,6 +87,7 @@ async function main() {
   await test('幂等单接口迁移、独立内部Key、非敏感池与同代秘密',async()=>{
     const f=await fixture();try {
       const before=fs.readFileSync(f.poolFile,'utf8');const result=await f.cli(['migrate']);assert.equal(result.code,0);assert.equal(fs.readFileSync(f.poolFile,'utf8'),before);
+      assert.equal(f.pool.entries.length,1);assert.equal(f.pool.entries.filter(entry=>entry.role==='primary').length,1);assert.equal(f.pool.entries[0].id,f.pool.primary_id);
       assert.notEqual(f.key,'fixture-key-0');assert.equal(f.pool.entries[0].base_url,f.upstreamBase+'/p0/v1');
       const visible=JSON.stringify((await f.cli(['list'])).value);assert.ok(!visible.includes('fixture-key-0'));assert.ok(!visible.includes('"x-fixture":"value"'));
       assert.equal((await f.post(sample,null)).status,400);assert.equal(f.calls.length,0);
@@ -97,6 +103,7 @@ async function main() {
       const backup=f.pool.entries[20].id;assert.equal((await f.cli(['enable',backup,'false'])).code,0);
       assert.equal((await f.cli(['add',f.file({provider:{},api_key:'fixture'})])).value.error.code,'pool_capacity');
       assert.equal((await f.cli(['primary',backup])).code,0);f.reload();assert.equal(f.pool.entries[0].id,backup);assert.equal(f.pool.entries[0].enabled,true);
+      const selected=await f.post();assert.equal(selected.status,200);assert.equal(f.calls.at(-1).index,20);assert.equal(f.calls.at(-1).body.model,'fixture-model-20');assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-key-20');
       assert.equal((await f.cli(['delete',backup])).value.error.code,'primary_required');
       const order=f.pool.entries.slice(1).map(entry=>entry.id).reverse();assert.equal((await f.cli(['order',f.file({ids:order})])).code,0);f.reload();assert.deepEqual(f.pool.entries.slice(1).map(entry=>entry.id),order);
       const models=await f.cli(['models',backup]);assert.equal(models.code,0,models.stdout);assert.deepEqual(models.value.models,['fixture-a','fixture-b']);assert.match(f.calls.at(-1).path,/p20\/v1\/models$/);
@@ -157,7 +164,9 @@ async function main() {
       const envelope=f.envelope();const body=copy(sample);body.messages[1].content+='\n'+envelopeMarker(envelope,f.key);
       assert.equal((await f.post(body,null)).status,200);assert.ok(!JSON.stringify(f.calls[0].body).includes('CRISPAI_PROVIDER_CONTEXT'));
       body.messages[1].content+='[[CRISPAI_PROVIDER_CONTEXT_V1:tampered]]';assert.equal((await f.post(body,null)).status,400);assert.equal(f.calls.length,1);
-      assert.equal((await f.post({...sample,previous_response_id:'provider-specific'})).status,400);assert.equal(f.calls.length,1);
+      for(const field of ['previous_response_id','thread_id','file_ids']) {
+        assert.equal((await f.post({...sample,[field]:field==='file_ids'?['provider-specific']:'provider-specific'})).status,400);assert.equal(f.calls.length,1);
+      }
     }finally{await f.close();}
   });
   await test('冷却跨重启保持、单半开租约、连续两次业务成功恢复且无后台付费探测',async()=>{
@@ -167,6 +176,9 @@ async function main() {
       await sleep(1100);const before=f.calls.length;await Promise.all([f.post(),f.post()]);assert.equal(f.calls.slice(before).filter(call=>call.index===0).length,1);
       assert.equal((await f.get('status')).entries[0].health,'unknown');await f.post();assert.equal((await f.get('status')).entries[0].health,'healthy');
       const total=f.calls.length;await sleep(200);assert.equal(f.calls.length,total);
+      f.behavior=async(call,response)=>{if(call.index===0){response.writeHead(503);response.end('{}');return true;}return false;};
+      assert.equal((await f.post()).status,200);assert.deepEqual(f.calls.slice(total).map(call=>call.index),[0,1]);assert.equal((await f.get('status')).entries[0].health,'cooling');
+      await sleep(1100);f.behavior=null;await f.post();assert.equal((await f.get('status')).entries[0].health,'unknown');
     }finally{await f.close();}
   });
   await test('人工接管、总开关、池热改取消在途且不记上游故障',async()=>{
@@ -194,6 +206,24 @@ async function main() {
       g.behavior=async()=>{await sleep(1300);return false;};const envelope=g.envelope();const started=Date.now();const result=await g.post(sample,envelope);assert.equal(result.status,400);assert.ok(Date.now()-started<2000);assert.equal(g.calls.length,1);
       await g.post(sample,envelope);assert.equal(g.calls.length,1);
     }finally{await g.close();}
+  });
+  await test('A13 多候选连续挂起共享总期限，剩余时间不够时不继续遍历',async()=>{
+    const f=await fixture(3,{call_timeout_ms:1200,connect_timeout_ms:200,question_timeout_ms:2000});try {
+      let closed=0;f.behavior=async(_call,response)=>{response.once('close',()=>{closed++;});return true;};
+      const envelope=f.envelope(),started=Date.now();const result=await f.post(sample,envelope);const elapsed=Date.now()-started;
+      assert.equal(result.status,400);assert.equal(result.value.error.code,'question_timeout');
+      assert.deepEqual(f.calls.map(call=>call.index),[0,1]);assert.ok(elapsed>=1900&&elapsed<3000,`共享2秒预算实耗${elapsed}ms`);
+      await until(()=>closed===2,'两个挂起请求均应被取消');await f.post(sample,envelope);assert.equal(f.calls.length,2);
+    }finally{await f.close();}
+  });
+  await test('A08 新接口池拒绝上游重定向，第三方接收端拿不到Key或Header',async()=>{
+    let received=0;const collector=http.createServer((_request,response)=>{received++;response.end('{}');});
+    await new Promise(resolve=>collector.listen(0,'127.0.0.1',resolve));
+    const f=await fixture(2);try {
+      f.behavior=async(call,response)=>{if(call.index===0){response.writeHead(302,{location:`http://127.0.0.1:${collector.address().port}/capture`});response.end('{}');return true;}return false;};
+      assert.equal((await f.post()).status,200);assert.deepEqual(f.calls.map(call=>call.index),[0,1]);assert.equal(received,0);
+      assert.equal(f.calls[1].headers.authorization,'Bearer fixture-key-1');assert.equal(f.calls[1].body.model,'fixture-model-1');
+    }finally{await f.close();collector.closeAllConnections();await new Promise(resolve=>collector.close(resolve));}
   });
   await test('编辑先验证失败保旧、Key/Header分代热改与实际运行回读',async()=>{
     const f=await fixture(2);try {
@@ -331,6 +361,95 @@ async function main() {
       assert.equal(f.calls.slice(before).filter(call=>call.index===0).length,1);assert.equal((await f.get('status')).entries[0].vision_health,'unknown');
       await f.post(visual,f.envelope('vision'));assert.equal((await f.get('status')).entries[0].vision_health,'healthy');
     }finally{await f.close();}
+  });
+  await test('A05 主备独立Key获取模型，选择后实际调用；改备不改主且备用使用新Key/模型',async()=>{
+    const f=await fixture(2);try {
+      const primary=f.pool.primary_id,backup=f.pool.entries[1].id,newKey='fixture-rotated-backup-key';let failPrimary=false;
+      f.behavior=async(call,response)=>{
+        if(call.path.endsWith('/models')) {
+          const model=call.index===0?'listed-primary-model':call.headers.authorization==='Bearer '+newKey?'listed-new-backup-model':'listed-backup-model';
+          response.end(JSON.stringify({data:[{id:model},{id:model}]}));return true;
+        }
+        if(failPrimary&&call.index===0){response.writeHead(503);response.end('{}');return true;}
+        return false;
+      };
+      const primaryModels=await f.cli(['models',primary]);assert.equal(primaryModels.code,0,primaryModels.stdout);
+      assert.deepEqual(primaryModels.value.models,['listed-primary-model']);
+      assert.equal(f.calls.at(-1).method,'GET');assert.equal(f.calls.at(-1).path,'/p0/v1/models');assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-key-0');
+      assert.equal((await f.cli(['edit',primary,f.file({provider:{model:primaryModels.value.models[0]}})])).code,0);f.reload();
+      assert.equal((await f.post()).value.model,'listed-primary-model');assert.equal(f.calls.at(-1).body.model,'listed-primary-model');assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-key-0');
+      const primaryBefore=copy(f.pool.entries[0]),primarySecretBefore=copy(f.secret[primary]);
+      const backupModels=await f.cli(['models',backup]);assert.equal(backupModels.code,0,backupModels.stdout);
+      assert.deepEqual(backupModels.value.models,['listed-backup-model']);assert.equal(f.calls.at(-1).method,'GET');assert.equal(f.calls.at(-1).path,'/p1/v1/models');assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-key-1');
+      const refreshed=await f.cli(['models',backup,f.file({provider:{},api_key:newKey})]);assert.equal(refreshed.code,0,refreshed.stdout);
+      assert.deepEqual(refreshed.value.models,['listed-new-backup-model']);assert.equal(f.calls.at(-1).method,'GET');assert.equal(f.calls.at(-1).headers.authorization,'Bearer '+newKey);
+      const result=await f.cli(['edit',backup,f.file({provider:{name:'改名后仍是原备用',model:refreshed.value.models[0]},api_key:newKey})]);assert.equal(result.code,0,result.stdout);f.reload();assert.equal(f.pool.entries[1].name,'改名后仍是原备用');
+      assert.deepEqual(f.pool.entries[0],primaryBefore);assert.deepEqual(f.secret[primary],primarySecretBefore);assert.equal(f.pool.entries[1].id,backup);assert.equal(f.secret[backup].api_key,newKey);
+      failPrimary=true;const before=f.calls.length,answer=await f.post();assert.equal(answer.status,200,answer.text);assert.equal(answer.value.model,'listed-new-backup-model');
+      const attempts=f.calls.slice(before);assert.deepEqual(attempts.map(call=>call.index),[0,1]);
+      assert.equal(attempts[0].body.model,'listed-primary-model');assert.equal(attempts[0].headers.authorization,'Bearer fixture-key-0');
+      assert.equal(attempts[1].body.model,'listed-new-backup-model');assert.equal(attempts[1].headers.authorization,'Bearer '+newKey);
+    }finally{await f.close();}
+  });
+  await test('A23 慢备用未完成时主恢复服务新问题，原问题不抢占不重复且只交付备用整答',async()=>{
+    const f=await fixture(2,{question_timeout_ms:8000,call_timeout_ms:5000,connect_timeout_ms:200,cooldown_initial_ms:1000,cooldown_max_ms:1000});
+    let releaseBackup;const backupGate=new Promise(resolve=>{releaseBackup=resolve;});
+    try {
+      let firstPrimary=true,backupEntered=false,oldSettled=false;
+      f.behavior=async(call,response)=>{
+        if(call.index===0&&firstPrimary){firstPrimary=false;response.writeHead(503);response.end('{}');return true;}
+        if(call.index===1){backupEntered=true;await backupGate;response.end(JSON.stringify(chat('旧问题仅由原备用完整回答')));return true;}
+        response.end(JSON.stringify(chat('恢复主接口只回答新问题')));return true;
+      };
+      const oldEnvelope=f.envelope(),oldBody={messages:[{role:'user',content:'原问题等待备用'}]};
+      const pending=f.post(oldBody,oldEnvelope).then(result=>{oldSettled=true;return result;});
+      await until(()=>backupEntered,'原问题未进入慢备用');
+      const cooling=(await f.get('status')).entries[0];assert.equal(cooling.health,'cooling');assert.equal(oldSettled,false);
+      await sleep(Math.max(0,cooling.cooldown_until-Date.now())+40);
+      const newEnvelope=f.envelope(),newBody={messages:[{role:'user',content:'冷却到期后的独立新问题'}]};
+      const current=await f.post(newBody,newEnvelope);assert.equal(current.status,200,current.text);assert.equal(current.value.choices[0].message.content,'恢复主接口只回答新问题');
+      assert.equal(oldSettled,false);assert.deepEqual(f.calls.map(call=>call.index),[0,1,0]);assert.equal((await f.get('status')).entries[0].health,'unknown');
+      releaseBackup();const previous=await pending;assert.equal(previous.status,200,previous.text);assert.equal(previous.value.choices[0].message.content,'旧问题仅由原备用完整回答');assert.equal(previous.value.model,'fixture-model-1');
+      assert.deepEqual(f.calls.map(call=>call.index),[0,1,0]);
+      const successes=(await f.get('recent')).records.filter(record=>record.outcome==='success');
+      assert.equal(successes.filter(record=>record.question_id===oldEnvelope.question_id&&record.entry_id===f.pool.entries[1].id).length,1);
+      assert.equal(successes.filter(record=>record.question_id===newEnvelope.question_id&&record.entry_id===f.pool.primary_id).length,1);assert.equal(successes.length,2);
+      const cached=await f.post(oldBody,oldEnvelope);assert.equal(cached.value.choices[0].message.content,'旧问题仅由原备用完整回答');assert.equal(f.calls.length,3);
+    }finally{releaseBackup();await f.close();}
+  });
+  await test('A27 半份JSON或违规SSE断流只交付备用完整SSE；半份等待中取消不续备、不计成功',async()=>{
+    for(const format of ['json','sse']) {
+      const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
+      try {
+        let partialSent=false,clientHeaders=false;
+        const leaked='不得拼入最终答案的半份上游内容',complete='仅保留备用接口的完整回答';
+        f.behavior=async(call,response)=>{
+          if(call.index===0){response.writeHead(200,{'content-type':format==='sse'?'text/event-stream':'application/json'});response.flushHeaders();response.write(format==='sse'?'data: '+JSON.stringify({choices:[{delta:{content:leaked}}]})+'\n\n':'{"choices":[{"message":{"content":"'+leaked);partialSent=true;await gate;response.destroy();return true;}
+          response.end(JSON.stringify(chat(complete)));return true;
+        };
+        const envelope=f.envelope(),body={...sample,stream:true};
+        const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope(envelope,f.key)},body:JSON.stringify(body)}).then(async response=>{clientHeaders=true;return{status:response.status,type:response.headers.get('content-type'),text:await response.text()};});
+        await until(()=>partialSent,'上游未发出半份内容');await sleep(30);assert.equal(clientHeaders,false);release();
+        const result=await pending;assert.equal(result.status,200);assert.match(result.type,/text\/event-stream/);assert.ok(!result.text.includes(leaked));
+        const events=result.text.split('\n').filter(line=>line.startsWith('data: ')).map(line=>line.slice(6));assert.equal(events.filter(event=>event==='[DONE]').length,1);assert.equal(events.at(-1),'[DONE]');
+        const chunks=events.filter(event=>event!=='[DONE]').map(event=>JSON.parse(event));assert.equal(chunks.length,2);assert.equal(chunks.map(chunk=>chunk.choices[0].delta.content||'').join(''),complete);assert.ok(chunks.every(chunk=>chunk.model==='fixture-model-1'));assert.equal(chunks.at(-1).choices[0].finish_reason,'stop');assert.equal(chunks.at(-1).usage.total_tokens,5);
+        assert.deepEqual(f.calls.map(call=>call.index),[0,1]);assert.ok(f.calls.every(call=>call.body.stream===false));
+        const records=(await f.get('recent')).records.filter(record=>record.question_id===envelope.question_id);assert.equal(records.filter(record=>record.outcome==='failed').length,1);assert.equal(records.filter(record=>record.outcome==='success').length,1);assert.equal(records.find(record=>record.outcome==='success').entry_id,f.pool.entries[1].id);
+        assert.equal((await f.post(body,envelope)).text,result.text);assert.equal(f.calls.length,2);
+      }finally{release();await f.close();}
+    }
+    const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
+    try {
+      let partialSent=false,clientHeaders=false,upstreamClosed=false;
+      f.behavior=async(_call,response)=>{response.once('close',()=>{upstreamClosed=true;});response.writeHead(200,{'content-type':'application/json'});response.write('{"choices":[{"message":{"content":"迟到内容');partialSent=true;await gate;response.end('不能出站"}}]}');return true;};
+      const envelope=f.envelope(),body={...sample,stream:true},controller=new AbortController();
+      const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope(envelope,f.key)},body:JSON.stringify(body),signal:controller.signal}).then(async response=>{clientHeaders=true;return{status:response.status,text:await response.text()};}).catch(error=>({aborted:error.name==='AbortError'}));
+      await until(()=>partialSent,'取消例未收到半份上游');assert.equal(clientHeaders,false);controller.abort();assert.equal((await pending).aborted,true);
+      const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+      await until(()=>upstreamClosed&&read(file).terminal?.code==='question_cancelled','客户端取消未持久结束上游');release();await sleep(30);
+      assert.equal(clientHeaders,false);assert.equal(f.calls.length,1);const stored=read(file);assert.equal(stored.attempts,1);assert.equal(stored.stages.answer.result,undefined);assert.equal((await f.get('recent')).records.length,0);
+      const again=await f.post(body,envelope);assert.equal(again.status,400);assert.equal(again.value.error.code,'question_cancelled');assert.ok(!again.text.includes('data: '));assert.ok(!again.text.includes('迟到内容'));assert.equal(f.calls.length,1);
+    }finally{release();await f.close();}
   });
   process.stdout.write(`UNIT/PROTOCOL 主备协议合计 ${count} 组通过，0 失败\n`);
 }
