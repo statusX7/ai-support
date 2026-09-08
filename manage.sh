@@ -514,7 +514,7 @@ knowledge_select() {
 knowledge_menu() {
   local choice name path selected listing query document
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 查看知识库及索引状态\n2. 创建命名知识库\n3. 重命名知识库\n4. 粘贴知识正文\n5. 导入文件或目录\n6. 查看/删除指定条目\n7. 启用知识库\n8. 停用知识库\n9. 删除知识库\n10. 同步知识库\n11. 重建索引\n12. 检索问题预览\n0. 返回\n'
+    printf '\n1. 查看知识库及索引状态\n2. 创建命名知识库\n3. 重命名知识库\n4. 粘贴知识正文\n5. 导入文件或目录\n6. 查看/删除指定条目\n7. 启用知识库\n8. 停用知识库\n9. 删除知识库\n10. 同步知识库\n11. 重建索引\n12. 生产问答测试（全部启用库，可能计费）\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
       1) manager_action manager_tool knowledge list ;;
@@ -542,14 +542,19 @@ knowledge_menu() {
           7) manager_action manager_tool knowledge enable "$selected" ;; 8) manager_action manager_tool knowledge disable "$selected" ;;
           9) if menu_confirm '删除所选知识库及原文？'; then manager_action manager_tool knowledge delete "$selected"; fi ;;
         esac ;;
-      10|11|12)
+      10|11)
         menu_read name '1 全部启用库 / 2 选择单库 / 0 返回：' || return
         case "$name" in 1) selected=all ;; 2) knowledge_select || continue; selected=$KNOWLEDGE_SELECTED ;; *) continue ;; esac
         case "$choice" in
           10) manager_action manager_tool knowledge sync "$selected" ;;
           11) if menu_confirm '重建所选知识索引？'; then manager_action manager_tool knowledge reindex "$selected"; fi ;;
-          12) menu_read query '检索测试问题：' || return; [[ -z "$query" ]] || manager_action manager_tool knowledge query "$selected" "$query" ;;
         esac ;;
+      12)
+        printf '本测试与实际客服共用全部已启用知识库和推理链，不向 Crisp 发送消息；故障切换时可能依次调用一个或多个上游并分别计费。\n'
+        menu_read query '测试问题（回车返回）：' || return
+        if [[ -n "$query" ]] && menu_confirm '确认发起本次生产问答测试？'; then
+          manager_action manager_tool knowledge query all "$query"
+        fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -558,7 +563,7 @@ knowledge_menu() {
 rule_edit() {
   local candidate=$1 rule_id=$2 name words exclusions match rule_action value text title cancel confirm seconds ttl priority field existing temp lines menus
   existing=$(jq -M -c --arg id "$rule_id" '.rules[]? | select(.id==$id)' "$candidate")
-  [[ -n "$existing" ]] || existing='{"enabled":true,"match_mode":"contains","action":"show_handoff_offer","cooldown_seconds":60,"offer_ttl_seconds":600,"priority":100,"confirm_label":"召唤人工客服","cancel_label":"继续 AI 客服","confirm_message":"已暂停本次对话的 AI 回复，您的人工协助请求已收到。"}'
+  [[ -n "$existing" ]] || existing='{"enabled":true,"match_mode":"contains","action":"show_handoff_offer","cooldown_seconds":60,"offer_ttl_seconds":600,"priority":100,"confirm_label":"召唤人工客服","cancel_label":"继续咨询","confirm_message":"您的人工协助请求已收到，请稍候。"}'
   menu_read name "规则名称 [$(jq -M -r '.name // "人工确认"' <<< "$existing")]：" || return
   name=${name:-$(jq -M -r '.name // "人工确认"' <<< "$existing")}
   menu_read words '关键词（逗号分隔；::PASTE:: 逐行粘贴；回车保留）：' || return
@@ -582,8 +587,8 @@ rule_edit() {
   for value in "$priority" "$seconds" "$ttl"; do [[ "$value" =~ ^[0-9]{1,8}$ ]] || { warn '秒数和优先级必须是整数'; return; }; done
   menu_read text '提示或固定回复文案（回车保留）：' || return; text=${text:-$(jq -M -r '.text // "需要人工协助吗？请点击下方按钮确认。"' <<< "$existing")}
   title=$(jq -M -r '.confirm_label // "召唤人工客服"' <<< "$existing")
-  cancel=$(jq -M -r '.cancel_label // "继续 AI 客服"' <<< "$existing")
-  confirm=$(jq -M -r '.confirm_message // "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"' <<< "$existing")
+  cancel=$(jq -M -r '.cancel_label // "继续咨询"' <<< "$existing")
+  confirm=$(jq -M -r '.confirm_message // "您的人工协助请求已收到，请稍候。"' <<< "$existing")
   if [[ "$rule_action" == show_handoff_offer ]]; then
     menu_read value "确认按钮 [$title]：" || return; title=${value:-$title}
     menu_read value "取消按钮 [$cancel]：" || return; cancel=${value:-$cancel}

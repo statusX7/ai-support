@@ -122,7 +122,7 @@ is_allowed_snapshot_path() {
   path=${path%/}
   [[ -z "$path" ]] && return 0
   case "$path" in
-    payload|payload/config|payload/knowledge|payload/n8n|payload/scripts|payload/docs|payload/data|payload/data/anythingllm|payload/data/postgres|payload/data/postgres/n8n.dump|payload/data/knowledge-manifest.json)
+    payload|payload/config|payload/knowledge|payload/n8n|payload/scripts|payload/docs|payload/data|payload/data/anythingllm|payload/data/postgres|payload/data/postgres/n8n.dump|payload/data/knowledge-manifest.json|payload/data/knowledge-projection.json)
       return 0
       ;;
     payload/VERSION|payload/CHANGELOG.md|payload/README.md|payload/LICENSE|payload/AGENTS.md|payload/.env.example|payload/docker-compose.yml|payload/get.sh|payload/install.sh|payload/manage.sh|payload/update.sh|payload/uninstall.sh|payload/n8n/workflow.json)
@@ -147,6 +147,45 @@ is_allowed_snapshot_path() {
       ;;
     *) return 1 ;;
   esac
+}
+
+knowledge_snapshot_modules_check() {
+  local root=$1 module count=0 file
+  local -a modules=(scripts/knowledge-component.js scripts/knowledge-profile.py
+    scripts/knowledge-profile.sh scripts/knowledge-lexical.py n8n/admin-query.js n8n/knowledge-lexical.js)
+  [[ -f "${root}/n8n/runtime.js" && ! -L "${root}/n8n/runtime.js" ]] \
+    || die '知识快照缺少安全的 n8n/runtime.js'
+  for module in "${modules[@]}"; do
+    if [[ -e "${root}/${module}" || -L "${root}/${module}" ]]; then
+      [[ -f "${root}/${module}" && ! -L "${root}/${module}" ]] \
+        || die "知识快照模块不安全：$module"
+      ((count += 1))
+    fi
+  done
+  (( count == 0 || count == ${#modules[@]} )) || die '知识快照模块不完整；不能保存或恢复混合代'
+  KNOWLEDGE_SNAPSHOT_HAS_P0=$(( count == ${#modules[@]} ))
+  if (( KNOWLEDGE_SNAPSHOT_HAS_P0 )); then
+    return 0
+  fi
+  # 未发布的早期同版本候选可以全无新模块；已声明新能力则不能冒充旧候选。
+  file="${root}/n8n/workflow.json"
+  if [[ ! -f "$file" || -L "$file" ]] \
+    || ! jq -e '(.meta.lexicalFileSha256 // "") == ""' "$file" >/dev/null 2>&1; then
+    die '知识快照声明了缺失的词法运行模块'
+  fi
+  for module in data/runtime/knowledge-profile.json data/runtime/knowledge-lexical.json; do
+    [[ ! -e "${root}/${module}" && ! -L "${root}/${module}" ]] \
+      || die '知识快照保留新索引代次但缺少对应程序'
+  done
+  file="${root}/config/materials-applied.json"
+  if [[ -e "$file" || -L "$file" ]]; then
+    if [[ ! -f "$file" || -L "$file" ]] \
+      || ! jq -e '[(.knowledge.profile_sha256 // ""),(.knowledge.lexical_sha256 // "")] | all(. == "")' \
+        "$file" >/dev/null 2>&1; then
+      die '知识快照投影引用了缺失的模型或词法程序'
+    fi
+  fi
+  return 0
 }
 
 require_command python3
@@ -198,6 +237,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 tar --extract --gzip --file "$ARCHIVE" --directory "$STAGING" --no-same-owner --no-same-permissions
 PAYLOAD="${STAGING}/payload"
+[[ ! -e "${PAYLOAD}/data/runtime/knowledge-migration.json" && ! -L "${PAYLOAD}/data/runtime/knowledge-migration.json" ]] \
+  || die '快照包含未完成知识迁移；未停止服务或恢复中间索引代'
 [[ -f "${PAYLOAD}/VERSION" && -f "${PAYLOAD}/docker-compose.yml" && -f "${PAYLOAD}/n8n/workflow.json" ]] || die "版本快照缺少必要文件"
 [[ -s "${PAYLOAD}/data/postgres/n8n.dump" && ! -L "${PAYLOAD}/data/postgres/n8n.dump" ]] || die "版本快照缺少 n8n 数据库备份"
 [[ "$(<"${PAYLOAD}/VERSION")" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "快照 VERSION 格式无效"
@@ -219,9 +260,11 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
     die "快照数据库密码无效；未修改部署"
   fi
   if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.2.1; then
-    for name in config/provider-pool-applied.json config/provider-pool.yaml scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh; do
+    for name in config/provider-pool-applied.json config/provider-pool.yaml \
+      scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/runtime.js; do
       [[ -f "${PAYLOAD}/${name}" && ! -L "${PAYLOAD}/${name}" ]] || die "主备版本快照缺少必要文件：$name"
     done
+    knowledge_snapshot_modules_check "$PAYLOAD"
   fi
   if [[ -e "${PAYLOAD}/config/provider-pool-applied.json" ]]; then
     python3 "${SCRIPT_DIR}/provider-pool.py" --deploy-dir "$PAYLOAD" list >/dev/null \
@@ -279,8 +322,13 @@ for name in "${DOC_FILES[@]}"; do
 done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh; do
+validate_optional_version_file "${PAYLOAD}/data/knowledge-projection.json" "${DEPLOY_DIR}/data/knowledge-projection.json" data/knowledge-projection.json
+for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh \
+  knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
+done
+for module in runtime.js admin-query.js knowledge-lexical.js; do
+  validate_optional_version_file "${PAYLOAD}/n8n/${module}" "${DEPLOY_DIR}/n8n/${module}" "n8n/${module}"
 done
 
 require_docker_runtime
@@ -372,10 +420,14 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh; do
+for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh \
+  knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   module_mode=0750
   case "$module" in *.js|*.py) module_mode=0640 ;; esac
   sync_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "$module_mode" "scripts/${module}"
+done
+for module in runtime.js admin-query.js knowledge-lexical.js; do
+  sync_optional_version_file "${PAYLOAD}/n8n/${module}" "${DEPLOY_DIR}/n8n/${module}" 0640 "n8n/${module}"
 done
 
 find "${DEPLOY_DIR}/knowledge" -maxdepth 1 -type f ! -name 'README.md' \
@@ -425,6 +477,7 @@ mv -- "$ANYTHING_RESTORE" "${DEPLOY_DIR}/data/anythingllm"
 if [[ -f "${PAYLOAD}/data/knowledge-manifest.json" ]]; then
   install -m 0600 -- "${PAYLOAD}/data/knowledge-manifest.json" "${DEPLOY_DIR}/data/knowledge-manifest.json"
 fi
+sync_optional_version_file "${PAYLOAD}/data/knowledge-projection.json" "${DEPLOY_DIR}/data/knowledge-projection.json" 0600 data/knowledge-projection.json
 
 MARKER_SOURCE=$(sed -n 's/^source=//p' "${DEPLOY_DIR}/${INSTALL_MARKER}" | head -n 1)
 write_installation_marker "$DEPLOY_DIR" "$MARKER_SOURCE" "$(<"${DEPLOY_DIR}/VERSION")" installing

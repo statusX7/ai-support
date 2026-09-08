@@ -50,6 +50,9 @@ async function main() {
     if(request.url === '/api/v1/document/upload'){
       const filename=/filename="([^"]+)"/.exec(data.toString('utf8'))?.[1];
       const location=`custom-documents/${filename}.${++sequence}.json`;
+      const parsed=path.join(deploy,'data/anythingllm/documents',location);
+      fs.mkdirSync(path.dirname(parsed),{recursive:true});
+      fs.writeFileSync(parsed,JSON.stringify({pageContent:`# ${filename}\n协议解析正文，不是真实业务知识。\n`}),{mode:0o640});
       documents.set(location,{filename});send(200,{success:true,documents:[{location}]});return;
     }
     if(request.url === '/api/v1/workspace/crisp-support/update-embeddings'){
@@ -152,6 +155,21 @@ async function main() {
     await ok('configuration.sh',['migrate']);
     assert.deepEqual([fs.readFileSync(keywordFile),fs.readFileSync(handoffFile)],neutralBytes);
     pass('中性显示只迁移系统精确旧默认，保留自定义和人工秒数，受限备份且重复不变');
+    const currentKeywordBytes=fs.readFileSync(keywordFile);
+    fs.writeFileSync(keywordFile,JSON.stringify({keywords:[{
+      id:'legacy-confirmation',name:'旧结构人工确认',enabled:true,match_mode:'contains',
+      keywords:['联系人工'],exclude_keywords:[],priority:9,cooldown_seconds:5,
+      action:{type:'handoff',text:'需要人工协助吗？请点击下方按钮确认。'}
+    }]}));
+    await ok('configuration.sh',['migrate']);
+    const convertedKeyword=JSON.parse(fs.readFileSync(keywordFile));
+    const convertedRule=convertedKeyword.rules.find(rule=>rule.id==='legacy-confirmation');
+    assert.equal(convertedKeyword.schema_version,2);
+    assert.equal(convertedRule.cancel_label,'继续咨询');
+    assert.equal(convertedRule.confirm_message,'您的人工协助请求已收到，请稍候。');
+    assert.doesNotMatch(JSON.stringify(convertedRule),/继续 AI 客服|已暂停本次对话的 AI 回复/);
+    fs.writeFileSync(keywordFile,currentKeywordBytes);
+    pass('旧关键词schema在同一次迁移返回前完成中性文案归一化，不发布旧生成缺省');
     await ok('knowledge.sh',['sync']);
     assert.equal(readCatalog().libraries[0].id,'kb_default');assert.equal(readCatalog().libraries[0].documents.length,1);const originalSequence=sequence;
     await ok('knowledge.sh',['sync']);assert.equal(sequence,originalSequence);pass('单库幂等迁移保留既有 filename 与索引');
@@ -180,7 +198,14 @@ async function main() {
     await ok('knowledge.sh',['disable',libraryIds[1]]);assert.equal(locations.length,4);assert.equal(sourceRemoval.length,removalBeforeDisable+2);assert.ok(disabled.documents.every(document=>!fs.existsSync(path.join(deploy,'knowledge',document.projection))));pass('停用库实际移除workspace索引，原文保留');
     await ok('knowledge.sh',['enable',libraryIds[1]]);assert.equal(locations.length,6);pass('重新启用恢复索引且不影响其他库');
     await ok('knowledge.sh',['delete',libraryIds[2]]);assert.equal(locations.length,5);assert.ok(!readCatalog().libraries.some(library=>library.id===libraryIds[2]));pass('删除指定库保护其他库与索引');
-    const query=JSON.parse((await ok('knowledge.sh',['query',libraryIds[0],'电脑问题的处理标记是什么？'])).stdout);assert.equal(query.results.length,2);assert.ok(query.results.every(item=>item.library_id===libraryIds[0]));pass('单库检索预览正确关联来源，明确协议层');
+    const queryOutput=(await ok('knowledge.sh',['query',libraryIds[0],'电脑问题的处理标记是什么？'])).stdout;
+    const query=JSON.parse(queryOutput);
+    assert.equal(query.answer,'协议模型回答');assert.equal(query.verified,true);assert.equal(query.retrieval_state,'knowledge_hit');
+    assert.equal(query.scope,'全部已启用知识库（与实际客服一致）');assert.match(query.note,/实际客服保持一致/);
+    assert.equal(query.sources.length,5);assert.ok(new Set(query.sources.map(item=>item.library_name)).size>=2);
+    assert.ok(query.sources.every(item=>assert.deepEqual(Object.keys(item).sort(),['library_name','projection'])===undefined));
+    for(const location of locations) assert.equal(queryOutput.includes(location),false);
+    pass('菜单检索走生产管理员同链，以全部已启用库返回脱敏唯一来源');
     const removedDocument=readCatalog().libraries.find(library=>library.id===libraryIds[0]).documents.find(document=>document.name==='同名.md');
     await ok('knowledge.sh',['remove',libraryIds[0],removedDocument.id]);
     assert.ok(!fs.existsSync(path.join(deploy,'knowledge',libraryIds[0],removedDocument.source)));

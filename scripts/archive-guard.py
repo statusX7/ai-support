@@ -45,6 +45,8 @@ def validate(path, kind, max_bytes):
                         allowed = len(parts) == 2 or parts[2] == "provider"
                     if section == "data":
                         allowed = len(parts) == 2 or parts[2] in ("anythingllm", "n8n", "runtime", "provider-router", "postgres", "knowledge-manifest.json")
+                        if len(parts) == 3 and parts[2] == "knowledge-projection.json" and member.isfile():
+                            allowed = True
                         if len(parts) >= 3 and parts[2] == "postgres":
                             allowed = len(parts) == 3 or (len(parts) == 4 and parts[3] == "n8n.dump")
             if not allowed:

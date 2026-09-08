@@ -34,7 +34,7 @@ git diff --check
 bash scripts/package-release.sh
 ```
 
-正式打包只允许干净提交和固定已跟踪清单，产物为 `dist/ai-support-v1.2.1.tar.gz`、只含该包一条记录的 `dist/SHA256SUMS`，以及供审计的 `dist/get.sh`。包须包含 provider pool/router/envelope、中文呈现/主备菜单模块及已有 materials/logs 等完整生产文件，排除 .git、.work、真实配置/知识、秘密代次、日志、数据、备份和测试工具二进制。两次构建应得到相同 SHA。
+正式打包只允许干净提交和固定已跟踪清单，产物为 `dist/ai-support-v1.2.1.tar.gz`、只含该包一条记录的 `dist/SHA256SUMS`，以及供审计的 `dist/get.sh`。包须包含 provider pool/router/envelope、中文呈现/主备菜单模块，以及本轮知识链的 `n8n/admin-query.js`、`n8n/knowledge-lexical.js`、`scripts/knowledge-component.js`、`scripts/knowledge-lexical.py`、`scripts/knowledge-profile.py`、`scripts/knowledge-profile.sh` 和已有 materials/logs 等完整生产文件；排除 .git、.work、真实配置/知识、秘密代次、日志、数据、备份和测试工具二进制。两次构建应得到相同 SHA。
 
 main/get.sh 是公共入口，默认解析一次 Latest 正式 tag，再固定同版归档和清单；不得分别使用两个 latest/download 地址或回退 main 归档。主推荐命令从 README 的标记后提取，与 INSTALL 和该版 release notes 逐字一致。
 
@@ -42,7 +42,7 @@ main/get.sh 是公共入口，默认解析一次 Latest 正式 tag，再固定�
 
 向唯一远程写操作者交付冻结提交、完整归档和精确校验清单。先保全现场及正式一致快照，再由完整包的生产升级器部署；同版复验走保留配置的完整安装流程，不散装拷贝源码或强制降级。读取新版程序清单动态逐文件核对，不沿用旧版固定文件数。
 
-核对真实配置/原文、人工/offer/jobs、主接口迁移与秘密代次保留，四核心、实际容器文件、active workflow、资料/池投影、日志 timer 的真实触发、新 SSH 双入口和专用 SDK 原窗口往返。取消评价、欢迎真回读与受控切换须有本轮证据；故障注入后恢复用户参数，不清状态凑成功。
+核对真实配置/原文、人工/offer/jobs、主接口迁移与秘密代次保留，四核心、实际容器文件、active workflow、资料/池投影、日志 timer 的真实触发、新 SSH 双入口和专用 SDK 原窗口往返。取消评价、完整 FAQ 原问的明确事实答案、中文改写、欢迎真回读与受控切换须有本轮证据；故障注入后恢复用户参数，不清状态凑成功。发布回执中的 `exact_knowledge_answer_verified` 必须来自该冻结包的实机问答，不能用协议固定回复代替。
 
 任何生产文件变化都使旧候选结论需要重新核对，仍使用完整冻结包复验。只有满足本轮门槛后才能进入下面的发布动作；后台真人未观察、仅格式断言失败等边界分别保留，不能用历史成功覆盖当前失败。
 

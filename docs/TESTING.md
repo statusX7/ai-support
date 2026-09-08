@@ -36,6 +36,12 @@ node tests/test_provider_adapter.js
 node tests/test_provider_pool.js
 node tests/test_feedback_runtime.js
 node tests/test_crisp_auth.js
+node tests/test_knowledge_context.js
+node tests/test_knowledge_lexical.js
+node tests/test_knowledge_hybrid.js
+node tests/test_knowledge_runtime.js
+python3 tests/test_knowledge_profile.py
+bash tests/test_knowledge_profile_integration.sh
 python3 tests/test_launcher.py
 python3 tests/test_docs_acceptance.py
 python3 tests/test_rag_context.py
@@ -61,6 +67,10 @@ ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服
 
 `test_feedback_runtime.js` 的图片阶段回归先保留旧请求失败：前问仍作为活动用户消息时，受控契约夹具返回前问答案。修后分别检查 Chat/Responses 的独立事实提取指令、原 Prompt、真实图像字段、只读历史和同会话摘要/重启后指代；另测视觉期间真人或总开关取消后不保存摘要、不续 RAG、不出站。这是请求/状态契约证据，不是视觉模型能力测试。实机必须另外核对原图可见内容、模型摘要及最终回复，不能仅凭非空或 HTTP 200 通过。
 
+`node tests/test_knowledge_context.js` 与 `node tests/test_knowledge_runtime.js` 验证固定 `/vector-search` 的实际结构、纯当前问题、完整片段与 Prompt、启用来源归属、上下文隔离、检索中人工取消及管理员同链。`test_knowledge_lexical.js` 实际从虚构 parsed 正文构建/验证补召回索引；`test_knowledge_hybrid.js` 再通过生产 runtime 和生成的 Code node 覆盖强命中跳过向量、向量 miss/故障降级、长文尾 FAQ、合并去重、部分覆盖、三层篡改、旧投影及生成中真人取消。测试只用虚构资料；正文断言解析实际 JSON 后逐字比较，不能用转义形式相似代替保真。HTTP 200 错误、未知来源不能算未命中。runtime 热路验证 materials/map/lexical/profile/settings 与迁移门禁；manifest/cache 摘要由 profile 和 Shell 集成套件另行验证，不把两层证据混成“每问实时扫描向量缓存”。
+
+`test_knowledge_profile.py` 与 `test_knowledge_profile_integration.sh` 验证模型/切块代次、完整组件保全、失败恢复、权限和会话状态保护。另在固定真实 AnythingLLM Embedding 环境比较中文原问与改写的排名、token 保留和完整答案片段；多语言模型、400 字符块的实测只证明检索层，最终还必须由真实模型根据送入的事实正确回答。UNIT 协议夹具、真实本地 Embedding 和 TARGET-A 最终回答是三个不同证据层级，不能合并计数。
+
 发布模式必须指定隔离真实部署，不能把本地集成缺失当外部豁免：
 
 ```bash
@@ -83,7 +93,7 @@ bash tests/run.sh
 1. 在无登录的干净 VM 原样执行 README/INSTALL 中同一条推荐命令，由入口取得并校验最终正式包，PTY 自动进入安装器。文件来源快速路径记录十个主要输入，确认后额外必答为零；多行粘贴逐行计数，不把输入行数误称十次按键。
 2. 确认安装器实际安装缺失包、Docker/Compose，启用 daemon 并运行容器；自动创建内部 Key/workspace，读回 Prompt、文档索引和已发布工作流。
 3. 从 `/`、`/tmp` 和新 shell 调用 `crispai`。通过真实菜单换配置、粘贴中文 Prompt，检查当前 AnythingLLM Prompt 与容器内配置一致。
-4. 创建“订阅使用”“电脑排障”“手机排障”三个命名库；使用有效 MD/TXT/PDF/DOCX。用中文改写问题检查真实向量搜索的来源、内容、排名，不以协议模型固定答复作为检索证据。
+4. 创建“订阅使用”“电脑排障”“手机排障”三个命名库；使用有效 MD/TXT/PDF/DOCX。分别用完整 FAQ 原问与中文同义改写走菜单 5 的同一生产问答链：原问强命中可跳过向量，改写必须保留真实向量路径；核对来源正文和最终答案都采用明确事实。停用其中一库后重测，该库不得出现于新来源。不以协议模型固定答复作为检索证据。
 5. 停用中间库、更新同名文件、重同步、重新启用、单库重建、删除条目；确认其他库的文档映射未被覆盖或误删。
 6. A/B 两位测试访客正常聊天。A 输入“人工”仅见原生 picker，不点继续业务问答仍有 AI；A 点击确认后仅 A 暂停并收到一次确认，B 持续正常。
 7. 设置 10 秒恢复；真人再次公开回复 A 更新 A 截止时间。用慢模型验证人工事件已落盘后旧结果不出站；访客消息不重置计时，期限到后只答新问题。

@@ -101,12 +101,14 @@ SHELL_FILES=(
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
   scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
+  scripts/knowledge-profile.sh
   scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
   tests/test_caddy_routing.sh tests/test_logs.sh tests/test_doctor_pool.sh
+  tests/test_knowledge_profile_integration.sh
   tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout tests/mocks/systemctl
 )
@@ -258,6 +260,14 @@ if command -v node >/dev/null 2>&1; then
   pass "直接编辑资料的校验、投影、真实协议回读与失败恢复专项"
   node "${SCRIPT_DIR}/test_material_limits.js"
   pass "Prompt、目录、命名知识库与菜单限制的边界和越界专项"
+  node "${SCRIPT_DIR}/test_knowledge_context.js"
+  node "${SCRIPT_DIR}/test_knowledge_lexical.js"
+  node "${SCRIPT_DIR}/test_knowledge_hybrid.js"
+  node "${SCRIPT_DIR}/test_knowledge_runtime.js"
+  pass "纯问题检索、词法/向量混合补召回、完整知识片段、管理员同链与取消专项（内部子项单列）"
+  python3 "${SCRIPT_DIR}/test_knowledge_profile.py"
+  "${SCRIPT_DIR}/test_knowledge_profile_integration.sh"
+  pass "中文 Embedding 配置代际、原子迁移及失败恢复专项（内部子项单列）"
   node "${SCRIPT_DIR}/test_provider_adapter.js"
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_provider_pool.js"

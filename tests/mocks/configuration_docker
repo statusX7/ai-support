@@ -45,6 +45,21 @@ if [[ "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == anythingllm && "${11:-}
   jq -M -er '.context_window' "$fixture_running"
   exit 0
 fi
+if [[ "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == n8n && "${11:-}" == node \
+  && "${12:-}" == /opt/crisp-ai/n8n/admin-query.js && $# -eq 12 ]]; then
+  fixture_compose_owned "$@" || exit 64
+  fixture_request=$(mktemp "$fixture_dir/tmp/admin-query-request.XXXXXXXX")
+  trap 'rm -f -- "$fixture_request"' EXIT
+  chmod 600 "$fixture_request"
+  cat > "$fixture_request"
+  jq -M -e '.question == "电脑问题的处理标记是什么？" and
+    (.budget_ms | type == "number" and floor == . and . >= 0)' "$fixture_request" >/dev/null \
+    || exit 64
+  jq -M -c -n --slurpfile map "$fixture_dir/data/runtime/knowledge-map.json" '
+    {answer:"协议模型回答",sources:[$map[0].documents[].location],
+      verified:true,retrieval_state:(if ($map[0].documents | length) > 0 then "knowledge_hit" else "knowledge_miss" end)}'
+  exit 0
+fi
 if [[ "$*" == *" config --quiet"* || "$*" == *" up -d "* ]]; then
   exit 0
 fi

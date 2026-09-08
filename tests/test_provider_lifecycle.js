@@ -11,6 +11,8 @@ const {createAdapter} = require('../scripts/provider-adapter.js');
 
 const project = path.resolve(__dirname, '..');
 const baseWork = path.join(project, '.work/v1.2.1');
+const knowledgeModules = ['scripts/knowledge-component.js','scripts/knowledge-profile.py',
+  'scripts/knowledge-profile.sh','scripts/knowledge-lexical.py','n8n/admin-query.js','n8n/knowledge-lexical.js'];
 fs.mkdirSync(baseWork, {recursive:true});
 const work = fs.mkdtempSync(path.join(baseWork, 'provider-lifecycle-'));
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -170,6 +172,27 @@ async function main(){
         const status=await f.invoke('materials.sh',['status']);assert.equal(status.code,2);assert.equal(JSON.parse(status.stdout).provider_pool.pending,true);
       }finally{f.rejectModel='';write(path.join(f.deploy,'config/provider-pool.yaml'),before['config/provider-pool.yaml']);}
     });
+    await test('PL11 任何知识迁移标记在容量及完整快照停服务前拒绝，不改池或调用模型',async()=>{
+      const marker=path.join(f.deploy,'data/runtime/knowledge-migration.json'),before=f.capture(),callCount=f.calls.length;
+      assert(!fs.existsSync(marker));
+      for(const kind of ['file','malformed','dangling','fifo','directory']){
+        if(kind==='file')write(marker,{state:'applying',synthetic:true});
+        else if(kind==='malformed')write(marker,'{');
+        else if(kind==='dangling')fs.symlinkSync('synthetic-missing',marker);
+        else if(kind==='fifo')await checked('mkfifo',[marker]);
+        else fs.mkdirSync(marker);
+        try{
+          for(const args of [['--quiet','--check-capacity'],['--quiet']]){
+            write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+            const result=await f.invoke('snapshot.sh',args,f.snapshotEnv);
+            write(path.join(work,`pending-knowledge-${kind}-${args.length}.log`),result.stdout+result.stderr);
+            assert.notEqual(result.code,0);assert.match(result.stderr,/知识迁移/);
+            assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+            assert.deepEqual(f.capture(),before);assert.equal(f.calls.length,callCount);assert(fs.lstatSync(marker));
+          }
+        }finally{kind==='directory'?fs.rmdirSync(marker):fs.unlinkSync(marker);}
+      }
+    });
     await test('PL08 本机完整快照包含同代secret/router并保持受限权限',async()=>{
       await f.ok('logs.sh',['initialize','--profile','new'],f.snapshotEnv);
       write(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'),{synthetic:true,state:'旧路由状态必须成套恢复'});
@@ -180,6 +203,9 @@ async function main(){
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
       for(const name of ['provider-router.js','provider-envelope.js','provider-pool.py'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
+      for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
+      assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
+      assert.equal(fs.statSync(path.join(payload,'data/knowledge-projection.json')).mode&0o777,0o600);
       assert.deepEqual(fs.readFileSync(path.join(payload,'.env')),fs.readFileSync(path.join(f.deploy,'.env')));
       assert.match(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8'),/stop .*provider-adapter/);
     });
@@ -190,6 +216,41 @@ async function main(){
       write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
       const before=f.capture();write(f.snapshotEnv.MOCK_DOCKER_LOG,'');const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],f.snapshotEnv);
       assert.notEqual(result.code,0);assert.match(result.stderr,/接口池与秘密代次不完整/);assert.deepEqual(f.capture(),before);assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+    });
+    await test('PL12 知识中间代、部分模块及冒充旧候选的自洽载荷全部停前拒绝',async()=>{
+      const clearNewModules=payload=>{
+        for(const name of knowledgeModules)fs.unlinkSync(path.join(payload,name));
+        for(const name of ['knowledge-profile.json','knowledge-lexical.json']){
+          const file=path.join(payload,'data/runtime',name);if(fs.existsSync(file))fs.unlinkSync(file);
+        }
+        const materialFile=path.join(payload,'config/materials-applied.json'),material=read(materialFile);
+        delete material.knowledge.profile_sha256;delete material.knowledge.lexical_sha256;write(materialFile,material);
+      };
+      const clearLexicalMetadata=payload=>{
+        const file=path.join(payload,'n8n/workflow.json'),value=read(file);delete value.meta.lexicalFileSha256;write(file,value);
+      };
+      const variants=[
+        ['pending',payload=>write(path.join(payload,'data/runtime/knowledge-migration.json'),{state:'applying'}),/未完成知识迁移/],
+        ['malformed-pending',payload=>write(path.join(payload,'data/runtime/knowledge-migration.json'),'{'),/未完成知识迁移/],
+        ['partial-module',payload=>fs.unlinkSync(path.join(payload,knowledgeModules[0])),/知识快照模块不完整/],
+        ['missing-runtime',payload=>fs.unlinkSync(path.join(payload,'n8n/runtime.js')),/缺少必要文件.*runtime/],
+        ['linked-module',payload=>{fs.unlinkSync(path.join(payload,knowledgeModules[0]));fs.symlinkSync('synthetic-missing',path.join(payload,knowledgeModules[0]));},/链接或特殊文件/],
+        ['declared-lexical',payload=>clearNewModules(payload),/声明了缺失的词法/],
+        ['retained-profile',payload=>{clearNewModules(payload);clearLexicalMetadata(payload);write(path.join(payload,'data/runtime/knowledge-profile.json'),{state:'applied'});},/保留新索引代次/],
+        ['retained-projection',payload=>{clearNewModules(payload);clearLexicalMetadata(payload);const file=path.join(payload,'config/materials-applied.json'),value=read(file);value.knowledge.profile_sha256='a'.repeat(64);write(file,value);},/投影引用了缺失/],
+      ];
+      for(const [name,mutate,expected] of variants){
+        const stage=path.join(work,'knowledge-broken-'+name);fs.mkdirSync(stage);
+        await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);mutate(path.join(stage,'payload'));
+        const id='synthetic-knowledge-'+name,directory=path.join(f.deploy,'backups/versions',id);fs.mkdirSync(directory);
+        const archive=path.join(directory,'snapshot.tar.gz');await checked('tar',['-czf',archive,'-C',stage,'payload']);
+        write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
+        const before=f.capture(),callCount=f.calls.length;write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+        const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],f.snapshotEnv);
+        write(path.join(work,'rollback-knowledge-'+name+'.log'),result.stdout+result.stderr);
+        assert.notEqual(result.code,0,name);assert.match(result.stderr,expected,name);assert.deepEqual(f.capture(),before);assert.equal(f.calls.length,callCount);
+        assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')),name);
+      }
     });
     await test('PL10 真实v1.1.0快照恢复旧程序配置，主备秘密与router受限成套保留',async()=>{
       const legacy=path.join(work,'legacy-v110'),sourceArchive=path.join(work,'legacy-source.tar');fs.mkdirSync(legacy);
@@ -209,6 +270,8 @@ async function main(){
       const snapshot=await checked('bash',[path.join(project,'scripts/snapshot.sh'),'--deploy-dir',legacy,'--quiet','--reason','synthetic-v110-restore'],{env:legacyEnv});const id=snapshot.stdout.trim();
       fs.cpSync(path.join(legacy,'backups/versions',id),path.join(f.deploy,'backups/versions',id),{recursive:true});
       const previous=f.pool(),previousSecret=f.secretEntries(),newRouter=fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'));
+      assert(!fs.existsSync(path.join(legacy,'data/knowledge-projection.json')));
+      assert(fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       write(path.join(f.deploy,'data/runtime/synthetic-current-only.json'),{synthetic:true,version:'v1.2.1'});
       write(f.snapshotEnv.MOCK_DOCKER_LOG,'');write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\nprovider-adapter\n');
       f.adapter.closeAllConnections();await new Promise(resolve=>f.adapter.close(resolve));f.adapter=null;
@@ -216,6 +279,8 @@ async function main(){
       write(path.join(work,'legacy-rollback.log'),result.stdout+result.stderr);assert.equal(result.code,0,result.stdout+result.stderr);
       for(const name of ['VERSION','install.sh','manage.sh','scripts/common.sh','scripts/provider.sh','n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(legacy,name)));
       for(const name of ['provider-router.js','provider-envelope.js','provider-pool.py','menu-display.py','menu-provider-ui.sh'])assert(!fs.existsSync(path.join(f.deploy,'scripts',name)));
+      for(const name of knowledgeModules)assert(!fs.existsSync(path.join(f.deploy,name)),name);
+      assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool-applied.json')));assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool.yaml')));
       assert(!fs.existsSync(path.join(f.deploy,'secrets')));assert(!fs.existsSync(path.join(f.deploy,'data/provider-router')));
       assert(!fs.readFileSync(path.join(f.deploy,'.env'),'utf8').includes('PROVIDER_POOL_REQUIRED'));
@@ -225,6 +290,15 @@ async function main(){
       const retainedSecret=kept.map(directory=>path.join(directory,'secrets/provider/generations',previous.secrets_generation+'.json')).find(file=>fs.existsSync(file));assert.deepEqual(read(retainedSecret).entries,previousSecret);
       const retainedRouter=kept.map(directory=>path.join(directory,'provider-router/synthetic-preserved.json')).find(file=>fs.existsSync(file));assert.deepEqual(fs.readFileSync(retainedRouter),newRouter);
       const docker=fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8');assert.match(docker,/pg_restore/);assert.match(docker,/--force-recreate anythingllm/);assert.equal(fs.readFileSync(legacyEnv.MOCK_POSTGRES_PASSWORD_DIGEST_FILE,'utf8').trim(),digest('synthetic-lifecycle-database-password'));
+    });
+    await test('PL13 旧版回滚后真实程序复制补齐七模块，不改知识原文或人工状态',async()=>{
+      const protectedFiles=files(path.join(f.deploy,'knowledge')).concat(files(path.join(f.deploy,'data/runtime')));
+      const before=Object.fromEntries(protectedFiles.map(file=>[file,digest(fs.readFileSync(file))]));
+      await checked('bash',['-c','set -euo pipefail\nsource "$1/scripts/common.sh"\ncopy_project_files "$1" "$2"','--',project,f.deploy]);
+      for(const name of [...knowledgeModules,'n8n/runtime.js','n8n/workflow.json'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(project,name)),name);
+      for(const [file,hash] of Object.entries(before))assert.equal(digest(fs.readFileSync(file)),hash,file);
+      assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
+      // 此组只验证真实升级的程序复制阶段，不冒充组件启动或索引迁移验收。
     });
   }finally{await f.close();}
   write(path.join(work,'result.json'),{layer:'UNIT/CONTRACT',passed,failed,synthetic_only:true});

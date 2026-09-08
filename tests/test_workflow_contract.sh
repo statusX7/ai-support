@@ -17,10 +17,15 @@ const crypto = require('crypto');
 const root = process.env.PROJECT_ROOT;
 const workflow = JSON.parse(fs.readFileSync(path.join(root, 'n8n/workflow.json'), 'utf8'));
 const rawRuntime = fs.readFileSync(path.join(root, 'n8n/runtime.js'), 'utf8');
+const rawLexical = fs.readFileSync(path.join(root, 'n8n/knowledge-lexical.js'), 'utf8');
 const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim();
-const embeddedRuntime = rawRuntime.replace(/^if \(typeof module[^\n]+\n?$/m, '').replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
+const embeddedLexical = rawLexical.replace(/^module\.exports[^\n]+\n?$/m, '');
+const embeddedRuntime = rawRuntime.replace(/^const \{ searchKnowledgeLexical \} = require\('\.\/knowledge-lexical\.js'\);\n?/m, '')
+  .replace(/^if \(typeof module[^\n]+\n?$/m, '');
+const embeddedSource = (embeddedLexical + '\n' + embeddedRuntime).replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
 assert.equal(workflow.meta.runtimeFileSha256, crypto.createHash('sha256').update(rawRuntime).digest('hex'));
-assert.equal(workflow.meta.runtimeSha256, crypto.createHash('sha256').update(embeddedRuntime).digest('hex'));
+assert.equal(workflow.meta.lexicalFileSha256, crypto.createHash('sha256').update(rawLexical).digest('hex'));
+assert.equal(workflow.meta.runtimeSha256, crypto.createHash('sha256').update(embeddedSource).digest('hex'));
 assert.notEqual(workflow.meta.runtimeFileSha256, workflow.meta.runtimeSha256, '原始模块和嵌入代码的 hash 语义不得混用');
 const { createRuntime } = require(path.join(root, 'n8n/runtime'));
 const runtime = createRuntime({}, { root });

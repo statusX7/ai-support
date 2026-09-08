@@ -63,9 +63,16 @@ fixture_env() {
     DOCTOR_FIXTURE_RAG_API_CONTEXT="${DOCTOR_FIXTURE_RAG_API_CONTEXT:-8192}" \
     DOCTOR_FIXTURE_EMPTY_WORKSPACE="${DOCTOR_FIXTURE_EMPTY_WORKSPACE:-0}" \
     DOCTOR_FIXTURE_WORKFLOW_FAIL="${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" \
+    DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE="${DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE:-${DEPLOY}/n8n/knowledge-lexical.js}" \
     DOCTOR_FIXTURE_N8N_CODE_FAIL="${DOCTOR_FIXTURE_N8N_CODE_FAIL:-0}" \
     DOCTOR_FIXTURE_ADAPTER_FAIL="${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" \
     DOCTOR_FIXTURE_PROVIDER_FAIL="${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" \
+    DOCTOR_FIXTURE_RETRIEVAL_FAIL="${DOCTOR_FIXTURE_RETRIEVAL_FAIL:-0}" \
+    DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN="${DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN:-0}" \
+    DOCTOR_FIXTURE_ADMIN_INVALID_RESULT="${DOCTOR_FIXTURE_ADMIN_INVALID_RESULT:-0}" \
+    DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS="${DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS:-0}" \
+    DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET="${DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET:-}" \
+    DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256="${DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256:-}" \
     DOCTOR_FIXTURE_CRISP_FAIL="${DOCTOR_FIXTURE_CRISP_FAIL:-0}" \
     DOCTOR_FIXTURE_WEBHOOK_FAIL="${DOCTOR_FIXTURE_WEBHOOK_FAIL:-0}" \
     DOCTOR_FIXTURE_DELAY_N8N_SECONDS="${DOCTOR_FIXTURE_DELAY_N8N_SECONDS:-0}" \
@@ -154,7 +161,7 @@ prepare_fixture() {
     cp -p -- "${PROJECT_ROOT}/${name}" "${DEPLOY}/${name}"
   done
   printf 'v1.2.0\n' > "${DEPLOY}/VERSION"
-  for name in workflow.json runtime.js runtime-cli.js build-workflow.js web-chat.js; do
+  for name in workflow.json runtime.js runtime-cli.js build-workflow.js web-chat.js admin-query.js knowledge-lexical.js; do
     cp -p -- "${PROJECT_ROOT}/n8n/${name}" "${DEPLOY}/n8n/${name}"
   done
   node "${DEPLOY}/n8n/build-workflow.js"
@@ -162,7 +169,8 @@ prepare_fixture() {
   mv -f -- "${DEPLOY}/n8n/workflow.json.new" "${DEPLOY}/n8n/workflow.json"
   for name in common.sh doctor.sh healthcheck.sh provider.sh configuration.sh provider-adapter.js launcher.sh bootstrap.sh \
     wizard.sh package-release.sh knowledge.sh migration.sh crisp-settings.sh full-backup.sh archive-guard.py \
-    backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh materials.sh logs.sh log-redact.py; do
+    backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh materials.sh logs.sh log-redact.py \
+    knowledge-profile.py knowledge-profile.sh knowledge-component.js knowledge-lexical.py; do
     cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
   done
   for name in runtime provider keyword menu handoff tags feedback logging; do
@@ -248,6 +256,42 @@ prepare_fixture() {
   }]}' > "${DEPLOY}/knowledge/catalog.json"
   jq -M -n --arg hash "$doc_hash" '{version:1,files:{"fixture.md":{sha256:$hash,locations:["custom-documents/fixture.json"]}},pending_files:{},garbage_locations:[]}' \
     > "${DEPLOY}/data/knowledge-manifest.json"
+  jq -M -n '{schema_version:2,revision:1,documents:[{library_id:"kb_default",library_name:"默认知识库",
+    document_id:"doc_1111111111111111",projection:"fixture.md",location:"custom-documents/fixture.json"}]}' \
+    > "${DEPLOY}/data/runtime/knowledge-map.json"
+  chmod 0600 "${DEPLOY}/data/runtime/knowledge-map.json"
+  # 合成的已应用索引代：这里只验证元数据/缓存身份，不把它称为真实 Embedding。
+  python3 -B - "$DEPLOY" <<'PY'
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("doctor_profile_fixture", root / "scripts/knowledge-profile.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+value = module.profile({"engine": "native", "model": "MintplexLabs/multilingual-e5-small",
+                        "chunk_size": 400, "chunk_overlap": 20, "component_version": "1.16.1"})
+key = module.fingerprint(value)
+module.atomic(root / "data/runtime/knowledge-profile.json",
+              {"schema_version": 1, "state": "applied", "profile": value, "fingerprint": key}, 0o640)
+module.atomic(root / "data/runtime/knowledge-settings.json",
+              {"schema_version": 1, "workspace_slug": "crisp-support", "temperature": 0.35, "observed_at": 1}, 0o640)
+manifest = module.read(root / "data/knowledge-manifest.json")
+manifest["embedding_profile"] = key
+for record in manifest["files"].values():
+    record["embedding_profile"] = key
+    record["cache_bindings"] = []
+    for location in record["locations"]:
+        module.atomic(root / "data/anythingllm/documents" / location,
+                      {"pageContent": "虚构知识：雨天测试码为蓝色。\n"})
+        cached = module.cache_path(root, location)
+        module.atomic(cached, {"fixture": "synthetic-vector-generation"})
+        record["cache_bindings"].append({"location": location, "sha256": module.digest(cached)})
+module.atomic(root / "data/knowledge-manifest.json", manifest)
+PY
+  python3 -B "${DEPLOY}/scripts/knowledge-lexical.py" build --deploy-dir "$DEPLOY" >/dev/null
   # v1.2 runtime 只读取已验证的生效资料投影。测试夹具从同一生产构建函数生成，
   # 不手写一个可能绕过 schema/哈希约束的假投影。
   chmod 0640 "${DEPLOY}/config/"{runtime,handoff,keyword,menu,tags,feedback}.yaml
@@ -286,6 +330,7 @@ prepare_fixture() {
   chmod 0770 "${DEPLOY}/data/analytics"
   chmod 0660 "${DEPLOY}/data/analytics/events.jsonl"
   chown -R 1000:1000 "${DEPLOY}/data/runtime" "${DEPLOY}/data/n8n" "${DEPLOY}/data/anythingllm"
+  chown root:1000 "${DEPLOY}/data/runtime/knowledge-lexical.json"
   chmod 0600 "${DEPLOY}/config/prompt.md"
   : > "$STOPPED_FILE"
   write_binding_state
@@ -298,6 +343,208 @@ prepare_fixture() {
 prepare_fixture
 chmod 0755 "$DOCTOR" "$FIXTURE_BIN/docker" "$FIXTURE_BIN/curl" "$FIXTURE_BIN/systemctl"
 if [[ "${CRISPAI_DOCTOR_FIXTURE_SETUP_ONLY:-0}" == 1 && "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+
+doctor_knowledge_cases() {
+  local original case_name state_hash changed_hash cache_hash
+  original=$(mktemp -d "${TEST_ROOT}/knowledge-original.XXXXXXXX")
+  cp -p -- "${DEPLOY}/data/runtime/knowledge-profile.json" "$original/profile.json"
+  cp -p -- "${DEPLOY}/data/runtime/knowledge-settings.json" "$original/settings.json"
+  cp -p -- "${DEPLOY}/data/knowledge-manifest.json" "$original/manifest.json"
+  cp -p -- "${DEPLOY}/config/materials-applied.json" "$original/materials.json"
+  state_hash=$(business_hash)
+  for case_name in applying profile-body profile-hash manifest-profile document-profile cache-binding cache-hash settings-slug settings-temperature settings-hash missing-referenced legacy minilm healthy; do
+    python3 -B - "$DEPLOY" "$original" "$case_name" <<'PY'
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+root, saved, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+spec = importlib.util.spec_from_file_location("doctor_profile_cases", root / "scripts/knowledge-profile.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+paths = {"profile": "data/runtime/knowledge-profile.json", "settings": "data/runtime/knowledge-settings.json",
+         "manifest": "data/knowledge-manifest.json", "materials": "config/materials-applied.json"}
+for name, target in paths.items():
+    module.atomic(root / target, json.loads((saved / (name + ".json")).read_text()), 0o600 if name == "manifest" else 0o640)
+profile = module.read(root / paths["profile"])
+manifest = module.read(root / paths["manifest"])
+settings = module.read(root / paths["settings"])
+materials = module.read(root / paths["materials"])
+record = manifest["files"]["fixture.md"]
+cache = module.cache_path(root, record["locations"][0])
+module.atomic(cache, {"fixture": "synthetic-vector-generation"})
+if case == "applying": profile["state"] = "applying"
+elif case == "profile-body": profile["profile"]["chunk_size"] += 1
+elif case == "manifest-profile": manifest["embedding_profile"] = "f" * 64
+elif case == "document-profile": record["embedding_profile"] = "f" * 64
+elif case == "cache-binding": record.pop("cache_bindings")
+elif case == "cache-hash": module.atomic(cache, {"fixture": "different-vector-generation"})
+elif case == "settings-slug": settings["workspace_slug"] = "another-workspace"
+elif case == "settings-temperature": settings["temperature"] = True
+elif case == "minilm":
+    profile["profile"] = module.profile({"engine": "native", "model": "Xenova/all-MiniLM-L6-v2",
+                                         "chunk_size": 1000, "chunk_overlap": 20, "component_version": "1.16.1"})
+    profile["fingerprint"] = module.fingerprint(profile["profile"])
+    manifest["embedding_profile"] = profile["fingerprint"]
+    record["embedding_profile"] = profile["fingerprint"]
+for name, value in (("profile", profile), ("settings", settings), ("manifest", manifest)):
+    module.atomic(root / paths[name], value, 0o600 if name == "manifest" else 0o640)
+for name in ("profile", "settings", "manifest"):
+    materials["knowledge"][name + "_sha256"] = module.digest(root / paths[name])
+if case == "profile-hash": materials["knowledge"]["profile_sha256"] = "f" * 64
+elif case == "settings-hash": materials["knowledge"]["settings_sha256"] = "f" * 64
+elif case in ("missing-referenced", "legacy"):
+    (root / paths["profile"]).unlink()
+    if case == "legacy":
+        materials["knowledge"]["profile_sha256"] = ""
+        manifest.pop("embedding_profile")
+        record.pop("embedding_profile")
+        record.pop("cache_bindings")
+        module.atomic(root / paths["manifest"], manifest)
+        materials["knowledge"]["manifest_sha256"] = module.digest(root / paths["manifest"])
+module.atomic(root / paths["materials"], materials, 0o640)
+PY
+    changed_hash=$(business_hash)
+    cache_hash=$(find "${DEPLOY}/data/anythingllm/vector-cache" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')
+    invoke --offline
+    case "$case_name" in
+      legacy|minilm) assert_result knowledge.profile WARN ;;
+      settings-*) assert_result knowledge.profile PASS; assert_result knowledge.settings FAIL ;;
+      healthy) assert_result knowledge.profile PASS; assert_result knowledge.settings PASS ;;
+      *) assert_result knowledge.profile FAIL ;;
+    esac
+    [[ "$changed_hash" == "$(business_hash)" ]] || fail "知识自检 ${case_name} 改动业务或索引元数据"
+    [[ "$cache_hash" == "$(find "${DEPLOY}/data/anythingllm/vector-cache" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')" ]] \
+      || fail "知识自检 ${case_name} 写入向量缓存"
+    [[ ! -e "${DEPLOY}/scripts/__pycache__" ]] || fail '知识只读校验在程序目录生成了 Python 缓存'
+    ! grep -Eq '^docker |^curl |虚构知识：雨天测试码为蓝色。|synthetic-vector-generation' "$FIXTURE_LOG" "$OUT" "$ERR" \
+      || fail "知识自检 ${case_name} 调用网络或输出知识/缓存正文"
+  done
+  cp -p -- "$original/profile.json" "${DEPLOY}/data/runtime/knowledge-profile.json"
+  cp -p -- "$original/settings.json" "${DEPLOY}/data/runtime/knowledge-settings.json"
+  cp -p -- "$original/manifest.json" "${DEPLOY}/data/knowledge-manifest.json"
+  cp -p -- "$original/materials.json" "${DEPLOY}/config/materials-applied.json"
+  [[ "$state_hash" == "$(business_hash)" ]] || fail '知识只读专项未恢复原合成配置'
+  pass '知识 profile/settings 14 个只读正负例：应用状态、正文指纹、文档缓存绑定和旧代警告'
+}
+
+doctor_lexical_cases() {
+  local original case_name baseline changed_hash source_hash
+  original=$(mktemp -d "${TEST_ROOT}/lexical-original.XXXXXXXX")
+  cp -p -- "${DEPLOY}/data/runtime/knowledge-lexical.json" "$original/index.json"
+  cp -p -- "${DEPLOY}/config/materials-applied.json" "$original/materials.json"
+  cp -p -- "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json" "$original/source.json"
+  baseline=$(business_hash)
+  for case_name in lexical-hash lexical-schema lexical-map lexical-source lexical-missing lexical-partial lexical-legacy lexical-healthy; do
+    python3 -B - "$DEPLOY" "$original" "$case_name" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+
+root, saved, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+target = root / "data/runtime/knowledge-lexical.json"
+source = root / "data/anythingllm/documents/custom-documents/fixture.json"
+projection = root / "config/materials-applied.json"
+for old, new in (("index.json", target), ("source.json", source), ("materials.json", projection)):
+    shutil.copy2(saved / old, new)
+target.chmod(0o640)
+import os
+os.chown(target, 0, 1000)
+index = json.loads(target.read_text())
+materials = json.loads(projection.read_text())
+if case == "lexical-schema": index["schema_version"] = 99
+elif case == "lexical-map": index["map_sha256"] = "f" * 64
+elif case == "lexical-source": source.write_text(json.dumps({"pageContent": "虚构解析源已经发生变化。"}, ensure_ascii=False))
+elif case == "lexical-partial":
+    index["complete"] = False
+    index["passages"] = []
+    coverage = index["coverage"]
+    coverage.update(indexed_documents=0, indexed_bytes=0, omitted_documents=coverage["source_documents"],
+                    omitted_bytes=coverage["source_bytes"], reasons=["index_capacity"])
+index.pop("payload_sha256")
+index["payload_sha256"] = hashlib.sha256(json.dumps(index, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+target.write_text(json.dumps(index, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+materials["knowledge"]["lexical_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+if case == "lexical-hash": materials["knowledge"]["lexical_sha256"] = "f" * 64
+elif case in ("lexical-missing", "lexical-legacy"):
+    target.unlink()
+    if case == "lexical-legacy": materials["knowledge"]["lexical_sha256"] = ""
+projection.write_text(json.dumps(materials, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    changed_hash=$(business_hash)
+    source_hash=$(sha256sum "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json" | awk '{print $1}')
+    invoke --offline
+    case "$case_name" in
+      lexical-partial|lexical-legacy) assert_result knowledge.lexical WARN ;;
+      lexical-healthy) assert_result knowledge.lexical PASS ;;
+      *) assert_result knowledge.lexical FAIL ;;
+    esac
+    [[ "$changed_hash" == "$(business_hash)" \
+      && "$source_hash" == "$(sha256sum "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json" | awk '{print $1}')" ]] \
+      || fail "词法自检 ${case_name} 改动业务状态、索引或解析源"
+    ! grep -Eq '^docker |^curl |虚构知识：雨天测试码为蓝色。|虚构解析源已经发生变化。' "$FIXTURE_LOG" "$OUT" "$ERR" \
+      || fail "词法自检 ${case_name} 调用网络或回显知识正文"
+  done
+  cp -p -- "$original/index.json" "${DEPLOY}/data/runtime/knowledge-lexical.json"
+  cp -p -- "$original/materials.json" "${DEPLOY}/config/materials-applied.json"
+  cp -p -- "$original/source.json" "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json"
+  [[ "$baseline" == "$(business_hash)" ]] || fail '词法自检未恢复原合成资料'
+  pass '词法 8 个只读正负例：真实索引校验、源/映射/材料绑定及合法部分覆盖警告'
+}
+
+doctor_workflow_lexical_cases() {
+  local original target
+  original=$(mktemp -d "${TEST_ROOT}/workflow-lexical.XXXXXXXX")
+  cp -p -- "${DEPLOY}/n8n/workflow.json" "${original}/workflow.json"
+  cp -p -- "${DEPLOY}/n8n/knowledge-lexical.js" "${original}/knowledge-lexical.js"
+  invoke --local
+  assert_result n8n.workflow PASS
+
+  printf '\n// 合成的词法源码新代。\n' >> "${DEPLOY}/n8n/knowledge-lexical.js"
+  invoke --local
+  assert_result n8n.workflow FAIL
+  cp -p -- "${original}/knowledge-lexical.js" "${DEPLOY}/n8n/knowledge-lexical.js"
+
+  printf '\n// 合成的容器旧挂载。\n' >> "${original}/knowledge-lexical.js"
+  export DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE="${original}/knowledge-lexical.js"
+  invoke --local
+  assert_result n8n.workflow FAIL
+  unset DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE
+
+  jq '(.nodes[] | select(.name=="处理持久任务") | .parameters.jsCode) |= ("// 合成的偏离内联。\n" + .)' \
+    "${DEPLOY}/n8n/workflow.json" > "${original}/changed.json"
+  cp -p -- "${original}/changed.json" "${DEPLOY}/n8n/workflow.json"
+  invoke --local
+  assert_result n8n.workflow FAIL
+  cp -p -- "${original}/workflow.json" "${DEPLOY}/n8n/workflow.json"
+
+  for target in n8n/knowledge-lexical.js scripts/knowledge-lexical.py; do
+    mv -- "${DEPLOY}/${target}" "${original}/missing-module"
+    invoke --offline
+    assert_result installation.files FAIL
+    mv -- "${original}/missing-module" "${DEPLOY}/${target}"
+  done
+}
+
+if [[ "${DOCTOR_TEST_FOCUS:-}" == workflow ]]; then
+  doctor_workflow_lexical_cases
+  pass '工作流实际 Node 校验的 6 个词法内联、挂载与漏件正负例'
+  printf '工作流自检聚焦完成：6 个场景，%s 组通过。\n' "$PASSED"
+  exit 0
+elif [[ "${DOCTOR_TEST_FOCUS:-}" == lexical ]]; then
+  doctor_lexical_cases
+  printf '词法自检聚焦完成：8 个场景，%s 组通过。\n' "$PASSED"
+  exit 0
+elif [[ "${DOCTOR_TEST_FOCUS:-}" == knowledge ]]; then
+  doctor_knowledge_cases
+  doctor_lexical_cases
+  printf '知识自检聚焦完成：22 个场景，%s 组通过。\n' "$PASSED"
+  exit 0
+fi
 
 before=$(business_hash)
 SESSION_FILE=$(find "${DEPLOY}/data/runtime" -maxdepth 1 -type f -name 'session-*.json' -print -quit)
@@ -319,7 +566,7 @@ env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
   "${DEPLOY}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY" --application \
   > "${TEST_ROOT}/health-application.out" 2> "${TEST_ROOT}/health-application.err" || health_rc=$?
 (( health_rc == 0 )) || fail "安装/更新 application 健康门禁失败（${health_rc}）"
-! grep -Eq 'provider\.example\.test|/chat(/|$)' "$FIXTURE_LOG" \
+! grep -Eq 'provider\.example\.test|/chat(/|$)|n8n/admin-query\.js' "$FIXTURE_LOG" \
   || fail '安装/更新 application 健康门禁执行了模型推理'
 [[ "$before" == "$(business_hash)" ]] || fail '安装/更新 application 健康门禁改动了业务状态'
 pass '安装与更新的 healthcheck --application 不执行付费推理'
@@ -463,6 +710,9 @@ assert_result logs.n8n_execution SKIP
 [[ "$before" == "$(business_hash)" ]] || fail 'offline 自检改动了业务状态'
 pass 'offline 静态核对日志/n8n配置，运行容器项明确跳过而不误报故障'
 
+doctor_knowledge_cases
+doctor_lexical_cases
+
 # 可编辑原文不是运行时权威源。它发生变化或损坏时，应保留并证明上一有效
 # 投影仍在运行；只有投影本身/运行中挂载偏离才是关键故障。
 prompt_saved="${TEST_ROOT}/prompt.saved.md"
@@ -540,9 +790,31 @@ jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
     sha256:$hash,locations:["custom-documents/pending-fixture.json"],old_locations:[],started_at:$now
   }}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
 invoke --local
-(( LAST_RC == 2 )) || fail '同 hash 且有 location 的正常 pending 文档应退出警告 2'
+(( LAST_RC == 1 )) || fail '已绑定模型代次的 pending 文档必须保持故障，不能提前宣称索引应用完成'
 assert_result knowledge.catalog WARN
+assert_result knowledge.profile FAIL
+assert_result knowledge.lexical PASS
 grep -q '仍在服务端对账' "$OUT" || fail '正常 pending 未给出处理中说明'
+
+# 真正无 profile 绑定的旧实例仍保留原有 pending 警告，不借新代文件冒充旧代。
+pending_materials_saved="${TEST_ROOT}/pending-materials.saved.json"
+pending_profile_saved="${TEST_ROOT}/pending-profile.saved.json"
+cp -p -- "${DEPLOY}/config/materials-applied.json" "$pending_materials_saved"
+mv -- "${DEPLOY}/data/runtime/knowledge-profile.json" "$pending_profile_saved"
+jq 'del(.embedding_profile)' "${DEPLOY}/data/knowledge-manifest.json" > "${TEST_ROOT}/pending-legacy-manifest.json"
+# 生产 manifest 是受限运行状态；测试候选也必须保持同一权限，否则
+# profile 校验会正确地把 world-readable 文件判为 FAIL，掩盖本例要验证的 legacy WARN。
+install -m 0600 -- "${TEST_ROOT}/pending-legacy-manifest.json" "${DEPLOY}/data/knowledge-manifest.json"
+jq --arg manifest_hash "$(sha256sum "${DEPLOY}/data/knowledge-manifest.json" | awk '{print $1}')" \
+  '.knowledge.profile_sha256="" | .knowledge.manifest_sha256=$manifest_hash' \
+  "$pending_materials_saved" > "${DEPLOY}/config/materials-applied.json"
+invoke --local
+(( LAST_RC == 2 )) || fail '无 profile 绑定旧代的正常 pending 文档应保留警告 2'
+assert_result knowledge.catalog WARN
+assert_result knowledge.profile WARN
+assert_result knowledge.lexical PASS
+mv -- "$pending_profile_saved" "${DEPLOY}/data/runtime/knowledge-profile.json"
+cp -p -- "$pending_materials_saved" "${DEPLOY}/config/materials-applied.json"
 
 jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
   .files={} | .pending_files={"unrelated.md":{
@@ -806,6 +1078,7 @@ invoke --local
 (( LAST_RC == 1 )) || fail 'workflow 导出/结构故障应退出 1'
 assert_result n8n.workflow FAIL
 unset DOCTOR_FIXTURE_WORKFLOW_FAIL
+doctor_workflow_lexical_cases
 export DOCTOR_FIXTURE_N8N_CODE_FAIL=1
 invoke --local
 (( LAST_RC == 1 )) || fail '通用 401 不能冒充 n8n Code 健康'
@@ -863,9 +1136,85 @@ unset DOCTOR_FIXTURE_PROVIDER_FAIL
 invoke --full
 (( LAST_RC == 0 )) || fail "健康 full 自检退出码应为 0，实际 ${LAST_RC}"
 assert_result provider.inference PASS
-grep -q '/api/v1/workspace/[^ ]*/chat' "$FIXTURE_LOG" || fail 'full 没有从真实 AnythingLLM 问答入口执行受控协议检查'
+grep -Fq 'exec -T n8n node /opt/crisp-ai/n8n/admin-query.js' "$FIXTURE_LOG" || fail 'full 没有从受控 n8n 管理员入口执行同链检查'
+[[ $(grep -c '^admin-query settings-source=applied-projection$' "$FIXTURE_LOG") == 1 \
+  && $(grep -c '^admin-query vector-search pure-query=true$' "$FIXTURE_LOG") == 1 \
+  && $(grep -c '^admin-query generation path=/responses prompt-complete=true knowledge-complete=true scope=legacy$' "$FIXTURE_LOG") == 1 ]] \
+  || fail 'full 必须真实执行管理员 runtime 的已应用温度、纯问题检索与完整 Prompt/片段生成'
+! grep -q '^admin-query workspace-read=true$' "$FIXTURE_LOG" || fail '已应用温度不应每问再次读取完整工作区文档'
+! grep -Eq '/api/v1/workspace/[^ ]*/chat|CRISPAI_PROVIDER_CONTEXT_V1:|仅作管理员连接检查，请简短回复连接正常。' "$FIXTURE_LOG" \
+  || fail 'full 仍使用旧 chat/正文信封，或把问题写入命令日志'
 [[ "$before" == "$(business_hash)" ]] || fail 'full 自检改动了配置、知识或会话状态'
-pass '只有 full 执行小样本模型请求并校验最终容器路径'
+pass '只有 full 经实际管理员 runtime 执行纯检索与完整上下文生成，且不修改客户状态'
+
+invoke_query() {
+  local question=$1 budget=${2:-0}
+  : > "$OUT"; : > "$ERR"; : > "$FIXTURE_LOG"
+  LAST_RC=0
+  # shellcheck disable=SC2016
+  printf '%s' "$question" | fixture_env bash -c '
+    set -euo pipefail
+    source "$1/configuration.sh"
+    question=$(cat)
+    configuration_query "$2" "$question" "$3"
+  ' doctor-query "${DEPLOY}/scripts" "$DEPLOY" "$budget" > "$OUT" 2> "$ERR" || LAST_RC=$?
+}
+
+query='这是虚构的管理员问题：请保留 "引号" 与反斜线 \\，不把问题写入命令参数。'
+export DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256
+DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256=$(printf '%s' "$query" | sha256sum | awk '{print $1}')
+DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET=0 invoke_query "$query"
+(( LAST_RC == 0 )) || fail '管理员默认预算/特殊字符 stdin 传递失败'
+jq -e '.answer == "合成协议连接正常" and .sources == ["custom-documents/fixture.json"]
+  and .verified == true and .retrieval_state == "knowledge_hit"' "$OUT" >/dev/null \
+  || fail '管理员结果未保留 answer/sources/verified 结构'
+! grep -Fq "$query" "$FIXTURE_LOG" "$ERR" || fail '管理员问题泄露到日志或命令参数'
+DOCTOR_FIXTURE_ADMIN_INVALID_RESULT=1 invoke_query "$query" 1000
+[[ "$LAST_RC" == 1 && ! -s "$OUT" ]] || fail '未验证管理员响应不能冒充成功'
+grep -Fq '知识问答测试未完成' "$ERR" || fail '管理员错误没有固定中文说明'
+! find "${DEPLOY}/tmp" -maxdepth 1 -name 'configuration-query.*' -print -quit | grep -q . \
+  || fail '管理员成功或失败遗留含答案的临时文件'
+pass '管理员 stdin 保留原问题，验证输出结构并清理受限临时结果'
+
+for failure in DOCTOR_FIXTURE_RETRIEVAL_FAIL DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN; do
+  export "$failure=1"
+  invoke_query "$query" 1000
+  unset "$failure"
+  [[ "$LAST_RC" == 1 && ! -s "$OUT" ]] || fail '坏检索/未映射来源不能作为管理员成功'
+  grep -q '^admin-query vector-search pure-query=true$' "$FIXTURE_LOG" || fail '管理员负例未到真实检索协议分支'
+  ! grep -q '^admin-query generation ' "$FIXTURE_LOG" || fail '坏检索/未映射来源仍触发模型'
+done
+[[ "$before" == "$(business_hash)" ]] || fail '管理员检索负例修改客户或配置状态'
+pass '管理员检索错误及未知来源准确失败，零模型调用且不降格成知识未命中'
+
+# 这里仅验证生产 runtime 的签名/预算协议，不伪造完整 adapter 或模型验收。
+[[ ! -e "${DEPLOY}/config/provider-pool-applied.json" ]] || fail '管理员池协议夹具覆盖了已有配置'
+cp -p -- "$RUNTIME_ENV_FILE" "${TEST_ROOT}/admin-runtime-env.saved"
+jq -M -n '{schema_version:1,revision:9,primary_id:"p_111111111111111111111111",
+  entries:[{id:"p_111111111111111111111111",model:"synthetic-admin-model"}],policy:{question_timeout_ms:1500}}' \
+  > "${DEPLOY}/config/provider-pool-applied.json"
+jq '.n8n=(.n8n[0:10]+["http://provider-adapter:8787/v1","synthetic-admin-internal-key","true"])' \
+  "$RUNTIME_ENV_FILE" > "${RUNTIME_ENV_FILE}.new"
+mv -f -- "${RUNTIME_ENV_FILE}.new" "$RUNTIME_ENV_FILE"
+DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET=10000 invoke_query "$query" 10000
+(( LAST_RC == 0 )) || fail '管理员新池签名或较小池预算绑定未通过'
+grep -q '^admin-query generation .*scope=admin$' "$FIXTURE_LOG" || fail '管理员新池没有验证 admin HMAC 及池/资料代次'
+rm -f -- "${DEPLOY}/config/provider-pool-applied.json"
+cp -p -- "${TEST_ROOT}/admin-runtime-env.saved" "$RUNTIME_ENV_FILE"
+[[ "$before" == "$(business_hash)" ]] || fail '管理员签名协议检查未恢复原夹具'
+pass '新池管理员同链使用受签名 admin scope、当前代和不超过池上限的预算'
+
+started=$SECONDS
+DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS=10 invoke_query "$query" 1000
+elapsed=$((SECONDS-started))
+(( LAST_RC == 1 && elapsed >= 5 && elapsed < 9 )) || fail "管理员有界 Compose 超时无效（${elapsed} 秒）"
+[[ ! -s "$OUT" ]] || fail '管理员超时返回了假成功'
+! find "${DEPLOY}/tmp" -maxdepth 1 -name 'configuration-query.*' -print -quit | grep -q . \
+  || fail '管理员超时遗留含答案的临时文件'
+invoke_query "$query" 180001
+[[ "$LAST_RC" == 1 && ! -s "$FIXTURE_LOG" ]] || fail '超限预算不应调用容器'
+unset DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256
+pass '管理员总预算加有限回程余量，挂起调用被终止，超限输入零执行'
 
 # timeout 必须真正包住 docker_compose Bash function，而不是尝试执行不存在的外部命令。
 export DOCTOR_FIXTURE_DELAY_N8N_SECONDS=12

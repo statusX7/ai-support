@@ -812,6 +812,42 @@ def welcome_presentation_cases():
     assert recovered.returncode == 0, recovered.stdout
 
 
+def neutral_rule_defaults_case():
+    """新建人工确认规则时，菜单展示和实际访客字段都使用中性缺省文案。"""
+    terminal = Terminal("neutral-rule-defaults")
+    terminal.expect("请选择："); terminal.send("6")
+    terminal.expect("1. 查看规则"); terminal.expect("请选择："); terminal.send("2")
+    for prompt, answer in (
+        ("规则名称", "中性默认回归"),
+        ("关键词（逗号分隔", "联络支持"),
+        ("排除词（逗号分隔", ""),
+        ("匹配：1 包含", ""),
+        ("动作：1 人工确认按钮", "1"),
+        ("优先级整数", ""),
+        ("重复展示冷却秒数", ""),
+        ("按钮有效期秒数", ""),
+        ("提示或固定回复文案", ""),
+        ("确认按钮 [召唤人工客服]", ""),
+        ("取消按钮 [继续咨询]", ""),
+        ("点击后的确认文案", ""),
+    ):
+        terminal.expect(prompt); terminal.send(answer)
+    terminal.expect("应用规则？关键词本身不会暂停 AI。"); terminal.send("1")
+    terminal.expect("设置已保存并完成实际回读")
+    terminal.expect("1. 查看规则"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("请选择："); terminal.send("0")
+    output = terminal.finish()
+    assert "继续 AI 客服" not in output and "已暂停本次对话的 AI 回复" not in output, output
+    rules = json.loads((DEPLOY / "config/keyword.yaml").read_text())["rules"]
+    created = next(rule for rule in rules if rule.get("name") == "中性默认回归")
+    assert created["cancel_label"] == "继续咨询"
+    assert created["confirm_message"] == "您的人工协助请求已收到，请稍候。"
+    visitor_fields = "\n".join(str(created.get(field, "")) for field in
+                               ("text", "confirm_label", "cancel_label", "confirm_message"))
+    assert not re.search(r"(?:AI|机器人|暂时无法回复|稍后再试)", visitor_fields, re.IGNORECASE), visitor_fields
+    passing("新建人工确认规则的菜单提示与生效访客字段均使用中性缺省文案")
+
+
 def presentation_cases():
     """实际管理入口呈现与纯机器回执分离，失败不改为成功。"""
     command = ["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)]
@@ -852,7 +888,23 @@ def presentation_cases():
             terminal.expect("文件日志保留天数"); terminal.send("0")
         terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
         assert_chinese_result(terminal.finish())
-    passing("真实知识/规则/恢复/总开关/欢迎/Crisp/统计/日志/资料子菜单读取中文结果，无内部对象或编号")
+    calls_before = MODEL_LIST["chat_calls"]
+    terminal = Terminal("knowledge-production-query-cancel")
+    terminal.expect("请选择："); terminal.send("5")
+    terminal.expect("生产问答测试（全部启用库，可能计费）")
+    terminal.expect("请选择："); terminal.send("12")
+    terminal.expect("共用全部已启用知识库和推理链")
+    terminal.expect("可能依次调用一个或多个上游并分别计费")
+    terminal.expect("测试问题（回车返回）："); terminal.send("虚构生产问答取消测试")
+    terminal.expect("确认发起本次生产问答测试？")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("0")
+    terminal.expect("生产问答测试（全部启用库，可能计费）")
+    terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("请选择："); terminal.send("0")
+    output = terminal.finish(); assert_chinese_result(output)
+    assert "1 全部启用库 / 2 选择单库" not in output
+    assert MODEL_LIST["chat_calls"] == calls_before
+    passing("真实知识/规则/恢复/总开关/欢迎/Crisp/统计/日志/资料子菜单均为中文；知识生产问答明确全库和费用且取消零调用")
 
     feedback = json.loads((DEPLOY / "config/feedback.yaml").read_text())
     old_runtime = json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"]
@@ -1085,6 +1137,9 @@ def main():
         if os.environ.get("MENU_TEST_FOCUS") == "welcome":
             welcome_presentation_cases()
             return
+        if os.environ.get("MENU_TEST_FOCUS") == "neutral-rule":
+            neutral_rule_defaults_case()
+            return
         if os.environ.get("MENU_TEST_FOCUS") == "provider":
             provider_retry_cases()
             provider_pool_menu_cases()
@@ -1111,6 +1166,7 @@ def main():
         log_menu_cases()
         material_menu_cases()
         welcome_presentation_cases()
+        neutral_rule_defaults_case()
         presentation_cases()
         renderer_cases()
         for name, width, extra in (("wide", 110, {}), ("narrow", 42, {}), ("dumb", 110, {"TERM": "dumb", "NO_COLOR": "1"}), ("plain", 110, {"CRISPAI_NO_EMOJI": "1"}), ("nonutf8", 110, {"LC_ALL": "C"})):

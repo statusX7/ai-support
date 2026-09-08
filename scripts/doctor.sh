@@ -556,7 +556,7 @@ doctor_files_and_config_check() {
   local runtime_config menu_config handoff_config
   local business_runtime_config business_menu_config business_handoff_config business_source business_projection_rc=0
   local -a required=(VERSION docker-compose.yml .env get.sh install.sh manage.sh update.sh uninstall.sh
-    n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
+    n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/build-workflow.js n8n/web-chat.js
     config/app.yaml config/Caddyfile.example config/runtime.yaml config/provider.yaml config/prompt.md
     config/keyword.yaml config/menu.yaml config/handoff.yaml config/tags.yaml config/feedback.yaml
     config/logging.yaml
@@ -564,7 +564,9 @@ doctor_files_and_config_check() {
     scripts/package-release.sh scripts/backup.sh scripts/restore.sh scripts/analytics.sh scripts/snapshot.sh
     scripts/rollback.sh scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/provider-adapter.js scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh
-    scripts/full-backup.sh scripts/archive-guard.py scripts/materials.sh scripts/logs.sh scripts/log-redact.py)
+    scripts/full-backup.sh scripts/archive-guard.py scripts/materials.sh scripts/logs.sh scripts/log-redact.py
+    scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-component.js
+    scripts/knowledge-lexical.py n8n/knowledge-lexical.js)
   DOCTOR_POOL_ENABLED=0
   if [[ -e "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" \
     || $(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]] \
@@ -1134,6 +1136,242 @@ doctor_anything_check() {
   fi
 }
 
+doctor_knowledge_metadata_check() {
+  local start report rc=0 workspace kind status summary name
+  start=$(doctor_now_ms)
+  report="${DOCTOR_TEMP_ROOT}/knowledge-metadata.json"
+  workspace=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)
+  # 只核验本机元数据和已存在缓存；-B 禁止导入校验器时生成 __pycache__。
+  doctor_timeout 15 python3 -B - "$DOCTOR_DEPLOY_DIR" "$workspace" > "$report" 2>/dev/null <<'PY' || rc=$?
+import hashlib
+import importlib.util
+import json
+import math
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+workspace = sys.argv[2]
+hex64 = lambda value: isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+result = {name: {"status": "FAIL", "summary": "知识元数据校验未完成；未把当前索引判为可用"} for name in ("profile", "settings")}
+
+def read(relative, maximum=65536, optional=False, protected=True):
+    path = root
+    for part in relative.split("/"):
+        path /= part
+        if path.is_symlink():
+            raise ValueError
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        if optional:
+            return None, None
+        raise
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum \
+            or protected and stat.S_IMODE(info.st_mode) & 0o137:
+        raise ValueError
+    raw = path.read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+def checked_profile(module, applied):
+    expected = applied.get("knowledge", {}).get("profile_sha256", "")
+    current, current_hash = read("data/runtime/knowledge-profile.json", optional=True)
+    manifest, manifest_hash = read("data/knowledge-manifest.json", 16777216)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise ValueError
+    if (root / "data/runtime/knowledge-migration.json").exists() or (root / "data/runtime/knowledge-migration.json").is_symlink():
+        return {"status": "FAIL", "summary": "知识迁移尚未完成或恢复，自动回复必须保持受阻止"}
+    if current is None:
+        legacy = expected == "" and not manifest.get("embedding_profile") and all(
+            isinstance(item, dict) and not item.get("embedding_profile") and not item.get("cache_bindings")
+            for item in manifest["files"].values())
+        return {"status": "WARN" if legacy else "FAIL", "summary":
+                "旧知识索引尚无已验证模型代次；未声明中文召回质量已确认" if legacy else "知识索引代次文件缺失，但有效资料或文档仍引用该代次"}
+    if not isinstance(current, dict) or current.get("schema_version") != 1:
+        raise ValueError
+    if current.get("state") != "applied":
+        return {"status": "FAIL", "summary": "知识索引代次尚未完整应用，自动回复必须保持受阻止"}
+    key = current.get("fingerprint")
+    value = current.get("profile")
+    if not hex64(expected) or current_hash != expected or not hex64(key) or not isinstance(value, dict) \
+            or module.fingerprint(value) != key or module.profile(value) != value:
+        return {"status": "FAIL", "summary": "知识模型正文、指纹或资料投影文件摘要不一致"}
+    if manifest.get("version") != 1 or manifest.get("embedding_profile") != key \
+            or manifest.get("pending_files") != {} or manifest.get("garbage_locations") != [] \
+            or applied.get("knowledge", {}).get("manifest_sha256") != manifest_hash:
+        return {"status": "FAIL", "summary": "知识 manifest 尚未完成对账或不属于当前资料与模型代次"}
+    locations_seen = set()
+    for item in manifest["files"].values():
+        if not isinstance(item, dict) or item.get("embedding_profile") != key:
+            raise ValueError
+        locations, bindings = item.get("locations"), item.get("cache_bindings")
+        if not isinstance(locations, list) or not locations or not all(isinstance(location, str) for location in locations) \
+                or len(set(locations)) != len(locations) or locations_seen.intersection(locations) \
+                or not isinstance(bindings, list) or len(bindings) != len(locations):
+            raise ValueError
+        locations_seen.update(locations)
+        by_location = {}
+        for binding in bindings:
+            if not isinstance(binding, dict) or binding.get("location") not in locations \
+                    or binding["location"] in by_location or not hex64(binding.get("sha256")):
+                raise ValueError
+            by_location[binding["location"]] = binding["sha256"]
+        if set(by_location) != set(locations):
+            raise ValueError
+        for location in locations:
+            cached = module.cache_path(root, location)
+            info = cached.stat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size == 0 or module.digest(cached) != by_location[location]:
+                raise ValueError
+    if value["model"] == "Xenova/all-MiniLM-L6-v2":
+        return {"status": "WARN", "summary": "已核对保留的英文 MiniLM 索引代；中文召回能力受限，词法补召回需另行核验"}
+    return {"status": "PASS", "summary": "已应用模型正文、指纹、全部文档缓存及资料投影摘要一致；未执行模型请求"}
+
+def checked_settings(applied):
+    value, digest = read("data/runtime/knowledge-settings.json", optional=True)
+    expected = applied.get("knowledge", {}).get("settings_sha256", "")
+    if value is None:
+        legacy = expected == "" and not applied.get("knowledge", {}).get("profile_sha256")
+        return {"status": "WARN" if legacy else "FAIL", "summary":
+                "旧资料尚无已验证知识运行设置，未声明温度配置已对账" if legacy else "当前资料引用的知识运行设置缺失"}
+    if not isinstance(value, dict) or value.get("schema_version") != 1 \
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace) or value.get("workspace_slug") != workspace \
+            or type(value.get("temperature")) not in (int, float) or not math.isfinite(value["temperature"]) or not 0 <= value["temperature"] <= 2 \
+            or type(value.get("observed_at")) is not int or value["observed_at"] < 0 \
+            or not hex64(expected) or digest != expected:
+        return {"status": "FAIL", "summary": "知识工作区、温度或运行设置文件摘要与当前资料不一致"}
+    return {"status": "PASS", "summary": "知识工作区、合法温度与资料投影摘要一致；默认自检未发起检索或推理"}
+
+try:
+    applied, _ = read("config/materials-applied.json", 16777216, optional=True)
+    if applied is None:
+        result = {name: {"status": "WARN", "summary": "旧实例尚无有效资料投影，知识运行代次未确认"} for name in result}
+    elif not isinstance(applied, dict) or applied.get("schema_version") != 1 or applied.get("state") != "applied":
+        result = {name: {"status": "FAIL", "summary": "资料应用尚未完成，知识运行代次不能判为可用"} for name in result}
+    else:
+        for name, check in (("settings", lambda: checked_settings(applied)), ("profile", None)):
+            try:
+                if name == "profile":
+                    module_path = root / "scripts/knowledge-profile.py"
+                    if module_path.is_symlink() or not module_path.is_file():
+                        raise ValueError
+                    spec = importlib.util.spec_from_file_location("doctor_knowledge_profile", module_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    result[name] = checked_profile(module, applied)
+                else:
+                    result[name] = check()
+            except Exception:
+                pass
+except Exception:
+    pass
+print(json.dumps(result, ensure_ascii=False))
+PY
+  if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null; then
+    doctor_deadline_add knowledge.profile '知识模型与索引代次' filesystem "$start"
+    doctor_deadline_add knowledge.settings '知识工作区运行设置' filesystem "$start"
+    return
+  fi
+  for kind in profile settings; do
+    name='知识模型与索引代次'; [[ "$kind" != settings ]] || name='知识工作区运行设置'
+    if (( rc != 0 )) || ! jq -e --arg kind "$kind" '.[$kind] | (.status == "PASS" or .status == "WARN" or .status == "FAIL") and (.summary | type == "string")' "$report" >/dev/null 2>&1; then
+      doctor_add "knowledge.${kind}" "$name" FAIL critical '知识只读校验没有返回完整结果' filesystem '完成当前知识资料应用或从受管备份恢复；不要删除原文或重建全部索引来伪造成功' "$start"
+    else
+      status=$(jq -r --arg kind "$kind" '.[$kind].status' "$report")
+      summary=$(jq -r --arg kind "$kind" '.[$kind].summary' "$report")
+      doctor_add "knowledge.${kind}" "$name" "$status" critical "$summary" filesystem \
+        "$([[ "$status" == PASS ]] || printf '%s' '通过知识资料受管入口完成同步或恢复；默认自检不会改变索引及客服开关')" "$start"
+    fi
+  done
+}
+
+doctor_knowledge_index_digest() {
+  doctor_timeout 5 python3 -B - "$DOCTOR_DEPLOY_DIR" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+for part in ("data", "runtime", "knowledge-lexical.json"):
+    path /= part
+    if path.is_symlink():
+        raise SystemExit(1)
+descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 16777216:
+        raise SystemExit(1)
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 1048576)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > 16777216:
+            raise SystemExit(1)
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise SystemExit(1)
+    print(digest.hexdigest())
+finally:
+    os.close(descriptor)
+PY
+}
+
+doctor_knowledge_lexical_check() {
+  local start projection expected actual report rc=0 count bytes
+  start=$(doctor_now_ms)
+  projection="${DOCTOR_DEPLOY_DIR}/config/materials-applied.json"
+  report="${DOCTOR_TEMP_ROOT}/knowledge-lexical-verify.json"
+  if [[ ! -e "$projection" && ! -L "$projection" ]]; then
+    doctor_add knowledge.lexical '知识词法补召回' WARN warning '旧实例尚无已绑定的词法补召回投影，未判为已验证' filesystem '通过受管知识资料应用建立当前启用范围的索引' "$start"
+    return
+  fi
+  if [[ ! -f "$projection" || -L "$projection" ]] \
+    || ! jq -e '.schema_version == 1 and .state == "applied"' "$projection" >/dev/null 2>&1; then
+    doctor_add knowledge.lexical '知识词法补召回' FAIL critical '资料应用尚未完成，词法索引不能判为可用' filesystem '完成当前受管知识应用或恢复；不要删除原资料' "$start"
+    return
+  fi
+  expected=$(jq -r '.knowledge.lexical_sha256 // ""' "$projection")
+  if [[ -z "$expected" ]]; then
+    doctor_add knowledge.lexical '知识词法补召回' WARN warning '旧资料投影未绑定词法补召回，未借未引用文件判断检索可用' filesystem '通过受管知识资料应用补齐；默认自检不构建索引' "$start"
+    return
+  fi
+  if [[ ! "$expected" =~ ^[a-f0-9]{64}$ \
+    || ! -f "${DOCTOR_DEPLOY_DIR}/scripts/knowledge-lexical.py" || -L "${DOCTOR_DEPLOY_DIR}/scripts/knowledge-lexical.py" ]] \
+    || ! actual=$(doctor_knowledge_index_digest 2>/dev/null) || [[ "$actual" != "$expected" ]]; then
+    doctor_add knowledge.lexical '知识词法补召回' FAIL critical '词法索引缺失、不安全或文件摘要偏离有效资料' filesystem '重新应用当前启用资料并核对投影；不要手工改写摘要' "$start"
+    return
+  fi
+  doctor_timeout 15 python3 -B "${DOCTOR_DEPLOY_DIR}/scripts/knowledge-lexical.py" verify --deploy-dir "$DOCTOR_DEPLOY_DIR" \
+    > "$report" 2>/dev/null || rc=$?
+  if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null; then
+    doctor_deadline_add knowledge.lexical '知识词法补召回' filesystem "$start"
+  elif (( rc != 0 )) || ! jq -e '.ok == true and .read_only == true and .schema_version == 1
+    and (.complete | type == "boolean") and (.coverage | type == "object")
+    and all([.coverage.omitted_documents,.coverage.omitted_bytes][]; type == "number" and floor == . and . >= 0)
+    and (.map_sha256 | type == "string" and test("^[a-f0-9]{64}$"))' "$report" >/dev/null 2>&1 \
+    || ! jq -e --slurpfile checked "$report" --arg expected "$expected" \
+      '.state == "applied" and .knowledge.lexical_sha256 == $expected and .knowledge.map_sha256 == $checked[0].map_sha256' "$projection" >/dev/null 2>&1 \
+    || [[ "$(doctor_knowledge_index_digest 2>/dev/null || true)" != "$actual" ]]; then
+    doctor_add knowledge.lexical '知识词法补召回' FAIL critical '词法 schema、片段、启用映射或实际解析源校验未通过' filesystem '从受管知识入口重新对账对应资料；不能将校验错误冒充无命中' "$start"
+  elif jq -e '.complete == true' "$report" >/dev/null; then
+    doctor_add knowledge.lexical '知识词法补召回' PASS critical '词法索引、资料摘要、启用映射及完整解析源覆盖一致；未加载模型' filesystem '' "$start"
+  else
+    count=$(jq -r '.coverage.omitted_documents' "$report")
+    bytes=$(jq -r '.coverage.omitted_bytes' "$report")
+    doctor_add knowledge.lexical '知识词法补召回' WARN warning \
+      "词法索引有效但存在容量遗漏：${count} 份文档、${bytes} 字节尚未覆盖" filesystem \
+      '查看资料容量及分段情况；未覆盖内容不能据此认定知识库没有相关事实' "$start"
+  fi
+}
+
 doctor_n8n_check() {
   local start port response status workflow_output remaining
   if (( DOCTOR_DOCKER_READY == 0 )); then
@@ -1164,7 +1402,7 @@ doctor_n8n_check() {
     output=$(mktemp /tmp/crispai-doctor-workflow.XXXXXX)
     trap '\''rm -f "$output"'\'' EXIT
     timeout 20 n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1
-    node - "$output" "$1" "$2" "$3" /opt/crisp-ai/n8n/runtime.js <<'\''NODE'\''
+    node - "$output" "$1" "$2" "$3" /opt/crisp-ai/n8n/runtime.js /opt/crisp-ai/n8n/knowledge-lexical.js "$4" <<'\''NODE'\''
 const fs=require("fs"),crypto=require("crypto");
 const raw=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
 const workflow=Array.isArray(raw)?raw[0]:raw;
@@ -1175,9 +1413,14 @@ const schedule=nodes.find(node=>String(node.type).endsWith(".scheduleTrigger") &
 const scanner=nodes.find(node=>String(node.type).includes("code") && String(node.parameters?.jsCode||"").includes("runtime.scan"));
 const scheduleTargets=(workflow.connections?.[schedule?.name]?.main||[]).flat().map(connection=>connection.node);
 const runtimeFile=fs.readFileSync(process.argv[6],"utf8");
-const source=runtimeFile.replace(/^if \(typeof module[^\n]+\n?$/m,"").replace(/ai_support_version: '\''v[^'\'']+'\''/g,"ai_support_version: '\''"+process.argv[4]+"'\''");
+const lexicalFile=fs.readFileSync(process.argv[7],"utf8");
+const lexicalSource=lexicalFile.replace(/^module\.exports[^\n]+\n?$/m,"");
+const runtimeSource=runtimeFile.replace(/^const \{ searchKnowledgeLexical \} = require\('\''\.\/knowledge-lexical\.js'\''\);\n?/m,"")
+  .replace(/^if \(typeof module[^\n]+\n?$/m,"");
+const source=(lexicalSource+"\n"+runtimeSource).replace(/ai_support_version: '\''v[^'\'']+'\''/g,"ai_support_version: '\''"+process.argv[4]+"'\''");
 const sourceHash=crypto.createHash("sha256").update(source).digest("hex");
 const fileHash=crypto.createHash("sha256").update(runtimeFile).digest("hex");
+const lexicalHash=crypto.createHash("sha256").update(lexicalFile).digest("hex");
 const runtimePrefix=source+"\nconst runtime = createRuntime($env);\n";
 const runtimeNodeNames=["校验并持久接收","处理持久任务","扫描持久会话与任务","只读公开显示选项"];
 const runtimeNodesMatch=runtimeNodeNames.every(name=>{
@@ -1189,14 +1432,16 @@ if (workflow.id!==process.argv[3] || workflow.active!==true || !types.some(type=
     !code.includes("runtime.process") || !code.includes("runtime.scan") ||
     workflow.meta?.aiSupportVersion!==process.argv[4] || workflow.meta?.runtimeFileSha256!==fileHash ||
     workflow.meta?.runtimeFileSha256!==process.argv[5] || workflow.meta?.runtimeSha256!==sourceHash ||
+    workflow.meta?.lexicalFileSha256!==lexicalHash || workflow.meta?.lexicalFileSha256!==process.argv[8] ||
     !runtimeNodesMatch) process.exit(1);
 process.stdout.write("verified\n");
 NODE
   ' sh "$WORKFLOW_ID" "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION")" \
     "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/runtime.js" | cut -d ' ' -f 1)" \
+    "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/knowledge-lexical.js" | cut -d ' ' -f 1)" \
     < /dev/null > "$workflow_output" 2>/dev/null \
     && grep -Fxq verified "$workflow_output"; then
-    doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，接收/处理/五秒扫描代码均存在' docker '' "$start"
+    doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，运行时及词法内联代码与当前挂载摘要一致' docker '' "$start"
   else
     if ! doctor_remaining >/dev/null 2>&1; then
       doctor_deadline_add n8n.workflow 'n8n 生产工作流' docker "$start"
@@ -2052,6 +2297,8 @@ doctor_run_checks() {
     doctor_adapter_check
   fi
   doctor_materials_check
+  doctor_knowledge_metadata_check
+  doctor_knowledge_lexical_check
   doctor_runtime_state_check
   doctor_runtime_scheduler_check
   doctor_logs_check

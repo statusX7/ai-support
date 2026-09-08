@@ -162,7 +162,7 @@ write_mock_package() {
       required+=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
     fi
     if [[ "$layout" == v121 ]]; then
-      required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
+      required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/admin-query.js n8n/knowledge-lexical.js scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py)
     fi
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
@@ -270,7 +270,7 @@ for entry_index in "${!V120_REQUIRED[@]}"; do
   rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V120_REQUIRED[entry_index]}"
   repack_mock_package "$missing_release"
 done
-V121_REQUIRED=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
+V121_REQUIRED=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/admin-query.js n8n/knowledge-lexical.js scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py)
 for entry_index in "${!V121_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 10))"
   write_mock_package "$missing_release" v121

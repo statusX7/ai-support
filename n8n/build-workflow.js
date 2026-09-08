@@ -6,7 +6,11 @@ const crypto = require('crypto');
 const root = path.resolve(__dirname, '..');
 const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim();
 const runtimeFile = fs.readFileSync(path.join(__dirname, 'runtime.js'), 'utf8');
-const source = runtimeFile.replace(/^if \(typeof module[^\n]+\n?$/m, '').replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
+const lexicalFile = fs.readFileSync(path.join(__dirname, 'knowledge-lexical.js'), 'utf8');
+const lexicalSource = lexicalFile.replace(/^module\.exports[^\n]+\n?$/m, '');
+const runtimeSource = runtimeFile.replace(/^const \{ searchKnowledgeLexical \} = require\('\.\/knowledge-lexical\.js'\);\n?/m, '')
+  .replace(/^if \(typeof module[^\n]+\n?$/m, '');
+const source = (lexicalSource + '\n' + runtimeSource).replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
 const makeNode = (name, type, parameters, x, y, typeVersion = 2) => ({ name, id: crypto.createHash('md5').update('ai-support:' + name).digest('hex').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5'), type: 'n8n-nodes-base.' + type, typeVersion, position: [x, y], parameters });
 const code = (body) => source + '\nconst runtime = createRuntime($env);\n' + body;
 const nodes = [
@@ -29,7 +33,7 @@ const workflow = {
   id: '5d2c37c9-1c8e-45d0-8f53-c0a6e79b3a40', name: 'Crisp AI 客服', nodes,
   connections: { 'Crisp Webhook': edge('校验并持久接收'), '校验并持久接收': edge('返回 Webhook'), '返回 Webhook': edge('处理持久任务'), '每五秒恢复与重试': edge('扫描持久会话与任务'), '公开欢迎配置': edge('只读公开显示选项'), '只读公开显示选项': edge('返回公开配置'), '网页接入脚本': edge('读取固定网页脚本'), '读取固定网页脚本': edge('返回网页脚本') },
   active: false, settings: { executionOrder: 'v1', saveManualExecutions: false, saveDataErrorExecution: 'none', saveDataSuccessExecution: 'none', saveExecutionProgress: false, callerPolicy: 'workflowsFromSameOwner' },
-  versionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', meta: { templateCredsSetupCompleted: true, aiSupportVersion: version, runtimeSha256: crypto.createHash('sha256').update(source).digest('hex'), runtimeFileSha256: crypto.createHash('sha256').update(runtimeFile).digest('hex') }, tags: [],
+  versionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', meta: { templateCredsSetupCompleted: true, aiSupportVersion: version, runtimeSha256: crypto.createHash('sha256').update(source).digest('hex'), runtimeFileSha256: crypto.createHash('sha256').update(runtimeFile).digest('hex'), lexicalFileSha256: crypto.createHash('sha256').update(lexicalFile).digest('hex') }, tags: [],
 };
 const rendered = JSON.stringify(workflow, null, 2) + '\n';
 const filename = path.join(__dirname, 'workflow.json');

@@ -361,36 +361,57 @@ configuration_prompt_apply() (
   jq -M -n --arg hash "$(sha256sum "$target" | awk '{print $1}')" '{applied:true,sha256:$hash}'
 )
 
-configuration_query() {
-  local deploy_dir=$1 question=$2 response payload status question_bytes marker_result marker request_timeout=120
-  local budget_ms=${3:-0}
+configuration_query() (
+  local deploy_dir=$1 question=$2 response='' question_bytes request_timeout maximum=90000
+  local budget_ms=${3:-0} effective_budget
+  trap '[[ -z "$response" ]] || rm -f -- "$response"' EXIT
   question_bytes=$(printf '%s' "$question" | wc -c | tr -d ' ')
-  (( question_bytes > 0 && question_bytes <= 8000 )) || return 1
+  if (( question_bytes < 1 || question_bytes > 8000 )) \
+    || [[ ! "$budget_ms" =~ ^(0|[1-9][0-9]{0,5})$ ]] || (( budget_ms > 180000 )); then
+    configuration_error '知识问答测试输入或时间预算无效，测试未发起'
+    return 1
+  fi
   if [[ -f "${deploy_dir}/config/provider-pool-applied.json" ]]; then
-    local -a marker_args=()
-    [[ "$budget_ms" =~ ^[0-9]+$ ]] || return 1
-    (( budget_ms == 0 )) || marker_args+=("$budget_ms")
-    marker_result=$(python3 "${CONFIGURATION_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" admin-marker "${marker_args[@]}") || return 1
-    marker=$(jq -M -er '.marker | select(type == "string" and startswith("[[CRISPAI_PROVIDER_CONTEXT_V1:"))' <<< "$marker_result") || return 1
-    request_timeout=$(jq -M -er '((.deadline_at / 1000 - now) | ceil) + 5 | select(. > 0 and . <= 190)' <<< "$marker_result") || return 1
-    question+=$'\n'"$marker"
+    if [[ -L "${deploy_dir}/config/provider-pool-applied.json" ]] \
+      || ! maximum=$(jq -M -er '.policy.question_timeout_ms | select(type == "number" and floor == . and . >= 1000 and . <= 180000)' \
+        "${deploy_dir}/config/provider-pool-applied.json" 2>/dev/null); then
+      configuration_error '接口池时间预算无效，测试未发起；请从菜单 3 修复接口配置'
+      return 1
+    fi
   elif [[ $(env_get "${deploy_dir}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]]; then
     configuration_error '接口池尚未应用，测试未发起；请从菜单 3 修复主接口'
     return 1
   fi
-  anythingllm_connection "$deploy_dir"
-  response=$(mktemp "${deploy_dir}/tmp/configuration-query.XXXXXX")
-  chmod 600 "$response"
-  payload=$(jq -M -cn --arg message "$question" '{message:$message,mode:"chat",sessionId:"ai-support-admin-test",reset:true}')
-  status=$(anythingllm_secure_request "$deploy_dir" POST "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/chat" "$ANYTHING_KEY" "$payload" "$response" "$request_timeout")
-  if [[ "$status" != 2?? ]] || ! jq -M -e '(.error == null or .error == false) and (.textResponse | type == "string" and length > 0)' "$response" >/dev/null; then
-    rm -f -- "$response"
-    configuration_error '测试问答失败，请检查 Provider 和知识索引'
+  effective_budget=$maximum
+  (( budget_ms == 0 || budget_ms >= maximum )) || effective_budget=$budget_ms
+  request_timeout=$(((effective_budget + 999) / 1000 + 5))
+  if ! command -v timeout >/dev/null 2>&1 \
+    || ! response=$(mktemp "${deploy_dir}/tmp/configuration-query.XXXXXX" 2>/dev/null); then
+    configuration_error '知识问答测试准备失败，测试未发起'
     return 1
   fi
-  jq -M '{answer:.textResponse,sources:(.sources // []),verified:true}' "$response"
-  rm -f -- "$response"
-}
+  chmod 600 "$response" || return 1
+  # 问题只经 stdin 进入容器，不写进命令参数；与客服共用检索、完整上下文和签名生成链。
+  # shellcheck disable=SC2016
+  if ! printf '%s' "$question" | jq -M -Rsc --argjson budget "$budget_ms" '{question:.,budget_ms:$budget}' \
+    | timeout --signal=TERM --kill-after=2s "${request_timeout}s" bash -c '
+      set -euo pipefail
+      source "$1/common.sh"
+      docker_compose "$2" exec -T n8n node /opt/crisp-ai/n8n/admin-query.js
+    ' configuration-query "$CONFIGURATION_DIR" "$deploy_dir" > "$response" 2>/dev/null; then
+    configuration_error '知识问答测试未完成；请检查当前检索、接口或配置应用状态'
+    return 1
+  fi
+  if [[ $(stat -c '%s' -- "$response") -gt 1048576 ]] \
+    || ! jq -M -e '.verified == true and (.answer | type == "string" and test("\\S"))
+      and (.sources | type == "array" and all(type == "string"))
+      and (.retrieval_state == "knowledge_hit" or .retrieval_state == "knowledge_miss")
+      and (.error == null or .error == false)' "$response" >/dev/null 2>&1; then
+    configuration_error '知识问答测试未完成；请检查当前检索、接口或配置应用状态'
+    return 1
+  fi
+  jq -M '{answer,sources,verified,retrieval_state}' "$response"
+)
 
 configuration_migrate_display_defaults() {
   local deploy_dir=$1 name target decoded normalized backup
@@ -476,11 +497,11 @@ json.dump(value,sys.stdout,ensure_ascii=False,indent=2)
         exclude_keywords:(.exclude_keywords // []),priority:(.priority // 0),cooldown_seconds:(.cooldown_seconds // 0),offer_ttl_seconds:600,
         action:(if .action.type == "handoff" then "show_handoff_offer" else .action.type end),
         text:(.action.text // ""),prompt:(.action.prompt // ""),target:(.action.target // ""),
-        confirm_label:"召唤人工客服",cancel_label:"继续 AI 客服",confirm_message:($handoff[0].handoff.message // "已暂停本次对话的 AI 回复，您的人工协助请求已收到。")
+        confirm_label:"召唤人工客服",cancel_label:"继续咨询",confirm_message:($handoff[0].handoff.message // "您的人工协助请求已收到，请稍候。")
       }] + [{id:"handoff-offer",name:"人工协助确认",enabled:(if ($handoff[0].handoff | has("enabled")) then $handoff[0].handoff.enabled else true end),match_mode:($handoff[0].handoff.match_mode // "contains"),
         keywords:($handoff[0].handoff.keywords // ["人工","转人工","人工客服"]),exclude_keywords:["不要人工","不需要人工","不用人工","不转人工"],priority:100,
-        cooldown_seconds:60,offer_ttl_seconds:600,action:"show_handoff_offer",text:"需要人工协助吗？请点击下方按钮确认。",confirm_label:"召唤人工客服",cancel_label:"继续 AI 客服",
-        confirm_message:($handoff[0].handoff.message // "已暂停本次对话的 AI 回复，您的人工协助请求已收到。")}] | unique_by(.id))}
+        cooldown_seconds:60,offer_ttl_seconds:600,action:"show_handoff_offer",text:"需要人工协助吗？请点击下方按钮确认。",confirm_label:"召唤人工客服",cancel_label:"继续咨询",
+        confirm_message:($handoff[0].handoff.message // "您的人工协助请求已收到，请稍候。")}] | unique_by(.id))}
     ' "$decoded" > "$temporary" \
       || { rm -f -- "$decoded" "$handoff_decoded" "$temporary"; return 1; }
     configuration_validate keyword "$temporary" \

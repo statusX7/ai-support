@@ -15,6 +15,11 @@ for (const name of ['keyword', 'handoff', 'menu', 'tags', 'feedback', 'runtime',
 fs.writeFileSync(path.join(root, 'config/prompt.md'), '这是虚构协议测试提示词。');
 const json = (name, value) => fs.writeFileSync(path.join(root, 'config', name + '.yaml'), JSON.stringify(value));
 json('runtime', {schema_version:2, enabled:true, revision:1, applied_revision:1});
+json('provider', {provider:{base_url:'https://identity-provider.invalid/v1',model:'synthetic-identity-model',api_mode:'chat_completions'}});
+fs.mkdirSync(path.join(root,'data/runtime'),{recursive:true});
+fs.writeFileSync(path.join(root,'data/runtime/knowledge-map.json'),JSON.stringify({schema_version:2,revision:1,documents:[{
+  library_id:'kb_default',document_id:'doc_2222222222222222',projection:'synthetic-identity.md',location:'synthetic/identity.json'
+}]}));
 const menu = JSON.parse(fs.readFileSync(path.join(root, 'config/menu.yaml')));
 menu.welcome.enabled = false; json('menu', menu);
 const env = {CRISP_WEBSITE_ID:'fixture-website-identity', CRISP_HOOK_MODE:'website', CRISP_WEBSITE_HOOK_SECRET:'fixture-hook-identity-0123456789', CRISP_AUTH_B64:'Zml4dHVyZTpleGFtcGxl', ANYTHINGLLM_API_KEY:'fixture-internal', ANYTHINGLLM_WORKSPACE:'support'};
@@ -50,7 +55,12 @@ const request = async (url, options={}) => {
     }
     throw Error('未知合成路径');
   }
-  if (parsed.hostname === 'anythingllm') {requests++;if(onModel)return onModel(options);return {status:200,body:{textResponse:'合成问题处理结果。',sources:[]}};}
+  if (parsed.hostname === 'anythingllm') {
+    if (options.method === 'GET') return {status:200,body:{workspace:{slug:env.ANYTHINGLLM_WORKSPACE || 'crisp-support',openAiTemp:0.7}}};
+    assert(parsed.pathname.endsWith('/vector-search'));
+    return {status:200,body:{results:[{id:'synthetic-identity-chunk',text:'虚构身份测试处理说明。',metadata:{title:'synthetic-identity.md'},distance:0.1,score:0.9}]}};
+  }
+  if (parsed.hostname === 'identity-provider.invalid') {requests++;if(onModel)return onModel(options);return {status:200,body:{choices:[{message:{content:'合成问题处理结果。'}}]}};}
   throw Error('禁止外部网络');
 };
 const restart = () => {runtime=createRuntime(env,{root,clock:()=>now,request});};
@@ -73,7 +83,7 @@ const verifyImmediateOperator = async (type, queued=0) => {
   const session='session_identity-official-'+type+'-'+queued, other='session_identity-peer-'+type+'-'+queued;
   let reached, release;
   const started=new Promise(resolve=>{reached=resolve;});
-  onModel=()=>{onModel=null;reached();return new Promise(resolve=>{release=()=>resolve({status:200,body:{textResponse:'合成迟到答复',sources:[]}});});};
+  onModel=()=>{onModel=null;reached();return new Promise(resolve=>{release=()=>resolve({status:200,body:{choices:[{message:{content:'合成迟到答复'}}]}});});};
   const accepted=await receive(event(session,'合成在途咨询'));
   assert.equal(accepted.route,'process');
   const processing=runtime.process(accepted.key,accepted.jobId);
@@ -238,7 +248,7 @@ const registeredConfirmation = async (session,expired=false) => {
   await test('无真人Hook但发前REST历史出现官方UUID，人工接管且旧答案零出站',async()=>{
     const session='session_identity-history-only';now+=1000;const before=requests;
     onModel=()=>{onModel=null;now+=1000;histories.set(session,[operatorEvent(session).data]);
-      return {status:200,body:{textResponse:'不应发送的合成旧答案',sources:[]}};};
+      return {status:200,body:{choices:[{message:{content:'不应发送的合成旧答案'}}]}};};
     try {await deliver(event(session,'需要处理的合成问题'));} finally {onModel=null;}
     assert.equal(requests,before+1);assert.equal(state(session).mode,'human');
     assert.equal(state(session).pause_reason,'operator_reply');assert.equal(sent.filter(message=>message.session_id===session).length,0);

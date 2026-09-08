@@ -101,8 +101,49 @@ OPTIONAL_ROOT_FILES=(get.sh)
 CONFIG_FILES=(app.yaml provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example)
 SCRIPT_FILES=(common.sh healthcheck.sh backup.sh restore.sh)
 OPTIONAL_SCRIPT_FILES=(analytics.sh snapshot.sh rollback.sh bootstrap.sh wizard.sh package-release.sh doctor.sh)
+N8N_FILES=(workflow.json)
 DOC_FILES=(INSTALL.md ARCHITECTURE.md CONFIG.md SECURITY.md TESTING.md)
 OPTIONAL_DOC_FILES=(RELEASE.md)
+OPTIONAL_DATA_FILES=(knowledge-manifest.json knowledge-projection.json)
+
+knowledge_snapshot_modules_check() {
+  local root=$1 module count=0 file
+  local -a modules=(scripts/knowledge-component.js scripts/knowledge-profile.py
+    scripts/knowledge-profile.sh scripts/knowledge-lexical.py n8n/admin-query.js n8n/knowledge-lexical.js)
+  [[ -f "${root}/n8n/runtime.js" && ! -L "${root}/n8n/runtime.js" ]] \
+    || die '知识快照缺少安全的 n8n/runtime.js'
+  for module in "${modules[@]}"; do
+    if [[ -e "${root}/${module}" || -L "${root}/${module}" ]]; then
+      [[ -f "${root}/${module}" && ! -L "${root}/${module}" ]] \
+        || die "知识快照模块不安全：$module"
+      ((count += 1))
+    fi
+  done
+  (( count == 0 || count == ${#modules[@]} )) || die '知识快照模块不完整；不能保存或恢复混合代'
+  KNOWLEDGE_SNAPSHOT_HAS_P0=$(( count == ${#modules[@]} ))
+  if (( KNOWLEDGE_SNAPSHOT_HAS_P0 )); then
+    return 0
+  fi
+  # 未发布的早期同版本候选可以全无新模块；已声明新能力则不能冒充旧候选。
+  file="${root}/n8n/workflow.json"
+  if [[ ! -f "$file" || -L "$file" ]] \
+    || ! jq -e '(.meta.lexicalFileSha256 // "") == ""' "$file" >/dev/null 2>&1; then
+    die '知识快照声明了缺失的词法运行模块'
+  fi
+  for module in data/runtime/knowledge-profile.json data/runtime/knowledge-lexical.json; do
+    [[ ! -e "${root}/${module}" && ! -L "${root}/${module}" ]] \
+      || die '知识快照保留新索引代次但缺少对应程序'
+  done
+  file="${root}/config/materials-applied.json"
+  if [[ -e "$file" || -L "$file" ]]; then
+    if [[ ! -f "$file" || -L "$file" ]] \
+      || ! jq -e '[(.knowledge.profile_sha256 // ""),(.knowledge.lexical_sha256 // "")] | all(. == "")' \
+        "$file" >/dev/null 2>&1; then
+      die '知识快照投影引用了缺失的模型或词法程序'
+    fi
+  fi
+  return 0
+}
 
 snapshot_version_at_least() {
   local value=$1 wanted_major=$2 wanted_minor=$3 wanted_patch=$4 major minor patch
@@ -126,6 +167,12 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 2 0; then
 fi
 if snapshot_version_at_least "$VERSION_VALUE" 1 2 1; then
   SCRIPT_FILES+=(provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh)
+  N8N_FILES+=(runtime.js)
+  knowledge_snapshot_modules_check "$DEPLOY_DIR"
+  if (( KNOWLEDGE_SNAPSHOT_HAS_P0 )); then
+    SCRIPT_FILES+=(knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py)
+    N8N_FILES+=(admin-query.js knowledge-lexical.js)
+  fi
   snapshot_pool_required=true
 fi
 
@@ -220,9 +267,11 @@ snapshot_validate_tree() {
 }
 
 snapshot_assert_provider_settled() {
-  local pending="${DEPLOY_DIR}/config/provider-pool-transaction.json"
+  local pending="${DEPLOY_DIR}/config/provider-pool-transaction.json" knowledge_pending="${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
   [[ ! -e "$pending" && ! -L "$pending" ]] \
     || die "接口窗口存在未完成事务，暂不能创建一致快照；请等待应用完成，或使用菜单 3→10→12 恢复后重试"
+  [[ ! -e "$knowledge_pending" && ! -L "$knowledge_pending" ]] \
+    || die '知识索引存在未完成迁移，暂不能创建一致快照；请先通过受管知识迁移入口完成或恢复'
 }
 
 SNAPSHOT_POOL_LOCK_FD=''
@@ -267,7 +316,9 @@ done
 for name in "${OPTIONAL_DOC_FILES[@]}"; do
   snapshot_validate_optional_file "docs/${name}" '可选快照文档'
 done
-snapshot_validate_file 'n8n/workflow.json' '快照 workflow'
+for name in "${N8N_FILES[@]}"; do
+  snapshot_validate_file "n8n/${name}" "快照 n8n 运行模块"
+done
 for directory in config knowledge n8n scripts docs data/anythingllm; do
   snapshot_validate_tree "$directory"
 done
@@ -281,7 +332,9 @@ if [[ ${snapshot_pool_required:-false} == true ]]; then
   snapshot_validate_tree secrets/provider/generations
   snapshot_validate_tree data/provider-router
 fi
-snapshot_validate_optional_file 'data/knowledge-manifest.json' '知识索引清单'
+for name in "${OPTIONAL_DATA_FILES[@]}"; do
+  snapshot_validate_optional_file "data/${name}" '知识索引元数据'
+done
 
 SNAPSHOT_SOURCE_PATHS=()
 for name in "${ROOT_FILES[@]}"; do
@@ -295,9 +348,9 @@ for directory in config knowledge n8n scripts docs data/anythingllm data/n8n dat
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${directory}")
 done
 SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/postgres")
-if [[ -f "${DEPLOY_DIR}/data/knowledge-manifest.json" ]]; then
-  SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/knowledge-manifest.json")
-fi
+for name in "${OPTIONAL_DATA_FILES[@]}"; do
+  [[ ! -f "${DEPLOY_DIR}/data/${name}" ]] || SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/${name}")
+done
 
 snapshot_capacity_check() {
   local reserve_kib required_kib source
@@ -451,9 +504,11 @@ while IFS= read -r -d '' file; do
   fi
 done < <(find "${DEPLOY_DIR}/knowledge" -maxdepth 1 -type f ! -type l -print0 | sort -z)
 
-if [[ -f "${DEPLOY_DIR}/data/knowledge-manifest.json" && ! -L "${DEPLOY_DIR}/data/knowledge-manifest.json" ]]; then
-  install -m 0600 -- "${DEPLOY_DIR}/data/knowledge-manifest.json" "$STAGING/payload/data/knowledge-manifest.json"
-fi
+for name in "${OPTIONAL_DATA_FILES[@]}"; do
+  if [[ -f "${DEPLOY_DIR}/data/${name}" && ! -L "${DEPLOY_DIR}/data/${name}" ]]; then
+    install -m 0600 -- "${DEPLOY_DIR}/data/${name}" "$STAGING/payload/data/${name}"
+  fi
+done
 
 if find "${DEPLOY_DIR}/data/anythingllm" -mindepth 1 \! -type f \! -type d -print -quit | grep -q .; then
   die "AnythingLLM 数据包含链接或特殊文件，拒绝创建回滚快照"

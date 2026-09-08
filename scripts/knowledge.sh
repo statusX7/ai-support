@@ -14,6 +14,94 @@ knowledge_valid_id() { [[ "$1" =~ ^kb_([a-f0-9]{16}|default)$ ]]; }
 knowledge_valid_document() { [[ "$1" =~ ^doc_[a-f0-9]{16}$ ]]; }
 knowledge_utf8_bytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
 
+knowledge_stable_snapshot() {
+  local source=$1 destination=$2 maximum=$3
+  python3 -B - "$source" "$destination" "$maximum" <<'PY'
+import os
+import stat
+import sys
+
+source, destination, maximum_raw = sys.argv[1:]
+maximum = int(maximum_raw)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(source, flags)
+try:
+    before = os.fstat(descriptor)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+                              value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size < 1 or before.st_size > maximum:
+        raise SystemExit(1)
+    chunks, total = [], 0
+    while True:
+        chunk = os.read(descriptor, min(1048576, maximum + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise SystemExit(1)
+    after = os.fstat(descriptor)
+    current = os.lstat(source)
+    if identity(before) != identity(after) or identity(after) != identity(current) or total != after.st_size:
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+
+target = os.lstat(destination)
+if not stat.S_ISREG(target.st_mode) or target.st_nlink != 1:
+    raise SystemExit(1)
+output_flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+output = os.open(destination, output_flags)
+try:
+    for chunk in chunks:
+        view = memoryview(chunk)
+        while view:
+            written = os.write(output, view)
+            if written <= 0:
+                raise SystemExit(1)
+            view = view[written:]
+    os.fchmod(output, 0o600)
+    os.fsync(output)
+finally:
+    os.close(output)
+PY
+}
+
+knowledge_lexical_build() {
+  local deploy_dir=$1 result status=0
+  result=$(mktemp "${deploy_dir}/tmp/knowledge-lexical-result.XXXXXXXX")
+  python3 -B "${KNOWLEDGE_SCRIPT_DIR}/knowledge-lexical.py" build --deploy-dir "$deploy_dir" > "$result" 2>/dev/null || status=$?
+  if (( status != 0 )) || ! jq -e '.ok == true and (.complete | type == "boolean") and (.coverage | type == "object")' "$result" >/dev/null 2>&1; then
+    rm -f -- "$result"
+    configuration_error '当前启用知识的词法补召回索引未能安全构建；旧运行代次不会继续冒充已应用'
+    return 1
+  fi
+  if [[ $(jq -r '.complete | tostring' "$result") != true ]]; then
+    warn '词法补召回索引已应用有界覆盖；超出容量的普通段落仍由向量检索处理，菜单 2 会显示覆盖警告'
+  fi
+  rm -f -- "$result"
+}
+
+knowledge_profile_refresh_bindings() {
+  local deploy_dir=$1 allow_migration=${2:-false} validate_only=${3:-false}
+  local profile="${1}/data/runtime/knowledge-profile.json" pointer="${1}/data/runtime/knowledge-migration.json" result
+  local -a arguments=(--deploy-dir "$deploy_dir" refresh-bindings)
+  [[ "$allow_migration" == true || "$allow_migration" == false ]] || return 1
+  [[ "$validate_only" == true || "$validate_only" == false ]] || return 1
+  if [[ ! -e "$profile" && ! -L "$profile" ]]; then
+    # 尚未建立受管 Embedding 代次的旧实例保持兼容；迁移指针不能脱离代次存在。
+    [[ ! -e "$pointer" && ! -L "$pointer" ]] || return 1
+    return 0
+  fi
+  [[ -f "$profile" && ! -L "$profile" ]] || return 1
+  [[ "$allow_migration" == false ]] || arguments+=(--allow-migration)
+  [[ "$validate_only" == false ]] || arguments+=(--validate-only)
+  result=$(python3 -B "${KNOWLEDGE_SCRIPT_DIR}/knowledge-profile.py" "${arguments[@]}") || return 1
+  jq -M -e '.success == true and .action == "refresh-bindings" and
+    (.changed | type == "boolean") and (.skipped | type == "boolean") and
+    (.bindings | type == "number" and floor == . and . >= 0)' <<< "$result" >/dev/null
+}
+
 knowledge_validate_name() {
   local value=$1 maximum=$2 description=$3 bytes
   bytes=$(knowledge_utf8_bytes "$value")
@@ -348,16 +436,26 @@ knowledge_catalog_project() {
 }
 
 knowledge_catalog_readback() {
-  local deploy_dir=$1 scope=${2:-all} manifest="${1}/data/knowledge-manifest.json" catalog="${1}/knowledge/catalog.json" locations temporary now
+  local deploy_dir=$1 scope=${2:-all} allow_profile_migration=${3:-false}
+  local manifest="${1}/data/knowledge-manifest.json" catalog="${1}/knowledge/catalog.json" locations temporary now
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   anythingllm_connection "$deploy_dir"
   locations=$(anythingllm_workspace_locations) || return 1
+  # 推理热路径只读取这份经管理 API 回读的最小投影，避免每条咨询下载整个工作区文档清单。
+  anythingllm_workspace_runtime_settings "$deploy_dir" || return 1
   jq -M -en --slurpfile catalog "$catalog" --slurpfile manifest "$manifest" --argjson locations "$locations" --arg scope "$scope" '
+    ($manifest[0].embedding_profile // "") as $profile |
     all($catalog[0].libraries[] | select($scope == "all" or .id == $scope) | select(.enabled) | .documents[]; . as $document |
       ($manifest[0].files[$document.projection].sha256 == $document.sha256) and
+      ($profile == "" or $manifest[0].files[$document.projection].embedding_profile == $profile) and
       ($manifest[0].files[$document.projection].locations | length > 0) and
       all($manifest[0].files[$document.projection].locations[]; . as $location | $locations | index($location) != null)) and
     all($catalog[0].libraries[] | select($scope == "all" or .id == $scope) | select(.enabled == false) | .documents[]; . as $document | $manifest[0].files[$document.projection] == null)
   ' >/dev/null || return 1
+  # 普通知识同步会重写 manifest 文档记录；在发布 map/lexical/materials 哈希前，
+  # 将实际向量缓存重新绑定到当前 Embedding 代次。迁移流程必须显式授权，
+  # 普通菜单遇到遗留 pointer 时保持失败，不能把受阻止代次显示为已应用。
+  knowledge_profile_refresh_bindings "$deploy_dir" "$allow_profile_migration" || return 1
   now=$(date +%s)
   temporary=$(mktemp "${catalog}.tmp.XXXXXX")
   jq -M --argjson now "$now" --arg scope "$scope" '.libraries |= map(if $scope == "all" or .id == $scope then . as $library | .status=(if .enabled then "indexed" else "disabled" end) | .last_sync=$now | .error=null |
@@ -369,13 +467,19 @@ knowledge_catalog_readback() {
     $manifest[0].files[$document.projection].locations[]? | {location:.,library_id:$library.id,library_name:$library.name,document_id:$document.id,projection:$document.projection}
   ]}' > "$temporary"
   chmod 640 "$temporary"
-  chown 1000:1000 "$temporary" 2>/dev/null || true
+  chown root:1000 "$temporary" 2>/dev/null || true
   mv -f -- "$temporary" "${deploy_dir}/data/runtime/knowledge-map.json"
+  knowledge_lexical_build "$deploy_dir" || return 1
 }
 
 knowledge_sync_catalog() {
-  local deploy_dir=$1 force=${2:-0} scope=${3:-all} filenames=null status=0 temporary
+  local deploy_dir=$1 force=${2:-0} scope=${3:-all} allow_profile_migration=${4:-false} filenames=null status=0 temporary
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   knowledge_catalog_migrate "$deploy_dir" || return 1
+  # 在复制投影、上传或变更 workspace 前只验证已有缓存摘要，绝不重签当前
+  # 缓存；pending/garbage 仍交给同步器的既有恢复路径处理。遗留迁移、
+  # 已绑定缓存被改动或混合代次则在任何外部副作用前被阻止。
+  knowledge_profile_refresh_bindings "$deploy_dir" "$allow_profile_migration" true || return 1
   if [[ "$scope" != all ]]; then
     knowledge_valid_id "$scope" || return 1
     jq -M -e --arg id "$scope" 'any(.libraries[]; .id == $id)' "${deploy_dir}/knowledge/catalog.json" >/dev/null || { configuration_error '知识库不存在'; return 1; }
@@ -387,7 +491,7 @@ knowledge_sync_catalog() {
   else
     knowledge_sync "$deploy_dir" "$force" >&2 || status=$?
   fi
-  if (( status == 0 )) && knowledge_catalog_readback "$deploy_dir" "$scope"; then
+  if (( status == 0 )) && knowledge_catalog_readback "$deploy_dir" "$scope" "$allow_profile_migration"; then
     return 0
   fi
   temporary=$(mktemp "${deploy_dir}/knowledge/catalog.json.tmp.XXXXXX")
@@ -448,32 +552,60 @@ knowledge_import_files() {
   find "${deploy_dir}/knowledge/${library_id}" -type d -exec chmod 750 {} +
 }
 
-knowledge_query() {
-  local deploy_dir=$1 library=$2 question=$3 response status payload map question_bytes
+knowledge_query() (
+  local deploy_dir=$1 library=$2 question=$3 response rendered map map_copy map_after catalog question_bytes
+  local map_hash expected_hash note=''
   [[ "$library" == all ]] || knowledge_valid_id "$library" || return 1
   question_bytes=$(knowledge_utf8_bytes "$question")
   (( question_bytes > 0 && question_bytes <= 8000 )) || return 1
-  anythingllm_connection "$deploy_dir"
-  response=$(mktemp "${deploy_dir}/tmp/knowledge-query.XXXXXX")
-  chmod 600 "$response"
-  payload=$(jq -M -cn --arg query "$question" '{query:$query,topN:20,scoreThreshold:0}')
-  status=$(anythingllm_secure_request "$deploy_dir" POST "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/vector-search" "$ANYTHING_KEY" "$payload" "$response" 120)
-  if [[ "$status" != 2?? ]] || ! jq -M -e '.results | type == "array"' "$response" >/dev/null; then rm -f -- "$response"; return 1; fi
+  catalog="${deploy_dir}/knowledge/catalog.json"
+  if [[ "$library" != all ]]; then
+    jq -M -e --arg id "$library" 'any(.libraries[]; .id == $id)' "$catalog" >/dev/null \
+      || { configuration_error '知识库不存在，检索测试未发起'; return 1; }
+    note='为与实际客服保持一致，本次使用全部已启用知识库；所选单库不作为额外过滤条件。'
+  fi
   map="${deploy_dir}/data/runtime/knowledge-map.json"
-  [[ -f "$map" ]] || { rm -f -- "$response"; return 1; }
-  jq -M --arg library "$library" --slurpfile map "$map" '
-    {query_scope:$library,results:[.results[] | . as $result |
-      ($map[0].documents | map(. as $document | select(
-        (.location == ($result.metadata.docpath // $result.docpath // "")) or
-        ((.location | split("/") | last) == (($result.metadata.location // "") | split("/") | last)) or
-        (.projection == ($result.metadata.title // "")) or
-        (($result.metadata.title // "") | startswith($document.projection))
-      )) | .[0] // {}) as $source |
-      . + {library_id:($source.library_id // "unknown"),library_name:($source.library_name // "未识别来源")} |
-      select($library == "all" or .library_id == $library)]}
-  ' "$response"
-  rm -f -- "$response"
-}
+  response=$(mktemp "${deploy_dir}/tmp/knowledge-query.XXXXXX")
+  rendered=$(mktemp "${deploy_dir}/tmp/knowledge-query-result.XXXXXX")
+  map_copy=$(mktemp "${deploy_dir}/tmp/knowledge-query-map.XXXXXX")
+  map_after=$(mktemp "${deploy_dir}/tmp/knowledge-query-map-after.XXXXXX")
+  trap 'rm -f -- "$response" "$rendered" "$map_copy" "$map_after"' EXIT
+  chmod 600 "$response" "$rendered" "$map_copy" "$map_after"
+  if ! knowledge_stable_snapshot "$map" "$map_copy" 16777216 2>/dev/null; then
+    configuration_error '当前已启用知识映射的文件类型、连接或容量不安全，检索测试未发起'
+    return 1
+  fi
+  map_hash=$(sha256sum -- "$map_copy" | awk '{print $1}')
+  expected_hash=$(jq -M -er 'select(.state == "applied") | .knowledge.map_sha256
+    | select(type == "string" and test("^[a-f0-9]{64}$"))' "${deploy_dir}/config/materials-applied.json" 2>/dev/null || true)
+  [[ -n "$expected_hash" && "$map_hash" == "$expected_hash" ]] \
+    || { configuration_error '当前已启用知识映射与应用代次不一致，检索测试未发起'; return 1; }
+  if ! configuration_query "$deploy_dir" "$question" > "$response"; then
+    configuration_error '知识问答测试未完成；请检查当前检索、接口或配置应用状态'
+    return 1
+  fi
+  if ! knowledge_stable_snapshot "$map" "$map_after" 16777216 2>/dev/null || ! cmp -s -- "$map_copy" "$map_after"; then
+    configuration_error '检索期间知识映射已变化，未展示可能过期的结果'
+    return 1
+  fi
+  if ! jq -M --arg scope '全部已启用知识库（与实际客服一致）' --arg note "$note" \
+      --slurpfile map "$map_copy" '
+    def mapped($location): [$map[0].documents[] | select(.location == $location)];
+    . as $result |
+    [($result.sources[]? | select(type == "string")) as $location |
+      mapped($location) as $matches |
+      if ($matches | length) != 1 then error("source mapping is not unique")
+      else {library_name:$matches[0].library_name,projection:$matches[0].projection} end]
+      | unique_by([.library_name,.projection]) as $sources |
+    {answer:$result.answer,verified:$result.verified,
+      retrieval_state:$result.retrieval_state,scope:$scope,
+      sources:$sources} + (if $note == "" then {} else {note:$note} end)
+  ' "$response" > "$rendered" 2>/dev/null; then
+    configuration_error '检索结果来源无法与当前已启用资料唯一对应，未展示结果'
+    return 1
+  fi
+  cat -- "$rendered"
+)
 
 knowledge_bootstrap_source() {
   local deploy_dir=$1 name=$2 input=$3 library_id
@@ -496,7 +628,7 @@ knowledge_main() (
   while (( $# )); do
     case "$1" in
       --deploy-dir) deploy_request=${2:?}; shift 2 ;;
-      --help|-h) printf '%s\n' '用法：knowledge.sh [--deploy-dir PATH] list | create NAME | rename ID NAME | enable ID | disable ID | delete ID | entries ID | import ID PATH | remove ID DOCID | sync [ID|all] | reindex [ID|all] | query ID|all QUESTION' '无部署预检：knowledge.sh inspect-source PATH | validate-library-name NAME'; return ;;
+      --help|-h) printf '%s\n' '用法：knowledge.sh [--deploy-dir PATH] list | create NAME | rename ID NAME | enable ID | disable ID | delete ID | entries ID | import ID PATH | remove ID DOCID | sync [ID|all] | reindex [ID|all] | query all QUESTION' 'query 使用全部已启用知识库并走实际客服推理链，可能经故障切换调用一个或多个上游并分别计费；兼容旧 ID 参数但不会缩小范围。' '无部署预检：knowledge.sh inspect-source PATH | validate-library-name NAME'; return ;;
       *) break ;;
     esac
   done

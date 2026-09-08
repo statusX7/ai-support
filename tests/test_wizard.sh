@@ -322,6 +322,10 @@ run_pty_case normal "$NORMAL_RESULT" "$NORMAL_TRANSCRIPT" "$NORMAL_COUNT"
 [[ "$(<"$NORMAL_COUNT")" == 10 ]] || fail '正常路径不是十次输入'
 [[ "$(grep -o '\[[0-9]\+/10\]' "$NORMAL_TRANSCRIPT" | sort -u | wc -l)" == 10 ]] \
   || fail '正常路径没有显示完整的 1/10 至 10/10'
+grep -Fq '人工恢复 3600 秒' "$NORMAL_TRANSCRIPT" \
+  || fail '向导摘要没有显示新实例实际采用的 3600 秒人工恢复默认值'
+! grep -Fq '人工恢复 1800 秒' "$NORMAL_TRANSCRIPT" \
+  || fail '向导摘要仍显示已废弃的新装 1800 秒默认值'
 [[ "$(stat -c '%a' "$NORMAL_RESULT")" == 600 ]] || fail '向导结果权限不是 0600'
 jq -e '
   .schema_version == 1 and .status == "confirmed" and .next_step == 10 and

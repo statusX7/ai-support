@@ -162,6 +162,8 @@ info "更新前迁移备份：$BACKUP_FILE"
 
 # 快照先记录旧镜像引用与镜像 ID；随后才迁移新版运行参数并拉取镜像。
 migrate_runtime_env "$DEPLOY_DIR"
+bash "${SOURCE_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" capture \
+  || die '旧知识模型配置无法安全识别；升级尚未启动新组件'
 docker_compose_command --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
   -f "${SOURCE_DIR}/docker-compose.yml" config --quiet
 # 镜像拉取在正式停机前完成；网络或 registry 失败不会影响当前运行服务。
@@ -192,6 +194,8 @@ if (( SKIP_START == 0 )); then
   wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
+  bash "${DEPLOY_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" ensure \
+    || die '中文知识检索模型或索引代次迁移未完成；升级将按原快照恢复'
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR"
   sync_prompt_to_anythingllm "$DEPLOY_DIR"

@@ -17,6 +17,13 @@ const invitation = '此回答是否解决问题？\n👍 是\n👎 否';
 const clarification = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
 const imageClarification = '请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。';
 const legacyFailure = '暂时无法回复，请稍后再试。';
+const messagesOf = body => body.messages || body.input;
+const textOf = message => typeof message.content === 'string' ? message.content
+  : message.content.filter(part => ['text', 'input_text', 'output_text'].includes(part.type)).map(part => part.text).join('\n');
+const textOfRequest = body => messagesOf(body).map(textOf).join('\n');
+const projection = 'kb_1111111111111111_doc_2222222222222222.md';
+const retrievalResult = (distance = 0.1) => ({ id: 'synthetic-feedback-chunk', text: '问题：如何保存设置？\n回答：在设置页面保存后重试。',
+  metadata: { title: projection }, distance, score: 1 - distance });
 const makeFixture = (name) => {
   const root = path.join(evidence, name);
   for (const directory of ['config', 'data/runtime', 'data/analytics']) fs.mkdirSync(path.join(root, directory), { recursive: true });
@@ -32,6 +39,10 @@ const makeFixture = (name) => {
   Object.assign(feedback.feedback, { enabled: true, auto_invite: true, prompt: invitation, negative_keywords: ['否', '👎', '还不行'], positive_keywords: ['是', '👍'] });
   writeConfig('feedback', feedback);
   writeConfig('provider', { provider: { base_url: 'https://provider.invalid/v1', model: 'synthetic-model', api_mode: 'chat_completions', supports_vision: true } });
+  fs.writeFileSync(path.join(root, 'data/runtime/knowledge-map.json'), JSON.stringify({ schema_version: 2, documents: [{
+    library_id: 'kb_1111111111111111', document_id: 'doc_2222222222222222', projection,
+    location: 'custom-documents/' + projection + '-33333333-3333-4333-8333-333333333333.json',
+  }] }));
   const env = { CRISP_WEBSITE_ID: '11111111-1111-4111-8111-111111111111', CRISP_WEBSITE_HOOK_SECRET: 'synthetic-feedback-hook-0001', CRISP_AUTH_B64: 'synthetic-feedback-auth', AI_API_KEY: 'synthetic-feedback-key', AI_SUPPORTS_VISION: 'true', ANYTHINGLLM_API_KEY: 'synthetic-feedback-rag', ANYTHINGLLM_WORKSPACE: 'synthetic-feedback' };
   let now = Date.now();
   let sequence = 1000;
@@ -39,6 +50,8 @@ const makeFixture = (name) => {
   const sent = [];
   const modelRequests = [];
   const visionRequests = [];
+  const retrievalRequests = [];
+  const workspaceRequests = [];
   const histories = new Map();
   const patches = [];
   const modes = { modelFailure: false, imageFailure: false, historyFailure: false, answer: '受控业务答案：请在设置中保存后重试。' };
@@ -62,17 +75,38 @@ const makeFixture = (name) => {
       throw new Error('未知 synthetic Crisp 路径：' + suffix);
     }
     if (parsed.hostname === 'anythingllm') {
-      modelRequests.push(structuredClone(options.body));
-      if (modes.onModelResponse) await modes.onModelResponse();
-      if (modes.modelThrow) throw Object.assign(new Error('synthetic-timeout'), { code: 'ETIMEDOUT' });
-      if (modes.modelPayload !== undefined) return { status: 200, body: modes.modelPayload };
-      return { status: modes.modelFailure ? 503 : 200, body: modes.modelFailure ? { error: 'synthetic-failure' } : { textResponse: modes.answer, sources: [{ docpath: 'synthetic/document.json', score: 0.9 }] } };
+      assert.equal(options.headers.Authorization, 'Bearer ' + env.ANYTHINGLLM_API_KEY);
+      const workspacePath = '/api/v1/workspace/' + env.ANYTHINGLLM_WORKSPACE;
+      if (parsed.pathname === workspacePath) {
+        assert.equal(options.method, 'GET'); assert.equal(options.body, undefined);
+        workspaceRequests.push(parsed.pathname);
+        return { status: modes.workspaceStatus ?? 200, body: modes.workspacePayload ?? { workspace: [{ slug: env.ANYTHINGLLM_WORKSPACE, openAiTemp: null }] } };
+      }
+      assert.equal(parsed.pathname, workspacePath + '/vector-search'); assert.equal(options.method, 'POST');
+      assert.deepEqual(Object.keys(options.body), ['query']);
+      retrievalRequests.push(structuredClone(options.body));
+      return { status: 200, body: modes.retrievalPayload ?? { results: [retrievalResult()] } };
     }
     if (parsed.hostname === 'provider.invalid') {
-      visionRequests.push(structuredClone(options.body));
-      if (modes.visionFailure) return { status: 503, body: { error: { code: 'synthetic-vision-error' } } };
-      const content = typeof modes.visionAnswer === 'function' ? modes.visionAnswer(structuredClone(options.body)) : modes.visionAnswer ?? '截图显示保存设置按钮。';
-      if (modes.onVisionResponse) await modes.onVisionResponse();
+      assert.equal(options.method, 'POST'); assert.equal(options.headers.Authorization, 'Bearer ' + env.AI_API_KEY);
+      assert.equal(parsed.pathname, options.body.input ? '/v1/responses' : '/v1/chat/completions');
+      const hasImage = messagesOf(options.body).some(message => Array.isArray(message.content)
+        && message.content.some(part => ['image_url', 'input_image'].includes(part.type)));
+      let content;
+      if (hasImage) {
+        visionRequests.push(structuredClone(options.body));
+        if (modes.visionFailure) return { status: 503, body: { error: { code: 'synthetic-vision-error' } } };
+        content = typeof modes.visionAnswer === 'function' ? modes.visionAnswer(structuredClone(options.body)) : modes.visionAnswer ?? '截图显示保存设置按钮。';
+        if (modes.onVisionResponse) await modes.onVisionResponse();
+      } else {
+        modelRequests.push(structuredClone(options.body));
+        assert.equal(options.body.temperature, modes.expectedTemperature ?? 0.7);
+        if (modes.onModelResponse) await modes.onModelResponse();
+        if (modes.modelThrow) throw Object.assign(new Error('synthetic-timeout'), { code: 'ETIMEDOUT' });
+        if (modes.modelPayload !== undefined) return { status: 200, body: modes.modelPayload };
+        if (modes.modelFailure) return { status: 503, body: { error: 'synthetic-failure' } };
+        content = modes.answer;
+      }
       return { status: 200, body: options.body.input ? { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] }] } : { choices: [{ message: { content } }] } };
     }
     if (parsed.hostname === 'storage.crisp.chat') return { status: modes.imageFailure ? 404 : 200, headers: { 'content-type': 'image/png' }, body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64') };
@@ -98,7 +132,7 @@ const makeFixture = (name) => {
     assert(!sent.some((item) => typeof item.content === 'string' && item.content.includes(invitation)), '不能发送系统自动评价邀请');
     assert(!events().some((item) => item.type === 'feedback'), '不能新登记自动评价');
   };
-  return { root, prompt, env, sent, patches, histories, modelRequests, visionRequests, modes, key, state, rawState, seed, makeJob, makeOutgoing, event, receive, deliver, readConfig, writeConfig, restart, events, noFeedback, runtime: () => runtime, advance: (milliseconds) => { now += milliseconds; }, now: () => now };
+  return { root, prompt, env, sent, patches, histories, modelRequests, visionRequests, retrievalRequests, workspaceRequests, modes, key, state, rawState, seed, makeJob, makeOutgoing, event, receive, deliver, readConfig, writeConfig, restart, events, noFeedback, runtime: () => runtime, advance: (milliseconds) => { now += milliseconds; }, now: () => now };
 };
 
 let passed = 0;
@@ -132,7 +166,8 @@ const test = async (name, action) => {
       f.restart(); const count = f.modelRequests.length;
       await f.deliver(f.event(session, content));
       assert.equal(f.modelRequests.length, count + 1, content + ' 不应被旧评分消费');
-      assert(f.modelRequests.at(-1).message.includes('访客当前问题：' + content));
+      assert.deepEqual(f.retrievalRequests.at(-1), { query: content });
+      assert.equal(textOf(messagesOf(f.modelRequests.at(-1)).at(-1)), content);
       assert.equal(f.sent.at(-1).content, f.modes.answer);
       assert.equal(f.state(session).mode, 'ai'); assert.equal(f.state(session).pending_feedback, null);
     }
@@ -354,6 +389,7 @@ const test = async (name, action) => {
         await f.deliver(f.event(session, data, { type: kind.startsWith('image-') ? 'file' : 'text' }));
       }
       assert.equal(f.sent.length, 1, kind);
+      assert.equal(f.modelRequests.length, ['http', 'throw', 'payload-error', 'missing-payload', 'image-rag'].includes(kind) ? 1 : 0, kind + ' 的故障注入必须发生在实际生成阶段');
       assert.equal(f.sent[0].content, kind.startsWith('image-') ? imageClarification : clarification, kind);
       assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
       assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
@@ -421,8 +457,9 @@ const test = async (name, action) => {
     f.modes.answer = '请先记录网页中的“' + legacyFailure + '”，再核对网络设置。';
     await f.deliver(f.event(session, quoted));
     assert.equal(f.sent.at(-1).content, f.modes.answer);
-    assert(f.modelRequests.at(-1).message.includes('访客当前问题：' + quoted));
-    assert(f.modelRequests.at(-1).message.includes('不得使用“暂时无法回复，请稍后再试。”及同类系统忙、稍后再试的机械话术'));
+    assert.deepEqual(f.retrievalRequests.at(-1), { query: quoted });
+    assert.equal(textOf(messagesOf(f.modelRequests.at(-1)).at(-1)), quoted);
+    assert(textOfRequest(f.modelRequests.at(-1)).includes('不得使用“暂时无法回复，请稍后再试。”及同类系统忙、稍后再试的机械话术'));
     await f.deliver(f.event('session_error-image-rule', { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
     assert.equal(f.visionRequests[0].messages[0].content, f.prompt);
     assert(f.visionRequests[0].messages[1].content.includes('不得使用“暂时无法回复，请稍后再试。”及同类系统忙、稍后再试的机械话术'));
@@ -512,17 +549,19 @@ const test = async (name, action) => {
       if (storage === 'applied') {
         const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map(name => [name, f.readConfig(name)]));
         const projection = { schema_version: 1, state: 'applied', revision: 1, source_sha256: digest('synthetic-materials-source'), configuration,
-          prompt: { text: f.prompt, bytes: Buffer.byteLength(f.prompt), sha256: digest(f.prompt) }, knowledge: { map_sha256: '' } };
+          prompt: { text: f.prompt, bytes: Buffer.byteLength(f.prompt), sha256: digest(f.prompt) },
+          knowledge: { map_sha256: digest(fs.readFileSync(path.join(f.root, 'data/runtime/knowledge-map.json'), 'utf8')) } };
         fs.writeFileSync(path.join(f.root, 'config/materials-applied.json'), JSON.stringify(projection));
         f.writeConfig('handoff', { handoff: { ...policy.handoff, [field]: '未应用编辑不应生效' } });
       }
-      f.modes.modelPayload = field === 'no_answer_message' ? { textResponse: '', sources: [] }
-        : { textResponse: '合成低分候选答案', sources: [{ docpath: 'synthetic-low-score.json', score: 0.01 }] };
+      f.modes.retrievalPayload = { results: field === 'no_answer_message' ? [] : [retrievalResult(0.99)] };
+      f.modes.answer = '合成低分候选答案';
       await f.deliver(f.event(session, '请帮我确认这个具体问题。'));
       assert.equal(f.sent.length, 1);
       assert.equal(f.sent[0].content, variant === 'custom' ? custom : clarification, [field, storage, variant].join('/'));
       assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
-      assert.equal(f.modelRequests.length, 1); f.noFeedback();
+      assert.equal(f.workspaceRequests.length, 1); assert.equal(f.retrievalRequests.length, 1);
+      assert.equal(f.modelRequests.length, field === 'no_answer_message' ? 0 : 1, '无来源按策略直接澄清，低分来源仍执行一次实际生成'); f.noFeedback();
       assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt);
     }
   });
@@ -713,14 +752,16 @@ const test = async (name, action) => {
       if (apiMode === 'responses') { assert.equal(body.store, false); assert.equal(body.max_output_tokens, 1200); }
       else assert.equal(body.max_tokens, 1200);
       assert.equal(f.state(session).image_context[0].summary, facts);
-      assert(f.modelRequests[0].message.includes(facts)); assert(f.modelRequests[0].message.includes(previous));
+      assert.deepEqual(f.retrievalRequests[0], { query: facts });
+      assert(textOfRequest(f.modelRequests[0]).includes(facts)); assert(textOfRequest(f.modelRequests[0]).includes(previous));
       assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, f.modes.answer);
       f.restart(); f.advance(1000);
       await f.deliver(f.event(session, '刚才图片左边是什么颜色和形状？'));
       assert.equal(f.visionRequests.length, 1, '后指使用已保存事实，不重复上传识图');
-      assert(f.modelRequests[1].message.includes(facts)); assert.equal(f.sent.length, 2);
+      assert.deepEqual(f.retrievalRequests[1], { query: '刚才图片左边是什么颜色和形状？' });
+      assert(textOfRequest(f.modelRequests[1]).includes(facts)); assert.equal(f.sent.length, 2);
       await f.deliver(f.event('session_other-vision', '另一会话的独立问题'));
-      assert(!f.modelRequests[2].message.includes(facts)); assert(!f.modelRequests[2].message.includes(previous));
+      assert(!textOfRequest(f.modelRequests[2]).includes(facts)); assert(!textOfRequest(f.modelRequests[2]).includes(previous));
       assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt); f.noFeedback();
     }
   });
@@ -743,6 +784,33 @@ const test = async (name, action) => {
       assert.equal(f.visionRequests.length, 1); assert.equal(f.modelRequests.length, 0); assert.equal(f.sent.length, 0);
       assert.equal((f.state(session).image_context || []).length, 0);
       assert(f.rawState(session).jobs.filter(job => job.event === 'message:send').every(job => job.status === 'cancelled'));
+      f.noFeedback();
+    }
+  });
+
+  await test('F31 工作区温度严格回读后用于两种生成协议，错误形态不检索也不生成', async () => {
+    for (const apiMode of ['chat_completions', 'responses']) for (const shape of ['object-default', 'array-explicit']) {
+      const f = makeFixture('temperature-' + apiMode + '-' + shape);
+      f.writeConfig('provider', { provider: { ...f.readConfig('provider').provider, api_mode: apiMode } });
+      const workspace = { slug: f.env.ANYTHINGLLM_WORKSPACE, openAiTemp: shape === 'array-explicit' ? 0.23 : null };
+      f.modes.workspacePayload = { workspace: shape === 'array-explicit' ? [workspace] : workspace };
+      f.modes.expectedTemperature = shape === 'array-explicit' ? 0.23 : 0.7;
+      await f.deliver(f.event('session_workspace-temperature', '虚构温度协议问题'));
+      assert.equal(f.workspaceRequests.length, 1); assert.equal(f.retrievalRequests.length, 1); assert.equal(f.modelRequests.length, 1);
+      assert.equal(f.modelRequests[0].temperature, f.modes.expectedTemperature);
+      assert.equal(textOf(messagesOf(f.modelRequests[0])[0]), f.prompt);
+      assert.equal(f.sent[0].content, f.modes.answer); assert.equal(f.state('session_workspace-temperature').mode, 'ai');
+    }
+    for (const failure of ['http', 'slug', 'temperature-string']) {
+      const f = makeFixture('temperature-invalid-' + failure);
+      f.modes.workspacePayload = { workspace: [{ slug: failure === 'slug' ? 'another-synthetic-workspace' : f.env.ANYTHINGLLM_WORKSPACE,
+        openAiTemp: failure === 'temperature-string' ? '0.7' : null }] };
+      if (failure === 'http') f.modes.workspaceStatus = 503;
+      await f.deliver(f.event('session_workspace-invalid', '虚构温度失败问题'));
+      assert.equal(f.workspaceRequests.length, 1); assert.equal(f.retrievalRequests.length, 0); assert.equal(f.modelRequests.length, 0);
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+      assert.equal(f.state('session_workspace-invalid').mode, 'ai');
+      assert.equal(f.events().filter(event => ['ai_reply', 'knowledge_hit', 'knowledge_miss', 'handoff'].includes(event.type)).length, 0);
       f.noFeedback();
     }
   });

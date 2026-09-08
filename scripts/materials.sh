@@ -197,7 +197,8 @@ materials_projection_validate() {
     (.prompt.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
     (.prompt.bytes | type == "number" and floor == . and . >= 1 and . <= 262144) and
     (.knowledge | type == "object") and
-    all([.knowledge.catalog_sha256,.knowledge.manifest_sha256,.knowledge.map_sha256][];
+    all([.knowledge.catalog_sha256,.knowledge.manifest_sha256,.knowledge.map_sha256,
+         (.knowledge.settings_sha256 // ""),(.knowledge.profile_sha256 // ""),(.knowledge.lexical_sha256 // "") ][];
       type == "string" and (. == "" or test("^[a-f0-9]{64}$"))) and
     (.knowledge.enabled_library_ids | type == "array" and all(type == "string" and test("^kb_([a-f0-9]{16}|default)$"))) and
     (.knowledge.library_count | type == "number" and floor == . and . >= 0 and . <= 100) and
@@ -231,7 +232,7 @@ PY
 
 materials_prepare_candidate() {
   local deploy_dir=$1 stage=$2 revision=$3 state=${4:-applied}
-  local name prompt_hash prompt_bytes catalog_hash manifest_hash map_hash source_hash now
+  local name prompt_hash prompt_bytes catalog_hash manifest_hash map_hash settings_hash profile_hash lexical_hash source_hash now lexical_result
   local components="${stage}/components.json" candidate="${stage}/materials-applied.json" runtime_semantic
   mkdir -p -- "${stage}/config" "${stage}/knowledge"
   for name in runtime handoff keyword menu tags feedback; do
@@ -246,12 +247,39 @@ materials_prepare_candidate() {
   catalog_hash=$(materials_sha_or_empty "${stage}/knowledge/catalog-semantic.json")
   manifest_hash=$(materials_sha_or_empty "${deploy_dir}/data/knowledge-manifest.json")
   map_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-map.json")
+  settings_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-settings.json")
+  profile_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-profile.json")
+  lexical_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-lexical.json")
   if [[ -f "${deploy_dir}/data/runtime/knowledge-map.json" ]]; then
     [[ ! -L "${deploy_dir}/data/runtime/knowledge-map.json" && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-map.json") -le $MATERIALS_PROJECTION_MAX_BYTES ]] \
       || { materials_error '运行时知识映射超过 16777216 字节或文件类型不安全'; return 1; }
     jq -M -e '.schema_version == 2 and (.documents | type == "array")' "${deploy_dir}/data/runtime/knowledge-map.json" >/dev/null \
       || { materials_error '运行时知识映射格式无效'; return 1; }
   fi
+  [[ -f "${deploy_dir}/data/runtime/knowledge-settings.json" && ! -L "${deploy_dir}/data/runtime/knowledge-settings.json" \
+      && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-settings.json") -le 65536 ]] \
+    || { materials_error '知识运行设置尚未通过工作区回读'; return 1; }
+  jq -M -e '.schema_version == 1 and (.workspace_slug | type == "string" and test("^[A-Za-z0-9_-]{1,128}$")) and
+    (.temperature | type == "number" and isfinite and . >= 0 and . <= 2) and
+    (.observed_at | type == "number" and floor == . and . >= 0)' "${deploy_dir}/data/runtime/knowledge-settings.json" >/dev/null \
+    || { materials_error '知识运行设置格式无效'; return 1; }
+  if [[ -n "$profile_hash" ]]; then
+    jq -M -e '.schema_version == 1 and .state == "applied" and
+      (.fingerprint | type == "string" and test("^[a-f0-9]{64}$")) and (.profile | type == "object")' \
+      "${deploy_dir}/data/runtime/knowledge-profile.json" >/dev/null \
+      || { materials_error '知识索引代次尚未完整应用'; return 1; }
+  fi
+  [[ -f "${deploy_dir}/data/runtime/knowledge-lexical.json" && ! -L "${deploy_dir}/data/runtime/knowledge-lexical.json" \
+      && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-lexical.json") -le $MATERIALS_PROJECTION_MAX_BYTES ]] \
+    || { materials_error '词法补召回索引缺失、超过 16777216 字节或文件类型不安全'; return 1; }
+  lexical_result=$(mktemp "${stage}/knowledge-lexical-verify.XXXXXXXX")
+  if ! python3 -B "${MATERIALS_SCRIPT_DIR}/knowledge-lexical.py" verify --deploy-dir "$deploy_dir" > "$lexical_result" 2>/dev/null \
+    || ! jq -e --arg map "$map_hash" '.ok == true and .read_only == true and .map_sha256 == $map and (.complete | type == "boolean")' "$lexical_result" >/dev/null 2>&1; then
+    rm -f -- "$lexical_result"
+    materials_error '词法补召回索引与当前启用知识或解析正文不一致'
+    return 1
+  fi
+  rm -f -- "$lexical_result"
   runtime_semantic="${stage}/config/runtime-semantic.json"
   jq -M 'del(.revision,.applied_revision)' "${stage}/config/runtime.json" > "$runtime_semantic"
   jq -M -n \
@@ -277,7 +305,8 @@ materials_prepare_candidate() {
     --slurpfile feedback "${stage}/config/feedback.json" \
     --rawfile prompt "${stage}/prompt.md" --arg prompt_hash "$prompt_hash" --argjson prompt_bytes "$prompt_bytes" \
     --slurpfile catalog "${stage}/knowledge/catalog.json" --arg catalog_hash "$catalog_hash" \
-    --arg manifest_hash "$manifest_hash" --arg map_hash "$map_hash" '
+    --arg manifest_hash "$manifest_hash" --arg map_hash "$map_hash" --arg settings_hash "$settings_hash" \
+    --arg profile_hash "$profile_hash" --arg lexical_hash "$lexical_hash" '
       {schema_version:$schema,revision:$revision,state:$state,applied_at:$now,
        source_sha256:$source_hash,source_components:$components[0],
        configuration:{
@@ -285,7 +314,8 @@ materials_prepare_candidate() {
          handoff:$handoff[0],keyword:$keyword[0],menu:$menu[0],tags:$tags[0],feedback:$feedback[0]},
        prompt:{text:$prompt,sha256:$prompt_hash,bytes:$prompt_bytes},
        knowledge:{catalog_revision:($catalog[0].revision // 0),catalog_sha256:$catalog_hash,
-         manifest_sha256:$manifest_hash,map_sha256:$map_hash,
+         manifest_sha256:$manifest_hash,map_sha256:$map_hash,settings_sha256:$settings_hash,
+         profile_sha256:$profile_hash,lexical_sha256:$lexical_hash,
          enabled_library_ids:[$catalog[0].libraries[] | select(.enabled) | .id],
          library_count:($catalog[0].libraries|length),
          document_count:([$catalog[0].libraries[].documents[]]|length)}}
@@ -364,8 +394,12 @@ materials_external_restore() {
     for file in knowledge-manifest.json knowledge-projection.json; do
       [[ ! -f "${restore_deploy}/data/${file}" ]] || install -m 600 -- "${restore_deploy}/data/${file}" "${deploy_dir}/data/${file}"
     done
-    [[ ! -f "${restore_deploy}/data/runtime/knowledge-map.json" ]] \
-      || install -m 640 -- "${restore_deploy}/data/runtime/knowledge-map.json" "${deploy_dir}/data/runtime/knowledge-map.json"
+    for file in knowledge-map.json knowledge-settings.json knowledge-lexical.json; do
+      if [[ -f "${restore_deploy}/data/runtime/${file}" ]]; then
+        install -m 640 -- "${restore_deploy}/data/runtime/${file}" "${deploy_dir}/data/runtime/${file}"
+        chown root:1000 "${deploy_dir}/data/runtime/${file}" 2>/dev/null || true
+      fi
+    done
     rm -rf -- "$stage"
     return 0
   fi

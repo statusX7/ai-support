@@ -42,7 +42,9 @@
 | `config/provider-pool.yaml` | 主备接口的非秘密权威源；可编辑已有条目的元数据/顺序/策略，不在此填 Key 或请求头值。新增凭据用菜单 3。 |
 | `config/provider-pool-applied.json` | 程序原子发布的有效池；引用秘密代次，不可手改，不以 `.env` 的旧值替代它。 |
 | `secrets/provider/generations` | 分代 Key 与请求头值，仅由受管程序写入；含真实秘密，不上传、不手工删除历史代次。 |
-| `data/knowledge-manifest.json`、`data/runtime/knowledge-map.json` | 真实索引对账和检索归属，不是用户输入；不要手动清空。 |
+| `data/knowledge-manifest.json`、`data/runtime/knowledge-map.json` | 真实索引对账和已启用来源归属；manifest 还绑定当前向量缓存摘要。它们不是用户输入，不要手动清空。 |
+| `data/runtime/knowledge-settings.json`、`knowledge-profile.json`、`knowledge-lexical.json` | 实际 workspace 检索设置、Embedding/切块代次与有界补召回索引。程序管理、不可手改。 |
+| `data/anythingllm/vector-cache/` | AnythingLLM 的实际向量缓存；由 manifest 的 `cache_bindings` 及知识 profile 维护链对账，不是日志或用户文件。 |
 | `backups/config-history/materials.applied.tar.gz` | 上一有效资料的恢复副本；含业务原文，受限保存。 |
 
 直接编辑已有资料后的完整操作：
@@ -143,9 +145,13 @@ AnythingLLM 继续负责 RAG，使用 `generic-openai` 经项目 adapter；runti
 
 字节与字数不同：`人工客服` 是 4 个汉字、12 个 UTF-8 字节；Emoji 和换行也占字节。`wc -c < '资料.md'` 查看实际文件字节数，不等于模型 token 数。PDF 头或 DOCX 容器校验成功只说明可以进入解析尝试，不保证文档可提取文字；扫描 PDF 未做 OCR 时应先转文字，再检查真实索引和来源。
 
-`data/knowledge-manifest.json` 保存 hash、远端文档位置和 pending/garbage 对账；`data/runtime/knowledge-map.json` 仅将已启用的有效位置映射回库/文档。上传、workspace 加入和索引回读分开处理。超时但服务端继续索引时保留 pending，重跑同步有限对账，不立即删远端工作。
+`data/knowledge-manifest.json` 保存 hash、远端文档位置、向量缓存绑定和 pending/garbage 对账；`data/runtime/knowledge-map.json` 仅将已启用的有效位置映射回库/文档。停用库不进入 map、词法候选或向量来源验证。上传、workspace 加入和索引回读分开处理。超时但服务端继续索引时保留 pending，重跑同步有限对账，不立即删远端工作。
 
-默认目录升级幂等迁移为 `kb_default`，保留原映射，避免重装重复 N 份。删索引不会擦除旧聊天中已经出现的知识；事实变更以当前库优先，冲突时应澄清，不拼接矛盾政策。检索预览应看中文问题结果与来源，不凭模拟 Provider 的固定回答判断检索质量。
+`data/runtime/knowledge-lexical.json` 是从当前映射指向的 AnythingLLM 已解析正文生成的受管补召回索引，不是第二份用户知识源。它最多 16 MiB、单片段最多 512 KiB；覆盖不完整时明确标记 `complete=false`，遗漏部分仍只由向量检索处理。该文件、`knowledge-map.json`、解析正文和 `config/materials-applied.json` 的哈希必须一致；停用、删除、同步或索引代次改变后会重建并回读，不能手工编辑。`knowledge-settings.json` 保存实际 workspace 检索设置的最小回读，`knowledge-profile.json` 保存当前 Embedding/切块代次；它们都是生成状态，不是用户编辑入口。客服与菜单问答热路实时校验 materials、map、lexical、profile 和 settings 代次；manifest 中的 `cache_bindings` 与实际 vector cache 完整性由同步/profile 维护链和 doctor 核对，不在每一条访客问题中重新扫描整个缓存目录。
+
+默认目录升级幂等迁移为 `kb_default`，保留原映射，避免重装重复 N 份。删索引不会擦除旧聊天中已经出现的知识；事实变更以当前库优先，冲突时应澄清，不拼接矛盾政策。生产问答测试应同时核对中文问题的检索来源与最终答案，不能凭模拟 Provider 的固定回答判断语义质量。
+
+客服检索只使用当前问题，系统护栏、内部认证信封和完整聊天历史不会混入 Embedding 输入；原 Prompt、已选知识块与本会话历史在生成阶段分别传入。明确的 FAQ 原问或足够具体的原文短语可先由同代词法索引命中；强命中不再被旧向量排名挤掉。其余问法继续使用向量检索，词法候选只作保守补充并与向量结果按来源/正文去重，不能把普通词语重叠冒充语义命中。workspace 的实际 topN、similarityThreshold 和 vectorSearchMode 仍决定向量结果，运行时合并后最多接受 20 块，不会为了掩盖漏检而自动降低阈值。已选片段须对应当前启用映射，完整传递而不在预处理时截断；遇到窗口不足则准确失败，不将缺失的片段解释为不存在的业务事实。来源非空也不是答案正确证明，需用原问和同义问题分别核对片段包含明确事实且最终答案采用了它。
 
 ## 5. 关键词、菜单与人工控制
 

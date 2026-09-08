@@ -624,6 +624,8 @@ chmod 0700 "${DEPLOY_DIR}/data/postgres"
 secure_permissions "$DEPLOY_DIR"
 
 if (( SKIP_START == 0 )); then
+  bash "${DEPLOY_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" capture \
+    || die '旧知识模型配置无法安全识别；未启动可能混用索引的新组件'
   docker_compose "$DEPLOY_DIR" config --quiet
   validate_managed_caddy_configuration "$DEPLOY_DIR" || die '安装候选反代配置未通过预检；未启动新服务代'
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
@@ -632,6 +634,8 @@ if (( SKIP_START == 0 )); then
   set_installation_fact "$DEPLOY_DIR" local_services ready
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
+  bash "${DEPLOY_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" ensure \
+    || die '中文知识检索模型或索引代次迁移未完成；原资料已保全，请用同一入口继续'
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR"
   sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"

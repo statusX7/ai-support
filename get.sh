@@ -472,6 +472,12 @@ scripts/provider-envelope.js
 scripts/provider-pool.py
 scripts/menu-display.py
 scripts/menu-provider-ui.sh
+n8n/admin-query.js
+n8n/knowledge-lexical.js
+scripts/knowledge-component.js
+scripts/knowledge-profile.py
+scripts/knowledge-profile.sh
+scripts/knowledge-lexical.py
 EOF
 }
 

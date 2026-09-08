@@ -755,8 +755,9 @@ copy_project_files() {
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
     config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
     config/logging.yaml.example
-    n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
+    n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/build-workflow.js n8n/web-chat.js
     scripts/provider-adapter.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
+    scripts/knowledge-component.js
     scripts/menu-display.py scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
     docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
@@ -768,7 +769,7 @@ copy_project_files() {
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
     scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
-    scripts/doctor.sh scripts/materials.sh scripts/logs.sh
+    scripts/doctor.sh scripts/materials.sh scripts/logs.sh scripts/knowledge-profile.sh scripts/knowledge-profile.py scripts/knowledge-lexical.py
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
@@ -862,7 +863,7 @@ migrate_config_files() {
       .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
     else . end |
     if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
-      .handoff.failure_message = "当前自动客服暂时不可用，请稍后再试。"
+      .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
     else . end |
     del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence, .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords, .handoff.resume_match_mode)
   ' "$handoff_file" > "$handoff_temp" || {
@@ -1766,6 +1767,35 @@ anythingllm_workspace_locations() {
   printf '%s\n' "$locations"
 }
 
+anythingllm_workspace_runtime_settings() {
+  local deploy_dir=$1 response_file status target temporary now
+  response_file=$(mktemp "${deploy_dir}/tmp/workspace-settings.XXXXXX")
+  status=$(anythingllm_secure_request "$deploy_dir" GET \
+    "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}" \
+    "$ANYTHING_KEY" "" "$response_file")
+  if [[ "$status" != 2?? ]] || ! jq -M -e --arg slug "$ANYTHING_WORKSPACE" '
+    .workspace as $value |
+    (if ($value|type) == "array" then $value elif ($value|type) == "object" then [$value] else [] end) as $items |
+    ($items|length) == 1 and $items[0].slug == $slug and
+    ((if $items[0].openAiTemp == null then 0.7 else $items[0].openAiTemp end) |
+      type == "number" and isfinite and . >= 0 and . <= 2)
+  ' "$response_file" >/dev/null 2>&1; then
+    rm -f -- "$response_file"
+    return 1
+  fi
+  target="${deploy_dir}/data/runtime/knowledge-settings.json"
+  now=$(date +%s)
+  temporary=$(mktemp "${target}.tmp.XXXXXX")
+  jq -M -n --arg slug "$ANYTHING_WORKSPACE" --argjson now "$now" \
+    --argjson temperature "$(jq -M -r '.workspace | (if type == "array" then .[0] else . end) |
+      if .openAiTemp == null then 0.7 else .openAiTemp end' "$response_file")" \
+    '{schema_version:1,workspace_slug:$slug,temperature:$temperature,observed_at:$now}' > "$temporary"
+  rm -f -- "$response_file"
+  chmod 640 "$temporary"
+  chown root:1000 "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$target"
+}
+
 anythingllm_locations_have_state() {
   local expected=$1
   local should_exist=$2
@@ -1879,25 +1909,39 @@ knowledge_record_garbage() {
   mv -f -- "$manifest_temp" "$manifest"
 }
 
+knowledge_current_profile() {
+  local deploy_dir=$1 file="${1}/data/runtime/knowledge-profile.json"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    printf '\n'
+    return 0
+  fi
+  [[ -f "$file" && ! -L "$file" && $(stat -c '%s' -- "$file") -le 65536 ]] || return 1
+  jq -M -er '
+    select(.schema_version == 1 and (.state == "applying" or .state == "applied")) |
+    .fingerprint | select(type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$file"
+}
+
 knowledge_record_pending() {
   local manifest=$1
   local filename=$2
   local hash=$3
   local locations=$4
   local old_locations=$5
+  local embedding_profile=${6:-}
   local manifest_temp now
 
   now=$(date +%s)
   manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
   jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
-    --argjson old_locations "$old_locations" --argjson started_at "$now" \
+    --argjson old_locations "$old_locations" --argjson started_at "$now" --arg profile "$embedding_profile" \
     '.pending_files = (.pending_files // {}) |
      .pending_files[$name] = {
        sha256:$hash,
        locations:$locations,
        old_locations:$old_locations,
        started_at:$started_at
-     }' "$manifest" > "$manifest_temp"
+     } + (if $profile == "" then {} else {embedding_profile:$profile} end)' "$manifest" > "$manifest_temp"
   chmod 600 "$manifest_temp"
   mv -f -- "$manifest_temp" "$manifest"
 }
@@ -1923,6 +1967,7 @@ knowledge_sync_legacy() {
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
   local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations escaped_key
   local pending_hash pending_locations pending_old_locations pending_started pending_age pending_retry_after update_status
+  local embedding_profile manifest_profile old_profile pending_profile profile_mismatch
   local failures=0 uploaded=0 removed=0 skipped=0
   local -a files=()
 
@@ -1937,8 +1982,22 @@ knowledge_sync_legacy() {
   jq -e '
     .version == 1 and (.files | type == "object") and
     ((.pending_files // {}) | type == "object") and
-    ((.garbage_locations // []) | type == "array" and all(type == "string"))
+    ((.garbage_locations // []) | type == "array" and all(type == "string")) and
+    ((.embedding_profile // "") | type == "string") and
+    all((.files + (.pending_files // {}))[];
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.locations | type == "array" and all(type == "string")) and
+      ((.embedding_profile // "") | type == "string"))
   ' "$manifest" >/dev/null || die "知识库清单格式无效：$manifest"
+  embedding_profile=$(knowledge_current_profile "$deploy_dir") \
+    || die '知识索引代次记录无效；已停止同步，避免混用不同向量模型'
+  manifest_profile=$(jq -r '.embedding_profile // ""' "$manifest")
+  if [[ -n "$embedding_profile" && "$manifest_profile" != "$embedding_profile" ]]; then
+    die '知识清单与当前索引代次不一致；已停止同步，避免混合索引'
+  fi
+  if [[ -z "$embedding_profile" && -n "$manifest_profile" ]]; then
+    die '知识清单引用了缺失的索引代次；已停止同步，避免错误检索'
+  fi
 
   garbage_locations=$(jq -c '(.garbage_locations // []) | unique' "$manifest")
   if [[ "$scope" == null && "$garbage_locations" != "[]" ]]; then
@@ -1974,7 +2033,9 @@ knowledge_sync_legacy() {
       || { warn "跳过非法文件名"; ((failures += 1)); continue; }
     hash=$(sha256sum -- "$file" | awk '{print $1}')
     old_hash=$(jq -r --arg name "$filename" '.files[$name].sha256 // ""' "$manifest")
+    old_profile=$(jq -r --arg name "$filename" '.files[$name].embedding_profile // ""' "$manifest")
     pending_hash=$(jq -r --arg name "$filename" '.pending_files[$name].sha256 // ""' "$manifest")
+    pending_profile=$(jq -r --arg name "$filename" '.pending_files[$name].embedding_profile // ""' "$manifest")
     locations=''
     old_locations=''
     if [[ -n "$pending_hash" ]]; then
@@ -1983,7 +2044,11 @@ knowledge_sync_legacy() {
       pending_started=$(jq -r --arg name "$filename" '.pending_files[$name].started_at // 0' "$manifest")
       [[ "$pending_started" =~ ^[0-9]+$ ]] || pending_started=0
       pending_age=$(( $(date +%s) - pending_started ))
-      if [[ "$hash" != "$pending_hash" || "$pending_locations" == "[]" ]]; then
+      profile_mismatch=false
+      [[ "$pending_profile" == "$embedding_profile" ]] || profile_mismatch=true
+      if [[ "$hash" != "$pending_hash" || "$pending_locations" == "[]" || "$profile_mismatch" == true ]]; then
+        # 不同 Embedding 代次的 pending 绝不能等待后复用；立即精确清理再重建。
+        [[ "$profile_mismatch" == false ]] || pending_age=$pending_retry_after
         if (( pending_age < pending_retry_after )); then
           warn "知识文件在上次索引结果未确认时发生变化，已保留进度供稍后重试：$filename"
           ((failures += 1))
@@ -2013,7 +2078,7 @@ knowledge_sync_legacy() {
         fi
         payload=$(jq -cn --argjson adds "$pending_locations" '{adds:$adds,deletes:[]}')
         knowledge_record_pending "$manifest" "$filename" "$hash" \
-          "$pending_locations" "$pending_old_locations"
+          "$pending_locations" "$pending_old_locations" "$embedding_profile"
         if anythingllm_update_embeddings "$payload"; then
           locations=$pending_locations
           old_locations=$pending_old_locations
@@ -2027,7 +2092,7 @@ knowledge_sync_legacy() {
     fi
 
     if [[ -z "$locations" ]]; then
-      if [[ "$force" != 1 && "$hash" == "$old_hash" ]]; then
+      if [[ "$force" != 1 && "$hash" == "$old_hash" && "$old_profile" == "$embedding_profile" ]]; then
         ((skipped += 1))
         continue
       fi
@@ -2059,7 +2124,7 @@ knowledge_sync_legacy() {
       fi
 
       old_locations=$(jq -c --arg name "$filename" '.files[$name].locations // []' "$manifest")
-      knowledge_record_pending "$manifest" "$filename" "$hash" "$locations" "$old_locations"
+      knowledge_record_pending "$manifest" "$filename" "$hash" "$locations" "$old_locations" "$embedding_profile"
       payload=$(jq -cn --argjson adds "$locations" '{adds:$adds,deletes:[]}')
       if anythingllm_update_embeddings "$payload"; then
         update_status=0
@@ -2102,8 +2167,9 @@ knowledge_sync_legacy() {
     fi
     manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
     jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
-      --argjson garbage "$garbage_locations" \
-      '.files[$name] = {sha256:$hash, locations:$locations} |
+      --argjson garbage "$garbage_locations" --arg profile "$embedding_profile" \
+      '.files[$name] = ({sha256:$hash, locations:$locations} +
+         (if $profile == "" then {} else {embedding_profile:$profile} end)) |
        .pending_files = (.pending_files // {}) | del(.pending_files[$name]) |
        .garbage_locations = (((.garbage_locations // []) + $garbage) | unique)' \
       "$manifest" > "$manifest_temp"

@@ -78,12 +78,13 @@ RELEASE_FILES=(
   config/handoff.yaml.example config/keyword.yaml.example config/menu.yaml.example
   config/prompt.md.example config/provider.yaml.example config/tags.yaml.example config/runtime.yaml.example
   config/logging.yaml.example
-  knowledge/README.md n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
+  knowledge/README.md n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/build-workflow.js n8n/web-chat.js
   scripts/analytics.sh scripts/backup.sh scripts/bootstrap.sh scripts/common.sh
   scripts/healthcheck.sh scripts/doctor.sh scripts/package-release.sh scripts/release-gate.py scripts/restore.sh
   scripts/rollback.sh scripts/snapshot.sh scripts/wizard.sh scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh
   scripts/configuration.sh scripts/provider.sh scripts/provider-adapter.js scripts/knowledge.sh
   scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py
+  scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py
   scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
   scripts/materials.sh scripts/logs.sh scripts/log-redact.py
   docs/ARCHITECTURE.md docs/CONFIG.md docs/INSTALL.md docs/RELEASE.md
@@ -93,6 +94,8 @@ RELEASE_FILES=(
   tests/test_feedback_runtime.js tests/test_provider_pool.js tests/test_runtime_provider_pool.js tests/test_provider_lifecycle.js
   tests/test_outgoing_identity.js tests/owned_outgoing.py tests/test_provider_log_redaction.py
   tests/test_rag_context.py tests/test_snapshot_live.py
+  tests/test_knowledge_context.js tests/test_knowledge_runtime.js tests/test_knowledge_lexical.js tests/test_knowledge_hybrid.js
+  tests/test_knowledge_profile.py tests/test_knowledge_profile_integration.sh
   tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
   tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
   tests/test_get.sh tests/test_doctor.sh tests/test_doctor_pool.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
@@ -125,9 +128,10 @@ for required in VERSION get.sh install.sh manage.sh update.sh uninstall.sh docke
   scripts/common.sh scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh \
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/provider-adapter.js \
   scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh \
+  scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py \
   scripts/launcher.sh scripts/doctor.sh scripts/migration.sh scripts/full-backup.sh scripts/archive-guard.py \
   scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
-  n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js config/app.yaml config/provider.yaml.example; do
+  n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/web-chat.js config/app.yaml config/provider.yaml.example; do
   grep -zFxq -- "$required" "$LIST_FILE" \
     || { printf '错误：发布清单缺少必要文件：%s\n' "$required" >&2; exit 1; }
 done

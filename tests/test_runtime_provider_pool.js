@@ -1,6 +1,6 @@
 'use strict';
 
-// 生产 runtime → HTTP 协议 RAG → 生产 adapter → HTTP 上游；不是真实 AnythingLLM/Crisp E2E。
+// 生产 runtime → HTTP 知识检索 → runtime → 生产 adapter → HTTP 上游；不是真实 AnythingLLM/Crisp E2E。
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -31,8 +31,13 @@ async function fixture(label) {
   const menu=read(path.join(root,'config/menu.yaml'));menu.welcome.enabled=false;write(path.join(root,'config/menu.yaml'),menu);
   const prompt='用户原文规则：结合知识与公开历史回答。';fs.writeFileSync(path.join(root,'config/prompt.md'),prompt);
   write(path.join(root,'config/runtime.yaml'),{schema_version:2,enabled:true,revision:1,applied_revision:1});
+  const projection='kb_1111111111111111_doc_2222222222222222.md';
+  write(path.join(root,'data/runtime/knowledge-map.json'),{schema_version:2,revision:1,documents:[{
+    library_id:'kb_1111111111111111',library_name:'合成处理资料',document_id:'doc_2222222222222222',projection,
+    location:'custom-documents/'+projection+'-33333333-3333-4333-8333-333333333333.json',
+  }]});
   let sequence=10000, runtime;
-  const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,adapterRestarts:0,answerResponses:[],sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
+  const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,adapterRestarts:0,answerRequests:[],answerResponses:[],sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
   const upstream=http.createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw||'{}');
     const index=Number(/^\/p(\d)\//.exec(req.url)?.[1]);
@@ -66,17 +71,24 @@ async function fixture(label) {
     await new Promise(resolve=>adapter.listen(0,'127.0.0.1',resolve));adapterBase=`http://127.0.0.1:${adapter.address().port}`;
   };
   await startAdapter();
-  const postAdapter=async(body,headers={})=>{
-    const response=await fetch(adapterBase+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body)});
+  const postAdapter=async(body,headers={},timeout=10000)=>{
+    const response=await fetch(adapterBase+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
     return{status:response.status,body:await response.json()};
   };
   const rag=http.createServer(async(req,res)=>{
+    assert.equal(req.headers.authorization,'Bearer synthetic-rag-key');
+    if(req.method==='GET'){
+      assert.equal(req.url,'/api/v1/workspace/synthetic');
+      res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({workspace:{slug:'synthetic',openAiTemp:0.35}}));return;
+    }
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);tasks.push(body);
-    // 协议 fixture 仅模拟 RAG 附加知识的消息布局，信封仍由生产 runtime 签名。
-    if(f.beforeAnswer)await f.beforeAnswer(body);
-    const response=await postAdapter({model:'anythingllm-compat-model',messages:[{role:'system',content:f.ragSystem ?? prompt+'\n启用知识：合成处理码是蓝色。'},{role:'user',content:body.message}]});
-    f.answerResponses.push(response);
-    res.writeHead(response.status,{'content-type':'application/json'});res.end(JSON.stringify(response.status===200?{textResponse:response.body.choices[0].message.content,sources:[{docpath:'synthetic/blue.json',score:0.9}]}:{error:'controlled-inference-failure'}));
+    assert.equal(req.method,'POST');assert.equal(req.url,'/api/v1/workspace/synthetic/vector-search');
+    assert.equal(typeof body.query,'string');assert(!JSON.stringify(body).includes('CRISPAI_PROVIDER_CONTEXT'));
+    // 固定官方检索响应；该服务不生成答案、不持有内部 adapter Key，也不构造信封。
+    res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({results:[{
+      id:'44444444-4444-4444-8444-444444444444',text:'合成处理码是蓝色，保存后可再次尝试。',
+      metadata:{title:projection},distance:0.1,score:0.9,
+    }]}));
   });
   await new Promise(resolve=>rag.listen(0,'127.0.0.1',resolve));
   const env={CRISP_WEBSITE_ID:'11111111-1111-4111-8111-111111111111',CRISP_WEBSITE_HOOK_SECRET:'synthetic-hook-only',CRISP_AUTH_B64:'synthetic-crisp-auth',ANYTHINGLLM_WORKSPACE:'synthetic',ANYTHINGLLM_API_KEY:'synthetic-rag-key',PROVIDER_ADAPTER_KEY:internal,PROVIDER_POOL_REQUIRED:'true',PROVIDER_ADAPTER_URL:adapterBase+'/v1',ANYTHINGLLM_INTERNAL_URL:`http://127.0.0.1:${rag.address().port}`};
@@ -98,7 +110,21 @@ async function fixture(label) {
       throw Error('未知合成 Crisp 路由');
     }
     assert.equal(parsed.hostname,'127.0.0.1');
-    if(options.headers?.['x-crispai-question'])f.visionRequest={body:structuredClone(options.body),headers:structuredClone(options.headers),envelope:verifyEnvelope(options.headers['x-crispai-question'],internal)};
+    if(options.headers?.['x-crispai-question']){
+      assert.equal(parsed.pathname,'/v1/chat/completions');
+      const captured={body:structuredClone(options.body),headers:structuredClone(options.headers),envelope:verifyEnvelope(options.headers['x-crispai-question'],internal)};
+      if(captured.envelope.stage==='vision')f.visionRequest=captured;
+      else {
+        assert.equal(captured.envelope.stage,'answer');assert.equal(captured.body.temperature,0.35);f.answerRequests.push(structuredClone(captured));
+        if(f.beforeAnswer)await f.beforeAnswer(captured);
+        // 在实际 adapter 之前扰动载荷，以保留完整 Prompt 守卫负例。
+        if(f.answerSystem!==undefined)captured.body.messages[0].content=f.answerSystem;
+      }
+      // 重启会更换本地随机端口；始终解析当前 adapter，模拟部署中不变的服务地址。
+      const response=await postAdapter(captured.body,captured.headers,options.timeout||10000);
+      if(captured.envelope.stage==='answer')f.answerResponses.push(response);
+      return response;
+    }
     const response=await fetch(url,{method:options.method||'GET',headers:{'content-type':'application/json',...options.headers},body:options.body?JSON.stringify(options.body):undefined,signal:AbortSignal.timeout(options.timeout||10000)});
     return{status:response.status,body:await response.json()};
   };
@@ -121,14 +147,19 @@ async function fixture(label) {
 let passed=0;
 async function test(name,action){const f=await fixture('case-'+passed);try{await action(f);passed++;console.log('通过 UNIT/PROTOCOL：'+name);}finally{await f.close();}}
 (async()=>{
-  await test('文本经生产签名/RAG布局/主备到Responses，唯一答案且无评价',async f=>{
+  await test('文本经官方检索结构/生产签名/主备到Responses，唯一答案且无评价',async f=>{
     f.failed=new Set([0,1]);assert.equal((await f.deliver(f.event('session_pool_text1','请说明保存操作。'))).status,'sent');
     assert.deepEqual(f.calls.map(x=>x.index),[0,1,2]);assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
     assert.equal(f.calls[2].body.model,'synthetic-backup-2');assert(!JSON.stringify(f.calls).includes('CRISPAI_PROVIDER_CONTEXT'));assert(!f.sent[0].content.includes('是否解决'));
-    await f.deliver(f.event('session_pool_text1','是'));assert.equal(f.sent.length,2);assert.equal(f.tasks.length,2);assert(f.tasks[1].message.includes('保存操作'));assert(f.tasks[1].message.includes('访客当前问题：是'));
+    await f.deliver(f.event('session_pool_text1','是'));assert.equal(f.sent.length,2);assert.equal(f.tasks.length,2);
+    assert.equal(f.tasks[0].query,'请说明保存操作。');assert.equal(f.tasks[1].query,'是');
+    assert(f.answerRequests[1].body.messages.some(message=>message.role==='user'&&message.content.includes('保存操作')));
+    assert.equal(f.answerRequests[1].body.messages.at(-1).content,'是');
+    assert.equal(f.answerRequests[0].envelope.stage,'answer');assert.equal(f.answerRequests[0].body.messages[0].content,'用户原文规则：结合知识与公开历史回答。');
+    assert(JSON.stringify(f.calls[2].body).includes('合成处理码是蓝色'));
   });
-  await test('RAG丢失业务Prompt时不推理或遍历备用，仅自然澄清且重启不重识图',async f=>{
-    f.ragSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
+  await test('adapter前丢失业务Prompt时不推理或遍历备用，仅自然澄清且重启不重识图',async f=>{
+    f.answerSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
     const event=f.event('session_pool_prompt1','合成普通问题');
     assert.equal((await f.deliver(event)).status,'sent');assert.equal(f.calls.length,0);assert.equal(f.sent.length,1);
     assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'context_preparation_incomplete');
@@ -144,7 +175,7 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     f.publish(pool=>{pool.policy.max_attempts=3;});f.failed=new Set([0]);f.failAnswer=true;
     const event=f.event('session_pool_image1',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
     await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.calls.filter(x=>x.visual).length,2);assert.equal(f.sent.length,1);assert.equal(f.state(event.data.session_id).mode,'ai');
-    assert(f.tasks[0].message.includes('蓝色保存按钮'));f.restart();await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.sent.length,1);
+    assert(f.tasks[0].query.includes('蓝色保存按钮'));f.restart();await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.sent.length,1);
   });
   await test('主备等待时真人优先暂停A，B独立回复，不续尝试不发送迟到A答案',async f=>{
     f.slow=true;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
@@ -162,15 +193,16 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
   });
   await test('A19 视觉后重启adapter仍共享真实总期限和累计次数，重放缓存不再次识图',async f=>{
     f.publish(pool=>{Object.assign(pool.policy,{question_timeout_ms:3000,call_timeout_ms:2500,connect_timeout_ms:100,max_attempts:4});});
-    let answerClosed=false,beforeRestart,afterRestart,replay,answerEnvelope,visionCallsBefore;
+    let answerClosed=false,answerClosedAt,beforeRestart,afterRestart,replay,answerEnvelope,visionCallsBefore,resolveAnswerClosed;
+    const answerClosedEvent=new Promise(resolve=>{resolveAnswerClosed=resolve;});
     f.behavior=async(call,response)=>{
       if(call.visual){await wait(call.index===0?250:700);if(call.index===0){response.writeHead(503);response.end('{}');return true;}return false;}
       if(call.index===1){await wait(350);response.writeHead(503);response.end('{}');return true;}
-      if(call.index===2){response.once('close',()=>{answerClosed=true;});return true;}
+      if(call.index===2){response.once('close',()=>{answerClosed=true;answerClosedAt=Date.now();resolveAnswerClosed();});return true;}
       return false;
     };
-    f.beforeAnswer=async body=>{
-      answerEnvelope=f.decode(/\[\[CRISPAI_PROVIDER_CONTEXT_V1:([A-Za-z0-9_.-]+)\]\]/.exec(body.message)[1]);
+    f.beforeAnswer=async request=>{
+      answerEnvelope=f.decode(request.headers['x-crispai-question']);
       beforeRestart=f.question(answerEnvelope.question_id);visionCallsBefore=f.calls.length;
       await f.restartAdapter();replay=await f.replayVision();afterRestart=f.question(answerEnvelope.question_id);
     };
@@ -179,9 +211,15 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.adapterRestarts,1);assert.equal(beforeRestart.attempts,2);assert.equal(afterRestart.attempts,2);assert.equal(visionCallsBefore,2);assert.equal(replay.status,200);assert.equal(replay.body.choices[0].message.content,'合成图片中是蓝色保存按钮。');
     assert.equal(f.visionRequest.envelope.stage,'vision');assert.equal(answerEnvelope.stage,'answer');assert.equal(f.visionRequest.envelope.question_id,answerEnvelope.question_id);assert.equal(f.visionRequest.envelope.deadline_at,answerEnvelope.deadline_at);
     assert.equal(beforeRestart.deadline,answerEnvelope.deadline_at);assert.equal(afterRestart.deadline,beforeRestart.deadline);assert.equal(stored.deadline,beforeRestart.deadline);assert.equal(stored.attempts,4);
-    assert.deepEqual(f.calls.map(call=>call.index),[0,1,1,2]);assert.equal(f.calls.filter(call=>call.visual).length,2);assert.equal(f.tasks.length,1);assert.match(f.tasks[0].message,/蓝色保存按钮/);
+    assert.deepEqual(f.calls.map(call=>call.index),[0,1,1,2]);assert.equal(f.calls.filter(call=>call.visual).length,2);assert.equal(f.tasks.length,1);assert.match(f.tasks[0].query,/蓝色保存按钮/);
     assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'question_timeout');assert.equal(stored.terminal.code,'question_timeout');assert.equal(stored.stages.answer.result,undefined);
-    assert.ok(ended>=stored.deadline);assert.ok(ended-stored.deadline<700);assert.ok(ended-f.calls[0].at<3700);assert.ok(ended-f.calls.at(-1).at<2200);assert.equal(answerClosed,true);
+    assert.ok(ended>=stored.deadline);assert.ok(ended-stored.deadline<700);assert.ok(ended-f.calls[0].at<3700);assert.ok(ended-f.calls.at(-1).at<2200);
+    // 直接 adapter 回程不再多经过 RAG HTTP；给同进程 socket 的 close 事件有限派发时间。
+    await Promise.race([answerClosedEvent,wait(100)]);
+    write(path.join(f.root,'deadline-observation.json'),{deadline:stored.deadline,returned_at:ended,
+      upstream_closed:answerClosed,upstream_closed_at:answerClosedAt??null,close_event_wait_max_ms:100,
+      attempts:stored.attempts,vision_attempts:f.calls.filter(call=>call.visual).length});
+    assert.equal(answerClosed,true);assert.ok(answerClosedAt<=ended+100);
     assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。');assert.equal(f.state(event.data.session_id).mode,'ai');
     f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
   });

@@ -35,10 +35,13 @@ if [[ "${1:-}" == version ]]; then
   exit 0
 fi
 
+project_directory=''
+compose_env_file=''
 while (( $# > 0 )); do
   case "$1" in
-    --project-directory) shift 2 ;;
-    --env-file|-f|--profile) shift 2 ;;
+    --project-directory) project_directory=$2; shift 2 ;;
+    --env-file) compose_env_file=$2; shift 2 ;;
+    -f|--profile) shift 2 ;;
     *) break ;;
   esac
 done
@@ -91,7 +94,116 @@ case "$command" in
     ;;
   exec)
     joined=" $* "
-    if [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
+    if [[ $# == 4 && "$1" == -T && "$2" == n8n && "$3" == node && "$4" == /opt/crisp-ai/n8n/admin-query.js ]]; then
+      [[ "$project_directory" == "${DOCTOR_FIXTURE_DEPLOY:?}" \
+        && "$compose_env_file" == "${DOCTOR_FIXTURE_DEPLOY}/.env" ]] || exit 1
+      service_stopped n8n && exit 1
+      # 实际执行部署副本的管理员 CLI/runtime；仅网络由严格协议替身接管。
+      # 不回显 stdin、Prompt、认证或答案，未实现的目标一律失败。
+      node -e '
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const root = process.argv[1];
+const read = name => JSON.parse(fs.readFileSync(root + "/" + name, "utf8"));
+const binding = JSON.parse(fs.readFileSync(process.env.DOCTOR_FIXTURE_RUNTIME_ENV_FILE, "utf8")).n8n;
+const legacy = binding.length === 16;
+assert(legacy || binding.length === 13);
+const env = {ANYTHINGLLM_API_KEY: binding[8], ANYTHINGLLM_WORKSPACE: binding[9],
+  ANYTHINGLLM_INTERNAL_URL: "http://anythingllm:3001",
+  ...(legacy ? {AI_API_BASE_URL: binding[10], AI_API_KEY: binding[11], AI_MODEL: binding[12],
+    AI_API_MODE: binding[13], AI_CUSTOM_HEADERS_JSON: binding[14], PROVIDER_POOL_REQUIRED: "false"}
+  : {PROVIDER_ADAPTER_URL: binding[10], PROVIDER_ADAPTER_KEY: binding[11], PROVIDER_POOL_REQUIRED: binding[12]})};
+const applied = read("config/materials-applied.json");
+const expectedWorkspaceReads = applied.knowledge.settings_sha256 ? 0 : 1;
+const mapping = read("data/runtime/knowledge-map.json");
+assert.equal(mapping.documents.length, 1);
+const document = mapping.documents[0];
+const fragment = fs.readFileSync(root + "/knowledge/kb_default/sources/doc_1111111111111111.md", "utf8");
+const log = message => { if (process.env.DOCTOR_FIXTURE_LOG) fs.appendFileSync(process.env.DOCTOR_FIXTURE_LOG, "admin-query " + message + "\n"); };
+let question, budget, deadline, workspaceRead = 0, searched = 0, generated = 0;
+const request = async (url, options) => {
+  const parsed = new URL(url);
+  assert(Number.isFinite(options.timeout) && options.timeout > 0 && options.timeout <= budget + 1000);
+  if (parsed.origin === "http://anythingllm:3001") {
+    const workspacePath = "/api/v1/workspace/" + encodeURIComponent(env.ANYTHINGLLM_WORKSPACE);
+    assert.equal(options.headers.Authorization, "Bearer " + env.ANYTHINGLLM_API_KEY);
+    if (parsed.pathname === workspacePath) {
+      assert.equal(options.method || "GET", "GET"); assert.equal(++workspaceRead, expectedWorkspaceReads);
+      log("workspace-read=true");
+      if (process.env.DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL === "1") return {status: 401, body: {error: true}};
+      return {status: 200, body: {workspace: {slug: env.ANYTHINGLLM_WORKSPACE, openAiTemp: 0.35}}};
+    }
+    assert.equal(options.method, "POST"); assert.equal(workspaceRead, expectedWorkspaceReads);
+    assert.equal(parsed.pathname, workspacePath + "/vector-search");
+    assert.deepEqual(options.body, {query: question});
+    assert.equal(++searched, 1);
+    log("vector-search pure-query=true");
+    if (process.env.DOCTOR_FIXTURE_ANYTHING_AUTH_FAIL === "1") return {status: 401, body: {error: true}};
+    if (process.env.DOCTOR_FIXTURE_RETRIEVAL_FAIL === "1") return {status: 200, body: {error: "synthetic_retrieval_failure"}};
+    return {status: 200, body: {results: [{id: "doctor-synthetic-chunk", text: fragment,
+      metadata: {title: process.env.DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN === "1" ? "unmapped.md" : document.projection}, distance: 0.1, score: 0.9}]}};
+  }
+  assert.equal(options.method, "POST");
+  assert.equal(searched, 1);
+  const expectedBase = new URL(legacy ? env.AI_API_BASE_URL : env.PROVIDER_ADAPTER_URL);
+  assert.equal(parsed.origin, expectedBase.origin);
+  assert.equal(parsed.pathname, expectedBase.pathname + (legacy && env.AI_API_MODE === "responses" ? "/responses" : "/chat/completions"));
+  assert.equal(options.headers.Authorization, "Bearer " + (legacy ? env.AI_API_KEY : env.PROVIDER_ADAPTER_KEY));
+  assert.equal(++generated, 1);
+  if (!legacy) {
+    const [payload, signature] = options.headers["x-crispai-question"].split(".");
+    assert.equal(signature, crypto.createHmac("sha256", env.PROVIDER_ADAPTER_KEY).update("crispai-provider-v1\0" + payload).digest("hex"));
+    const envelope = JSON.parse(Buffer.from(payload, "base64url"));
+    assert.equal(envelope.scope, "admin"); assert.equal(envelope.stage, "answer");
+    assert.match(envelope.question_id, /^[a-f0-9]{64}$/);
+    assert.equal(envelope.pool_revision, read("config/provider-pool-applied.json").revision);
+    assert.equal(envelope.runtime_revision, applied.revision);
+    assert(!Object.hasOwn(envelope, "session_key") && !Object.hasOwn(envelope, "generation"));
+    assert(envelope.deadline_at > Date.now() && envelope.deadline_at <= deadline);
+  }
+  const messages = (options.body.messages || options.body.input).map(message => ({role: message.role,
+    content: Array.isArray(message.content) ? message.content.map(part => part.text).join("") : message.content}));
+  assert.equal(options.body.temperature, 0.35);
+  assert.equal(messages[0].role, "system"); assert.equal(messages[0].content, applied.prompt.text);
+  assert.deepEqual(messages.at(-1), {role: "user", content: question});
+  assert(messages[1].content.includes("不得主动邀请用户评价"));
+  const citation = messages.find(message => message.role === "system" && message.content.includes("\n{\"knowledge\":"));
+  const knowledge = JSON.parse(citation.content.slice(citation.content.indexOf("\n") + 1)).knowledge;
+  assert.equal(knowledge.length, 1); assert.equal(knowledge[0].text, fragment);
+  assert.equal(knowledge[0].source.projection, document.projection);
+  log("generation path=" + (legacy && env.AI_API_MODE === "responses" ? "/responses" : "/chat/completions")
+    + " prompt-complete=true knowledge-complete=true scope=" + (legacy ? "legacy" : "admin"));
+  if (process.env.DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS) await new Promise(resolve => setTimeout(resolve, Number(process.env.DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS) * 1000));
+  if (process.env.DOCTOR_FIXTURE_PROVIDER_FAIL === "1") return {status: 503, body: {error: "synthetic_provider_failure"}};
+  return {status: 200, body: legacy && env.AI_API_MODE === "responses"
+    ? {output_text: "合成协议连接正常"} : {choices: [{message: {role: "assistant", content: "合成协议连接正常"}}]}};
+};
+const moduleValue = require(root + "/n8n/runtime.js");
+const createRuntime = moduleValue.createRuntime;
+moduleValue.createRuntime = (_, options) => {
+  assert.equal(options.allowAdmin, true);
+  const runtime = createRuntime(env, {...options, root, request});
+  return {administratorQuery: async (input, budgetMs) => {
+    assert.equal(typeof input, "string"); assert(input.trim() && Buffer.byteLength(input) <= 8000);
+    assert(!input.includes("CRISPAI_PROVIDER_CONTEXT_V1:"));
+    assert(Number.isSafeInteger(budgetMs) && budgetMs >= 0 && budgetMs <= 180000);
+    if (process.env.DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET) assert.equal(budgetMs, Number(process.env.DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET));
+    if (process.env.DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256) assert.equal(crypto.createHash("sha256").update(input).digest("hex"), process.env.DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256);
+    question = input;
+    const maximum = legacy ? 90000 : read("config/provider-pool-applied.json").policy.question_timeout_ms;
+    budget = Math.min(budgetMs || maximum, maximum); deadline = Date.now() + budget + 100;
+    log("input-via-stdin=true budget_ms=" + budgetMs);
+    log("settings-source=" + (expectedWorkspaceReads ? "legacy-workspace-read" : "applied-projection"));
+    const result = await runtime.administratorQuery(input, budgetMs);
+    assert.equal(workspaceRead, expectedWorkspaceReads); assert.equal(searched, 1); assert.equal(generated, 1);
+    assert.deepEqual(result.sources, [document.location]);
+    return process.env.DOCTOR_FIXTURE_ADMIN_INVALID_RESULT === "1" ? {...result, verified: false} : result;
+  }};
+};
+require(root + "/n8n/admin-query.js");
+' "$DOCTOR_FIXTURE_DEPLOY"
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
       expected=$(cat)
       actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/scripts/provider-adapter.js" | awk '{print $1}')
       [[ "${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
@@ -166,31 +278,38 @@ if len(expected)!=len(actual) or not all(hmac.compare_digest(left,right) for lef
       # SIGTTIN 并一直停到超时。测试夹具主动读一次，以锁定该回归。
       if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
       [[ "${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" != 1 ]] || exit 1
-      python3 - "${DOCTOR_FIXTURE_DEPLOY:?}" <<'PY'
-import hashlib
-import json
+      # 执行生产 doctor 实际传入的 Node 校验正文，避免桩复制旧算法却假绿。
+      python3 - "${DOCTOR_FIXTURE_DEPLOY:?}" "$@" <<'PY'
+import os
 import pathlib
 import re
+import shlex
+import subprocess
 import sys
 
 deploy = pathlib.Path(sys.argv[1])
-workflow = json.loads((deploy / "n8n/workflow.json").read_text(encoding="utf-8"))
-runtime_file = (deploy / "n8n/runtime.js").read_text(encoding="utf-8")
-version = (deploy / "VERSION").read_text(encoding="utf-8").strip()
-source = re.sub(r"^if \(typeof module[^\n]+\n?$", "", runtime_file, count=1, flags=re.MULTILINE)
-source = re.sub(r"ai_support_version: 'v[^']+'", f"ai_support_version: '{version}'", source)
-metadata = workflow.get("meta", {})
-if metadata.get("runtimeFileSha256") != hashlib.sha256(runtime_file.encode()).hexdigest():
-    raise SystemExit(1)
-if metadata.get("runtimeSha256") != hashlib.sha256(source.encode()).hexdigest():
-    raise SystemExit(1)
-prefix = source + "\nconst runtime = createRuntime($env);\n"
-by_name = {node.get("name"): node for node in workflow.get("nodes", [])}
-for name in ("校验并持久接收", "处理持久任务", "扫描持久会话与任务", "只读公开显示选项"):
-    if not str(by_name.get(name, {}).get("parameters", {}).get("jsCode", "")).startswith(prefix):
-        raise SystemExit(1)
+command = sys.argv[2:]
+assert command[:4] == ["-T", "n8n", "sh", "-ec"]
+shell, parameters = command[4], command[5:]
+assert parameters[0] == "sh"
+before, remainder = shell.split("<<'NODE'\n", 1)
+source, _ = remainder.split("\nNODE\n", 1)
+call = shlex.split(before.splitlines()[-1])
+assert call[:2] == ["node", "-"]
+paths = {"$output": deploy / "n8n/workflow.json",
+         "/opt/crisp-ai/n8n/runtime.js": deploy / "n8n/runtime.js",
+         "/opt/crisp-ai/n8n/knowledge-lexical.js": pathlib.Path(os.environ.get(
+             "DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE", str(deploy / "n8n/knowledge-lexical.js")))}
+arguments = []
+for token in call[2:]:
+    if token in paths:
+        arguments.append(str(paths[token]))
+    elif re.fullmatch(r"\$[1-9][0-9]*", token):
+        arguments.append(parameters[int(token[1:])])
+    else:
+        raise SystemExit(2)
+raise SystemExit(subprocess.run(["node", "-", *arguments], input=source, text=True, check=False).returncode)
 PY
-      printf 'verified\n'
     elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/internal/provider/status'* ]]; then
       if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
       [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1

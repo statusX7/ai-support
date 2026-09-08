@@ -93,6 +93,9 @@ PRODUCTION_EXECUTABLES=(
   scripts/doctor.sh
   scripts/materials.sh
   scripts/logs.sh
+  scripts/knowledge-profile.sh
+  scripts/knowledge-profile.py
+  scripts/knowledge-lexical.py
 )
 for relative in "${PRODUCTION_EXECUTABLES[@]}"; do
   require_executable_file "${PROJECT_ROOT}/${relative}"
@@ -145,6 +148,18 @@ for script_name in bootstrap.sh wizard.sh package-release.sh; do
   ' "${PROJECT_ROOT}/scripts/rollback.sh")
   grep -Fq "$script_name" <<< "$ROLLBACK_SCRIPT_LIST" \
     || fail "回滚恢复清单未包含 ${script_name}"
+done
+for script_name in knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
+  grep -Fq "$script_name" "${PROJECT_ROOT}/scripts/snapshot.sh" \
+    || fail "v1.2.1 快照清单未包含 ${script_name}"
+  grep -Fq "$script_name" "${PROJECT_ROOT}/scripts/rollback.sh" \
+    || fail "v1.2.1 回滚校验或同步未覆盖 ${script_name}"
+done
+for runtime_name in runtime.js admin-query.js knowledge-lexical.js; do
+  grep -Fq "$runtime_name" "${PROJECT_ROOT}/scripts/snapshot.sh" \
+    || fail "v1.2.1 快照未要求 n8n/${runtime_name}"
+  grep -Fq "$runtime_name" "${PROJECT_ROOT}/scripts/rollback.sh" \
+    || fail "v1.2.1 回滚未同步 n8n/${runtime_name}"
 done
 assert_contains "${PROJECT_ROOT}/manage.sh" \
   'SCRIPT_DIR[^\n]*install\.sh|\$\{SCRIPT_DIR\}/install\.sh' \
@@ -319,7 +334,8 @@ for relative in scripts/common.sh docker-compose.yml n8n/workflow.json \
   config/app.yaml config/provider.yaml.example config/prompt.md.example config/runtime.yaml.example knowledge/README.md \
   scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/knowledge.sh \
   scripts/provider.sh scripts/provider-adapter.js scripts/migration.sh scripts/full-backup.sh \
-  scripts/crisp-settings.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/web-chat.js \
+  scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py \
+  scripts/crisp-settings.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/web-chat.js \
   scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
   docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md; do
   require_regular_file "${PACKAGE_ROOT}/${relative}"

@@ -15,7 +15,8 @@ import sys
 
 CHECKS = {
     "candidate_installed", "production_files_match", "command_menu_doctor",
-    "text_knowledge_image_no_rating", "welcome_state_verified", "failover_real_upstream",
+    "text_knowledge_image_no_rating", "exact_knowledge_answer_verified",
+    "welcome_state_verified", "failover_real_upstream",
     "handoff_isolation_cancellation", "restart_new_login", "fixtures_removed_settings_restored",
     "services_running", "privacy_scan_passed", "neutral_display_no_bot_badge",
 }

@@ -15,7 +15,7 @@ async function main() {
   fs.mkdirSync(evidenceRoot, {recursive:true});
   const work = fs.mkdtempSync(path.join(evidenceRoot, 'materials-'));
   const deploy = path.join(work, 'deploy');
-  for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','bin']) {
+  for (const directory of ['config','knowledge','tmp','data/runtime','data/anythingllm/documents/custom-documents','backups/config-history','bin']) {
     fs.mkdirSync(path.join(deploy, directory), {recursive:true});
   }
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=ready\n',{mode:0o600});
@@ -69,7 +69,9 @@ async function main() {
     if(request.url==='/api/v1/document/upload') {
       const filename=/filename="([^"]+)"/.exec(data.toString('latin1'))?.[1] || `document-${sequence}`;
       const location=`custom-documents/${filename}.${++sequence}.json`;
-      documents.set(location,{filename});send(200,{success:true,documents:[{location}]});return;
+      documents.set(location,{filename});
+      fs.writeFileSync(path.join(deploy,'data/anythingllm/documents',location),JSON.stringify({pageContent:`# ${filename}\n虚构资料正文。\n`})+'\n',{mode:0o600});
+      send(200,{success:true,documents:[{location}]});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update-embeddings') {
       embeddingUpdates++;
@@ -78,7 +80,10 @@ async function main() {
       send(200,{success:true});return;
     }
     if(request.url==='/api/v1/system/remove-documents') {
-      for(const name of body.names||[]) documents.delete(name);
+      for(const name of body.names||[]) {
+        documents.delete(name);
+        fs.rmSync(path.join(deploy,'data/anythingllm/documents',name),{force:true});
+      }
       send(200,{success:true});return;
     }
     send(404,{error:true});
@@ -184,6 +189,12 @@ async function main() {
     assert.equal(rolledBack.state,'applied');assert.equal(rolledBack.prompt.text,oldAppliedPrompt);
     assert.equal(prompt,oldAppliedPrompt);assert.equal(rolledBack.revision,oldRevision+2);
     assert.equal(fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'),failedPrompt);
+    for(const name of ['knowledge-map.json','knowledge-settings.json','knowledge-lexical.json']) {
+      const restored=path.join(deploy,'data/runtime',name),info=fs.statSync(restored);
+      assert.equal(info.mode&0o777,0o640,`${name} 恢复权限`);
+      if(typeof process.getuid==='function'&&process.getuid()===0) {assert.equal(info.uid,0);assert.equal(info.gid,1000);}
+    }
+    assert.equal(sha(path.join(deploy,'data/runtime/knowledge-lexical.json')),rolledBack.knowledge.lexical_sha256);
     assert.equal(JSON.parse((await invoke(['status'])).stdout).pending,true);
     pass('Prompt 已写外部而知识失败时恢复旧外部状态、旧投影以新代次生效且保留待修原文');
 

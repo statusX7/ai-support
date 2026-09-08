@@ -999,7 +999,7 @@ wizard_show_summary() {
   else
     printf '  知识库：已选择 %s 个支持文件\n' "$WIZARD_KNOWLEDGE_FILES"
   fi
-  printf '  新实例默认：客服启用；关键词展示确认按钮；人工恢复 1800 秒；欢迎启用；自动展开关闭。\n'
+  printf '  新实例默认：客服启用；关键词展示确认按钮；人工恢复 3600 秒；欢迎启用；自动展开关闭。\n'
   printf '  已有实例：保留合法的自定义启停、欢迎和恢复设置。\n'
 }
 

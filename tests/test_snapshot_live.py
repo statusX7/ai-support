@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +13,7 @@ import select
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -24,8 +27,8 @@ REAL_DU = shutil.which("du")
 REAL_PYTHON = shutil.which("python3")
 
 
-def production_function(name: str) -> str:
-    text = SOURCE.read_text(encoding="utf-8")
+def production_function(name: str, source=SOURCE) -> str:
+    text = source.read_text(encoding="utf-8")
     match = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}", text, re.M | re.S)
     if not match:
         raise AssertionError("未找到生产快照函数：" + name)
@@ -387,6 +390,157 @@ class SnapshotLiveTests(unittest.TestCase):
                 if process is not None and process.poll() is None:
                     process.kill()
                     process.communicate(timeout=3)
+
+    def test_13_pending_knowledge_migration_is_rejected(self):
+        """知识迁移的任何尚存标记都拒绝，不解析坏文件或跟随链接。"""
+        self.assertEqual(self.run_function("pending").returncode, 0)
+        pending = self.tree / "knowledge-migration.json"
+        for kind in ("file", "malformed", "dangling", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                if kind in ("file", "malformed"):
+                    pending.write_text('{"state":"applying"}' if kind == "file" else "{", encoding="utf-8")
+                elif kind == "dangling":
+                    pending.symlink_to(self.tree / "missing")
+                elif kind == "fifo":
+                    os.mkfifo(pending)
+                else:
+                    pending.mkdir()
+                try:
+                    result = self.run_function("pending")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("知识迁移", result.stderr)
+                    self.assertTrue(pending.exists() or pending.is_symlink())
+                finally:
+                    pending.rmdir() if kind == "directory" else pending.unlink()
+
+    def test_14_same_version_knowledge_capabilities_are_complete_or_absent(self):
+        """旧候选全无可用；六模块部分、链接、运行文件缺失及伪装旧代均拒绝。"""
+        name = "knowledge_snapshot_modules_check"
+        definition = production_function(name)
+        self.assertEqual(definition, production_function(name, ROOT / "scripts/rollback.sh"))
+        for relative in ("scripts", "n8n", "config"):
+            (self.base / relative).mkdir()
+        runtime = self.base / "n8n/runtime.js"
+        runtime.write_text("synthetic-runtime", encoding="utf-8")
+        workflow = self.base / "n8n/workflow.json"
+        workflow.write_text('{"meta":{}}', encoding="utf-8")
+        modules = [self.base / relative for relative in (
+            "scripts/knowledge-component.js", "scripts/knowledge-profile.py",
+            "scripts/knowledge-profile.sh", "scripts/knowledge-lexical.py",
+            "n8n/admin-query.js", "n8n/knowledge-lexical.js")]
+
+        def run():
+            script = "set -euo pipefail\ndie(){ printf '%s\\n' \"$*\" >&2; exit 1; }\n" + definition
+            script += '\nknowledge_snapshot_modules_check "$1"\nprintf "%s\\n" "$KNOWLEDGE_SNAPSHOT_HAS_P0"\n'
+            return subprocess.run(["bash", "-c", script, "--", str(self.base)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+
+        self.assertEqual((run().returncode, run().stdout.strip()), (0, "0"))
+        for module in modules:
+            module.write_text("synthetic-module", encoding="utf-8")
+        self.assertEqual((run().returncode, run().stdout.strip()), (0, "1"))
+        for module in modules:
+            with self.subTest(missing=module.name):
+                module.unlink()
+                self.assertNotEqual(run().returncode, 0)
+                module.write_text("synthetic-module", encoding="utf-8")
+        for kind in ("symlink", "dangling", "fifo"):
+            with self.subTest(kind=kind):
+                modules[0].unlink()
+                if kind == "fifo":
+                    os.mkfifo(modules[0])
+                else:
+                    modules[0].symlink_to(runtime if kind == "symlink" else self.base / "missing")
+                self.assertNotEqual(run().returncode, 0)
+                modules[0].unlink()
+                modules[0].write_text("synthetic-module", encoding="utf-8")
+        runtime.unlink()
+        self.assertNotEqual(run().returncode, 0)
+        runtime.write_text("synthetic-runtime", encoding="utf-8")
+        for module in modules:
+            module.unlink()
+        workflow.write_text(json.dumps({"meta": {"lexicalFileSha256": "a" * 64}}), encoding="utf-8")
+        self.assertNotEqual(run().returncode, 0)
+        workflow.write_text('{"meta":{}}', encoding="utf-8")
+        for filename in ("knowledge-profile.json", "knowledge-lexical.json"):
+            with self.subTest(state=filename):
+                marker = self.tree / filename
+                marker.write_text('{"state":"applied"}', encoding="utf-8")
+                self.assertNotEqual(run().returncode, 0)
+                marker.unlink()
+        applied = self.base / "config/materials-applied.json"
+        for field in ("profile_sha256", "lexical_sha256"):
+            with self.subTest(projection=field):
+                applied.write_text(json.dumps({"state": "applied", "knowledge": {field: "b" * 64}}), encoding="utf-8")
+                self.assertNotEqual(run().returncode, 0)
+        applied.unlink()
+        self.assertEqual(run().returncode, 0)
+
+    def test_15_projection_archive_allowance_is_exact_and_regular(self):
+        """只新增精确普通投影文件，目录、相近路径及所有链接类型仍拒绝。"""
+        entries = (
+            ("payload/data/knowledge-projection.json", tarfile.REGTYPE, 0),
+            ("payload/data/knowledge-projection.json", tarfile.DIRTYPE, 1),
+            ("payload/data/knowledge-projection.json/child", tarfile.REGTYPE, 1),
+            ("payload/data/knowledge-projection-other.json", tarfile.REGTYPE, 1),
+            ("payload/data/knowledge-projection.json", tarfile.SYMTYPE, 1),
+            ("payload/data/knowledge-projection.json", tarfile.LNKTYPE, 1),
+            ("payload/data/knowledge-projection.json", tarfile.FIFOTYPE, 1),
+        )
+        for index, (name, kind, expected) in enumerate(entries):
+            with self.subTest(name=name, kind=kind):
+                archive = self.base / f"projection-{index}.tar.gz"
+                with tarfile.open(archive, "w:gz") as output:
+                    item = tarfile.TarInfo(name)
+                    item.type = kind
+                    item.mode = 0o600
+                    if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                        item.linkname = "payload/data/synthetic-missing"
+                    data = b"[]\n" if kind == tarfile.REGTYPE else b""
+                    item.size = len(data)
+                    output.addfile(item, io.BytesIO(data))
+                result = subprocess.run([sys.executable, str(ROOT / "scripts/archive-guard.py"),
+                                         str(archive), "--kind", "snapshot"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_16_projection_restore_keeps_bytes_and_clears_a_newer_generation(self):
+        """调用真实恢复函数：投影逐字恢复0600；旧载荷无投影只移除该普通文件。"""
+        rollback = ROOT / "scripts/rollback.sh"
+        definitions = "\n".join(production_function(name, rollback) for name in
+                                ("validate_optional_version_file", "sync_optional_version_file"))
+        source = self.base / "snapshot-projection.json"
+        destination = self.base / "data/knowledge-projection.json"
+        untouched = self.base / "data/synthetic-unrelated.json"
+        untouched.write_text("keep", encoding="utf-8")
+
+        def run():
+            script = "set -euo pipefail\ndie(){ exit 1; }\ninfo(){ :; }\n" + definitions
+            script += '\nvalidate_optional_version_file "$1" "$2" data/knowledge-projection.json\n'
+            script += 'sync_optional_version_file "$1" "$2" 0600 data/knowledge-projection.json\n'
+            return subprocess.run(["bash", "-c", script, "--", str(source), str(destination)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+
+        value = b'[{"filename":"synthetic-projection.md","sha256":"synthetic-digest"}]\n'
+        source.write_bytes(value)
+        destination.write_text("newer-stale-generation", encoding="utf-8")
+        self.assertEqual(run().returncode, 0)
+        self.assertEqual(destination.read_bytes(), value)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        source.unlink()
+        self.assertEqual(run().returncode, 0)
+        self.assertFalse(destination.exists())
+        self.assertEqual(untouched.read_text(), "keep")
+        for kind in ("symlink", "dangling", "fifo"):
+            with self.subTest(destination=kind):
+                if kind == "fifo":
+                    os.mkfifo(destination)
+                else:
+                    destination.symlink_to(untouched if kind == "symlink" else source)
+                self.assertNotEqual(run().returncode, 0)
+                self.assertTrue(destination.exists() or destination.is_symlink())
+                self.assertEqual(untouched.read_text(), "keep")
+                destination.unlink()
 
 
 if __name__ == "__main__":
