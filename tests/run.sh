@@ -301,9 +301,57 @@ export PATH="${MOCK_DIR}:${ORIGINAL_PATH}"
 export MOCK_DOCKER_LOG="${TEST_ROOT}/docker.log"
 export MOCK_ANYTHING_STATE="${TEST_ROOT}/anythingllm-state.json"
 export MOCK_SYSTEMD_STATE="${TEST_ROOT}/systemd-state"
+export MOCK_CHOWN_ROOT="$TEST_ROOT"
 export CRISPAI_LOGS_SYSTEMD_TEST=1
 export CRISPAI_LOGS_SYSTEMD_DIR="${TEST_ROOT}/systemd"
 mkdir -p -- "$MOCK_SYSTEMD_STATE" "$CRISPAI_LOGS_SYSTEMD_DIR"
+python3 - "${MOCK_DIR}/chown" "$TEST_ROOT" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+command, parent = sys.argv[1], Path(sys.argv[2])
+root = parent / ".test-runtime.permissions"
+root.mkdir(mode=0o700)
+inside = root / "inside"
+inside.mkdir()
+item = inside / "普通文件.md"
+item.write_text("permission fixture\n", encoding="utf-8")
+outside = parent / "permission-outside"
+outside.write_text("outside sentinel\n", encoding="utf-8")
+original = (outside.read_bytes(), outside.stat().st_uid, outside.stat().st_gid)
+environment = dict(os.environ, MOCK_CHOWN_ROOT=str(root))
+
+def invoke(*args, expected, env=environment):
+    result = subprocess.run([command, *map(str, args)], env=env, capture_output=True)
+    assert result.returncode == expected, (args, result.returncode)
+
+invoke("-R", "root:1000", inside, expected=0)
+assert inside.stat().st_gid == 1000 and item.stat().st_gid == 1000
+without_scope = dict(environment)
+without_scope.pop("MOCK_CHOWN_ROOT")
+invoke("root:1000", outside, expected=0, env=without_scope)
+invoke("root:1000", outside, expected=1)
+invoke("root:1000", root, expected=1)
+invoke("root:1000", str(root) + "/../permission-outside", expected=1)
+invoke("--reference", outside, item, expected=1)
+link = root / "link"
+link.symlink_to(outside)
+invoke("root:1000", link, expected=1)
+link.unlink()
+os.link(outside, root / "hardlink")
+invoke("-R", "root:1000", inside, root / "hardlink", expected=1)
+(root / "hardlink").unlink()
+os.chown(item, 0, 0)
+invoke("root:1000", item, outside, expected=1)
+assert item.stat().st_gid == 0, "必须先检查全部目标，再执行真实 chown"
+root.chmod(0o755)
+invoke("root:1000", item, expected=1)
+root.chmod(0o700)
+assert (outside.read_bytes(), outside.stat().st_uid, outside.stat().st_gid) == original
+PY
+pass "生命周期权限夹具仅在受限临时根真实修改属主，拒绝越界、链接与不完整校验"
 STUB_HOST_FIXTURE="${TEST_ROOT}/host-fixture"
 mkdir -p -- "${STUB_HOST_FIXTURE}/etc/ssl/certs"
 printf '%s\n' 'ID=debian' 'VERSION_ID="12"' 'VERSION_CODENAME=bookworm' \

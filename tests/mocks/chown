@@ -1,5 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 桩测试不改变宿主机属主；真实 UID/GID 由部署集成检查验证。
-exit 0
+# 默认桩测试不改变属主；生命周期可显式启用仅限其受限临时根的真实权限操作。
+[[ -n "${MOCK_CHOWN_ROOT:-}" ]] || exit 0
+exec python3 - "$MOCK_CHOWN_ROOT" "$@" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+try:
+    root = Path(sys.argv[1])
+    args = sys.argv[2:]
+    if not root.is_absolute() or not re.fullmatch(r"\.test-runtime\.[A-Za-z0-9]+", root.name):
+        raise ValueError("root")
+    if any(parent.is_symlink() for parent in (root, *root.parents)):
+        raise ValueError("root link")
+    info = root.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("root permissions")
+    recursive = bool(args and args[0] == "-R")
+    parsed = args[1:] if recursive else args[:]
+    if len(parsed) < 2 or not re.fullmatch(r"(?:root|[0-9]+):(?:root|[0-9]+)", parsed[0]):
+        raise ValueError("arguments")
+    targets = parsed[1:]
+    for raw in targets:
+        path = Path(raw)
+        if not path.is_absolute() or ".." in path.parts or path == root or not path.is_relative_to(root):
+            raise ValueError("scope")
+        if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+            raise ValueError("control")
+        if any(parent.is_symlink() for parent in (path, *path.parents)):
+            raise ValueError("link")
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            info = current.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                if recursive:
+                    pending.extend(current.iterdir())
+            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("member")
+    os.execv("/usr/bin/chown", ["chown", *args])
+except (OSError, ValueError):
+    print("测试权限操作拒绝：只允许受限临时根内的普通文件和目录。", file=sys.stderr)
+    sys.exit(1)
+PY
