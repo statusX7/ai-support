@@ -33,6 +33,13 @@ case "$url" in
   http://127.0.0.1:*/api/ping)
     [[ "${DOCTOR_FIXTURE_ANYTHING_PING_FAIL:-0}" != 1 ]] || { status=503; body='{"error":true}'; }
     ;;
+  http://127.0.0.1:*/api/v1/workspace/*/chat)
+    if [[ "${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" == 1 ]]; then
+      status=503; body='{"error":"synthetic_provider_failure"}'
+    else
+      body='{"textResponse":"合成协议连接正常","sources":[]}'
+    fi
+    ;;
   http://127.0.0.1:*/api/v1/workspace/*)
     if [[ "${DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS:-0}" =~ ^[1-9][0-9]*$ ]]; then
       sleep "$DOCTOR_FIXTURE_DELAY_ANYTHING_SECONDS"

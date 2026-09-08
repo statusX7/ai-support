@@ -6,13 +6,14 @@ const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
+const {createAdapter} = require('../scripts/provider-adapter.js');
 const root = path.resolve(__dirname, '..');
 
 async function main() {
-  fs.mkdirSync(path.join(root,'.work'),{recursive:true});
-  const work = fs.mkdtempSync(path.join(root,'.work/configuration-contract-'));
+  fs.mkdirSync(path.join(root,'.work/v1.2.1'),{recursive:true});
+  const work = fs.mkdtempSync(path.join(root,'.work/v1.2.1/configuration-contract-'));
   const deploy = path.join(work,'deploy');
-  for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','n8n','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
+  for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','n8n','scripts','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=staged\n');
   fs.writeFileSync(path.join(deploy,'VERSION'),'v1.1.0\n');
   for (const name of ['keyword','handoff','menu','tags','feedback','provider']) {
@@ -23,6 +24,7 @@ async function main() {
   fs.copyFileSync(path.join(root,'config/prompt.md.example'),path.join(deploy,'config/prompt.md'));
   fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
   fs.copyFileSync(path.join(root,'n8n/workflow.json'),path.join(deploy,'n8n/workflow.json'));
+  for (const name of ['provider-adapter.js','provider-router.js','provider-envelope.js','provider-pool.py']) fs.copyFileSync(path.join(root,'scripts',name),path.join(deploy,'scripts',name));
   fs.copyFileSync(path.join(root,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker'));
   fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
   const documents = new Map(); let locations=[], prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'), sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
@@ -64,19 +66,41 @@ async function main() {
   const port=service.address().port;
   const secret='synthetic-secret-not-for-real-use';
   fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=${secret}\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nN8N_PORT=${port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=2\nLOCAL_HEALTH_INTERVAL_SECONDS=1\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=2\nAI_API_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_PROBE_BASE_URL=http://127.0.0.1:${port}/proxy/v1\nAI_API_KEY=${secret}\nAI_MODEL=synthetic-a\nAI_API_MODE=chat_completions\n`);
+  fs.appendFileSync(path.join(deploy,'.env'),'AI_CUSTOM_HEADERS_JSON=\'{"x-original":"synthetic-original"}\'\n');
   fs.chmodSync(path.join(deploy,'.env'),0o600);
   fs.writeFileSync(path.join(deploy,'config/provider.yaml'),JSON.stringify({schema_version:2,provider:{base_url:`http://127.0.0.1:${port}/proxy/v1`,model:'synthetic-a',api_mode:'chat_completions',api_key_env:'AI_API_KEY'}}));
   let count=0;
+  let adapter, adapterBase='';
+  const startAdapter=async()=>{
+    const internal=/^PROVIDER_ADAPTER_KEY=(.*)$/m.exec(fs.readFileSync(path.join(deploy,'.env'),'utf8'))[1];
+    adapter=createAdapter({PROVIDER_ROOT:deploy,PROVIDER_POOL_REQUIRED:'true',PROVIDER_REQUIRE_ENVELOPE:'true',PROVIDER_ADAPTER_KEY:internal});
+    await new Promise(resolve=>adapter.listen(0,'127.0.0.1',resolve));
+    adapterBase=`http://127.0.0.1:${adapter.address().port}`;
+  };
   const pass=name=>{count++;console.log(`通过 UNIT/CONTRACT：${name}`);};
   const invoke=(script,args=[],overrides={})=>new Promise(resolve=>{
-    const child=spawn('bash',[path.join(root,'scripts',script),'--deploy-dir',deploy,...args],{cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`,CONFIGURATION_FIXTURE_DEPLOY:deploy,...overrides}});
+    const child=spawn('bash',[path.join(root,'scripts',script),'--deploy-dir',deploy,...args],{cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`,CONFIGURATION_FIXTURE_DEPLOY:deploy,PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,...overrides}});
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',code=>resolve({code,stdout,stderr}));
   });
   const ok=async(script,args)=>{const output=await invoke(script,args);assert.equal(output.code,0,`${script} ${args.join(' ')}\n${output.stderr}\n${output.stdout}`);return output;};
   const readCatalog=()=>JSON.parse(fs.readFileSync(path.join(deploy,'knowledge/catalog.json')));
   try {
+    await ok('provider.sh',['migrate']);
+    await startAdapter();
     fs.writeFileSync(path.join(deploy,'knowledge/原先资料.md'),'# 原先资料\n虚构内容，流程标记为蓝色。\n');
+    const legacyFeedback=JSON.parse(fs.readFileSync(path.join(deploy,'config/feedback.yaml')));
+    legacyFeedback.feedback.enabled=true;
+    legacyFeedback.feedback.prompt='历史自定义评价文案，仅保留不派发';
+    fs.writeFileSync(path.join(deploy,'config/feedback.yaml'),JSON.stringify(legacyFeedback));
     await ok('configuration.sh',['migrate']);
+    const migratedFeedback=JSON.parse(fs.readFileSync(path.join(deploy,'config/feedback.yaml')));
+    assert.equal(migratedFeedback.feedback.enabled,false);
+    assert.equal(migratedFeedback.feedback.auto_invite,false);
+    assert.equal(migratedFeedback.feedback.prompt,legacyFeedback.feedback.prompt);
+    const migratedFeedbackBytes=fs.readFileSync(path.join(deploy,'config/feedback.yaml'));
+    await ok('configuration.sh',['migrate']);
+    assert.deepEqual(fs.readFileSync(path.join(deploy,'config/feedback.yaml')),migratedFeedbackBytes);
+    pass('旧评价配置显式幂等停用，历史自定义文案及保留设置不丢失');
     await ok('knowledge.sh',['sync']);
     assert.equal(readCatalog().libraries[0].id,'kb_default');assert.equal(readCatalog().libraries[0].documents.length,1);const originalSequence=sequence;
     await ok('knowledge.sh',['sync']);assert.equal(sequence,originalSequence);pass('单库幂等迁移保留既有 filename 与索引');
@@ -118,6 +142,24 @@ async function main() {
     const markedState=JSON.parse(fs.readFileSync(path.join(deploy,'config/runtime.yaml')));
     assert.equal(markedState.revision,markedState.applied_revision);
     pass('mark-applied 反向加载 knowledge 不重复派发入口或输出旧状态');
+    const welcomeCandidate=path.join(work,'welcome.json');
+    const oldMenu=JSON.parse((await ok('configuration.sh',['get','menu'])).stdout);
+    oldMenu.welcome.enabled=false;
+    fs.writeFileSync(welcomeCandidate,JSON.stringify(oldMenu));
+    const welcomeResult=JSON.parse((await ok('configuration.sh',['apply','menu','--input',welcomeCandidate])).stdout);
+    assert.equal(welcomeResult.target,'menu');assert.equal(welcomeResult.applied,true);
+    assert.equal(welcomeResult.value.welcome.enabled,false);
+    assert.equal(welcomeResult.enabled,true);
+    const welcomeProjection=JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json')));
+    assert.equal(welcomeProjection.configuration.menu.welcome.enabled,false);
+    assert.equal(welcomeProjection.configuration.runtime.enabled,true);
+    pass('关闭欢迎回执指明真实目标及已应用值，不能把总开关 enabled=true 误当欢迎');
+    const feedbackCandidate=path.join(work,'feedback.json');
+    fs.writeFileSync(feedbackCandidate,JSON.stringify(legacyFeedback));
+    const feedbackResult=JSON.parse((await ok('configuration.sh',['apply','feedback','--input',feedbackCandidate])).stdout);
+    assert.equal(feedbackResult.value.feedback.enabled,false);assert.equal(feedbackResult.value.feedback.auto_invite,false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(deploy,'config/feedback.yaml'))).feedback.prompt,legacyFeedback.feedback.prompt);
+    pass('旧启用反馈候选重新应用仍停用邀请，不篡改历史正文');
     const candidate=path.join(work,'runtime.json');fs.writeFileSync(candidate,JSON.stringify({enabled:false}));await ok('configuration.sh',['apply','runtime','--input',candidate]);
     let runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.applied_revision,runtime.revision);pass('全局配置原子提交与运行时文件读回');
     const revision=runtime.revision;fs.writeFileSync(candidate,JSON.stringify({enabled:true}));const failure=await invoke('configuration.sh',['apply','runtime','--input',candidate],{CONFIGURATION_FIXTURE_READBACK_FAIL:'1'});assert.notEqual(failure.code,0);
@@ -125,7 +167,8 @@ async function main() {
     const models=JSON.parse((await ok('provider.sh',['models'])).stdout);assert.deepEqual(models.models,['synthetic-a','synthetic-b']);pass('模型列表去重与排序');
     modelStatus=401;assert.equal((await invoke('provider.sh',['models'])).code,3);modelStatus=404;assert.equal((await invoke('provider.sh',['models'])).code,2);modelStatus=200;pass('模型鉴权失败和手填后备状态可区分');
     modelEmpty=true;const emptyModels=await invoke('provider.sh',['models']);
-    assert.equal(emptyModels.code,2);assert.equal(emptyModels.stdout.trim(),'');modelEmpty=false;
+    assert.equal(emptyModels.code,2);
+    const emptyResult=JSON.parse(emptyModels.stdout);assert.equal(emptyResult.ok,false);assert.equal(emptyResult.error.code,'models_unavailable');assert.equal(emptyResult.models,undefined);modelEmpty=false;
     pass('空模型列表进入手填后备，不编造模型');
     modelStatus=429;let initialCalls=modelCalls;const limited=await invoke('provider.sh',['models']);
     assert.equal(limited.code,4);assert.equal(modelCalls-initialCalls,3);assert(!limited.stdout.includes(secret));modelStatus=200;
@@ -133,7 +176,6 @@ async function main() {
     modelHang=true;initialCalls=modelCalls;const started=Date.now();const timed=await invoke('provider.sh',['models']);
     assert.equal(timed.code,4);assert(modelCalls-initialCalls<=3);assert(Date.now()-started>=29000 && Date.now()-started<110000);assert(!timed.stdout.includes(secret));modelHang=false;
     pass('模型列表真实HTTP挂起在有限超时内失败，不伪造可用模型');
-    fs.appendFileSync(path.join(deploy,'.env'),'AI_CUSTOM_HEADERS_JSON=\'{"x-original":"synthetic-original"}\'\n');
     const providerCandidate=path.join(work,'provider.json');fs.writeFileSync(providerCandidate,JSON.stringify({provider:{custom_headers:{'X-New':'synthetic-new'}}}));
     await ok('provider.sh',['probe',providerCandidate]);assert.equal(lastProviderHeaders['x-original'],'synthetic-original');assert.equal(lastProviderHeaders['x-new'],'synthetic-new');pass('新增高级Header保留未编辑的现有Header');
     fs.writeFileSync(providerCandidate,JSON.stringify({provider:{remove_header:'x-original'}}));await ok('provider.sh',['probe',providerCandidate]);assert.equal(lastProviderHeaders['x-original'],undefined);pass('高级Header可以安全单项删除');
@@ -154,17 +196,23 @@ async function main() {
     assert.equal(fs.statSync(path.join(deploy,'knowledge')).ino,knowledgeInode);
     pass('业务导入应用真实 YAML 且替换知识内容时保持既有 bind 根目录 inode');
     providerChatFailure=true;
+    // 相同接口池导入不会重复付费探测；关闭本地 adapter，真实覆盖应用与恢复回读均失败。
+    adapter.closeAllConnections();await new Promise(resolve=>adapter.close(resolve));adapter=null;
     const failedImport=await invoke('migration.sh',['import',migration]);
     assert.notEqual(failedImport.code,0);assert.match(failedImport.stderr,/恢复未完全确认/);assert.doesNotMatch(failedImport.stderr,/已恢复原配置与知识/);
     assert.equal(fs.statSync(path.join(deploy,'knowledge')).ino,knowledgeInode);
     assert.equal(JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json'),'utf8')).state,'applying');
     providerChatFailure=false;
+    await startAdapter();
     pass('导入失败且 Provider 回读恢复失败时不再假称完整恢复，以 applying 阻止自动回复且知识 bind 根 inode 不变');
     assert.ok(!JSON.stringify(preview).includes(secret));pass('导出预览和正常输出不泄露Key');
     const unsafeSource=path.join(work,'unsafe');fs.mkdirSync(unsafeSource);fs.symlinkSync(path.join(deploy,'.env'),path.join(unsafeSource,'secret-link'));
     const unsafeArchive=path.join(work,'unsafe.tar.gz');await new Promise((resolve,reject)=>{const child=spawn('tar',['-czf',unsafeArchive,'-C',unsafeSource,'.']);child.on('close',code=>code?reject(new Error('tar')):resolve());});
     assert.notEqual((await invoke('migration.sh',['import-preview',unsafeArchive])).code,0);pass('迁移包拒绝未授权路径和符号链接');
     console.log(`UNIT/CONTRACT 合计 ${count} 通过，0 失败；证据 ${path.relative(root,work)}`);
-  } finally {service.closeAllConnections();await new Promise(resolve=>service.close(resolve));}
+  } finally {
+    if(adapter){adapter.closeAllConnections();await new Promise(resolve=>adapter.close(resolve));}
+    service.closeAllConnections();await new Promise(resolve=>service.close(resolve));
+  }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

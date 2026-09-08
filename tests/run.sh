@@ -101,12 +101,12 @@ SHELL_FILES=(
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
   scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
-  scripts/launcher.sh scripts/menu-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
+  scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
-  tests/test_caddy_routing.sh tests/test_logs.sh
+  tests/test_caddy_routing.sh tests/test_logs.sh tests/test_doctor_pool.sh
   tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout tests/mocks/systemctl
 )
@@ -137,6 +137,7 @@ python3 "${SCRIPT_DIR}/test_launcher.py"
 pass "正式 crispai 与受管 crisp 兼容入口及外来命令保护专项"
 
 "${SCRIPT_DIR}/test_doctor.sh"
+"${SCRIPT_DIR}/test_doctor_pool.sh"
 pass "组件自检、故障注入、只读与显式修复专项"
 
 "${SCRIPT_DIR}/test_logs.sh"
@@ -249,7 +250,13 @@ if command -v node >/dev/null 2>&1; then
   pass "Prompt、目录、命名知识库与菜单限制的边界和越界专项"
   node "${SCRIPT_DIR}/test_provider_adapter.js"
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_provider_pool.js"
+  node "${SCRIPT_DIR}/test_runtime_provider_pool.js"
+  pass "主备池生产协议与管理专项（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_feedback_runtime.js"
+  pass "取消评价与历史出站恢复专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_configuration_protocol.js"
+  node "${SCRIPT_DIR}/test_provider_lifecycle.js"
   pass "配置与多知识库生产 CLI 协议专项（内部子项单列，不重复计入总数）"
 else
   critical_skip "系统未安装开发测试依赖 Node.js，未执行配置护栏和 Provider/配置协议专项"

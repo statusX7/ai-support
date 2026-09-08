@@ -147,7 +147,7 @@ write_mock_package() {
     scripts/provider-adapter.js n8n/workflow.json n8n/runtime.js
     config/app.yaml config/provider.yaml.example
   )
-  if [[ "$layout" == current || "$layout" == v120 ]]; then
+  if [[ "$layout" == current || "$layout" == v120 || "$layout" == v121 ]]; then
     required+=(
       .env.example get.sh
       config/Caddyfile.example config/feedback.yaml.example config/handoff.yaml.example
@@ -158,8 +158,11 @@ write_mock_package() {
       scripts/restore.sh scripts/rollback.sh scripts/snapshot.sh scripts/menu-ui.sh
       scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
     )
-    if [[ "$layout" == v120 ]]; then
+    if [[ "$layout" == v120 || "$layout" == v121 ]]; then
       required+=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
+    fi
+    if [[ "$layout" == v121 ]]; then
+      required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
     fi
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
@@ -259,11 +262,19 @@ write_mock_package v1.1.0 legacy
 write_mock_package v1.1.1
 write_mock_package v1.1.2
 write_mock_package v1.2.0 v120
+write_mock_package v1.2.1 v121
 V120_REQUIRED=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
 for entry_index in "${!V120_REQUIRED[@]}"; do
-  missing_release="v1.2.$((entry_index + 1))"
-  write_mock_package "$missing_release" v120
+  missing_release="v1.2.$((entry_index + 2))"
+  write_mock_package "$missing_release" v121
   rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V120_REQUIRED[entry_index]}"
+  repack_mock_package "$missing_release"
+done
+V121_REQUIRED=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
+for entry_index in "${!V121_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 10))"
+  write_mock_package "$missing_release" v121
+  rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V121_REQUIRED[entry_index]}"
   repack_mock_package "$missing_release"
 done
 
@@ -683,8 +694,32 @@ run_tty "$CALLER_DIR" "${TEST_ROOT}/v120.typescript" "$V120_CAPTURE" \
 assert_contains "$V120_CAPTURE" 'action=install' 'v1.2.0 完整包没有进入正式安装器'
 pass 'v1.2.0 完整包满足新增资料与日志模块能力，同时保持旧版本包兼容'
 
+V121_CAPTURE="${TEST_ROOT}/v121.capture"
+: > "$V121_CAPTURE"
+run_tty "$CALLER_DIR" "${TEST_ROOT}/v121.typescript" "$V121_CAPTURE" \
+  --release v1.2.1 --deploy-dir "${TEST_ROOT}/v121-deploy"
+assert_contains "$V121_CAPTURE" 'action=install' 'v1.2.1 完整包没有进入正式安装器'
+pass 'v1.2.1 完整包包含全部接口池、签名信封和中文菜单模块'
+
+for entry_index in "${!V121_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 10))"
+  MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
+  MISSING_DEPLOY="${TEST_ROOT}/missing-${missing_release}.deploy"
+  MISSING_LOG="${TEST_ROOT}/missing-${missing_release}.typescript"
+  : > "$MISSING_CAPTURE"
+  set +e
+  run_tty "$CALLER_DIR" "$MISSING_LOG" "$MISSING_CAPTURE" \
+    --release "$missing_release" --deploy-dir "$MISSING_DEPLOY"
+  MISSING_STATUS=$?
+  set -e
+  [[ "$MISSING_STATUS" != 0 && ! -s "$MISSING_CAPTURE" && ! -e "$MISSING_DEPLOY" ]] \
+    || fail '新版包缺少必要接口池模块却执行了安装器'
+  assert_contains "$MISSING_LOG" "归档缺少生产文件：${V121_REQUIRED[entry_index]}" '新版缺失模块未准确定位'
+done
+pass 'v1.2.1 五个新增生产模块逐项缺失均在执行包内程序前拒绝'
+
 for entry_index in "${!V120_REQUIRED[@]}"; do
-  missing_release="v1.2.$((entry_index + 1))"
+  missing_release="v1.2.$((entry_index + 2))"
   MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
   MISSING_DEPLOY="${TEST_ROOT}/missing-${missing_release}.deploy"
   MISSING_LOG="${TEST_ROOT}/missing-${missing_release}.typescript"

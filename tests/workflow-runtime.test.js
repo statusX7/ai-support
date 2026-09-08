@@ -320,16 +320,22 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal((await receive(body)).reason, '重复事件已忽略');
     const file = path.join(root, 'data', 'runtime', 'session-' + entry.key + '.json'); assert.equal(fs.statSync(file).mode & 0o777, 0o600); assert(!fs.readFileSync(file, 'utf8').includes('持久接收'));
   });
-  await test('T40/T41 标签并集、权限失败、检索未知与负反馈', async () => {
+  await test('T40/T41 标签并集、权限失败、检索未知与历史负反馈保留', async () => {
     await deliver(message('session_tags0001', '有资料的问题')); assert(segments.get('session_tags0001').includes('external-vip')); assert(segments.get('session_tags0001').includes('ai_replied')); assert(!segments.get('session_tags0001').includes('ai_resolved'));
     tagFailure = true; await deliver(message('session_tagsfail1', '标签失败正文仍发送')); assert.equal(sent.at(-1).session_id, 'session_tagsfail1'); tagFailure = false;
     miss = true; await deliver(message('session_miss0001', '知识未命中')); miss = false;
     low = true; await deliver(message('session_low00001', '低分问题')); low = false;
     unknownSources = true; await deliver(message('session_unknown1', '元数据缺失')); unknownSources = false;
     modelFailure = true; await deliver(message('session_modelerror', '接口失败')); modelFailure = false;
+    const eventFile = path.join(root, 'data', 'analytics', 'events.jsonl');
+    const historicalFeedback = { type: 'feedback', at: new Date(now).toISOString(), answer_id: 'synthetic-historical-answer', session: 'synthetic-history', question: '[历史问题指纹]', feedback: 'negative' };
+    fs.appendFileSync(eventFile, JSON.stringify(historicalFeedback) + '\n');
+    const modelCount = modelRequests.length;
     await deliver(message('session_negative1', 'token=synthetic-private-value 为什么失败')); await deliver(message('session_negative1', '👎')); assert.equal(state('session_negative1').mode, 'ai');
-    const events = fs.readFileSync(path.join(root, 'data', 'analytics', 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-    assert(events.some((event) => event.type === 'knowledge_unknown')); assert(events.some((event) => event.type === 'knowledge_miss')); assert(events.some((event) => event.type === 'feedback' && event.feedback === 'negative'));
+    assert.equal(modelRequests.length, modelCount + 2); assert.equal(state('session_negative1').pending_feedback, null);
+    const events = fs.readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse);
+    assert(events.some((event) => event.type === 'knowledge_unknown')); assert(events.some((event) => event.type === 'knowledge_miss'));
+    assert.deepEqual(events.filter((event) => event.type === 'feedback'), [historicalFeedback]);
     assert(!JSON.stringify(events).includes('synthetic-private-value')); assert.equal(state('session_modelerror').mode, 'ai');
   });
   await test('上下文单源、同session reset、新Prompt和隐私过滤', async () => {
@@ -415,6 +421,11 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       assert.equal(providerRequests.length, visualCount + 1);
       const visual = providerRequests.at(-1).body;
       assert.equal(visual.messages?.[0]?.content || visual.input?.[0]?.content?.[0]?.text, prompt, '视觉协议不得截断合法已应用 Prompt');
+      const serviceRule = visual.messages?.[1] || visual.input?.[1];
+      assert.equal(serviceRule.role, 'system');
+      const serviceText = typeof serviceRule.content === 'string' ? serviceRule.content : serviceRule.content[0].text;
+      assert.match(serviceText, /不得主动邀请用户评价、评分、点赞或确认满意度/);
+      assert.match(serviceText, /仅在完成当前咨询确实缺少必要信息时提出具体澄清问题/);
       projection.revision += 1; projection.configuration.runtime.revision += 1; projection.configuration.runtime.applied_revision += 1;
       projection.configuration.keyword.rules[0].text = '已应用版本二'; publish();
       await deliver(message('session_materials001', '资料应用测试'));

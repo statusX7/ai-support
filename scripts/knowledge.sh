@@ -534,11 +534,11 @@ knowledge_main() (
       elif [[ ${1:-all} != all ]]; then
         # 单库范围仍由现有索引器执行；随后统一投影回读新的 map/manifest。
         if [[ "$action" == reindex ]]; then knowledge_sync_catalog "$deploy_dir" 1 "$1"; else knowledge_sync_catalog "$deploy_dir" 0 "$1"; fi
-        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply --refresh-projection >/dev/null
+        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --refresh-projection >/dev/null
       elif [[ "$action" == reindex ]]; then
-        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply --force-knowledge >/dev/null
+        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --force-knowledge >/dev/null
       else
-        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply --sync-knowledge >/dev/null
+        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --sync-knowledge >/dev/null
       fi
       jq -M '.' "${deploy_dir}/knowledge/catalog.json"
       return ;;
@@ -578,7 +578,7 @@ knowledge_main() (
       mv -- "${deploy_dir}/knowledge/${library_id}/${removed_source}" "${history}/${library_id}/${removed_source}" ;;
     *) configuration_error "未知知识库操作：$action"; return 1 ;;
   esac
-  if (( status == 0 )) && bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply >/dev/null; then
+  if (( status == 0 )) && bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business >/dev/null; then
     if [[ "$action" == delete && -d "${deploy_dir}/knowledge/${library_id}" && ! -L "${deploy_dir}/knowledge/${library_id}" ]]; then
       mv -- "${deploy_dir}/knowledge/${library_id}" "${history}/${library_id}"
     fi

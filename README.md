@@ -2,6 +2,8 @@
 
 自用 Crisp AI 客服：n8n + AnythingLLM + PostgreSQL，提供中文快速初始化与 Shell 管理。
 
+v1.2.1 取消自动评价邀请，保留历史统计；主菜单 3 管理 1 个主接口和最多 20 个备用接口，未配置备用也可使用。按顺序切换仅用于可恢复的接口故障，不绕过内容安全拒绝、不自动转人工。备用可能接收必要上下文并产生额外费用，添加前请确认服务可信。
+
 在 Debian 12/13 或 Ubuntu 22.04/24.04 服务器终端执行唯一推荐命令（普通用户会调用 `sudo`）：
 
 <!-- CRISPAI_RECOMMENDED_INSTALL_COMMAND -->
@@ -15,4 +17,4 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 装好后，在任意目录运行 `crispai`。日常检查用 `crispai doctor`；查看日志用 `crispai logs status`；编辑资料后先 `crispai apply --check`，再 `crispai apply`。资料路径和完整操作见[配置说明](docs/CONFIG.md)。
 
-[新手安装](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布说明](docs/releases/v1.2.0.md)
+[新手安装](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布说明与验收状态](docs/releases/v1.2.1.md)

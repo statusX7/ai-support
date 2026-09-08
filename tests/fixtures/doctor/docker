@@ -97,6 +97,13 @@ case "$command" in
       [[ "${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
       [[ "$expected" == "$actual" ]] || exit 1
       printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* || "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
+      expected=$(cat)
+      module=provider-router.js
+      [[ "$joined" != *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]] || module=provider-envelope.js
+      actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/scripts/$module" | awk '{print $1}')
+      [[ "$expected" == "$actual" ]] || exit 1
+      printf 'matched\n'
     elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* ]]; then
       IFS= read -r expected
       actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/config/Caddyfile" | awk '{print $1}')
@@ -180,6 +187,10 @@ for name in ("校验并持久接收", "处理持久任务", "扫描持久会话�
         raise SystemExit(1)
 PY
       printf 'verified\n'
+    elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/internal/provider/status'* ]]; then
+      if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
+      [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1
+      jq '.' "${DOCTOR_FIXTURE_DEPLOY:?}/tmp/fixture-pool-status.json"
     elif [[ "$joined" == *' anythingllm '* && "$joined" == *'provider-adapter:8787/healthz'* ]]; then
       if [[ "${DOCTOR_FIXTURE_STDIN_PROBE:-0}" == 1 ]]; then IFS= read -r _ || true; fi
       [[ "${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" != 1 ]] || exit 1

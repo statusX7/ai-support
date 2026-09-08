@@ -10,6 +10,8 @@ source "${SCRIPT_DIR}/scripts/common.sh"
 source "${SCRIPT_DIR}/scripts/wizard.sh"
 # shellcheck source=scripts/menu-ui.sh
 source "${SCRIPT_DIR}/scripts/menu-ui.sh"
+# shellcheck source=scripts/menu-provider-ui.sh
+source "${SCRIPT_DIR}/scripts/menu-provider-ui.sh"
 
 DEPLOY_REQUEST=""
 ORIGINAL_ARGS=("$@")
@@ -18,6 +20,7 @@ DOCTOR_ARGS=()
 LOG_ARGS=()
 MATERIALS_COMMAND=apply
 MATERIALS_ARGS=()
+MANAGE_JSON=0
 MANAGE_EOF=0
 MANAGE_TEMP=""
 MANAGE_READER_PID=''
@@ -29,8 +32,8 @@ manage_usage() {
   printf '%s\n' '用法：crispai [--deploy-dir PATH] [命令]' '无参数打开中文管理菜单。' \
     'status：本地状态；doctor：非破坏自检；init：快速初始化或继续安装。' \
     'doctor [--local|--full] [--json] [--fix]：本地/完整检查、JSON 与显式安全修复。' \
-    'enable / disable：客服总开关；uninstall：数字确认卸载。' \
-    'apply [--check|--force-external]：应用资料；--check 只校验，--force-external 重新同步并回读组件。' \
+    'enable / disable [--json]：客服总开关；uninstall：数字确认卸载。' \
+    'apply [--check|--force-external] [--json]：应用资料；--check 只校验，--force-external 重新同步并回读组件。' \
     'logs --help：日志查看、清理和保留策略。' \
     '--help / --version：帮助与版本，不要求 Docker 或完整配置。'
 }
@@ -54,7 +57,14 @@ while (( $# > 0 )); do
       [[ "$MANAGE_COMMAND" == apply && "$MATERIALS_COMMAND" == apply && ${#MATERIALS_ARGS[@]} == 0 ]] \
         || { printf '错误：--force-external 仅用于 apply，不能与 --check 或自身重复。\n' >&2; exit 64; }
       MATERIALS_ARGS=(--force-external); shift ;;
-    --local|--full|--json|--fix|--last|--offline)
+    --json)
+      case "$MANAGE_COMMAND" in
+        doctor) DOCTOR_ARGS+=(--json) ;;
+        apply|enable|disable|status) MANAGE_JSON=1 ;;
+        *) printf '错误：--json 仅用于状态、自检、资料应用、客服开关或日志命令。\n' >&2; exit 64 ;;
+      esac
+      shift ;;
+    --local|--full|--fix|--last|--offline)
       [[ "$MANAGE_COMMAND" == doctor ]] || { printf '错误：%s 仅用于 doctor 命令。\n' "$1" >&2; exit 64; }
       DOCTOR_ARGS+=("$1"); shift ;;
     --timeout)
@@ -74,7 +84,7 @@ if [[ "$MANAGE_COMMAND" == doctor ]]; then
   # 默认自检不得隐式补依赖；缺失项由 doctor 报告，只有 --fix 才修复。
   exec bash "$SCRIPT_DIR/scripts/doctor.sh" --deploy-dir "$DEPLOY_DIR" "${DOCTOR_ARGS[@]}"
 fi
-if [[ "$MANAGE_COMMAND" == logs || "$MANAGE_COMMAND" == apply ]]; then
+if [[ "$MANAGE_COMMAND" == logs || "$MANAGE_COMMAND" == apply || "$MANAGE_JSON" == 1 ]]; then
   # 保留子命令的 JSON/结构化 stdout；依赖检查和修复进度仍供终端 stderr 阅读。
   bootstrap_prepare_minimal_dependencies >&2 || die '基础工具自动修复失败，请查看上方具体原因'
 else
@@ -198,10 +208,76 @@ manager_tool() {
 
 manager_action() {
   local status
-  if "$@"; then return 0; else status=$?; fi
+  # 本函数仅负责留在菜单；底层 manager_result/实际操作仍保留失败退出码，CLI 不走此导航包装。
+  MANAGER_ACTION_STATUS=0
+  if manager_result "$@"; then return 0; else status=$?; fi
+  MANAGER_ACTION_STATUS=$status
   if (( status == 2 )); then warn '操作取消或本地完成但外部接入待验证，请查看本次结果'
   else warn "操作未完成（退出码 $status）；保留现有状态，可修复对应项后重试"; fi
   return 0
+}
+
+manager_capture() {
+  manager_temporary || return 1
+  MANAGER_STDOUT=$MANAGE_FILE
+  MANAGER_STDERR="$MANAGE_FILE.stderr"
+  MANAGER_STATUS=0
+  if "$@" > "$MANAGER_STDOUT" 2> "$MANAGER_STDERR"; then :; else MANAGER_STATUS=$?; fi
+}
+
+manager_render_result() {
+  local kind=$1
+  local -a arguments=()
+  (( MANAGE_JSON == 0 )) || arguments=(--json)
+  [[ -z ${2:-} ]] || arguments+=(--names "$2")
+  python3 "$SCRIPT_DIR/scripts/menu-display.py" "$kind" "$MANAGER_STDOUT" "$MANAGER_STDERR" "$MANAGER_STATUS" "${arguments[@]}"
+}
+
+manager_result() {
+  local kind=detail status names=''
+  if [[ ${1:-} == manager_tool && ${2:-} == configuration && ( ${3:-} == get || ${3:-} == status ) ]]; then
+    manager_configuration_view "${4:-runtime}"
+    return $?
+  fi
+  if [[ ${1:-} == doctor ]]; then
+    manager_capture "$@" --json || return 1
+    status=$MANAGER_STATUS
+    manager_render_result doctor || return 1
+    return "$status"
+  fi
+  if [[ ${1:-} == manager_tool && ${2:-} == logs && ( ${3:-} == status || ${3:-} == policy ) ]]; then
+    manager_capture "$@" --json || return 1
+    status=$MANAGER_STATUS
+    manager_render_result logs || return 1
+    return "$status"
+  fi
+  case "${1:-}: ${2:-}: ${3:-}" in
+    'manager_tool: configuration: prompt-show') "$@"; return $? ;;
+    'manager_tool: configuration: get'|'manager_tool: configuration: status')
+      kind=${4:-runtime}; [[ "$kind" != menu ]] || kind=welcome ;;
+    'manager_tool: provider: recent') kind=records ;;
+    'manager_tool: provider: list'|'manager_tool: provider: get'|'manager_tool: provider: status'|'manager_tool: provider: add'|'manager_tool: provider: edit'|'manager_tool: provider: primary'|'manager_tool: provider: enable'|'manager_tool: provider: delete'|'manager_tool: provider: order'|'manager_tool: provider: apply-file'|'manager_tool: provider: import'|'manager_tool: provider: draft'|'manager_tool: provider: edit-draft'|'manager_tool: provider: apply-draft') kind=pool ;;
+    'runtime_cli: list: ') kind=sessions ;;
+    'manager_tool: crisp-settings: hook-url') "$@"; return $? ;;
+    'manager_tool:'*|'runtime_cli:'*) ;;
+    *) "$@"; return $? ;;
+  esac
+  manager_capture "$@" || return 1
+  status=$MANAGER_STATUS
+  if [[ "$kind" == records && "$status" == 0 && "$MANAGE_JSON" == 0 ]]; then
+    manager_temporary || return 1; names=$MANAGE_FILE
+    if ! manager_tool provider list > "$names"; then warn '接口名称暂不可读；近期记录将以匿名序号显示'; names=''; fi
+  fi
+  manager_render_result "$kind" "$names" || return 1
+  return "$status"
+}
+
+manager_checked_error() {
+  local message=$1
+  if (( MANAGE_JSON )); then
+    jq -M -n --arg message "$message" '{ok:false,error:{code:"readback_failed",message:$message}}'
+  else warn "$message"; fi
+  return 1
 }
 
 manager_candidate() {
@@ -209,7 +285,95 @@ manager_candidate() {
   manager_tool configuration get "$1" > "$MANAGE_FILE" || return 1
 }
 
-manager_apply() { manager_action manager_tool configuration apply "$1" --input "$2"; }
+manager_applied_read() {
+  local name=$1 target=$2 projection="$DEPLOY_DIR/config/materials-applied.json"
+  [[ -f "$projection" && ! -L "$projection" ]] || return 1
+  jq -M -e --arg name "$name" 'select(.state=="applied") | .configuration[$name] | select(type=="object")' "$projection" > "$target"
+}
+
+manager_configuration_view() {
+  local name=$1 source actual status kind=$1 pending=false projection="$DEPLOY_DIR/config/materials-applied.json"
+  [[ "$kind" != menu ]] || kind=welcome
+  manager_capture manager_tool configuration get "$name" || return 1
+  source=$MANAGER_STDOUT; status=$MANAGER_STATUS
+  manager_temporary || return 1; actual=$MANAGE_FILE
+  if ! manager_applied_read "$name" "$actual"; then
+    if (( MANAGE_JSON )); then
+      jq -M -n --arg target "$name" '{ok:false,target:$target,applied:false,error:{code:"effective_state_unconfirmed",message:"有效配置尚未确认，请运行自检或完成资料应用。"}}'
+    else
+      printf '当前有效配置尚未确认，不能将原文当作已生效状态；资料应用或恢复未完成时自动回复暂停。\n'
+      if [[ ! -e "$projection" && ! -L "$projection" ]] && (( status == 0 )); then
+        printf '以下仅为待确认的原文配置：\n'
+        python3 "$SCRIPT_DIR/scripts/menu-display.py" detail "$source" /dev/null 0 || return 1
+      fi
+    fi
+    return 2
+  fi
+  if (( status == 0 )) && ! jq -M -e --slurpfile actual "$actual" \
+    'def business: del(.revision,.applied_revision,.updated_at); business==($actual[0]|business)' "$source" >/dev/null; then pending=true; fi
+  if (( MANAGE_JSON )); then
+    jq -M -n --arg target "$name" --argjson pending "$pending" --argjson valid "$([[ "$status" == 0 ]] && printf true || printf false)" \
+      --slurpfile value "$actual" '{ok:$valid,target:$target,applied:true,pending:$pending,value:$value[0]}'
+  else
+    if (( status != 0 )); then manager_render_result detail || return 1; fi
+    printf '当前已应用状态：\n'
+    python3 "$SCRIPT_DIR/scripts/menu-display.py" "$kind" "$actual" /dev/null 0 || return 1
+    if [[ "$pending" == true ]]; then printf '另有未应用的原文修改；上述为当前有效状态，完成资料应用后才会改变。\n'; fi
+  fi
+  (( status == 0 )) || return "$status"
+  [[ "$pending" == false ]] || return 2
+}
+
+manager_apply_checked() {
+  local name=$1 candidate=$2 before_global='' after_global status actual source
+  manager_temporary || return 1; actual=$MANAGE_FILE; source="$actual.source"
+  if [[ "$name" != runtime ]]; then
+    if manager_tool configuration get runtime > "$actual.runtime"; then before_global=$(jq -M -er '.enabled|tostring' "$actual.runtime"); else return 1; fi
+    if [[ -e "$DEPLOY_DIR/config/materials-applied.json" || -L "$DEPLOY_DIR/config/materials-applied.json" ]]; then
+      if ! manager_applied_read runtime "$actual.runtime-effective"; then
+        manager_checked_error '当前客服总开关的有效状态尚未确认，请先完成资料应用或自检；本次未保存'
+        return 1
+      fi
+      if [[ $(jq -M -er '.enabled|tostring' "$actual.runtime-effective") != "$before_global" ]]; then
+        manager_checked_error '客服总开关原文有未应用修改，请先单独应用或还原；本次未改变欢迎或其他配置'
+        return 1
+      fi
+    fi
+  fi
+  manager_capture manager_tool configuration apply "$name" --input "$candidate" || return 1
+  status=$MANAGER_STATUS
+  if (( status != 0 )); then
+    manager_render_result detail || return 1
+    if (( MANAGE_JSON )); then return "$status"; fi
+    printf '保存未完成；以下仅显示当前仍可确认的已应用状态：\n'
+    if manager_applied_read "$name" "$actual"; then
+      python3 "$SCRIPT_DIR/scripts/menu-display.py" "$([[ "$name" == menu ]] && printf welcome || printf '%s' "$name")" "$actual" /dev/null 0
+    else printf '当前有效状态无法确认，请运行菜单 2 自检；未宣称保存成功。\n'; fi
+    return "$status"
+  fi
+  if ! manager_tool configuration get "$name" > "$source" || ! manager_applied_read "$name" "$actual" \
+    || ! jq -M -e --slurpfile source "$source" --slurpfile expected "$candidate" \
+      'def business: del(.revision,.applied_revision,.updated_at); (business)==($source[0]|business) and (business)==($expected[0]|business)' "$actual" >/dev/null; then
+    manager_checked_error '保存后的原文、候选与已应用状态不一致，不能声明本次操作成功；请运行菜单 2 自检'
+    return 1
+  fi
+  if [[ "$name" != runtime ]]; then
+    if ! manager_applied_read runtime "$actual.runtime"; then return 1; fi
+    after_global=$(jq -M -er '.enabled|tostring' "$actual.runtime")
+    [[ "$before_global" == "$after_global" ]] || { manager_checked_error '客服总开关发生非预期变化；本次操作不能判为成功'; return 1; }
+  fi
+  if (( MANAGE_JSON )); then
+    jq -M -n --arg target "$name" --slurpfile configuration "$actual" '{ok:true,target:$target,applied:true,configuration:$configuration[0]}'
+  else
+    printf '设置已保存并完成实际回读。\n'
+    python3 "$SCRIPT_DIR/scripts/menu-display.py" "$([[ "$name" == menu ]] && printf welcome || printf '%s' "$name")" "$actual" /dev/null 0
+    if [[ "$name" != runtime ]]; then
+      printf '客服总开关保持不变（%s）。\n' "$([[ "$after_global" == true ]] && printf 已启用 || printf 已停用)"
+    fi
+  fi
+}
+
+manager_apply() { manager_action manager_apply_checked "$1" "$2"; }
 
 menu_multiline() {
   local output=$1 line bytes=0 max_bytes=${2:-262144}
@@ -230,7 +394,7 @@ menu_pick_json() {
   local data=$1 id_field=$2 title_field=$3 answer count
   count=$(jq -M 'length' "$data")
   (( count > 0 )) || { printf '暂无可选项目。\n'; return 1; }
-  jq -M -r --arg title "$title_field" 'to_entries[] | "\(.key+1). \(.value[$title] // .value.id // .value.key)"' "$data"
+  jq -M -r --arg title "$title_field" 'to_entries[] | "\(.key+1). \(.value[$title] // "未命名项目")"' "$data"
   menu_read answer '请选择序号（0 返回）：' || return 1
   [[ "$answer" =~ ^[1-9][0-9]{0,5}$ ]] && (( 10#$answer <= count )) || return 1
   MENU_SELECTED_ID=$(jq -M -r --arg field "$id_field" --argjson index "$((10#$answer-1))" '.[$index][$field]' "$data")
@@ -262,8 +426,9 @@ show_installation_facts() {
   state_file="$DEPLOY_DIR/config/runtime.yaml"
   if [[ -f "$DEPLOY_DIR/config/materials-applied.json" ]]; then state_file="$DEPLOY_DIR/config/materials-applied.json"; fi
   if [[ -f "$state_file" && ! -L "$state_file" ]]; then
-    jq -M -r '(.configuration.runtime // .) | select(.enabled|type=="boolean") |
-      "客服总开关（已应用）：\(if .enabled then "启用" else "停用" end)；配置版本：\(.revision // 0) / 已应用：\(.applied_revision // 0)"' \
+    jq -M -r 'if .state? == "applying" then "资料应用或恢复未完成：暂缓自动回复，请完成应用或自检。" else
+      (.configuration.runtime // .) | select(.enabled|type=="boolean") |
+      "客服总开关（已应用）：\(if .enabled then "启用" else "停用" end)" end' \
       "$state_file" 2>/dev/null || printf '客服配置：无法解析；请从菜单 2 检查，未修改当前配置。\n'
   fi
 }
@@ -301,106 +466,6 @@ status_menu() {
       3) manager_action doctor --last ;;
       4) manager_action doctor --fix ;;
       5) manager_action export_doctor_report ;;
-      0) return ;; *) warn '请输入有效数字' ;;
-    esac
-  done
-}
-
-provider_candidate() {
-  manager_temporary || return 1
-  manager_tool provider get > "$MANAGE_FILE" || return 1
-  jq -M 'if has("provider") then {provider:.provider} else {provider:del(.key_status,.custom_header_names)} end' "$MANAGE_FILE" > "$MANAGE_FILE.new"
-  mv -f -- "$MANAGE_FILE.new" "$MANAGE_FILE"
-}
-
-provider_model_select() {
-  local candidate=$1 models_file choice query='' page=0 total start request_status
-  manager_temporary || return; models_file=$MANAGE_FILE
-  while true; do
-    if manager_tool provider models "$candidate" > "$models_file"; then break; else request_status=$?; fi
-    if (( request_status == 3 )); then warn '模型列表鉴权失败，请先修正本次地址与 Key'; return; fi
-    if (( request_status == 4 )); then
-      menu_read choice '模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消：' || return
-      case "$choice" in 1) continue ;; *) return ;; esac
-    fi
-    warn '列表不可用；可手填模型并验证实际推理，空输入取消本次修改'
-    menu_read choice '手动模型原名：' || return
-    [[ -n "$choice" ]] || return
-    jq -M --arg model "$choice" '.provider.model=$model' "$candidate" > "$candidate.new"
-    mv -f -- "$candidate.new" "$candidate"
-    if menu_confirm '使用手填模型验证并应用？'; then manager_action manager_tool provider apply "$candidate"; fi
-    return
-  done
-  jq -M '[if type=="array" then .[] else (.models // .data // [])[] end | if type=="string" then . else .id end | select(type=="string")] | unique' "$models_file" > "$models_file.ids"
-  while true; do
-    jq -M --arg query "$query" '[.[] | select(contains($query))]' "$models_file.ids" > "$models_file.filtered"
-    total=$(jq -M 'length' "$models_file.filtered")
-    (( total > 0 )) || { warn '列表为空，请使用手动模型入口'; return; }
-    start=$((page*15)); (( start < total )) || { page=0; start=0; }
-    jq -M -r --argjson start "$start" 'to_entries[$start:$start+15][] | "\(.key+1). \(.value)"' "$models_file.filtered"
-    menu_read choice '选择模型（数字，n 下一页，p 上一页，/词 搜索，0 返回）：' || return
-    case "$choice" in
-      0) return ;; n) ((page+=1)) ;; p) if ((page>0)); then page=$((page-1)); fi ;; /*) query=${choice:1}; page=0 ;;
-      *)
-        if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( 10#$choice <= total )); then
-          jq -M --slurpfile models "$models_file.filtered" --argjson index "$((10#$choice-1))" '.provider.model=$models[0][$index]' "$candidate" > "$candidate.new"
-          mv -f -- "$candidate.new" "$candidate"
-          manager_action manager_tool provider apply "$candidate"; return
-        fi
-        warn '序号无效' ;;
-    esac
-  done
-}
-
-ai_config_menu() {
-  local choice value candidate secret_file header_name field
-  while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 查看脱敏配置\n2. 修改 API 地址\n3. 替换 API Key\n4. 刷新并选择模型\n5. 手动指定模型\n6. 选择请求协议\n7. 测试当前模型\n8. 测试图片能力\n9. 自定义请求头\n10. 同时更换供应商地址、Key 与模型\n0. 返回\n'
-    menu_read choice '请选择：' || return
-    case "$choice" in
-      1) manager_action manager_tool provider get ;;
-      2|3|4|5|6|9|10)
-        provider_candidate || { warn '无法读取当前接口配置'; continue; }; candidate=$MANAGE_FILE
-        case "$choice" in
-          2|5)
-            if [[ "$choice" == 2 ]]; then field=base_url; else field=model; fi
-            menu_read value "新的 $field（回车保留）：" || return; [[ -n "$value" ]] || continue
-            jq -M --arg field "$field" --arg value "$value" '.provider[$field]=$value' "$candidate" > "$candidate.new" ;;
-          3)
-            menu_read value '新 API Key（隐藏输入，回车保留）：' 1 || return; [[ -n "$value" ]] || continue
-            manager_temporary || return; secret_file=$MANAGE_FILE
-            printf '%s' "$value" > "$secret_file"; unset value
-            jq -M --rawfile secret "$secret_file" '.api_key=$secret' "$candidate" > "$candidate.new"; rm -f -- "$secret_file" ;;
-          4) provider_model_select "$candidate"; continue ;;
-          6)
-            menu_read value '1 Chat Completions（聊天接口）/ 2 Responses（响应接口）/ 0 返回：' || return
-            case "$value" in 1) value=chat_completions ;; 2) value=responses ;; *) continue ;; esac
-            jq -M --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new" ;;
-          9)
-            menu_read header_name '请求头名称（回车返回；不能覆盖 Host 等协议头）：' || return; [[ -n "$header_name" ]] || continue
-            menu_read value '请求头值（隐藏输入；::DELETE:: 删除该项）：' 1 || return; [[ -n "$value" ]] || continue
-            manager_temporary || return; secret_file=$MANAGE_FILE
-            printf '%s' "$value" > "$secret_file"; unset value
-            jq -M --arg name "$header_name" --rawfile value "$secret_file" 'if $value=="::DELETE::" then .provider.remove_header=$name else .provider.custom_headers[$name]=$value end' "$candidate" > "$candidate.new"
-            rm -f -- "$secret_file" ;;
-          10)
-            menu_read value '新 API Base URL（回车保留）：' || return
-            if [[ -n "$value" ]]; then jq -M --arg value "$value" '.provider.base_url=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; fi
-            menu_read value '新 API Key（隐藏输入，回车保留）：' 1 || return
-            if [[ -n "$value" ]]; then
-              manager_temporary || return; secret_file=$MANAGE_FILE; printf '%s' "$value" > "$secret_file"; unset value
-              jq -M --rawfile value "$secret_file" '.api_key=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"; rm -f -- "$secret_file"
-            fi
-            menu_read value '请求协议：1 Chat Completions / 2 Responses（回车保留）：' || return
-            case "$value" in 1) value=chat_completions ;; 2) value=responses ;; '') value=$(jq -M -r '.provider.api_mode' "$candidate") ;; *) continue ;; esac
-            jq -M --arg value "$value" '.provider.api_mode=$value' "$candidate" > "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
-            printf '将使用候选地址与 Key 读取模型列表，选定后才验证并应用完整配置。\n'
-            provider_model_select "$candidate"; continue ;;
-        esac
-        chmod 0600 "$candidate.new"; mv -f -- "$candidate.new" "$candidate"
-        printf '将发送少量合成请求验证配置，可能产生服务商费用。\n'
-        if menu_confirm '应用本次接口修改？'; then manager_action manager_tool provider apply "$candidate"; fi ;;
-      7) manager_action manager_tool provider test ;; 8) manager_action manager_tool provider vision-test ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -490,7 +555,7 @@ knowledge_menu() {
 }
 
 rule_edit() {
-  local candidate=$1 rule_id=$2 name words exclusions match rule_action value text title cancel confirm seconds ttl priority field existing temp lines
+  local candidate=$1 rule_id=$2 name words exclusions match rule_action value text title cancel confirm seconds ttl priority field existing temp lines menus
   existing=$(jq -M -c --arg id "$rule_id" '.rules[]? | select(.id==$id)' "$candidate")
   [[ -n "$existing" ]] || existing='{"enabled":true,"match_mode":"contains","action":"show_handoff_offer","cooldown_seconds":60,"offer_ttl_seconds":600,"priority":100,"confirm_label":"召唤人工客服","cancel_label":"继续 AI 客服","confirm_message":"已暂停本次对话的 AI 回复，您的人工协助请求已收到。"}'
   menu_read name "规则名称 [$(jq -M -r '.name // "人工确认"' <<< "$existing")]：" || return
@@ -529,8 +594,10 @@ rule_edit() {
     '$original + {id:$id,name:$name,keywords:$words,exclude_keywords:$exclusions,match_mode:$match,action:$action,priority:$priority,cooldown_seconds:$seconds,offer_ttl_seconds:$ttl,text:$text,confirm_label:$title,cancel_label:$cancel,confirm_message:$confirm}' > "$temp"
   case "$rule_action" in
     menu|prompt)
-      if [[ "$rule_action" == menu ]]; then field=target; else field=prompt; fi
-      menu_read value "${field}（目标菜单 ID / 知识问答引导，回车保留）：" || return
+      if [[ "$rule_action" == menu ]]; then
+        field=target; manager_candidate menu || return; menus=$MANAGE_FILE
+        printf '请选择这条规则打开的菜单：\n'; menus_select_node "$menus" || return; value=$MENU_SELECTED_ID
+      else field=prompt; menu_read value '知识问答引导（回车保留）：' || return; fi
       if [[ -n "$value" ]]; then jq -M --arg field "$field" --arg value "$value" '.[$field]=$value' "$temp" > "$temp.new"; mv -f -- "$temp.new" "$temp"; fi ;;
   esac
   jq -M --slurpfile rule "$temp" --arg id "$rule_id" '.schema_version=2 | .rules=((.rules // [] | map(select(.id!=$id))) + $rule) | del(.keywords)' "$candidate" > "$candidate.new"
@@ -567,7 +634,11 @@ rules_menu() {
         menu_read query '虚构客户消息（只预演，不向 Crisp 发送）：' || return
         if ! matched_rule=$(runtime_cli preview-rule "$query"); then warn '无法读取运行中规则，请先诊断服务'; continue; fi
         if [[ "$matched_rule" == null ]]; then printf '未命中关键词，将按总开关和会话模式进行普通问答。\n'
-        else jq -M -r '"命中：\(.name // .id)\n动作：\(.action)\n文案：\(.text // .prompt // "")\n按钮：\(.confirm_label // "无")"' <<< "$matched_rule"; printf '只有合法人工确认按钮点击才会暂停当前会话。\n'; fi ;;
+        else
+          manager_temporary || return; printf '%s\n' "$matched_rule" > "$MANAGE_FILE"
+          printf '命中规则：\n'; python3 "$SCRIPT_DIR/scripts/menu-display.py" detail "$MANAGE_FILE" /dev/null 0
+          printf '只有合法人工确认按钮点击才会暂停当前会话。\n'
+        fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
@@ -592,7 +663,7 @@ handoff_menu() {
       4|5)
         manager_temporary || return; listing=$MANAGE_FILE
         if ! runtime_cli list > "$listing"; then warn '无法读取会话状态'; continue; fi
-        jq -M 'if type=="array" then . else .sessions // .conversations // [] end | map(. + {name:(.session_id+"；原因="+(.pause_reason // "未知")+"；截止="+((.resume_at // "永久")|tostring))})' "$listing" > "$listing.array"
+        jq -M 'if type=="array" then . else .sessions // .conversations // [] end | map(select(.mode=="human")) | to_entries | map(.value + {name:("人工会话 "+((.key+1)|tostring)+"；"+(if .value.resume_at==null then "不自动恢复" else "剩余 "+((.value.remaining_seconds // 0)|tostring)+" 秒" end))})' "$listing" > "$listing.array"
         menu_pick_json "$listing.array" key name || continue; key=$MENU_SELECTED_ID
         if [[ "$choice" == 4 ]]; then
           if menu_confirm '恢复所选会话 AI？'; then manager_action runtime_cli resume "$key"; fi
@@ -611,7 +682,7 @@ set_global_switch() {
   manager_candidate runtime || return 1; candidate=$MANAGE_FILE
   jq -M --argjson enabled "$1" '.enabled=$enabled' "$candidate" > "$candidate.new"
   mv -f -- "$candidate.new" "$candidate"
-  manager_tool configuration apply runtime --input "$candidate"
+  manager_apply_checked runtime "$candidate"
 }
 
 global_switch_menu() {
@@ -625,7 +696,7 @@ global_switch_menu() {
 
 menus_select_node() {
   local candidate=$1
-  jq -M '[.menus | to_entries[] | {id:.key,name:(.key+" — "+.value.title)}]' "$candidate" > "$candidate.nodes"
+  jq -M '[.menus | to_entries[] | {id:.key,name:.value.title}]' "$candidate" > "$candidate.nodes"
   menu_pick_json "$candidate.nodes" id name
 }
 
@@ -635,7 +706,8 @@ menus_edit_option() {
   menu_read title '按钮标题：' || return; [[ -n "$title" ]] || return
   menu_read action '动作：1 下级菜单 / 2 固定回复 / 3 知识问答 / 4 人工确认 / 5 返回父级：' || return
   case "$action" in
-    1) action=menu; menu_read value '目标菜单 ID：' || return ;; 2) action=reply; menu_read value '固定回复文案：' || return ;;
+    1) action=menu; printf '请选择目标菜单：\n'; menus_select_node "$candidate" || return; value=$MENU_SELECTED_ID ;;
+    2) action=reply; menu_read value '固定回复文案：' || return ;;
     3) action=prompt; menu_read value '知识问答引导：' || return ;; 4) action=show_handoff_offer; value='' ;;
     5) action=menu; is_back=true; value=$(jq -M -r --arg node "$node_id" '.menus[$node].parent // .root' "$candidate") ;; *) return ;;
   esac
@@ -652,7 +724,10 @@ multilevel_menu() {
     printf '\n1. 查看/预览菜单\n2. 新建节点\n3. 修改节点标题\n4. 新增/修改按钮\n5. 删除按钮\n6. 删除节点\n7. 设置根菜单\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) manager_action manager_tool configuration get menu ;;
+      1)
+        manager_candidate menu || continue
+        printf '菜单原文预览（是否已应用请在欢迎配置或资料状态中核对）：\n'
+        python3 "$SCRIPT_DIR/scripts/menu-display.py" detail "$MANAGE_FILE" /dev/null 0 ;;
       2)
         menu_read title '新节点标题：' || return; [[ -n "$title" ]] || continue
         manager_candidate menu || continue; candidate=$MANAGE_FILE
@@ -660,8 +735,8 @@ multilevel_menu() {
         jq -M --arg node "$node" --arg title "$title" --arg parent "$parent" \
           '(([.menus[$parent].options | keys[] | tonumber] | max // 0)+1) as $next | .menus[$node]={title:$title,parent:$parent,options:{"0":{label:"返回上一级",action:{type:"menu",target:$parent,back:true}}}} | .menus[$parent].options[($next|tostring)]={label:$title,order:$next,action:{type:"menu",target:$node}}' "$candidate" > "$candidate.new"
         mv -f -- "$candidate.new" "$candidate"
-        if manager_tool configuration apply menu --input "$candidate"; then
-          printf '新节点 ID：%s；已在父级增加入口与返回按钮。\n' "$node"
+        if manager_apply_checked menu "$candidate"; then
+          printf '新菜单“%s”已生效；已在父级增加入口与返回按钮。\n' "$title"
         else warn '新节点未生效；请修正当前菜单配置后重试'; fi ;;
       3|4|5|6|7)
         manager_candidate menu || continue; candidate=$MANAGE_FILE; menus_select_node "$candidate" || continue; node=$MENU_SELECTED_ID
@@ -767,11 +842,11 @@ crisp_menu() {
 statistics_menu() {
   local choice candidate value field
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 知识命中分析\n2. 回答反馈统计\n3. 查看标签配置\n4. 修改标签\n5. 反馈启停与保留设置\n6. 清除统计与反馈记录\n0. 返回\n'
+    printf '\n自动评价邀请已停用；本页只管理历史统计、标签与历史保留期。\n1. 知识命中分析\n2. 历史评价统计\n3. 查看标签配置\n4. 修改标签\n5. 查看或修改历史保留天数\n6. 清除统计与历史评价记录\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) manager_action bash "$DEPLOY_DIR/scripts/analytics.sh" knowledge --deploy-dir "$DEPLOY_DIR" ;;
-      2) manager_action bash "$DEPLOY_DIR/scripts/analytics.sh" feedback --deploy-dir "$DEPLOY_DIR" ;;
+      1) manager_action manager_analytics knowledge ;;
+      2) manager_action manager_analytics feedback ;;
       3) manager_action manager_tool configuration get tags ;;
       4)
         menu_read value '标签：1 已回复 / 2 未命中 / 3 低置信度 / 4 人工 / 5 启用 / 6 关闭 / 0 返回：' || return
@@ -787,20 +862,24 @@ statistics_menu() {
         mv -f -- "$candidate.new" "$candidate"; manager_apply tags "$candidate" ;;
       5)
         manager_candidate feedback || continue; candidate=$MANAGE_FILE
-        menu_read value '反馈：1 启用 / 2 关闭 / 3 有效期秒数 / 4 保留天数 / 0 返回：' || return
-        case "$value" in
-          1|2) if [[ "$value" == 1 ]]; then value=true; else value=false; fi
-            jq -M --argjson value "$value" '.feedback.enabled=$value' "$candidate" > "$candidate.new" ;;
-          3|4) if [[ "$value" == 3 ]]; then field=expires_after_seconds; else field=retention_days; fi
-            menu_read value '请输入正整数：' || return; [[ "$value" =~ ^[1-9][0-9]{0,7}$ ]] || continue
-            jq -M --arg field "$field" --argjson value "$value" '.feedback[$field]=$value' "$candidate" > "$candidate.new" ;;
-          *) continue ;;
-        esac
-        mv -f -- "$candidate.new" "$candidate"; manager_apply feedback "$candidate" ;;
+        printf '当前历史保留：%s 天；修改不会启用评价邀请。\n' "$(jq -M -r '.feedback.retention_days' "$candidate")"
+        menu_read value '新的历史保留天数（1～3650，0 或回车返回）：' || return
+        if [[ ! "$value" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$value>3650 )); then continue; fi
+        jq -M --argjson value "$((10#$value))" '.feedback.retention_days=$value | .feedback.enabled=false | .feedback.auto_invite=false' "$candidate" > "$candidate.new"
+        mv -f -- "$candidate.new" "$candidate"
+        if menu_confirm '保存历史保留天数？'; then manager_apply feedback "$candidate"; fi ;;
       6) if menu_confirm '删除统计反馈记录（保留人工状态）？'; then manager_action runtime_cli clear-analytics; fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
+}
+
+manager_analytics() {
+  local mode=$1 status
+  manager_capture bash "$DEPLOY_DIR/scripts/analytics.sh" "$mode" --deploy-dir "$DEPLOY_DIR" --json || return 1
+  status=$MANAGER_STATUS
+  python3 "$SCRIPT_DIR/scripts/menu-display.py" "analytics-$mode" "$MANAGER_STDOUT" "$MANAGER_STDERR" "$status" "$DEPLOY_DIR/knowledge/catalog.json" || return 1
+  return "$status"
 }
 
 migration_menu() {
@@ -814,7 +893,7 @@ migration_menu() {
         printf '知识原文属于业务资料，请保护迁移包；新服务器需重新填写 AI/Crisp 凭据。\n'
         manager_action manager_tool migration export "$path" ;;
       2) menu_read path '迁移包路径（回车返回）：' || return; [[ -n "$path" ]] || continue
-        if manager_tool migration import-preview "$path"; then
+        if manager_result manager_tool migration import-preview "$path"; then
           if menu_confirm '按预览替换业务配置并同步，保留本机秘密？'; then manager_action manager_tool migration import "$path"; fi
         fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
@@ -863,13 +942,22 @@ update_rollback_menu() {
       2) menu_read path '完整新版发布包的解压目录：' || return; [[ -n "$path" ]] || continue
         if menu_confirm '更新前自动快照，失败自动回滚。继续？'; then manager_action bash "$DEPLOY_DIR/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$path" --no-pull; fi ;;
       3) if menu_confirm '从原 Git 工作区更新并升级？'; then manager_action bash "$DEPLOY_DIR/update.sh" --deploy-dir "$DEPLOY_DIR"; fi ;;
-      4) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list ;;
-      5) manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list
-        menu_read snapshot '要恢复的快照 ID（回车返回）：' || return; [[ -n "$snapshot" ]] || continue
+      4) if manager_snapshot_options; then
+          jq -M -r 'if length==0 then "暂无版本快照。" else to_entries[] | "\(.key+1). \(.value.name)" end' "$MANAGE_SNAPSHOTS"
+        fi ;;
+      5) manager_snapshot_options || continue
+        menu_pick_json "$MANAGE_SNAPSHOTS" id name || continue; snapshot=$MENU_SELECTED_ID
         if menu_confirm '恢复该版本程序、配置及数据？'; then manager_action bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --snapshot "$snapshot"; fi ;;
       0) return ;; *) warn '请输入有效数字' ;;
     esac
   done
+}
+
+manager_snapshot_options() {
+  manager_capture bash "$DEPLOY_DIR/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" --list || return 1
+  if (( MANAGER_STATUS != 0 )); then manager_render_result detail; return "$MANAGER_STATUS"; fi
+  MANAGE_SNAPSHOTS="$MANAGER_STDOUT.options"
+  python3 "$SCRIPT_DIR/scripts/menu-display.py" --snapshot-options "$MANAGER_STDOUT" > "$MANAGE_SNAPSHOTS"
 }
 
 menu_log_source() {
@@ -889,7 +977,8 @@ follow_log_source() {
   printf '持续查看日志，Ctrl+C 仅停止查看并返回日志菜单。\n'
   # 父菜单与前台查看进程同属终端进程组；只在查看期间抑制父菜单退出。
   trap ':' INT
-  bash "$DEPLOY_DIR/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" follow "$source" || status=$?
+  bash "$DEPLOY_DIR/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" follow "$source" \
+    | python3 "$SCRIPT_DIR/scripts/menu-display.py" --stream || status=$?
   trap manage_interrupt INT
   if (( status == 130 )); then printf '\n已停止日志查看，服务未停止。\n'; return 0; fi
   return "$status"
@@ -918,13 +1007,13 @@ diagnostics_menu() {
           menu_read choice '请选择：' || return
           case "$choice" in 1) operation=rotate ;; 2) ;; *) continue ;; esac
         fi
-        if manager_tool logs "$operation" "$source" --preview \
+        if manager_result manager_tool logs "$operation" "$source" --preview \
           && menu_confirm '只处理上述日志；清空内容不可恢复。确认？'; then
           manager_action manager_tool logs "$operation" "$source" --apply
         fi ;;
       5) menu_read days '删除多少天以前的受管历史（1～3650，0 或回车返回）：' || return
         if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$days > 3650 )); then continue; fi
-        if manager_tool logs cleanup --days "$days" --preview \
+        if manager_result manager_tool logs cleanup --days "$days" --preview \
           && menu_confirm '删除上述历史日志（不可恢复），不改变当前保留策略？'; then
           manager_action manager_tool logs cleanup --days "$days" --apply
         fi ;;
@@ -936,11 +1025,11 @@ diagnostics_menu() {
         [[ "$size" =~ ^[1-9][0-9]{0,3}$ ]] || continue
         menu_read files '最多保留份数（1～20，回车返回）：' || return
         if [[ ! "$files" =~ ^[1-9][0-9]?$ ]] || (( 10#$files > 20 )); then continue; fi
-        if manager_tool logs configure --days "$days" --max-size-mib "$size" --max-files "$files" --preview \
+        if manager_result manager_tool logs configure --days "$days" --max-size-mib "$size" --max-files "$files" --preview \
           && menu_confirm '应用容量策略需要重建本项目容器，短暂停机但保留数据及人工状态。继续？'; then
           manager_action manager_tool logs configure --days "$days" --max-size-mib "$size" --max-files "$files" --apply
         fi ;;
-      7) if manager_tool logs cleanup --preview && menu_confirm '按当前策略删除上述过期日志（不可恢复）？'; then
+      7) if manager_result manager_tool logs cleanup --preview && menu_confirm '按当前策略删除上述过期日志（不可恢复）？'; then
           manager_action manager_tool logs cleanup --apply
         fi ;;
       8) manager_action manager_tool logs export ;;
@@ -988,8 +1077,8 @@ services_menu() {
 
 show_document() {
   local document=$1
-  if [[ -f "$DEPLOY_DIR/docs/$document" ]]; then sed -n '1,320p' "$DEPLOY_DIR/docs/$document"
-  elif [[ -f "$SCRIPT_DIR/docs/$document" ]]; then sed -n '1,320p' "$SCRIPT_DIR/docs/$document"
+  if [[ -f "$DEPLOY_DIR/docs/$document" ]]; then python3 "$SCRIPT_DIR/scripts/menu-display.py" --document "$DEPLOY_DIR/docs/$document"
+  elif [[ -f "$SCRIPT_DIR/docs/$document" ]]; then python3 "$SCRIPT_DIR/scripts/menu-display.py" --document "$SCRIPT_DIR/docs/$document"
   else warn "本地文档缺失：$document"; fi
   printf '\n对应文档：https://github.com/statusX7/ai-support/blob/main/docs/%s\n' "$document"
 }
@@ -1022,10 +1111,15 @@ uninstall_menu() {
 }
 
 case "$MANAGE_COMMAND" in
-  status) show_installation_facts; exit 0 ;; init) quick_initialization; exit 0 ;; doctor) doctor; exit $? ;;
+  status)
+    if (( MANAGE_JSON )); then
+      require_installation; manager_result manager_tool configuration get runtime
+    else show_installation_facts; fi
+    exit $? ;;
+  init) quick_initialization; exit 0 ;; doctor) doctor; exit $? ;;
   enable) require_installation; set_global_switch true; exit $? ;; disable) require_installation; set_global_switch false; exit $? ;;
   uninstall) require_installation; uninstall_menu; exit 0 ;;
-  apply) require_installation; manager_tool materials "$MATERIALS_COMMAND" "${MATERIALS_ARGS[@]}"; exit $? ;;
+  apply) require_installation; manager_result manager_tool materials "$MATERIALS_COMMAND" "${MATERIALS_ARGS[@]}"; exit $? ;;
   logs) require_installation; manager_tool logs "${LOG_ARGS[@]}"; exit $? ;;
 esac
 

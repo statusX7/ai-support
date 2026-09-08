@@ -16,6 +16,13 @@ git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 for ignored_path in \
   .env \
   config/provider.yaml \
+  config/provider-pool.yaml \
+  config/provider-pool-applied.json \
+  config/provider-pool-import-draft.json \
+  config/provider-pool.lock \
+  config/materials-applied.json \
+  config/logging.yaml \
+  secrets/provider/generations/example.json \
   config/runtime.yaml \
   config/prompt.md \
   data/runtime.db \
@@ -38,13 +45,13 @@ for tracked in "${tracked_files[@]}"; do
     .env|.env.*)
       [[ "$tracked" == ".env.example" ]] || fail "Git 已跟踪真实环境文件：$tracked"
       ;;
-    config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml|config/runtime.yaml)
+    config/provider.yaml|config/provider-pool.yaml|config/provider-pool-applied.json|config/provider-pool-import-draft.json|config/provider-pool.lock|config/materials-applied.json|config/logging.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml|config/runtime.yaml)
       fail "Git 已跟踪真实配置：$tracked"
       ;;
     knowledge/*)
       [[ "$tracked" == "knowledge/README.md" ]] || fail "Git 已跟踪知识库内容：$tracked"
       ;;
-    data/*|logs/*|backups/*|tmp/*|.crisp-ai-installation|*.pem|*.key|*.secret)
+    secrets/*|data/*|logs/*|backups/*|tmp/*|.crisp-ai-installation|*.pem|*.key|*.secret)
       fail "Git 已跟踪敏感或运行时文件：$tracked"
       ;;
   esac

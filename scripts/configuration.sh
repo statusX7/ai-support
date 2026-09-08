@@ -143,10 +143,17 @@ PY
 }
 
 configuration_normalize_file() {
-  local name=$1 input=$2 output=$3
+  local name=$1 input=$2 output=$3 policy_output
   configuration_decode_file "$input" "$output" || return 1
   configuration_validate "$name" "$output" \
-    || { configuration_error "${name} 配置不符合 schema 或边界"; return 1; }
+    || { configuration_error "${name} 配置格式或边界无效"; return 1; }
+  if [[ "$name" == feedback ]]; then
+    # 本版停用自动邀请是控制策略，不允许旧导入或直编配置重新开启。
+    policy_output=$(mktemp "${output}.policy.XXXXXXXX") || return 1
+    jq -M '.feedback.enabled=false | .feedback.auto_invite=false' "$output" > "$policy_output" \
+      || { rm -f -- "$policy_output"; return 1; }
+    mv -f -- "$policy_output" "$output"
+  fi
 }
 
 configuration_revision() {
@@ -227,12 +234,15 @@ configuration_apply() (
   chmod 640 "$temporary"
   chown root:1000 "$temporary" 2>/dev/null || true
   mv -f -- "$temporary" "$target"
-  if ! bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply >/dev/null; then
+  if ! bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business >/dev/null; then
     [[ ! -f "${history}/previous" ]] || cp -p -- "${history}/previous" "$target"
     configuration_error '配置未通过统一应用与运行时回读；原编辑文件已恢复'
     return 1
   fi
-  jq -M '.configuration.runtime | {schema_version,enabled,revision,applied_revision}' \
+  # 保留旧机器调用者的顶层总开关字段，同时明确本次修改的对象和有效值。
+  jq -M --arg name "$name" '. as $projection |
+    (.configuration.runtime | {schema_version,enabled,revision,applied_revision}) +
+    {target:$name,applied:($projection.state == "applied"),value:$projection.configuration[$name]}' \
     "${deploy_dir}/config/materials-applied.json"
 )
 
@@ -314,7 +324,7 @@ configuration_prompt_apply() (
   install -m 640 -- "$input" "$stage"
   chown root:1000 "$stage" 2>/dev/null || true
   mv -f -- "$stage" "$target"
-  if ! bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply >/dev/null; then
+  if ! bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business >/dev/null; then
     install -m 640 -- "${history}/previous.md" "$target"
     chown root:1000 "$target" 2>/dev/null || true
     configuration_error 'Prompt 应用失败；上一有效正文与运行投影保持，编辑文件已恢复'
@@ -325,14 +335,27 @@ configuration_prompt_apply() (
 )
 
 configuration_query() {
-  local deploy_dir=$1 question=$2 response payload status question_bytes
+  local deploy_dir=$1 question=$2 response payload status question_bytes marker_result marker request_timeout=120
+  local budget_ms=${3:-0}
   question_bytes=$(printf '%s' "$question" | wc -c | tr -d ' ')
   (( question_bytes > 0 && question_bytes <= 8000 )) || return 1
+  if [[ -f "${deploy_dir}/config/provider-pool-applied.json" ]]; then
+    local -a marker_args=()
+    [[ "$budget_ms" =~ ^[0-9]+$ ]] || return 1
+    (( budget_ms == 0 )) || marker_args+=("$budget_ms")
+    marker_result=$(python3 "${CONFIGURATION_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" admin-marker "${marker_args[@]}") || return 1
+    marker=$(jq -M -er '.marker | select(type == "string" and startswith("[[CRISPAI_PROVIDER_CONTEXT_V1:"))' <<< "$marker_result") || return 1
+    request_timeout=$(jq -M -er '((.deadline_at / 1000 - now) | ceil) + 5 | select(. > 0 and . <= 190)' <<< "$marker_result") || return 1
+    question+=$'\n'"$marker"
+  elif [[ $(env_get "${deploy_dir}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]]; then
+    configuration_error '接口池尚未应用，测试未发起；请从菜单 3 修复主接口'
+    return 1
+  fi
   anythingllm_connection "$deploy_dir"
   response=$(mktemp "${deploy_dir}/tmp/configuration-query.XXXXXX")
   chmod 600 "$response"
   payload=$(jq -M -cn --arg message "$question" '{message:$message,mode:"chat",sessionId:"ai-support-admin-test",reset:true}')
-  status=$(anythingllm_secure_request "$deploy_dir" POST "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/chat" "$ANYTHING_KEY" "$payload" "$response" 120)
+  status=$(anythingllm_secure_request "$deploy_dir" POST "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/chat" "$ANYTHING_KEY" "$payload" "$response" "$request_timeout")
   if [[ "$status" != 2?? ]] || ! jq -M -e '(.error == null or .error == false) and (.textResponse | type == "string" and length > 0)' "$response" >/dev/null; then
     rm -f -- "$response"
     configuration_error '测试问答失败，请检查 Provider 和知识索引'
@@ -345,6 +368,28 @@ configuration_query() {
 configuration_migrate() {
   local deploy_dir=$1 target temporary decoded handoff_decoded
   configuration_runtime_init "$deploy_dir"
+  target="${deploy_dir}/config/feedback.yaml"
+  if [[ -f "$target" || -L "$target" ]]; then
+    decoded=$(mktemp "${deploy_dir}/tmp/feedback-migrate.XXXXXX") || return 1
+    if ! configuration_decode_file "$target" "$decoded" || ! configuration_validate feedback "$decoded"; then
+      rm -f -- "$decoded"
+      configuration_error '评价历史配置无效，未修改其他配置'
+      return 1
+    fi
+    if ! jq -M -e '.feedback.enabled == false and .feedback.auto_invite == false' "$decoded" >/dev/null; then
+      temporary=$(mktemp "${target}.tmp.XXXXXX") || { rm -f -- "$decoded"; return 1; }
+      jq -M '.feedback.enabled=false | .feedback.auto_invite=false' "$decoded" > "$temporary" \
+        || { rm -f -- "$decoded" "$temporary"; return 1; }
+      if [[ ! -e "${deploy_dir}/backups/config-history/feedback.pre-v1.2.1.yaml" ]]; then
+        install -m 600 -- "$target" "${deploy_dir}/backups/config-history/feedback.pre-v1.2.1.yaml" \
+          || { rm -f -- "$decoded" "$temporary"; return 1; }
+      fi
+      chmod 640 "$temporary"
+      chown root:1000 "$temporary" 2>/dev/null || true
+      mv -f -- "$temporary" "$target"
+    fi
+    rm -f -- "$decoded"
+  fi
   target="${deploy_dir}/config/provider.yaml"
   if [[ -f "$target" ]] && ! jq -M -e '.provider | type == "object"' "$target" >/dev/null 2>&1; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
@@ -453,7 +498,7 @@ configuration_main() {
       ;;
     mark-applied)
       if [[ -f "${deploy_dir}/config/materials-applied.json" ]]; then
-        bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply --refresh-projection >/dev/null
+        bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --refresh-projection >/dev/null
       else
         bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" initialize >/dev/null
       fi
@@ -477,7 +522,7 @@ configuration_main() {
         knowledge_sync "$deploy_dir" && import_and_publish_workflow "$deploy_dir" &&
         configuration_prompt_verify "$deploy_dir" || return 1
       if [[ -f "${deploy_dir}/config/materials-applied.json" ]]; then
-        bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply --refresh-projection >/dev/null
+        bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --refresh-projection >/dev/null
       else
         bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" initialize >/dev/null
       fi

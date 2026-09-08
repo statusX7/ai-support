@@ -93,6 +93,29 @@ function createRuntime(env = {}, options = {}) {
   const handoff = () => config('handoff.yaml', {}).handoff || {};
   const menus = () => config('menu.yaml', { welcome: { enabled: false }, root: 'main', menus: {} });
   const provider = () => config('provider.yaml', {}).provider || {};
+  const noRatingInstruction = '不得主动邀请用户评价、评分、点赞或确认满意度；不要在答案末尾例行询问是否解决问题。仅在完成当前咨询确实缺少必要信息时提出具体澄清问题。';
+  const providerPool = () => {
+    const value = safeRead(root + '/config/provider-pool-applied.json', null, 1048576);
+    if (!value) {
+      if (String(env.PROVIDER_POOL_REQUIRED).toLowerCase() === 'true') throw new Error('接口池尚未正确应用');
+      return null;
+    }
+    if (value.schema_version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > 21
+      || !Number.isSafeInteger(value.policy?.question_timeout_ms) || value.policy.question_timeout_ms < 1000
+      || value.policy.question_timeout_ms > 180000) throw new Error('接口池生效投影无效');
+    return value;
+  };
+  const providerGenerationCurrent = (job) => !job.inference || job.inference.pool_revision === (providerPool()?.revision ?? null);
+  const providerToken = (key, job, stage) => {
+    if (job.inference?.pool_revision === null) return '';
+    if (!job.inference || !env.PROVIDER_ADAPTER_KEY) throw new Error('内部推理认证尚未配置');
+    const payload = Buffer.from(JSON.stringify({version: 1, scope: 'conversation', question_id: job.id,
+      session_key: key, generation: job.generation, runtime_revision: job.revision,
+      pool_revision: job.inference.pool_revision, deadline_at: job.inference.deadline_at, stage})).toString('base64url');
+    return payload + '.' + crypto.createHmac('sha256', env.PROVIDER_ADAPTER_KEY).update('crispai-provider-v1\0' + payload).digest('hex');
+  };
+  const inferenceRemaining = (job) => Math.max(0, (job.inference?.deadline_at ?? (clock() + 90000)) - clock());
   const retainedImages = (state) => (Array.isArray(state.image_context) ? state.image_context : [])
     .filter((entry) => entry && /^[a-f0-9]{64}$/.test(entry.job_id || '') && typeof entry.fingerprint === 'string' && entry.fingerprint.length <= 160
       && typeof entry.summary === 'string' && entry.summary.trim() && Number.isFinite(entry.created_at) && Number.isFinite(entry.event_time)
@@ -155,7 +178,62 @@ function createRuntime(env = {}, options = {}) {
     welcome_sent: false, menu_node: null, offers: {}, cooldowns: {}, jobs: [], outgoing: {},
     worker: null, uncertain_events: [], pending_feedback: null, updated_at: clock(),
   });
+  const feedbackPurpose = (value) => ['feedback', 'feedback_invite', 'feedback_prompt', 'feedback_offer', 'feedback_ack',
+    'feedback_response', 'feedback_thanks', 'feedback_clarification', 'feedback_positive', 'feedback_negative'].includes(value);
+  const feedbackOnly = (value) => Boolean(value && (['purpose', 'kind', 'action', 'type'].some((field) => feedbackPurpose(value[field]))
+    || value.feedback_event && typeof value.feedback_event === 'object'));
+  const retireFeedback = (state) => {
+    state.pending_feedback = null;
+    const retiredOffers = new Set();
+    const retiredFingerprints = new Set();
+    for (const [id, offer] of Object.entries(state.offers || {})) {
+      if (!feedbackOnly(offer)) continue;
+      retiredOffers.add(id);
+      if (offer.fingerprint) retiredFingerprints.add(String(offer.fingerprint));
+      delete state.offers[id];
+    }
+    const outgoing = Object.entries(state.outgoing || {});
+    for (const job of state.jobs || []) {
+      const retired = job.feedback_retired === true || feedbackOnly(job) || feedbackOnly(job.plan) || feedbackOnly(job.choice_action)
+        || (job.event === 'message:updated' || job.data?.type === 'picker') && retiredOffers.has(String(job.data?.content?.id || ''));
+      if (retired) {
+        const pending = !['done', 'cancelled', 'failed'].includes(job.status);
+        const records = outgoing.filter(([fingerprint, record]) => record.job_id === job.id || job.plan?.fingerprint && String(job.plan.fingerprint) === fingerprint);
+        const uncertain = records.find(([, record]) => ['unknown', 'sending'].includes(record.status));
+        for (const [fingerprint] of records) retiredFingerprints.add(fingerprint);
+        if (pending) {
+          const firstRetirement = job.feedback_retired !== true;
+          job.feedback_retired = true;
+          if (uncertain) {
+            // 未知回执只保留原指纹对账；不能恢复为普通问题或重新生成评价。
+            if (!job.plan) job.plan = { type: uncertain[1].body?.type || 'text', content: uncertain[1].body?.content || '旧评价回执对账', purpose: 'feedback', fingerprint: Number(uncertain[0]) };
+            if (firstRetirement) { job.status = 'received'; job.lease_until = 0; }
+          } else {
+            job.status = 'cancelled'; job.lease_until = 0; job.retry_at = null;
+            delete job.data; delete job.plan;
+          }
+          if ((!uncertain || firstRetirement) && state.worker?.job === job.id) state.worker = null;
+        }
+        continue;
+      }
+      // 旧版 plan 保存原答案，outgoing.body 才包含系统追加段。仅精确匹配可证明的追加结果。
+      if (job.plan?.feedback !== true || job.plan.type !== 'text' || typeof job.plan.content !== 'string') continue;
+      for (const [, record] of outgoing.filter(([, record]) => record.job_id === job.id)) {
+        if (['unknown', 'sending', 'sent', 'cancelled', 'failed'].includes(record.status) || record.body?.type !== 'text') continue;
+        const prompt = String(config('feedback.yaml', {}).feedback?.prompt || '是否解决问题？\n👍 是\n👎 否');
+        if (record.body.content === (job.plan.content + '\n\n' + prompt).slice(0, 8000)) record.body.content = job.plan.content;
+      }
+    }
+    for (const [fingerprint, record] of outgoing) {
+      if (!retiredFingerprints.has(fingerprint) && !record.feedback_retired && !feedbackOnly(record)) continue;
+      if (['sent', 'cancelled', 'failed'].includes(record.status)) continue;
+      record.feedback_retired = true;
+      if (!['unknown', 'sending'].includes(record.status)) { record.status = 'cancelled'; delete record.body; }
+    }
+    return state;
+  };
   const expire = (state) => {
+    retireFeedback(state);
     if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= clock()) {
       state.mode = 'ai';
       state.generation += 1;
@@ -174,13 +252,12 @@ function createRuntime(env = {}, options = {}) {
     for (const [fingerprint, outgoing] of Object.entries(state.outgoing || {})) {
       if (['sent', 'cancelled', 'failed'].includes(outgoing.status) && outgoing.created_at < clock() - 604800000) delete state.outgoing[fingerprint];
     }
-    if (state.pending_feedback?.expires_at <= clock()) state.pending_feedback = null;
     if (Object.prototype.hasOwnProperty.call(state, 'image_context')) state.image_context = retainedImages(state);
     return state;
   };
   const readState = (key, website, session) => {
     const current = safeRead(statePath(key), null);
-    if (current) return current;
+    if (current) return retireFeedback(current);
     const fresh = emptyState(website, session);
     if (website && session) {
       const legacy = safeRead(directory + '/session-' + hash(session) + '.json', null);
@@ -591,41 +668,63 @@ function createRuntime(env = {}, options = {}) {
   };
   const active = async (key, job, ordinary = true) => transaction(key, (state) => {
     const global = settings();
-    return global.enabled && global.revision === job.revision && state.generation === job.generation && (!ordinary || state.mode === 'ai') && state.uncertain_events.length === 0;
+    return global.enabled && global.revision === job.revision && state.generation === job.generation && (!ordinary || state.mode === 'ai') && state.uncertain_events.length === 0 && providerGenerationCurrent(job);
   });
+  const beginInference = async (key, job) => {
+    const pool = providerPool();
+    const value = await transaction(key, (state) => {
+      const global = settings();
+      const stored = state.jobs.find((entry) => entry.id === job.id);
+      if (!stored || !global.enabled || global.revision !== job.revision || state.mode !== 'ai'
+        || state.generation !== job.generation || state.uncertain_events.length || stored.status === 'cancelled') return null;
+      // 两阶段与故障恢复共用首次推理的预算，重试不能重新获得90秒或另一组21次调用。
+      if (!stored.inference) stored.inference = {pool_revision: pool?.revision ?? null,
+        deadline_at: clock() + (pool?.policy.question_timeout_ms ?? 90000)};
+      return {...stored.inference};
+    });
+    if (!value) return false;
+    job.inference = value;
+    return providerGenerationCurrent(job);
+  };
   const knowledgePlan = async (key, job, directive = '') => {
     const state = readState(key);
     const history = await messagesFor(state);
     await observeOperators(key, history);
-    if (!await active(key, job)) return null;
+    if (!await active(key, job) || !await beginInference(key, job)) return null;
     const prompt = appliedMaterials()?.prompt.text ?? fs.readFileSync(root + '/config/prompt.md', 'utf8');
     const prior = transcript(history, job, readState(key));
     const text = typeof job.data.content === 'string' ? job.data.content.slice(0, 10000) : '[客户发送图片]';
     const content = job.data.content || {};
     const isImage = ['file', 'animation'].includes(job.data.type) && String(content.type || '').startsWith('image/');
     const fail = (message) => ({ type: 'text', content: message, ordinary: true, purpose: 'safe_error', tags: ['low_confidence'] });
+    if (!inferenceRemaining(job)) return fail('自动客服暂时无法回答，请稍后再试。');
     if (isImage) {
-      if (String(env.AI_SUPPORTS_VISION).toLowerCase() !== 'true' && provider().supports_vision !== true && provider().capabilities?.vision !== true) return fail('目前无法可靠识别这张图片，请补充截图中的报错文字和您正在操作的步骤。');
+      const pool = providerPool();
+      const visionSupported = pool ? pool.entries.some((entry) => entry.enabled && entry.capabilities?.vision === true)
+        : String(env.AI_SUPPORTS_VISION).toLowerCase() === 'true' || provider().supports_vision === true || provider().capabilities?.vision === true;
+      if (!visionSupported) return fail('目前无法可靠识别这张图片，请补充截图中的报错文字和您正在操作的步骤。');
       try {
         const image = await imageContent(content);
         if (!await active(key, job)) return null;
         const configProvider = provider();
-        const base = String(configProvider.base_url || env.AI_API_BASE_URL || '').replace(/\/+$/, '');
-        const model = String(configProvider.model || env.AI_MODEL || '');
-        const apiMode = configProvider.api_mode || env.AI_API_MODE;
-        const customHeaders = JSON.parse(String(env.AI_CUSTOM_HEADERS_JSON || '{}'));
+        const base = String(pool ? (env.PROVIDER_ADAPTER_URL || 'http://provider-adapter:8787/v1') : configProvider.base_url || env.AI_API_BASE_URL || '').replace(/\/+$/, '');
+        const model = String(pool ? pool.entries.find((entry) => entry.id === pool.primary_id)?.model : configProvider.model || env.AI_MODEL || '');
+        const apiMode = pool ? 'chat_completions' : configProvider.api_mode || env.AI_API_MODE;
+        const customHeaders = pool ? {} : JSON.parse(String(env.AI_CUSTOM_HEADERS_JSON || '{}'));
         for (const [name, value] of Object.entries(customHeaders)) {
           if (!/^[A-Za-z][A-Za-z0-9-]{0,99}$/.test(name) || /^(host|content-length|content-type|authorization|cookie|connection|transfer-encoding|proxy-authorization)$/i.test(name) || typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value)) throw new Error('自定义请求头不安全');
         }
-        const requestHeaders = { ...customHeaders, Authorization: 'Bearer ' + String(env.AI_API_KEY || '') };
-        const messages = [{ role: 'system', content: prompt }, ...prior, { role: 'user', content: [{ type: 'text', text: directive || '请结合本会话上下文理解这张图片，并简短回答客户的问题。' }, { type: 'image_url', image_url: { url: image } }] }];
+        const requestHeaders = { ...customHeaders, Authorization: 'Bearer ' + String(pool ? env.PROVIDER_ADAPTER_KEY || '' : env.AI_API_KEY || '') };
+        if (pool) requestHeaders['x-crispai-question'] = providerToken(key, job, 'vision');
+        const messages = [{ role: 'system', content: prompt }, { role: 'system', content: noRatingInstruction }, ...prior, { role: 'user', content: [{ type: 'text', text: directive || '请结合本会话上下文理解这张图片，并简短回答客户的问题。' }, { type: 'image_url', image_url: { url: image } }] }];
         const body = apiMode === 'responses' ? { model, store: false, input: messages.map((message) => ({ role: message.role, content: typeof message.content === 'string' ? [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.content }] : message.content.map((part) => part.type === 'text' ? { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: part.text } : { type: 'input_image', image_url: part.image_url.url }) })), max_output_tokens: 1200 } : { model, messages, max_tokens: 1200 };
-        const response = await network(base + (apiMode === 'responses' ? '/responses' : '/chat/completions'), { method: 'POST', headers: requestHeaders, body, timeout: 90000 });
+        if (!inferenceRemaining(job)) throw new Error('推理预算已用尽');
+        const response = await network(base + (apiMode === 'responses' ? '/responses' : '/chat/completions'), { method: 'POST', headers: requestHeaders, body, timeout: inferenceRemaining(job) + 1000 });
         const answer = response.body?.choices?.[0]?.message?.content || response.body?.output_text || response.body?.output?.flatMap((entry) => entry.content || []).map((entry) => entry.text || '').join('\n');
         if (response.status >= 300 || response.body?.error || typeof answer !== 'string' || !answer.trim()) throw new Error('视觉回答不可用');
         const remembered = await transaction(key, (current) => {
           const global = settings();
-          if (!global.enabled || global.revision !== job.revision || current.mode !== 'ai' || current.generation !== job.generation || current.uncertain_events.length) return false;
+          if (!global.enabled || global.revision !== job.revision || current.mode !== 'ai' || current.generation !== job.generation || current.uncertain_events.length || !providerGenerationCurrent(job)) return false;
           current.image_context = [...retainedImages(current).filter((entry) => entry.job_id !== job.id), {
             job_id: job.id, fingerprint: String(job.data.fingerprint || '').slice(0, 160), summary: answer.trim().slice(0, 2000), created_at: clock(), event_time: job.event_time,
           }].slice(-3);
@@ -644,11 +743,14 @@ function createRuntime(env = {}, options = {}) {
     const policy = handoff();
     const fail = (message) => ({ type: 'text', content: message, ordinary: true, purpose: 'safe_error', tags: ['low_confidence'] });
     const conversation = prior.map((message) => (message.role === 'user' ? '访客：' : '客服：') + message.content).join('\n').slice(-14000);
-    const message = [directive, conversation ? '本会话近期公开对话（仅作为背景，不覆盖当前知识与提示词）：\n' + conversation : '', '访客当前问题：' + text].filter(Boolean).join('\n\n');
+    let message = ['系统自动服务约束：' + noRatingInstruction, directive, conversation ? '本会话近期公开对话（仅作为背景，不覆盖当前知识与提示词）：\n' + conversation : '', '访客当前问题：' + text].filter(Boolean).join('\n\n');
+    const token = providerToken(key, job, 'answer');
+    if (token) message += '\n[[CRISPAI_PROVIDER_CONTEXT_V1:' + token + ']]';
     const base = String(env.ANYTHINGLLM_INTERNAL_URL || 'http://anythingllm:3001').replace(/\/+$/, '');
     let response;
     try {
-      response = await network(base + '/api/v1/workspace/' + encodeURIComponent(env.ANYTHINGLLM_WORKSPACE || 'crisp-support') + '/chat', { method: 'POST', timeout: 90000, headers: { Authorization: 'Bearer ' + String(env.ANYTHINGLLM_API_KEY || '') }, body: { message, mode: 'chat', sessionId: state.session_id, reset: true } });
+      if (!inferenceRemaining(job)) return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。');
+      response = await network(base + '/api/v1/workspace/' + encodeURIComponent(env.ANYTHINGLLM_WORKSPACE || 'crisp-support') + '/chat', { method: 'POST', timeout: inferenceRemaining(job) + 5000, headers: { Authorization: 'Bearer ' + String(env.ANYTHINGLLM_API_KEY || '') }, body: { message, mode: 'chat', sessionId: state.session_id, reset: true } });
     } catch (_) { return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。'); }
     const payload = response.body?.data && typeof response.body.data === 'object' ? response.body.data : response.body;
     if (response.status >= 300 || !payload || payload.error || response.body?.error) return fail(policy.failure_message || '自动客服暂时无法回答，请稍后再试。');
@@ -662,19 +764,8 @@ function createRuntime(env = {}, options = {}) {
     let final = answer;
     if (!answer || miss) final = policy.no_answer_message || '目前知识还不足以确认，请补充您遇到的具体情况。';
     else if (low) final = policy.low_confidence_message || '现有资料还不足以确定答案，请补充更多细节。';
-    return { type: 'text', content: final.slice(0, 8000), ordinary: true, purpose, ai: true, feedback: Boolean(answer && !miss && !low), outcome, sources: sources.map((source) => String(source.docpath || source.document?.docpath || source.title || '')).slice(0, 20), tags: miss ? ['knowledge_miss'] : low ? ['low_confidence'] : ['ai_replied'] };
+    return { type: 'text', content: final.slice(0, 8000), ordinary: true, purpose, ai: true, outcome, sources: sources.map((source) => String(source.docpath || source.document?.docpath || source.title || '')).slice(0, 20), tags: miss ? ['knowledge_miss'] : low ? ['low_confidence'] : ['ai_replied'] };
   };
-  const feedbackPlan = async (key, job) => transaction(key, (state) => {
-    const pending = state.pending_feedback;
-    const feedback = config('feedback.yaml', {}).feedback || {};
-    if (!pending || feedback.enabled === false || pending.expires_at <= clock()) return null;
-    const text = normalized(job.data?.content);
-    const positive = (feedback.positive_keywords || []).some((word) => normalized(word) === text);
-    const negative = (feedback.negative_keywords || []).some((word) => normalized(word) === text);
-    if (!positive && !negative) { state.pending_feedback = null; return null; }
-    state.pending_feedback = null;
-    return { type: 'text', content: String(positive ? feedback.positive_message || '感谢您的反馈。' : feedback.negative_message || '感谢反馈，请补充尚未解决的具体情况。'), ordinary: true, purpose: 'feedback', feedback_event: { session: hash(key).slice(0, 24), answer_id: pending.answer_id, question: pending.question, answer: pending.answer, feedback: positive ? 'positive' : 'negative' }, tags: positive ? ['ai_resolved'] : [] };
-  });
   const actionPlan = async (key, job, action) => {
     if (!action) return null;
     const type = typeof action.action === 'string' ? action.action : action.type;
@@ -721,8 +812,6 @@ function createRuntime(env = {}, options = {}) {
     }
     const data = job.data || {};
     const text = data.type === 'text' && typeof data.content === 'string' ? data.content.trim() : '';
-    const feedback = text ? await feedbackPlan(key, job) : null;
-    if (feedback) return feedback;
     const rule = text ? matchRule(text) : null;
     if (rule) {
       const last = readState(key).cooldowns[rule.id] || 0;
@@ -764,42 +853,41 @@ function createRuntime(env = {}, options = {}) {
     record.status = 'sent';
     record.sent_at = clock();
     delete record.body;
+    if (record.feedback_retired || job.feedback_retired || feedbackOnly(job) || feedbackOnly(plan)) return;
     if (plan.welcome) state.welcome_sent = true;
     if (plan.ai) {
       appendEvent('ai_reply');
       if (state.observations?.binding !== connectionBinding()) state.observations = { binding: connectionBinding() };
       state.observations.ai_reply_sent_at = clock();
     }
-    if (plan.feedback_event) appendEvent('feedback', plan.feedback_event);
-    if (plan.feedback) {
-      const feedback = config('feedback.yaml', {}).feedback || {};
-      if (feedback.enabled !== false && state.mode === 'ai') {
-        const rawQuestion = typeof job.data?.content === 'string' ? job.data.content : '[图片消息]';
-        state.pending_feedback = { answer_id: hash(key + '|' + fingerprint).slice(0, 24), question: feedback.retain_text === true ? redact(rawQuestion, bounded(feedback.max_text_chars, 200, 2000)) : '[问题指纹:' + hash(normalized(rawQuestion)).slice(0, 16) + ']', answer: feedback.retain_text === true ? redact(plan.content, 500) : '[回答指纹:' + hash(plan.content).slice(0, 16) + ']', expires_at: clock() + bounded(feedback.expires_after_seconds, 86400) * 1000 };
-      }
-    }
   });
   const send = async (key, job, plan) => {
     if (!plan?.content) return 'none';
-    if (!await active(key, job, plan.ordinary !== false)) return 'cancelled';
     const state = readState(key);
     const fingerprint = plan.fingerprint || Number.parseInt(hash(key + '|' + job.id + '|' + plan.purpose).slice(0, 12), 16);
     let outgoing = state.outgoing[String(fingerprint)];
-    if (outgoing?.status === 'sent') return 'sent';
+    const retired = job.feedback_retired || outgoing?.feedback_retired || feedbackOnly(job) || feedbackOnly(plan);
+    if (outgoing?.status === 'sent') return retired ? 'cancelled' : 'sent';
+    if (outgoing?.status === 'cancelled') return 'cancelled';
     if (outgoing && ['unknown', 'sending'].includes(outgoing.status)) {
       let history;
       try { history = await messagesFor(state); } catch (_) { return 'retry'; }
       if (history.some((message) => String(message.fingerprint) === String(fingerprint))) {
         await rememberSent(key, job, plan, fingerprint);
-        return 'sent';
+        return retired ? 'cancelled' : 'sent';
       }
       if (clock() - outgoing.created_at < 10000) return 'retry';
+      if (retired || clock() - job.received_at > 300000) {
+        await transaction(key, (current) => { const record = current.outgoing[String(fingerprint)]; record.status = 'cancelled'; delete record.body; });
+        return 'cancelled';
+      }
       if (outgoing.attempts >= 2) {
         await transaction(key, (current) => { current.outgoing[String(fingerprint)].status = 'failed'; });
         appendEvent('delivery_failed', { reason: 'delivery_unknown' });
         return 'failed';
       }
     }
+    if (retired || !await active(key, job, plan.ordinary !== false)) return 'cancelled';
     if (plan.ordinary !== false) {
       let history;
       try { history = await messagesFor(readState(key)); } catch (_) {
@@ -810,14 +898,12 @@ function createRuntime(env = {}, options = {}) {
       const unresolved = history.filter(publicOperator).some((message) => timestamp(message.timestamp) > job.event_time && automation(message, readState(key)) === null);
       if (unresolved || !await active(key, job)) return 'cancelled';
     }
-    const feedback = config('feedback.yaml', {}).feedback || {};
     // 官方 automated 与持久出站 fingerprint 已能标识本项目消息；不发送未经支持的属性键。
     const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, automated: true };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
-    if (plan.feedback && feedback.enabled !== false && body.type === 'text') body.content = (body.content + '\n\n' + String(feedback.prompt || '是否解决问题？\n👍 是\n👎 否')).slice(0, 8000);
     const registered = await transaction(key, (current) => {
       const global = settings();
-      if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai') return false;
+      if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai' || !providerGenerationCurrent(job)) return false;
       const previous = current.outgoing[String(fingerprint)];
       current.outgoing[String(fingerprint)] = { status: 'sending', body, created_at: previous?.created_at || clock(), attempts: (previous?.attempts || 0) + 1, job_id: job.id, generation: current.generation };
       return true;
@@ -854,9 +940,11 @@ function createRuntime(env = {}, options = {}) {
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
         if (!selected.control && state.worker && state.worker.until > clock()) return null;
-        if (!selected.control && clock() - selected.received_at > 300000) { selected.status = 'cancelled'; delete selected.data; return null; }
+        const reconciling = selected.plan && Object.entries(state.outgoing || {}).some(([fingerprint, record]) =>
+          ['unknown', 'sending'].includes(record.status) && (record.job_id === selected.id || selected.plan.fingerprint && String(selected.plan.fingerprint) === fingerprint));
+        if (!selected.control && clock() - selected.received_at > 300000 && !reconciling) { selected.status = 'cancelled'; delete selected.data; return null; }
         token = crypto.randomBytes(12).toString('hex');
-        // 图片分析及知识问答各有 90 秒上限，租约覆盖两段请求和发送前复核。
+        // 生产推理两阶段共享90秒（可配置至180秒），租约另外覆盖检索与出站对账。
         if (!selected.control) state.worker = { job: selected.id, token, until: clock() + 300000 };
         selected.lease_until = clock() + 300000;
         selected.status = 'processing';

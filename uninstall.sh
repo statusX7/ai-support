@@ -78,6 +78,9 @@ for protected_directory in config knowledge backups logs data; do
   path="${DEPLOY_DIR}/${protected_directory}"
   [[ -d "$path" && ! -L "$path" ]] || die "受保护目录缺失或不安全：$path"
 done
+if [[ -e "${DEPLOY_DIR}/secrets" || -L "${DEPLOY_DIR}/secrets" ]]; then
+  [[ -d "${DEPLOY_DIR}/secrets" && ! -L "${DEPLOY_DIR}/secrets" ]] || die '受保护接口秘密目录不安全'
+fi
 [[ -f "${DEPLOY_DIR}/.env" && ! -L "${DEPLOY_DIR}/.env" ]] \
   || die "恢复密钥文件缺失或不安全：${DEPLOY_DIR}/.env"
 
@@ -213,7 +216,7 @@ chmod 0600 "${DEPLOY_DIR}/.env" "${DEPLOY_DIR}/${INSTALL_MARKER}"
 
 printf '\n安全卸载完成。\n'
 printf '删除内容：Docker 容器、Docker 网络、Compose 服务定义、程序脚本、workflow 副本和程序文档。\n'
-printf '保留内容：config、knowledge、backups、logs、data，以及权限为 0600 的 .env 离线恢复密钥。\n'
+printf '保留内容：config、knowledge、secrets、backups、logs、data，以及权限为 0600 的 .env 离线恢复密钥。\n'
 printf '完整备份：%s（含凭据和运行数据，必须私密保管）\n' "$BACKUP_FILE"
 printf '恢复方式：从新的源码目录运行 sudo ./install.sh --deploy-dir %s；安装程序会复用保留的数据和 .env。\n' "$DEPLOY_DIR"
 printf '安全提示：.env 仍含敏感恢复密钥，服务已停止但该文件不得上传或公开。\n'

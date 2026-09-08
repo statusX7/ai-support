@@ -156,6 +156,7 @@ bash -c 'set -euo pipefail
   initialize_config_files "$2"
   migrate_config_files "$2"
   migrate_runtime_env "$2"
+  python3 "$1/scripts/provider-pool.py" --deploy-dir "$2" migrate >/dev/null
   write_installation_marker "$2" "$1" "$(<"$1/VERSION")" local-ready
 ' -- "$PROJECT_ROOT" "$DEPLOY_DIR"
 bash "${PROJECT_ROOT}/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" \

@@ -5,12 +5,26 @@ MIGRATION_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/materials.sh
 source "${MIGRATION_SCRIPT_DIR}/materials.sh"
 
+migration_apply_legacy_provider() {
+  local deploy_dir=$1 file=$2 candidate status=0
+  candidate=$(mktemp "${deploy_dir}/tmp/migration-provider.XXXXXXXX")
+  # 旧业务包的 type/api_key_env 是投影元数据，不是新版池编辑字段。
+  # 只应用原有三元组，Key 和敏感 Header 仍使用本机同一主接口的保存值。
+  if jq -M '{provider:(.provider | {base_url,model,api_mode})}' "$file" > "$candidate"; then
+    bash "${MIGRATION_SCRIPT_DIR}/provider.sh" --deploy-dir "$deploy_dir" apply "$candidate" || status=$?
+  else
+    status=1
+  fi
+  rm -f -- "$candidate"
+  return "$status"
+}
+
 migration_allowed_path() {
   local entry=${1#./}
   entry=${entry%/}
   [[ "$entry" != /* && "$entry" != *'..'* && "$entry" != *\\* && "$entry" != *$'\n'* && "$entry" != *$'\r'* ]] || return 1
   case "$entry" in
-    ''|config|knowledge|n8n|VERSION|manifest.json|checksums.sha256|knowledge/catalog.json|n8n/workflow.json|config/runtime.yaml|config/provider.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml) return 0 ;;
+    ''|config|knowledge|n8n|VERSION|manifest.json|checksums.sha256|knowledge/catalog.json|n8n/workflow.json|config/runtime.yaml|config/provider.yaml|config/provider-pool.yaml|config/prompt.md|config/keyword.yaml|config/menu.yaml|config/handoff.yaml|config/tags.yaml|config/feedback.yaml) return 0 ;;
   esac
   [[ "$entry" =~ ^knowledge/kb_([a-f0-9]{16}|default)(/sources(/doc_[a-f0-9]{16}\.(md|txt|pdf|docx))?)?$ ]]
 }
@@ -30,7 +44,7 @@ allowed_exact = {
     "", "config", "knowledge", "n8n", "VERSION", "manifest.json", "checksums.sha256",
     "knowledge/catalog.json", "n8n/workflow.json", "config/runtime.yaml", "config/provider.yaml",
     "config/prompt.md", "config/keyword.yaml", "config/menu.yaml", "config/handoff.yaml",
-    "config/tags.yaml", "config/feedback.yaml",
+    "config/tags.yaml", "config/feedback.yaml", "config/provider-pool.yaml",
 }
 knowledge = re.compile(r"^knowledge/kb_(?:[a-f0-9]{16}|default)(?:/sources(?:/doc_[a-f0-9]{16}\.(?:md|txt|pdf|docx))?)?$")
 seen = set()
@@ -86,6 +100,15 @@ migration_export() (
   else
     jq -M -n --arg base "$(env_get "${deploy_dir}/.env" AI_API_PROBE_BASE_URL)" --arg model "$(env_get "${deploy_dir}/.env" AI_MODEL)" --arg mode "$(env_get "${deploy_dir}/.env" AI_API_MODE)" '{schema_version:2,provider:{type:"openai-compatible",base_url:$base,model:$model,api_mode:$mode,api_key_env:"AI_API_KEY"}}' > "${stage}/config/provider.yaml"
   fi
+  if [[ -f "${deploy_dir}/config/provider-pool-applied.json" && ! -L "${deploy_dir}/config/provider-pool-applied.json" ]]; then
+    python3 "${MIGRATION_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" list > "${stage}/pool.json" || return 1
+    jq -M '{schema_version:1,revision:0,primary_id,entries:(.entries|map(del(.key_status))),policy}' \
+      "${stage}/pool.json" > "${stage}/config/provider-pool.yaml"
+    rm -f -- "${stage}/pool.json"
+    python3 "${MIGRATION_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" validate-file \
+      "${stage}/config/provider-pool.yaml" >/dev/null || return 1
+    chmod 0600 "${stage}/config/provider-pool.yaml"
+  fi
   install -m 600 -- "${deploy_dir}/config/prompt.md" "${stage}/config/prompt.md"
   install -m 600 -- "${deploy_dir}/VERSION" "${stage}/VERSION"
   install -m 600 -- "${deploy_dir}/n8n/workflow.json" "${stage}/n8n/workflow.json"
@@ -95,7 +118,7 @@ migration_export() (
     [[ -f "${deploy_dir}/knowledge/${library}/${source}" && ! -L "${deploy_dir}/knowledge/${library}/${source}" ]] || return 1
     install -D -m 600 -- "${deploy_dir}/knowledge/${library}/${source}" "${stage}/knowledge/${library}/${source}"
   done < <(jq -M -c '.libraries[] | .id as $library | .documents[] | {library:$library,source:.source}' "${stage}/knowledge/catalog.json")
-  jq -M -n --arg version "$(<"${stage}/VERSION")" '{format:"ai-support-business-v2",schema_version:2,version:$version,contains_secrets:false,contains_knowledge:true,requires_credentials:["AI_API_KEY","CRISP_TOKEN_IDENTIFIER","CRISP_TOKEN_KEY","Webhook Secret"]}' > "${stage}/manifest.json"
+  jq -M -n --arg version "$(<"${stage}/VERSION")" '{format:"ai-support-business-v2",schema_version:2,version:$version,contains_secrets:false,contains_knowledge:true,requires_credentials:["各接口独立 API Key 及自定义认证 Header（按稳定接口 ID 匹配本机保留值）","CRISP_TOKEN_IDENTIFIER","CRISP_TOKEN_KEY","Webhook Secret"]}' > "${stage}/manifest.json"
   # shellcheck disable=SC2094
   (cd -- "$stage"; find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256)
   temporary=$(mktemp "$(dirname -- "$output")/.migration.XXXXXX")
@@ -127,6 +150,10 @@ migration_extract_validate() {
   normalize_api_base "$(jq -M -r '.provider.base_url' "${stage}/config/provider.yaml")" >/dev/null || return 1
   validate_model_identifier "$(jq -M -r '.provider.model' "${stage}/config/provider.yaml")" || return 1
   configuration_prompt_candidate_validate "${stage}/config/prompt.md" || return 1
+  if [[ -f "${stage}/config/provider-pool.yaml" ]]; then
+    python3 "${MIGRATION_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" validate-file \
+      "${stage}/config/provider-pool.yaml" >/dev/null || return 1
+  fi
   while IFS= read -r row; do
     source=$(jq -M -r '.path' <<< "$row"); hash=$(jq -M -r '.sha256' <<< "$row")
     extension=${source##*.}; extension=${extension,,}
@@ -139,11 +166,17 @@ migration_import() (
   local deploy_dir=$1 input=$2 preview=${3:-false} stage history name row library source temporary
   local candidate_knowledge restore_stage provider_restore_stage failed_knowledge materials_ok=false provider_ok=false knowledge_installed=false
   local materials_restored=false provider_restored=false knowledge_restored=false runtime_guarded=false guard_projection guard_revision
+  local pool_result='{}' pool_applied=true pool_preview='null'
+  local -a backup_paths=(config knowledge .env)
   stage=$(mktemp -d "${deploy_dir}/tmp/migration-import.XXXXXX")
   trap 'rm -rf -- "$stage"' EXIT
   migration_extract_validate "$deploy_dir" "$input" "$stage" || { configuration_error '迁移包校验失败，现有配置未改变'; return 1; }
   if [[ "$preview" == true ]]; then
-    jq -M -n --slurpfile manifest "${stage}/manifest.json" --slurpfile catalog "${stage}/knowledge/catalog.json" '{manifest:$manifest[0],libraries:[$catalog[0].libraries[] | {id,name,enabled,documents:(.documents|length)}],mode:"替换业务配置并保留本机秘密"}'
+    if [[ -f "${stage}/config/provider-pool.yaml" ]]; then
+      pool_preview=$(jq -Mc '{primary_id,entries:[.entries[]|{id,name,role,enabled,model,api_mode}],policy}' "${stage}/config/provider-pool.yaml")
+    fi
+    jq -M -n --slurpfile manifest "${stage}/manifest.json" --slurpfile catalog "${stage}/knowledge/catalog.json" --argjson pool "$pool_preview" \
+      '{manifest:$manifest[0],libraries:[$catalog[0].libraries[] | {id,name,enabled,documents:(.documents|length)}],provider_pool:$pool,mode:"替换业务配置并保留本机秘密；缺少接口 Key 的项目仅保存停用草稿"}'
     return 0
   fi
   acquire_maintenance_lock "$deploy_dir"
@@ -151,11 +184,19 @@ migration_import() (
   configuration_materials_ensure "$deploy_dir" || return 1
   history=$(mktemp -d "${deploy_dir}/backups/config-history/migration.XXXXXXXX")
   migration_export "$deploy_dir" "${history}/previous.tar.gz" >/dev/null || return 1
-  tar -czf "${history}/local.tar.gz" -C "$deploy_dir" config knowledge .env
+  if [[ -d "${deploy_dir}/secrets" && ! -L "${deploy_dir}/secrets" ]]; then
+    if find "${deploy_dir}/secrets" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
+      configuration_error '接口秘密目录不安全，导入未开始'
+      return 1
+    fi
+    backup_paths+=(secrets)
+  fi
+  tar -czf "${history}/local.tar.gz" -C "$deploy_dir" "${backup_paths[@]}"
   chmod 600 "${history}/local.tar.gz"
   for name in runtime handoff keyword menu tags feedback; do
     temporary=$(mktemp "${deploy_dir}/config/${name}.yaml.tmp.XXXXXX")
-    install -m 640 -- "${stage}/config/${name}.yaml" "$temporary"
+    configuration_normalize_file "$name" "${stage}/config/${name}.yaml" "$temporary" || return 1
+    chmod 0640 "$temporary"
     chown root:1000 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "${deploy_dir}/config/${name}.yaml"
   done
@@ -180,15 +221,27 @@ migration_import() (
     knowledge_installed=true
   fi
 
-  if [[ "$knowledge_installed" == true ]] && bash "${MIGRATION_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply >/dev/null; then
+  if [[ "$knowledge_installed" == true ]] && bash "${MIGRATION_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business >/dev/null; then
     materials_ok=true
   fi
-  if [[ "$materials_ok" == true ]] && bash "${MIGRATION_SCRIPT_DIR}/provider.sh" --deploy-dir "$deploy_dir" apply "${stage}/config/provider.yaml" >/dev/null; then
-    provider_ok=true
+  if [[ "$materials_ok" == true ]]; then
+    if [[ -f "${stage}/config/provider-pool.yaml" ]]; then
+      if pool_result=$(python3 "${MIGRATION_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" import "${stage}/config/provider-pool.yaml") \
+        && jq -e '.ok == true' <<< "$pool_result" >/dev/null; then
+        provider_ok=true
+        pool_applied=$(jq -r 'if .applied == false then false else true end' <<< "$pool_result")
+      fi
+    elif migration_apply_legacy_provider "$deploy_dir" "${stage}/config/provider.yaml" >/dev/null; then
+      provider_ok=true
+    fi
   fi
   if [[ "$materials_ok" == true && "$provider_ok" == true ]]; then
     jq -M -n --arg backup "${history}/local.tar.gz" --argjson revision "$(jq -M -r '.revision' "${deploy_dir}/config/materials-applied.json")" \
-      '{applied:true,secrets_preserved:true,recovery_backup:$backup,revision:$revision}'
+      --argjson pool_applied "$pool_applied" --argjson pool "$pool_result" \
+      '{applied:$pool_applied,business_applied:true,provider_pool_applied:$pool_applied,draft:($pool_applied|not),
+        secrets_preserved:true,recovery_backup:$backup,revision:$revision,
+        missing_credentials:[$pool.entries[]?|select(.draft == true)|{id,name}],
+        message:(if $pool_applied then "业务配置已应用，接口秘密按本机稳定 ID 保留" else "业务资料已应用；导入主接口缺少 Key，接口池仅保存草稿，原有效池继续工作。请到菜单 3 补齐并应用草稿" end)}'
     return 0
   fi
 
@@ -213,14 +266,19 @@ migration_import() (
     chown -R root:1000 "${deploy_dir}/knowledge" 2>/dev/null || true
   fi
   if [[ "$knowledge_restored" == true ]] &&
-    bash "${MIGRATION_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply >/dev/null 2>&1 &&
+    bash "${MIGRATION_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business >/dev/null 2>&1 &&
     bash "${MIGRATION_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" status >/dev/null 2>&1; then
     materials_restored=true
   fi
   provider_restore_stage=$(mktemp -d "${deploy_dir}/tmp/migration-provider-restore.XXXXXXXX")
-  if tar -xzf "${history}/previous.tar.gz" -C "$provider_restore_stage" --no-same-owner --no-same-permissions &&
-    bash "${MIGRATION_SCRIPT_DIR}/provider.sh" --deploy-dir "$deploy_dir" apply "${provider_restore_stage}/config/provider.yaml" >/dev/null 2>&1; then
-    provider_restored=true
+  if tar -xzf "${history}/previous.tar.gz" -C "$provider_restore_stage" --no-same-owner --no-same-permissions; then
+    if [[ -f "${provider_restore_stage}/config/provider-pool.yaml" ]]; then
+      if python3 "${MIGRATION_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" apply-file "${provider_restore_stage}/config/provider-pool.yaml" >/dev/null 2>&1; then
+        provider_restored=true
+      fi
+    elif migration_apply_legacy_provider "$deploy_dir" "${provider_restore_stage}/config/provider.yaml" >/dev/null 2>&1; then
+      provider_restored=true
+    fi
   fi
   rm -rf -- "$provider_restore_stage"
   if [[ "$materials_restored" == true && "$provider_restored" != true ]]; then

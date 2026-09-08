@@ -2,6 +2,7 @@
 """Drive production Shell menus; application HTTP/daemon readback are protocol fixtures."""
 
 import errno
+import copy
 import fcntl
 import hashlib
 import http.server
@@ -100,7 +101,7 @@ class Terminal:
 
 PROMPT = {"text": "初始虚构 Prompt。\n"}
 MODEL_LIST = {"status": 200, "calls": 0, "chat_calls": 0, "probes": [],
-              "ids": ["synthetic-menu-model"]}
+              "ids": ["synthetic-menu-model"], "post_status": 200}
 
 
 class ApplicationFixture(http.server.BaseHTTPRequestHandler):
@@ -146,6 +147,9 @@ class ApplicationFixture(http.server.BaseHTTPRequestHandler):
             vision = isinstance(content, list) and any(
                 item.get("type") in ("image_url", "input_image") for item in content)
             MODEL_LIST["probes"].append((self.path, body.get("model"), vision))
+            if MODEL_LIST["post_status"] != 200:
+                self.answer({"error": {"code": "invalid_api_key", "message": "虚构候选验证失败"}}, MODEL_LIST["post_status"])
+                return
             self.answer({"choices": [{"message": {"content": "协议测试，不是真实模型。"}}], "output_text": "协议测试"})
         elif self.path == "/webhook/crisp-webhook?key=ai-support-healthcheck-invalid":
             self.answer({"accepted": False, "reason": "Webhook 校验失败"}, 401)
@@ -195,7 +199,7 @@ def log_menu_cases():
     terminal.send("2"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
     terminal.expect("最近行数"); terminal.send("1")
     terminal.expect("时间窗口"); terminal.send("2h")
-    terminal.expect("ui_regression"); leave(terminal)
+    terminal.expect("动作：已记录维护事件"); leave(terminal)
     assert active.read_bytes() == original
     passing("日志菜单按来源/行数/时间窗调用真实查看器，不修改日志或业务资料")
 
@@ -208,7 +212,7 @@ def log_menu_cases():
 
     terminal = enter("logs-follow-interrupt")
     terminal.send("3"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
-    terminal.expect("ui_regression")
+    terminal.expect("动作：已记录维护事件")
     os.killpg(terminal.process.pid, signal.SIGINT)
     terminal.expect("已停止日志查看，服务未停止"); leave(terminal)
     assert active.read_bytes() == original
@@ -292,107 +296,296 @@ printf '受管匿名在线更新入口已调用\n'
         online_entry.chmod(0o750)
 
 
+
+
+def provider_pool():
+    return json.loads((DEPLOY / "config/provider-pool-applied.json").read_text())
+
+
+def provider_snapshot():
+    files = [DEPLOY / name for name in (".env", "config/provider.yaml", "config/runtime.yaml",
+                                       "config/provider-pool.yaml", "config/provider-pool-applied.json")]
+    files += sorted((DEPLOY / "secrets/provider/generations").glob("*.json"))
+    return {path: path.read_bytes() for path in files}
+
+
+def assert_chinese_result(output):
+    assert not re.search(r'"(?:ok|enabled|schema_version|revision|applied_revision|entries)"\s*:', output), output
+    assert not re.search(r'\b(?:schema_version|applied_revision|revision|Traceback)\b|p_[0-9a-f]{24}|(?:kb_|rule_|menu_)[0-9a-f]{8,}', output), output
+    assert not re.search(r'synthetic-(?:menu-key|backup-secret|hidden-secret|header-value)', output), output
+
+
+def enter_provider(name, extra=None):
+    terminal = Terminal(name, extra=extra)
+    terminal.expect("请选择："); terminal.send("3")
+    terminal.expect("1. 查看主备接口列表"); terminal.expect("请选择：")
+    return terminal
+
+
+def leave_provider(terminal, *, editing=False):
+    if editing:
+        terminal.expect("9. 验证并保存整组修改"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("1. 查看主备接口列表"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("请选择："); terminal.send("0")
+    output = terminal.finish()
+    assert_chinese_result(output)
+    return output
+
+
 def provider_retry_cases():
-    """PTY 驱动生产 models/apply；Docker 仅在本测试的明确边界内模拟。"""
-    docker = BIN / "docker"
-    original_docker = docker.read_bytes()
-    delegate = BIN / "configuration-docker-readback"
-    delegate.write_bytes(original_docker)
-    delegate.chmod(0o755)
-    operation_log = WORK / "provider-menu-docker.log"
-    docker.write_text(r'''#!/usr/bin/env bash
-set -euo pipefail
-arguments=("$@")
-if [[ "$*" == *'GENERIC_OPEN_AI_BASE_PATH'* && "$*" == *'fetch('* ]]; then
-  printf 'runtime-provider-test\n' >> "${MENU_PROVIDER_OPERATION_LOG:?}"
-  printf '{"verified":true,"environment":"unit-menu-provider-fixture"}\n'
-  exit 0
-fi
-while (( $# )); do
-  case "$1" in
-    config) exit 0 ;;
-    up) printf 'up\n' >> "${MENU_PROVIDER_OPERATION_LOG:?}"; exit 0 ;;
-    ps) printf 'postgres\nanythingllm\nn8n\n'; exit 0 ;;
-    --project-directory|--env-file|-f) shift 2 ;;
-    *) shift ;;
-  esac
-done
-exec "${BASH_SOURCE[0]%/*}/configuration-docker-readback" "${arguments[@]}"
-''', encoding="utf-8")
-    docker.chmod(0o755)
-    operation_log.touch(mode=0o600)
-    files = [DEPLOY / name for name in (".env", "config/provider.yaml", "config/runtime.yaml")]
+    """真实 PTY → provider.sh → 本地生产 adapter → 虚构上游；不模拟保存回执。"""
     retry_prompt = "模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消："
-    extra = {"MENU_PROVIDER_OPERATION_LOG": str(operation_log), "FUNCNEST": "12"}
-
-    def current_configuration():
-        return [path.read_bytes() for path in files]
-
-    def provider_history():
-        return set((DEPLOY / "backups/config-history").glob("provider.*"))
 
     def open_models(name):
-        terminal = Terminal(name, extra=extra)
-        terminal.expect("请选择："); terminal.send("3")
-        terminal.expect("请选择："); terminal.send("4")
+        terminal = enter_provider(name, {"FUNCNEST": "12"})
+        terminal.send("2"); terminal.expect("请选择："); terminal.send("4")
         return terminal
-
-    def exit_provider(terminal):
-        terminal.expect("1. 查看脱敏配置"); terminal.expect("请选择："); terminal.send("0")
-        terminal.expect("请选择："); terminal.send("0")
-        return terminal.finish()
 
     try:
         MODEL_LIST.update(status=429, calls=0, chat_calls=0, probes=[], ids=["synthetic-menu-retry-model"])
-        before = current_configuration()
-        history_before = provider_history()
+        before = provider_snapshot()
         terminal = open_models("models-transient-retry")
-        # 失败重试次数超过 FUNCNEST，递归重新进入选择函数会触发 Bash 上限。
         for _ in range(14):
             terminal.expect(retry_prompt)
-            assert current_configuration() == before and provider_history() == history_before
-            assert operation_log.read_text() == "" and MODEL_LIST["chat_calls"] == 0
+            assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == 0
             terminal.send("1")
-        terminal.expect(retry_prompt)
-        MODEL_LIST["status"] = 200
-        terminal.send("1")
+        terminal.expect(retry_prompt); MODEL_LIST["status"] = 200; terminal.send("1")
         terminal.expect("1. synthetic-menu-retry-model")
         terminal.expect("选择模型（数字"); terminal.send("1")
-        terminal.expect("unit-menu-provider-fixture")
-        output = exit_provider(terminal)
-        actual = json.loads((DEPLOY / "config/provider.yaml").read_text())["provider"]
-        runtime = json.loads((DEPLOY / "config/runtime.yaml").read_text())
-        assert actual["model"] == "synthetic-menu-retry-model"
-        assert runtime["revision"] == runtime["applied_revision"]
-        assert len(provider_history() - history_before) == 1
-        assert operation_log.read_text().splitlines() == ["up", "runtime-provider-test"]
-        assert MODEL_LIST["calls"] >= 16 and MODEL_LIST["chat_calls"] == 3, MODEL_LIST
-        assert MODEL_LIST["probes"] == [
-            ("/proxy/v1/chat/completions", "synthetic-menu-retry-model", False),
-            ("/proxy/v1/responses", "synthetic-menu-retry-model", False),
-            ("/proxy/v1/chat/completions", "synthetic-menu-retry-model", True),
-        ], MODEL_LIST["probes"]
-        assert output.count(retry_prompt) == 15
-        assert "手动模型原名" not in output and "maximum function nesting" not in output
-        passing("生产PTY模型列表429返回4、连续重试不递归，恢复后数字选择仅应用一次")
-
-        for action, label in (("0", "取消"), ("2", "返回修改接口")):
+        terminal.expect("模型已写入本次候选")
+        assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == 0
+        terminal.expect("请选择："); terminal.send("9"); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+        terminal.expect("接口共")
+        output = leave_provider(terminal)
+        assert provider_pool()["entries"][0]["model"] == "synthetic-menu-retry-model"
+        # 模型列表后端每轮最多3次无推理GET重试；15轮失败+最终成功1次。
+        assert MODEL_LIST["calls"] == 46 and MODEL_LIST["chat_calls"] == 1, MODEL_LIST
+        assert MODEL_LIST["probes"] == [("/proxy/v1/chat/completions", "synthetic-menu-retry-model", False)], MODEL_LIST
+        assert output.count(retry_prompt) == 15 and "maximum function nesting" not in output
+        passing("生产PTY模型429连续14次重试不递归，模型选择不保存，整组确认才由真实adapter探测并应用一次")
+        for action, label in (("0", "取消"), ("2", "返回编辑")):
             MODEL_LIST.update(status=503, calls=0, chat_calls=0, probes=[])
-            before = current_configuration()
-            history_before = provider_history()
-            operation_log.write_text("")
+            before = provider_snapshot()
             terminal = open_models("models-transient-" + action)
             terminal.expect(retry_prompt); terminal.send(action)
-            output = exit_provider(terminal)
-            assert current_configuration() == before and provider_history() == history_before
-            assert operation_log.read_text() == "" and MODEL_LIST["chat_calls"] == 0
-            assert MODEL_LIST["calls"] >= 1 and output.count(retry_prompt) == 1
-            assert "手动模型原名" not in output and "unit-menu-provider-fixture" not in output
-            passing(f"生产PTY模型列表503返回4后{label}，不改配置、不推理、不apply")
+            output = leave_provider(terminal, editing=True)
+            assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == 0
+            assert MODEL_LIST["calls"] == 3 and output.count(retry_prompt) == 1
+            passing(f"生产PTY模型503后{label}，有效池/秘密不变且未触发推理")
     finally:
-        MODEL_LIST.update(status=200, ids=["synthetic-menu-model"])
-        docker.write_bytes(original_docker)
-        docker.chmod(0o755)
+        MODEL_LIST.update(status=200, ids=["synthetic-menu-model"], post_status=200)
+
+
+def provider_pool_menu_cases():
+    primary = provider_pool()["primary_id"]
+    original = provider_pool()["entries"][0]
+    base = original["base_url"]
+
+    def select(terminal, action, identifier=None, *, backup=False):
+        terminal.send(str(action)); terminal.expect("请选择序号（0 返回）：")
+        entries = [item for item in provider_pool()["entries"] if not backup or item["role"] == "backup"]
+        index = next(i for i, item in enumerate(entries, 1) if item["id"] == identifier) if identifier else 1
+        terminal.send(str(index))
+
+    def save(terminal):
+        terminal.expect("请选择："); terminal.send("9")
+        terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共")
+        return leave_provider(terminal)
+
+    def add(name, model):
+        terminal = enter_provider("pool-add-" + model)
+        terminal.send("3"); terminal.expect("备用接口显示名称"); terminal.send(name)
+        terminal.expect("备用接口地址"); terminal.send(base)
+        terminal.expect("备用接口密钥（隐藏输入）"); terminal.send("synthetic-backup-secret")
+        terminal.expect("请选择："); terminal.send("5")
+        terminal.expect("准确模型名称"); terminal.send(model)
+        save(terminal)
+        return next(item["id"] for item in provider_pool()["entries"] if item["name"] == name)
+
+    calls = MODEL_LIST["chat_calls"]
+    before = provider_snapshot()
+    terminal = enter_provider("pool-readonly")
+    terminal.send("1"); terminal.expect("合法的单接口配置")
+    terminal.expect("请选择："); terminal.send("11"); terminal.expect("近期切换记录")
+    leave_provider(terminal)
+    assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == calls
+    passing("单接口零备用列表与近期记录真实读取、不付费、不热改")
+
+    first = add("备用甲", "backup-a")
+    assert provider_pool()["entries"][0] == original and len(provider_pool()["entries"]) == 2
+    passing("数字添加备用接口，整组验证后生效且主接口不变")
+    secret = json.loads((DEPLOY / "secrets/provider/generations" / (provider_pool()["secrets_generation"] + ".json")).read_text())["entries"][first]
+    terminal = enter_provider("pool-edit-backup")
+    select(terminal, 4, first)
+    terminal.expect("请选择："); terminal.send("3"); terminal.expect("新 API Key"); terminal.send("")
+    terminal.expect("请选择："); terminal.send("5"); terminal.expect("准确模型名称"); terminal.send("backup-a-updated")
+    save(terminal)
+    assert provider_pool()["entries"][0] == original
+    assert next(item for item in provider_pool()["entries"] if item["id"] == first)["model"] == "backup-a-updated"
+    after_secret = json.loads((DEPLOY / "secrets/provider/generations" / (provider_pool()["secrets_generation"] + ".json")).read_text())["entries"][first]
+    assert after_secret == secret
+    passing("编辑指定备用模型不改主，稳定标识不变，隐藏Key回车保留且结果不泄Key/内部编号")
+
+    before = provider_snapshot()
+    terminal = enter_provider("pool-candidate-cancel")
+    select(terminal, 4, first)
+    terminal.expect("请选择："); terminal.send("3"); terminal.expect("新 API Key"); terminal.send("synthetic-hidden-secret")
+    leave_provider(terminal, editing=True)
+    assert provider_snapshot() == before
+    passing("含新密钥的候选数字取消保留旧整组与秘密代次")
+
+    before = provider_snapshot(); MODEL_LIST["post_status"] = 401
+    terminal = enter_provider("pool-failed-save")
+    select(terminal, 4, first)
+    terminal.expect("请选择："); terminal.send("5"); terminal.expect("准确模型名称"); terminal.send("rejected-model")
+    terminal.expect("请选择："); terminal.send("9"); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("验证未通过，候选仍保留")
+    leave_provider(terminal, editing=True)
+    MODEL_LIST["post_status"] = 200
+    assert provider_snapshot() == before
+    passing("候选真实上游401失败保旧，错误中文且留编辑页重试、不显示假成功")
+
+    second = add("备用乙", "backup-b")
+    terminal = enter_provider("pool-order")
+    terminal.send("5"); terminal.expect("逗号分隔"); terminal.send("2,1")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+    assert [item["id"] for item in provider_pool()["entries"]] == [primary, second, first]
+    before = provider_snapshot()
+    terminal = enter_provider("pool-order-invalid")
+    terminal.send("5"); terminal.expect("逗号分隔"); terminal.send("1,2,bad")
+    terminal.expect("每个备用序号恰好出现一次"); leave_provider(terminal)
+    assert provider_snapshot() == before
+    passing("备用数字排序真实回读；非法多余项不被过滤后冒充合法顺序")
+
+    for value, expected in (("2", False), ("1", True), ("2", False)):
+        terminal = enter_provider("pool-enable-" + value + str(expected))
+        select(terminal, 6, first, backup=True)
+        terminal.expect("1 启用 / 2 停用"); terminal.send(value)
+        terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+        assert next(item for item in provider_pool()["entries"] if item["id"] == first)["enabled"] is expected
+        assert provider_pool()["entries"][0] == original
+    terminal = enter_provider("pool-primary-exchange")
+    select(terminal, 7, first)
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+    assert provider_pool()["primary_id"] == first and provider_pool()["entries"][0]["enabled"] is True
+    assert next(item for item in provider_pool()["entries"] if item["id"] == primary)["role"] == "backup"
+    passing("备用启停实际生效；停用备用设主时自动启用、原主原子转备")
+
+    calls = MODEL_LIST["chat_calls"]
+    terminal = enter_provider("pool-test-cancel")
+    select(terminal, 9, second)
+    terminal.expect("1 测试文本 / 2 测试图片"); terminal.send("1")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("0"); leave_provider(terminal)
+    assert MODEL_LIST["chat_calls"] == calls
+    terminal = enter_provider("pool-explicit-test")
+    select(terminal, 9, second)
+    terminal.expect("1 测试文本 / 2 测试图片"); terminal.send("1")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("实际回读通过：是"); leave_provider(terminal)
+    assert MODEL_LIST["chat_calls"] == calls + 1 and MODEL_LIST["probes"][-1][1] == "backup-b"
+    passing("指定接口测试取消零调用；明确确认才测所选备用，不误测主")
+
+    terminal = enter_provider("pool-policy")
+    terminal.send("10"); terminal.expect("修改哪一项："); terminal.send("4")
+    terminal.expect("新的正整数"); terminal.send("3")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("每问题最多调用次数：3")
+    leave_provider(terminal)
+    assert provider_pool()["policy"]["max_attempts"] == 3
+    before = provider_snapshot()
+    terminal = enter_provider("pool-policy-invalid")
+    terminal.send("10"); terminal.expect("修改哪一项："); terminal.send("1")
+    terminal.expect("新的正整数"); terminal.send("1000")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("操作未完成")
+    leave_provider(terminal)
+    assert provider_snapshot() == before
+    passing("策略整组回读；违反连接/单次/总期限关系时拒绝且旧策略不变")
+
+    terminal = enter_provider("pool-restore-original-primary")
+    select(terminal, 7, primary)
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+    for identifier in (first, second):
+        terminal = enter_provider("pool-delete-" + ("a" if identifier == first else "b"))
+        select(terminal, 8, identifier, backup=True)
+        terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+        assert identifier not in [item["id"] for item in provider_pool()["entries"]]
+    assert provider_pool()["entries"] == [original]
+    passing("数字删除仅所选备用，恢复为合法零备用且原主凭据配置保持")
+
+
+def provider_file_menu_cases():
+    source = DEPLOY / "config/provider-pool.yaml"
+    active = DEPLOY / "config/provider-pool-applied.json"
+    original = copy.deepcopy(provider_pool())
+    name = original["entries"][0]["name"]
+
+    def policy(terminal, action):
+        terminal.send("10"); terminal.expect("修改哪一项："); terminal.send(str(action))
+
+    changed = json.loads(source.read_text())
+    changed["entries"][0]["name"] = "文件编辑后的主接口"
+    source.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
+    before = active.read_bytes()
+    terminal = enter_provider("pool-source-apply-cancel")
+    policy(terminal, 9); terminal.expect("校验通过只表示原文格式可用")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("0"); leave_provider(terminal)
+    assert active.read_bytes() == before
+    terminal = enter_provider("pool-source-apply")
+    policy(terminal, 9); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("文件编辑后的主接口"); leave_provider(terminal)
+    assert provider_pool()["entries"][0]["name"] == changed["entries"][0]["name"]
+    passing("主备原文只读校验与数字取消不生效，明确确认后由生产apply-file回读生效")
+
+    original_source = json.loads(source.read_text())
+    original_source["entries"][0]["name"] = name
+    imported = copy.deepcopy(original_source)
+    former = copy.deepcopy(imported["entries"][0]); former.update(role="backup", order=1)
+    imported["entries"][0].update(id="p_" + "b" * 24, name="导入的新主", role="primary", order=0)
+    new_backup = copy.deepcopy(former); new_backup.update(id="p_" + "c" * 24, name="待补密钥备用", order=2)
+    imported["entries"] += [former, new_backup]
+    imported["primary_id"] = imported["entries"][0]["id"]
+    file = WORK / "虚构主备导入.json"
+    file.write_text(json.dumps(imported, ensure_ascii=False), encoding="utf-8"); file.chmod(0o600)
+    before = {path: path.read_bytes() for path in (active, source, DEPLOY / ".env")}
+    terminal = enter_provider("pool-import-draft")
+    policy(terminal, 10); terminal.expect("结构文件路径"); terminal.send(str(file))
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("仅保存草稿，尚未应用"); leave_provider(terminal)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    draft = json.loads((DEPLOY / "config/provider-pool-import-draft.json").read_text())
+    assert draft["primary_id"] == imported["primary_id"]
+    passing("陌生主接口无本机Key导入仅受限草稿，普通中文明确未应用且旧池/.env字节不变")
+
+    terminal = enter_provider("pool-complete-draft")
+    policy(terminal, 11)
+    terminal.expect("请选择："); terminal.send("2")
+    terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+    terminal.expect("请选择："); terminal.send("3"); terminal.expect("新 API Key"); terminal.send("synthetic-backup-secret")
+    terminal.expect("请选择："); terminal.send("9"); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("仅保存草稿，尚未应用")
+    terminal.expect("请选择："); terminal.send("0"); leave_provider(terminal)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    draft = json.loads((DEPLOY / "config/provider-pool-import-draft.json").read_text())
+    assert draft["primary_id"] == imported["primary_id"] and not draft["entries"][0].get("draft", False)
+    passing("导入草稿数字选中主接口补隐藏Key，真实验证后只保存草稿且稳定编号/当前池保持")
+
+    terminal = enter_provider("pool-apply-draft")
+    policy(terminal, 11)
+    terminal.expect("请选择："); terminal.send("3"); terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("导入的新主"); leave_provider(terminal)
+    assert provider_pool()["primary_id"] == imported["primary_id"]
+    pending = next(item for item in provider_pool()["entries"] if item["id"] == new_backup["id"])
+    assert pending["enabled"] is False and pending["draft"] is True
+    assert provider_pool()["entries"][1]["id"] == original["primary_id"]
+    passing("草稿明确确认后才整体应用，缺Key备用保持禁用，匹配旧接口本机秘密继续保留")
+
+    terminal = enter_provider("pool-file-fixture-restore-primary")
+    terminal.send("7"); terminal.expect("请选择序号（0 返回）："); terminal.send("2")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+    for suffix in ("new-primary", "empty-backup"):
+        terminal = enter_provider("pool-file-fixture-delete-" + suffix)
+        terminal.send("8"); terminal.expect("请选择序号（0 返回）："); terminal.send("1")
+        terminal.expect("1 确认 / 0 返回："); terminal.send("1"); terminal.expect("接口共"); leave_provider(terminal)
+    assert provider_pool()["entries"] == original["entries"]
 
 
 def material_menu_cases():
@@ -418,7 +611,7 @@ def material_menu_cases():
         terminal = Terminal("material-apply-menu")
         terminal.expect("请选择："); terminal.send("16"); terminal.expect("请选择："); terminal.send("6")
         terminal.expect("仅应用已编辑的资料变更"); terminal.expect("请选择："); terminal.send("1")
-        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('"applied": true')
+        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('资料已应用：是')
         terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
         terminal.finish()
         assert PROMPT["text"] == candidate
@@ -428,7 +621,7 @@ def material_menu_cases():
         terminal = Terminal("material-force-menu")
         terminal.expect("请选择："); terminal.send("16"); terminal.expect("请选择："); terminal.send("6")
         terminal.expect("重新同步现有资料"); terminal.expect("请选择："); terminal.send("2")
-        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('"applied": true')
+        terminal.expect("1 确认 / 0 返回"); terminal.send("1"); terminal.expect('资料已应用：是')
         terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
         terminal.finish()
         assert PROMPT["text"] == candidate and source.read_text() == candidate
@@ -442,6 +635,175 @@ def material_menu_cases():
         source.write_bytes(original)
         result = invoke(command + ["--force-external"])
         assert result.returncode == 0 and PROMPT["text"] == original.decode(), result.stdout
+
+
+def welcome_presentation_cases():
+    """欢迎与总开关分别实际回读，普通菜单不能显示后端总开关的 JSON 冒充欢迎结果。"""
+    runtime_before = json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"]
+    for action, expected, label in (("3", False, "欢迎语：已关闭"), ("2", True, "欢迎语：已启用")):
+        terminal = Terminal("welcome-readable-" + action)
+        terminal.expect("请选择："); terminal.send("9")
+        terminal.expect("请选择："); start = len(terminal.output); terminal.send(action)
+        terminal.expect("1. 查看欢迎配置")
+        terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0")
+        output = terminal.finish()
+        actual = json.loads((DEPLOY / "config/menu.yaml").read_text())
+        projection = json.loads((DEPLOY / "config/materials-applied.json").read_text())
+        assert actual["welcome"]["enabled"] is expected
+        assert projection["configuration"]["menu"]["welcome"]["enabled"] is expected
+        assert projection["configuration"]["runtime"]["enabled"] is runtime_before
+        assert label in output[start:], output
+        assert not re.search(r'"(?:enabled|schema_version|revision|applied_revision)"\s*:', output[start:]), output
+    passing("欢迎启停按目标与有效投影回读中文结果，总开关保持且不泄露内部JSON")
+    before = json.loads((DEPLOY / "config/menu.yaml").read_text())
+    terminal = Terminal("welcome-failure-old-state", extra={"CONFIGURATION_FIXTURE_READBACK_FAIL": "1"})
+    terminal.expect("请选择："); terminal.send("9"); terminal.expect("请选择："); terminal.send("3")
+    terminal.expect("保存未完成")
+    terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+    output = terminal.finish()
+    assert "设置已保存并完成实际回读" not in output
+    assert json.loads((DEPLOY / "config/menu.yaml").read_text())["welcome"] == before["welcome"]
+    assert_chinese_result(output)
+    passing("欢迎保存回读失败保留旧欢迎，中文不声称目标已关闭或保存成功")
+    recovered = invoke(["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY), "apply", "--force-external"])
+    assert recovered.returncode == 0, recovered.stdout
+
+
+def presentation_cases():
+    """实际管理入口呈现与纯机器回执分离，失败不改为成功。"""
+    command = ["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)]
+    for action, state in (("disable", False), ("enable", True)):
+        result = subprocess.run(command + [action, "--json"], env=ENV, cwd=WORK, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        reply = json.loads(result.stdout)
+        assert reply["ok"] is True and reply["target"] == "runtime" and reply["configuration"]["enabled"] is state
+        applied = json.loads((DEPLOY / "config/materials-applied.json").read_text())
+        assert applied["configuration"]["runtime"]["enabled"] is state
+    for arguments in (["apply", "--check", "--json"], ["status", "--json"], ["logs", "policy", "--json"]):
+        result = subprocess.run(command + arguments, env=ENV, cwd=WORK, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        reply = json.loads(result.stdout)
+        assert isinstance(reply, dict)
+        if arguments[0] == "logs":
+            # 本夹具不是 Docker/systemd 环境，报告非绿灯仍须准确透传而非改成成功。
+            assert result.returncode == {"PASS": 0, "WARN": 2, "FAIL": 1}[reply["status"]], result.stdout
+        else:
+            assert result.returncode == 0, repr(arguments) + result.stdout + result.stderr
+    result = subprocess.run(command + ["disable", "--json"], env={**ENV, "CONFIGURATION_FIXTURE_READBACK_FAIL": "1"},
+                            cwd=WORK, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert result.returncode != 0 and json.loads(result.stdout)["ok"] is False
+    assert json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"] is True
+    passing("显式 enable/disable/apply/status/logs --json 的stdout逐份严格解析；失败非零且不夹中文进度或假成功")
+    recovered = invoke(command + ["apply", "--force-external"])
+    assert recovered.returncode == 0, recovered.stdout
+
+    for number, action, token in ((5, 1, "知识库："), (6, 1, "规则："), (7, 1, "自动恢复秒数"),
+                                  (8, 3, "客服总开关："), (9, 1, "欢迎语："), (10, 1, "网站标识："),
+                                  (11, 1, "总问题："), (11, 2, "历史好评："), (15, 1, "日志维护："),
+                                  (15, 6, "日志保留"), (16, 8, "资料路径：")):
+        terminal = Terminal(f"readable-menu-{number}-{action}")
+        terminal.expect("请选择："); terminal.send(str(number)); terminal.expect("请选择："); terminal.send(str(action))
+        terminal.expect(token)
+        if number == 15 and action == 6:
+            terminal.expect("文件日志保留天数"); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        assert_chinese_result(terminal.finish())
+    passing("真实知识/规则/恢复/总开关/欢迎/Crisp/统计/日志/资料子菜单读取中文结果，无内部对象或编号")
+
+    feedback = json.loads((DEPLOY / "config/feedback.yaml").read_text())
+    old_runtime = json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"]
+    terminal = Terminal("history-retention-no-invite")
+    terminal.expect("请选择："); terminal.send("11")
+    terminal.expect("自动评价邀请已停用"); terminal.expect("请选择："); terminal.send("5")
+    terminal.expect("新的历史保留天数"); terminal.send("45")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("保留天数：45")
+    terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+    output = terminal.finish(); assert_chinese_result(output)
+    actual = json.loads((DEPLOY / "config/feedback.yaml").read_text())["feedback"]
+    assert actual["retention_days"] == 45 and actual["enabled"] is False and actual["auto_invite"] is False
+    assert actual["prompt"] == feedback["feedback"]["prompt"]
+    assert json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"] is old_runtime
+    assert "反馈：1 启用" not in output and "反馈启停" not in output
+    passing("统计菜单仅历史保留期真实应用，邀请始终停用、原历史文案和总开关保持")
+
+    menu_source = DEPLOY / "config/menu.yaml"
+    runtime_source = DEPLOY / "config/runtime.yaml"
+    menu_before, runtime_before = menu_source.read_bytes(), runtime_source.read_bytes()
+    projection = DEPLOY / "config/materials-applied.json"
+    effective_before = projection.read_bytes()
+    try:
+        menu = json.loads(menu_before); menu["welcome"]["enabled"] = False
+        menu_source.write_text(json.dumps(menu), encoding="utf-8")
+        terminal = Terminal("welcome-read-effective-not-source")
+        terminal.expect("请选择："); terminal.send("9"); terminal.expect("请选择："); terminal.send("1")
+        terminal.expect("当前已应用状态："); terminal.expect("欢迎语：已启用")
+        terminal.expect("另有未应用的原文修改")
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        output = terminal.finish(); assert_chinese_result(output)
+        assert "欢迎语：已关闭" not in output and projection.read_bytes() == effective_before
+        menu_source.write_bytes(menu_before)
+        runtime = json.loads(runtime_before); runtime["enabled"] = False
+        runtime_source.write_text(json.dumps(runtime), encoding="utf-8")
+        result = subprocess.run(command + ["status", "--json"], env=ENV, cwd=WORK, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        reply = json.loads(result.stdout)
+        assert result.returncode == 2 and reply["applied"] is True and reply["pending"] is True and reply["value"]["enabled"] is True
+        terminal = Terminal("welcome-pending-global-guard")
+        terminal.expect("请选择："); terminal.send("9"); terminal.expect("请选择："); terminal.send("3")
+        terminal.expect("客服总开关原文有未应用修改")
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        output = terminal.finish(); assert_chinese_result(output)
+        assert menu_source.read_bytes() == menu_before and projection.read_bytes() == effective_before
+        assert "设置已保存" not in output
+    finally:
+        menu_source.write_bytes(menu_before); runtime_source.write_bytes(runtime_before)
+    passing("原文未应用时欢迎/状态显示真实有效值与待应用标记；欢迎操作拒绝夹带修改总开关")
+
+
+def renderer_cases():
+    source = WORK / "renderer-source.json"
+    errors = WORK / "renderer-error.txt"
+    script = ["python3", str(DEPLOY / "scripts/menu-display.py")]
+    errors.write_text("", encoding="utf-8")
+    cases = [
+        ("welcome", {"welcome": {"enabled": False}, "enabled": True, "revision": 3}, "欢迎语：已关闭"),
+        ("welcome", {"enabled": True}, "欢迎语：未能确认"),
+        ("runtime", {"enabled": False, "revision": 0}, "客服总开关：已停用"),
+        ("detail", {"count": 0, "enabled": True}, "数量：0"),
+        ("detail", {"count": 1, "enabled": False}, "数量：1"),
+        ("pool", {"ok": True, "draft": True, "applied": False, "entries": 3}, "仅保存草稿，尚未应用"),
+        ("detail", {"applied": False, "draft": True, "business_applied": True,
+                    "provider_pool_applied": False, "missing_credentials": [{"id": "p_" + "a" * 24, "name": "待补主接口"}]}, "3 → 10 → 11"),
+        ("detail", {"website_id": "private-website-identifier", "api_key": "synthetic-hidden-secret"}, "网站标识：已配置（默认隐藏）"),
+        ("sessions", [{"key": "a" * 64, "session_id": "private-session", "mode": "human", "resume_at": None},
+                      {"key": "b" * 64, "mode": "ai"}], "当前人工会话：1 个"),
+        ("doctor", {"results": [{"id": "private-check-id", "name": "虚构组件", "status": "WARN", "summary": "待验证"}],
+                    "summary": {"pass": 0, "warn": 1, "fail": 0, "skip": 0}}, "【需关注】虚构组件"),
+    ]
+    for kind, value, expected in cases:
+        source.write_text(json.dumps(value), encoding="utf-8")
+        result = invoke(script + [kind, str(source), str(errors), "0"])
+        assert result.returncode == 0 and expected in result.stdout, result.stdout
+        assert_chinese_result(result.stdout)
+        assert not re.search(r'private-(?:check-id|session|website-identifier)', result.stdout), result.stdout
+    errors.write_text('Traceback (most recent call last):\n  File "private", line 1\nValueError: synthetic-hidden-secret\n', encoding="utf-8")
+    source.write_text('{broken output', encoding="utf-8")
+    result = invoke(script + ["detail", str(source), str(errors), "1"])
+    assert "操作未完成" in result.stdout and "发生异常" in result.stdout
+    assert "synthetic-hidden-secret" not in result.stdout and "Traceback" not in result.stdout
+    source.write_text(json.dumps({"enabled": True, "revision": 7}), encoding="utf-8")
+    result = subprocess.run(script + ["runtime", str(source), str(errors), "1", "--json"], env=ENV, cwd=WORK,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    assert json.loads(result.stdout)["ok"] is False
+    assert "synthetic-hidden-secret" not in result.stdout + result.stderr
+    errors.write_text("中文进度，不可放机器标准输出。\n", encoding="utf-8")
+    result = subprocess.run(script + ["runtime", str(source), str(errors), "0", "--json"], env=ENV, cwd=WORK,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    assert json.loads(result.stdout) == {"enabled": True, "revision": 7} and "中文进度" in result.stderr
+    passing("中文展示器13个边界：数值非布尔、目标未知不冒称关闭、草稿未生效、隐藏标识/秘密、失败纯JSON且进度仅stderr")
 
 
 def signal_menu_cases():
@@ -505,7 +867,7 @@ def signal_menu_cases():
 
     for name, commands, ready in (
         ("submenu", ("2",), "请选择："),
-        ("hidden", ("3", "3"), "新 API Key（隐藏输入，回车保留）："),
+        ("hidden", ("3", "2", "3"), "新 API Key（隐藏输入，回车保留）（0 取消本项）："),
         ("multiline", ("4", "2"), "正文需要结束符字面量时"),
         ("confirm", ("16", "2"), "1 确认 / 0 返回："),
     ):
@@ -520,9 +882,9 @@ def signal_menu_cases():
                 terminal.expect("请选择：")
                 terminal.send(command)
             terminal.expect(ready)
-            # 保留既有语义：直接传播 read 失败的子菜单为 1，捕捉取消的分支为 0。
+            # 直接传播 read 失败的子菜单为 1；候选编辑由导航包装取消，退出为 0。
             finish_interrupt(terminal, signals, hidden=name == "hidden", eof=eof,
-                             eof_status=1 if name in ("submenu", "hidden") else 0)
+                             eof_status=1 if name == "submenu" else 0)
 
     result = invoke(["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)], content="2\n0\n0\n")
     assert result.returncode == 0 and "快速自检" in result.stdout, result.stdout
@@ -564,17 +926,47 @@ def main():
         encoding="utf-8")
     (DEPLOY / ".env").chmod(0o600)
     ENV = {**os.environ, "PATH": str(BIN) + ":" + os.environ["PATH"], "LANG": "C.UTF-8", "CONFIGURATION_FIXTURE_DEPLOY": str(DEPLOY)}
+    migrated = invoke(["bash", str(DEPLOY / "scripts/provider.sh"), "--deploy-dir", str(DEPLOY), "migrate"])
+    assert migrated.returncode == 0, migrated.stdout
+    pool_key = next(line.split("=", 1)[1] for line in (DEPLOY / ".env").read_text().splitlines()
+                    if line.startswith("PROVIDER_ADAPTER_KEY="))
+    adapter_log = (WORK / "adapter-stderr.log").open("w", encoding="utf-8")
+    adapter = subprocess.Popen(["node", "-e", "const {createAdapter}=require(process.argv[1]);const s=createAdapter();s.listen(0,'127.0.0.1',()=>process.stdout.write(String(s.address().port)+'\\n'));process.on('SIGTERM',()=>{s.closeAllConnections();s.close(()=>process.exit(0));});", str(DEPLOY / "scripts/provider-adapter.js")],
+                               stdout=subprocess.PIPE, stderr=adapter_log, text=True,
+                               env={**ENV, "PROVIDER_ROOT": str(DEPLOY), "PROVIDER_ADAPTER_KEY": pool_key,
+                                    "PROVIDER_POOL_REQUIRED": "true"})
+    assert select.select([adapter.stdout], [], [], 10)[0], "真实本地 adapter 未有界启动"
+    adapter_port = adapter.stdout.readline().strip()
+    assert adapter_port.isdecimal() and adapter.poll() is None
+    ENV["PROVIDER_ADAPTER_MANAGEMENT_URL"] = f"http://127.0.0.1:{adapter_port}"
     try:
+        if os.environ.get("MENU_TEST_FOCUS") == "welcome":
+            welcome_presentation_cases()
+            return
+        if os.environ.get("MENU_TEST_FOCUS") == "provider":
+            provider_retry_cases()
+            provider_pool_menu_cases()
+            provider_file_menu_cases()
+            return
+        if os.environ.get("MENU_TEST_FOCUS") == "presentation":
+            material_menu_cases()
+            welcome_presentation_cases()
+            presentation_cases()
+            renderer_cases()
+            return
         for argument in ("--help", "--version"):
             result = invoke(["bash", str(DEPLOY / "manage.sh"), argument])
             assert result.returncode == 0, result.stdout
         passing("帮助与版本不调用 Docker 或外部 Provider")
-        labels = ["保留现有配置", "快速自检", "查看脱敏配置", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "匿名在线更新至最新正式版", "日志来源、占用与保留策略", "启动本项目服务", "安装部署", "安全卸载"]
+        labels = ["保留现有配置", "快速自检", "查看主备接口列表", "查看当前 Prompt", "查看知识库及索引状态", "查看规则", "查看恢复设置", "关闭客服会停止", "查看欢迎配置", "查看脱敏接入配置", "知识命中分析", "导出完整业务", "创建本机完整备份", "匿名在线更新至最新正式版", "日志来源、占用与保留策略", "启动本项目服务", "安装部署", "安全卸载"]
         for number, label in enumerate(labels, 1):
             menu_case(number, label)
         online_update_menu_case()
         log_menu_cases()
         material_menu_cases()
+        welcome_presentation_cases()
+        presentation_cases()
+        renderer_cases()
         for name, width, extra in (("wide", 110, {}), ("narrow", 42, {}), ("dumb", 110, {"TERM": "dumb", "NO_COLOR": "1"}), ("plain", 110, {"CRISPAI_NO_EMOJI": "1"}), ("nonutf8", 110, {"LC_ALL": "C"})):
             terminal = Terminal(name, width=width, extra=extra)
             terminal.expect("请选择：")
@@ -606,6 +998,8 @@ def main():
         passing("回车/非法数字/EOF 安全退出，空闲菜单不持维护锁")
         signal_menu_cases()
         provider_retry_cases()
+        provider_pool_menu_cases()
+        provider_file_menu_cases()
         prompt = '## 中文 🙂 Prompt\n\n$ # = " \\ `touch should-not-execute`\n::END::\n\n'
         terminal = Terminal("prompt-paste")
         for prompt_token, answer in (("请选择：", "4"), ("请选择：", "2")):
@@ -614,7 +1008,7 @@ def main():
         for line in prompt.splitlines():
             terminal.send("\\" + line if line in ("::END::", "::CANCEL::") else line)
         terminal.send("::END::"); terminal.expect("应用新 Prompt 到当前客服？"); terminal.send("1")
-        terminal.expect('"applied": true'); terminal.expect("请选择："); terminal.send("0")
+        terminal.expect('资料已应用：是'); terminal.expect("请选择："); terminal.send("0")
         terminal.expect("请选择："); terminal.send("0"); terminal.finish()
         assert (DEPLOY / "config/prompt.md").read_text() == prompt
         assert PROMPT["text"] == prompt
@@ -639,9 +1033,9 @@ def main():
         passing("运行时回读失败时CLI非零且保留旧总开关")
         terminal = Terminal("welcome-resume")
         terminal.expect("请选择："); terminal.send("7"); terminal.expect("请选择："); terminal.send("2")
-        terminal.expect("新恢复秒数"); terminal.send("0"); terminal.expect('"applied_revision"')
+        terminal.expect("新恢复秒数"); terminal.send("0"); terminal.expect('设置已保存并完成实际回读')
         terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("9")
-        terminal.expect("请选择："); terminal.send("3"); terminal.expect('"applied_revision"')
+        terminal.expect("请选择："); terminal.send("3"); terminal.expect('欢迎语：已关闭')
         terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0"); terminal.finish()
         assert json.loads((DEPLOY / "config/handoff.yaml").read_text())["handoff"]["resume_after_seconds"] == 0
         assert json.loads((DEPLOY / "config/menu.yaml").read_text())["welcome"]["enabled"] is False
@@ -649,7 +1043,7 @@ def main():
         terminal = Terminal("new-menu-node")
         terminal.expect("请选择："); terminal.send("9"); terminal.expect("请选择："); terminal.send("8")
         terminal.expect("请选择："); terminal.send("2"); terminal.expect("新节点标题："); terminal.send("虚构测试节点")
-        terminal.expect("请选择序号"); terminal.send("1"); terminal.expect("新节点 ID：")
+        terminal.expect("请选择序号"); terminal.send("1"); terminal.expect("新菜单“虚构测试节点”已生效")
         for _ in range(3):
             terminal.expect("请选择："); terminal.send("0")
         output = terminal.finish()
@@ -700,6 +1094,10 @@ def main():
         print(f"管理入口专项：{COUNT} 通过，0 失败。协议Fixture不是空机/真实Docker证据。")
         print(f"脱敏测试转录：{WORK.relative_to(ROOT)}")
     finally:
+        adapter.terminate()
+        adapter.wait(timeout=5)
+        adapter.stdout.close()
+        adapter_log.close()
         fixture.shutdown(); fixture.server_close()
 
 

@@ -151,6 +151,7 @@ prepare_fixture() {
   for name in VERSION docker-compose.yml get.sh manage.sh install.sh update.sh uninstall.sh; do
     cp -p -- "${PROJECT_ROOT}/${name}" "${DEPLOY}/${name}"
   done
+  printf 'v1.2.0\n' > "${DEPLOY}/VERSION"
   for name in workflow.json runtime.js runtime-cli.js build-workflow.js web-chat.js; do
     cp -p -- "${PROJECT_ROOT}/n8n/${name}" "${DEPLOY}/n8n/${name}"
   done
@@ -179,6 +180,8 @@ prepare_fixture() {
   # shellcheck source=scripts/common.sh disable=SC1091
   source "${PROJECT_ROOT}/scripts/common.sh"
   env_set "${DEPLOY}/.env" DEPLOY_DIR "$DEPLOY"
+  # 本组先保留升级前单接口兼容实例的检查；主备池另做显式迁移及故障注入。
+  env_set "${DEPLOY}/.env" PROVIDER_POOL_REQUIRED false
   env_set "${DEPLOY}/.env" N8N_PORT 5678
   env_set "${DEPLOY}/.env" ANYTHINGLLM_PORT 3001
   env_set "${DEPLOY}/.env" WEBHOOK_ACCESS_MODE external_proxy
@@ -292,6 +295,7 @@ prepare_fixture() {
 
 prepare_fixture
 chmod 0755 "$DOCTOR" "$FIXTURE_BIN/docker" "$FIXTURE_BIN/curl" "$FIXTURE_BIN/systemctl"
+if [[ "${CRISPAI_DOCTOR_FIXTURE_SETUP_ONLY:-0}" == 1 && "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
 before=$(business_hash)
 SESSION_FILE=$(find "${DEPLOY}/data/runtime" -maxdepth 1 -type f -name 'session-*.json' -print -quit)
@@ -857,7 +861,7 @@ unset DOCTOR_FIXTURE_PROVIDER_FAIL
 invoke --full
 (( LAST_RC == 0 )) || fail "健康 full 自检退出码应为 0，实际 ${LAST_RC}"
 assert_result provider.inference PASS
-grep -q 'provider.example.test' "$FIXTURE_LOG" || fail 'full 没有执行受控模型协议检查'
+grep -q '/api/v1/workspace/[^ ]*/chat' "$FIXTURE_LOG" || fail 'full 没有从真实 AnythingLLM 问答入口执行受控协议检查'
 [[ "$before" == "$(business_hash)" ]] || fail 'full 自检改动了配置、知识或会话状态'
 pass '只有 full 执行小样本模型请求并校验最终容器路径'
 

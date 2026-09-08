@@ -110,6 +110,8 @@ DOCTOR_DOCKER_READY=0
 DOCTOR_N8N_READY=0
 DOCTOR_ANYTHING_READY=0
 DOCTOR_PREBOOTSTRAP_JQ_FIXED=0
+DOCTOR_POOL_ENABLED=0
+DOCTOR_POOL_READY=0
 DOCTOR_EXPECTED_SERVICES=(postgres anythingllm n8n provider-adapter)
 
 # shellcheck disable=SC2317
@@ -135,12 +137,14 @@ doctor_cache_file() {
 doctor_render_text() {
   local report=$1 cached=${2:-0}
   jq -M -r --argjson cached "$cached" '
-    if $cached == 1 then "CrispAI 上次自检（缓存）：\(.checked_at)\n范围：\(.scope)\n"
-    else "CrispAI 组件自检 \(.version)\n范围：\(.scope)；检测时间：\(.checked_at)\n" end,
-    (.results[] | "[\(.status)] \(.name)：\(.summary)" +
+    def status_label: {PASS:"通过",WARN:"需关注",FAIL:"故障",SKIP:"未检查"}[.] // .;
+    def scope: {local:"本地组件",offline:"离线资料",full:"完整连接与少量模型测试",default:"常规只读"}[.] // .;
+    if $cached == 1 then "CrispAI 上次自检（缓存）：\(.checked_at)\n范围：\(.scope|scope)\n"
+    else "CrispAI 组件自检 \(.version)\n范围：\(.scope|scope)；检测时间：\(.checked_at)\n" end,
+    (.results[] | "[\(.status|status_label)] \(.name)：\(.summary)" +
       (if (.suggestion // "") == "" then "" else "\n  建议：\(.suggestion)" end)),
     (if (.fix.actions // [] | length) > 0 then
-      "修复动作：", (.fix.actions[] | "[\(.status)] \(.name)：\(.summary)")
+      "修复动作：", (.fix.actions[] | "[\(.status|status_label)] \(.name)：\(.summary)")
      else empty end),
     "结果：通过 \(.summary.pass)，警告 \(.summary.warn)，失败 \(.summary.fail)，跳过 \(.summary.skip)。"
   ' "$report"
@@ -557,6 +561,13 @@ doctor_files_and_config_check() {
     scripts/rollback.sh scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/provider-adapter.js scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh
     scripts/full-backup.sh scripts/archive-guard.py scripts/materials.sh scripts/logs.sh scripts/log-redact.py)
+  DOCTOR_POOL_ENABLED=0
+  if [[ -e "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" \
+    || $(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]] \
+    || version_at_least "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)" v1.2.1; then
+    DOCTOR_POOL_ENABLED=1
+    required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
+  fi
   start=$(doctor_now_ms)
   for relative in "${required[@]}"; do
     [[ -f "${DOCTOR_DEPLOY_DIR}/${relative}" && ! -L "${DOCTOR_DEPLOY_DIR}/${relative}" ]] || missing+=" ${relative}"
@@ -578,11 +589,11 @@ doctor_files_and_config_check() {
     doctor_add config.syntax '配置格式' FAIL critical "无法安全解析的 YAML/JSON 配置：${invalid# }" filesystem '从配置历史恢复后再应用；不要 source 配置文件' "$start"
   elif ! jq -e '.schema_version == 2 and (.enabled | type == "boolean") and (.revision | type == "number") and (.applied_revision | type == "number")' \
       "$runtime_config" >/dev/null 2>&1; then
-    doctor_add config.syntax '配置格式' FAIL critical 'runtime.yaml schema 或字段类型无效' filesystem '从配置历史恢复有效 schema' "$start"
+    doctor_add config.syntax '配置格式' FAIL critical '自动客服配置格式或字段类型无效' filesystem '从配置历史恢复有效配置' "$start"
   elif jq -e '.revision == .applied_revision' "$runtime_config" >/dev/null 2>&1; then
-    doctor_add config.syntax '配置格式' PASS critical '配置 schema 有效，desired/applied revision 一致' filesystem '' "$start"
+    doctor_add config.syntax '配置格式' PASS critical '配置格式有效，保存值与运行时已应用内容一致' filesystem '' "$start"
   else
-    doctor_add config.syntax '配置格式' WARN warning '配置 revision 尚未完成运行时应用' filesystem '使用配置菜单重新同步有效配置' "$start"
+    doctor_add config.syntax '配置格式' WARN warning '已保存的配置尚未完成运行时应用' filesystem '使用配置菜单重新同步有效配置' "$start"
   fi
 
   start=$(doctor_now_ms)
@@ -806,6 +817,14 @@ doctor_file_bindings_check() {
   doctor_container_file_binding provider.adapter_code_binding 'Provider adapter 程序运行代' \
     provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-adapter.js" \
     /opt/crisp-ai/scripts/provider-adapter.js CRISPAI_EXPECTED_FILE_BINDING_PROVIDER
+  if (( DOCTOR_POOL_ENABLED )); then
+    doctor_container_file_binding provider.router_code_binding '主备路由程序运行代' \
+      provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-router.js" \
+      /opt/crisp-ai/scripts/provider-router.js CRISPAI_EXPECTED_FILE_BINDING_ROUTER
+    doctor_container_file_binding provider.envelope_code_binding '推理预算认证程序运行代' \
+      provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-envelope.js" \
+      /opt/crisp-ai/scripts/provider-envelope.js CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE
+  fi
   if [[ "$access_mode" == managed_https ]]; then
     doctor_container_file_binding caddy.file_binding 'Caddy 配置运行代' caddy \
       "${DOCTOR_DEPLOY_DIR}/config/Caddyfile" /etc/caddy/Caddyfile CRISPAI_EXPECTED_FILE_BINDING_CADDY
@@ -1200,7 +1219,149 @@ NODE
   fi
 }
 
+doctor_provider_pool_files() {
+  local start count desired actual internal valid_files=false
+  DOCTOR_POOL_READY=0
+  (( DOCTOR_POOL_ENABLED )) || return 0
+  start=$(doctor_now_ms)
+  if doctor_timeout 6 python3 "${DOCTOR_DIR}/provider-pool.py" --deploy-dir "$DOCTOR_DEPLOY_DIR" list \
+    > "${DOCTOR_TEMP_ROOT}/provider-pool.json" 2>/dev/null \
+    && jq -e '.ok == true and (.entries | length > 0 and length <= 21)' "${DOCTOR_TEMP_ROOT}/provider-pool.json" >/dev/null 2>&1; then
+    internal=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY 2>/dev/null || true)
+    if ! is_placeholder "$internal" && [[ "$internal" != "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" AI_API_KEY 2>/dev/null || true)" ]]; then
+      DOCTOR_POOL_READY=1
+      count=$(jq '.entries | length - 1' "${DOCTOR_TEMP_ROOT}/provider-pool.json")
+      doctor_add provider.configuration 'AI 主备配置与秘密引用' PASS critical "1 个主接口，${count}/20 个备用；角色、顺序及秘密代次已验证" filesystem '' "$start"
+    fi
+  fi
+  if (( DOCTOR_POOL_READY == 0 )); then
+    if ! doctor_remaining >/dev/null 2>&1; then
+      doctor_deadline_add provider.configuration 'AI 主备配置与秘密引用' filesystem "$start"
+    else
+      doctor_add provider.configuration 'AI 主备配置与秘密引用' FAIL critical '接口池有效投影、数量、主角色、秘密代次或内部认证无效' filesystem '从菜单 3 恢复有效接口配置；不要把 Key 写进可分享文件' "$start"
+    fi
+    return
+  fi
+  start=$(doctor_now_ms)
+  if doctor_timeout 5 python3 "${DOCTOR_DIR}/provider-pool.py" --deploy-dir "$DOCTOR_DEPLOY_DIR" validate-file \
+    "${DOCTOR_DEPLOY_DIR}/config/provider-pool.yaml" > /dev/null 2>&1 \
+    && configuration_decode_file "${DOCTOR_DEPLOY_DIR}/config/provider-pool.yaml" "${DOCTOR_TEMP_ROOT}/provider-source.json" >/dev/null 2>&1; then
+    desired=$(jq -McS '{primary_id,entries,policy}' "${DOCTOR_TEMP_ROOT}/provider-source.json")
+    actual=$(jq -McS '{primary_id,entries:(.entries|map(del(.key_status))),policy}' "${DOCTOR_TEMP_ROOT}/provider-pool.json")
+    if [[ "$desired" == "$actual" ]]; then
+      doctor_add provider.pending '接口池原文应用状态' PASS warning '可编辑原文与当前有效接口池一致' filesystem '' "$start"
+    else
+      doctor_add provider.pending '接口池原文应用状态' WARN warning '接口池原文存在未应用变更，运行时仍使用上一份有效配置' filesystem '校验后从菜单 16 应用资料或执行 crispai apply' "$start"
+    fi
+  else
+    doctor_add provider.pending '接口池原文应用状态' WARN warning '接口池编辑稿缺失或无效，当前有效池未被该编辑稿覆盖' filesystem '修正 config/provider-pool.yaml 后重新应用' "$start"
+  fi
+  start=$(doctor_now_ms)
+  if doctor_timeout 4 python3 - "$DOCTOR_DEPLOY_DIR" 2>/dev/null <<'PY'
+import json, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+value = json.loads((root / 'config/provider-pool-applied.json').read_text())
+paths = [root / 'secrets', root / 'secrets/provider', root / 'secrets/provider/generations',
+         root / 'secrets/provider/generations' / (value['secrets_generation'] + '.json')]
+for file in paths:
+    info = file.lstat()
+    if file.is_symlink() or info.st_uid != 0 or info.st_gid != 1000 or stat.S_IMODE(info.st_mode) != (0o750 if file.is_dir() else 0o640):
+        sys.exit(1)
+PY
+  then valid_files=true; fi
+  if [[ "$valid_files" == true ]]; then
+    doctor_add provider.secret_permissions '接口秘密访问权限' PASS critical '秘密目录及当前代文件仅供受管身份读取，未输出内容' filesystem '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.secret_permissions '接口秘密访问权限' filesystem "$start"
+  else
+    doctor_add provider.secret_permissions '接口秘密访问权限' FAIL critical '接口秘密所有权或权限不符合受管边界' filesystem '执行 crispai doctor --fix 修复受管权限；不要设置 777' "$start"
+  fi
+}
+
+doctor_pool_adapter_check() {
+  local start output count healthy cooling unknown hook_secret plugin_secret
+  start=$(doctor_now_ms)
+  if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )); then
+    for output in provider.adapter provider.adapter_binding anything.provider_binding n8n.runtime_binding provider.pool_health; do
+      doctor_skip "$output" '主备接口运行检查' '因接口池或 Docker 上游故障未检查' docker
+    done
+    return
+  fi
+  if doctor_container_env_binding provider-adapter \
+    'PROVIDER_ADAPTER_KEY,PROVIDER_POOL_REQUIRED,PROVIDER_REQUIRE_ENVELOPE,PROVIDER_HOST_GATEWAY' \
+    "${DOCTOR_TEMP_ROOT}/adapter-binding.txt" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY)" true true host.docker.internal; then
+    doctor_add provider.adapter_binding '主备 adapter 运行接线' PASS critical '内部认证、强制池模式、问题预算认证及宿主网关接线一致' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.adapter_binding '主备 adapter 运行接线' docker "$start"
+  else
+    doctor_add provider.adapter_binding '主备 adapter 运行接线' FAIL critical 'adapter 环境仍为旧代或内部认证偏离' docker '从受管更新流程重新创建本实例 adapter，保留路由及人工状态' "$start"
+  fi
+  start=$(doctor_now_ms)
+  if doctor_container_env_binding anythingllm 'GENERIC_OPEN_AI_BASE_PATH,GENERIC_OPEN_AI_API_KEY' \
+    "${DOCTOR_TEMP_ROOT}/anything-binding.txt" http://provider-adapter:8787/v1 \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY)"; then
+    doctor_add anything.provider_binding 'AnythingLLM 推理接线' PASS critical 'AnythingLLM 只使用内部 adapter 认证；每次实际模型由接口池独立选择' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add anything.provider_binding 'AnythingLLM 推理接线' docker "$start"
+  else
+    doctor_add anything.provider_binding 'AnythingLLM 推理接线' FAIL critical 'AnythingLLM 尚未接入当前内部 adapter' docker '使用受管更新修复组件接线，不重建知识索引' "$start"
+  fi
+  start=$(doctor_now_ms)
+  hook_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
+  plugin_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
+  if doctor_container_env_binding n8n \
+    'CRISP_WEBSITE_ID,CRISP_API_BASE_URL,CRISP_TOKEN_TIER,CRISP_AUTH_B64,CRISP_HOOK_MODE,CRISP_WEBSITE_HOOK_SECRET,CRISP_PLUGIN_SIGNING_SECRET,WEBHOOK_URL,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,PROVIDER_ADAPTER_URL,PROVIDER_ADAPTER_KEY,PROVIDER_POOL_REQUIRED' \
+    "${DOCTOR_TEMP_ROOT}/n8n-runtime-binding.txt" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_ID)" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_API_BASE_URL 2>/dev/null || printf 'https://api.crisp.chat/v1')" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_TOKEN_TIER)" "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_AUTH_B64)" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_HOOK_MODE)" "${hook_secret:-not-configured}" "${plugin_secret:-not-configured}" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PUBLIC_WEBHOOK_URL)" "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY)" \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE)" http://provider-adapter:8787/v1 \
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY)" true; then
+    doctor_add n8n.runtime_binding 'n8n AI/Crisp 运行接线' PASS critical '当前 Crisp/AnythingLLM 认证和共享主备推理入口一致' docker '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add n8n.runtime_binding 'n8n AI/Crisp 运行接线' docker "$start"
+  else
+    doctor_add n8n.runtime_binding 'n8n AI/Crisp 运行接线' FAIL critical 'n8n 仍持有旧版或偏离的 Crisp/AI 接线' docker '从受管更新流程修复 n8n，不清空人工会话' "$start"
+  fi
+  start=$(doctor_now_ms)
+  output="${DOCTOR_TEMP_ROOT}/adapter-pool-status.json"
+  if doctor_compose_timeout 8 exec -T anythingllm node -e '
+    fetch("http://provider-adapter:8787/internal/provider/status",{headers:{authorization:"Bearer "+process.env.GENERIC_OPEN_AI_API_KEY},signal:AbortSignal.timeout(5000)})
+      .then(async r=>{const b=await r.json();if(!r.ok||b.ok!==true)throw Error();process.stdout.write(JSON.stringify(b));})
+      .catch(()=>{process.exitCode=1;});
+  ' < /dev/null > "$output" 2>/dev/null \
+    && jq -e --slurpfile expected "${DOCTOR_TEMP_ROOT}/provider-pool.json" \
+      '.ok == true and .revision == $expected[0].revision and (.entries | type == "array" and length > 0) and
+       ([.entries[]|{id,enabled}]|sort_by(.id)) == ([$expected[0].entries[]|{id,enabled}]|sort_by(.id)) and
+       all(.entries[]; (.health == "healthy" or .health == "cooling" or .health == "unknown" or .health == "half_open" or (.enabled == false and .health == "disabled")))' "$output" >/dev/null 2>&1; then
+    doctor_add provider.adapter '主备 adapter 实际读取' PASS critical 'AnythingLLM 网络通过内部认证读取当前接口池，配置应用代次一致；未调用模型' docker '' "$start"
+    count=$(jq '[.entries[]|select(.enabled)]|length' "$output")
+    healthy=$(jq '[.entries[]|select(.enabled and .health=="healthy")]|length' "$output")
+    cooling=$(jq '[.entries[]|select(.enabled and .health=="cooling")]|length' "$output")
+    unknown=$(jq '[.entries[]|select(.enabled and (.health=="unknown" or .health=="half_open"))]|length' "$output")
+    if (( count > 0 && cooling == count )); then
+      doctor_add provider.pool_health 'AI 接口可用性' FAIL critical '所有已启用接口目前均在故障冷却中，推理暂不可用' docker '从菜单 3 查看脱敏原因，修正或增加有权限的接口' "$start"
+    elif (( cooling > 0 )); then
+      doctor_add provider.pool_health 'AI 接口可用性' WARN warning "降级运行：${cooling} 个接口冷却；${healthy} 个有当前健康证据，${unknown} 个待确认" docker '从菜单 3 查看最近切换原因；不要把冷却当成管理员停用' "$start"
+    elif (( unknown > 0 )); then
+      doctor_add provider.pool_health 'AI 接口可用性' WARN warning "${unknown} 个启用接口尚未检测或恢复待确认；默认自检不会付费轮询" docker '按需显式测试指定接口，或等待正常问题产生当前成功证据' "$start"
+    else
+      doctor_add provider.pool_health 'AI 接口可用性' PASS warning '已启用接口均有当前配置的健康证据' docker '' "$start"
+    fi
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.adapter '主备 adapter 实际读取' docker "$start"
+    doctor_skip provider.pool_health 'AI 接口可用性' '因自检总截止时间已到未检查' docker
+  else
+    doctor_add provider.adapter '主备 adapter 实际读取' FAIL critical '容器网络、认证或 adapter 已应用代次未通过核对' docker '使用菜单 2 检查组件和受限秘密挂载，再从菜单 3 重新应用' "$start"
+    doctor_skip provider.pool_health 'AI 接口可用性' '因本地 adapter 不可验证，未推断上游是否健康' docker
+  fi
+}
+
 doctor_adapter_check() {
+  if (( DOCTOR_POOL_ENABLED )); then doctor_pool_adapter_check; return; fi
   local start output mode configured_mode runtime_base configured_base configured_model runtime_model
   local header_json header_names vision configured_vision mode_capability hook_secret plugin_secret remaining provider_config
   start=$(doctor_now_ms)
@@ -1209,7 +1370,7 @@ doctor_adapter_check() {
     || ! jq -e '.schema_version == 2 and (.provider.base_url | type == "string" and length > 0) and
       (.provider.model | type == "string" and length > 0) and (.provider.api_mode == "chat_completions" or .provider.api_mode == "responses")' \
       "$provider_config" >/dev/null 2>&1; then
-    doctor_add provider.configuration 'Provider 配置接线' FAIL critical 'Provider 配置 schema、模型或协议无效' filesystem '从第三方 AI 菜单修复整组配置' "$start"
+    doctor_add provider.configuration 'Provider 配置接线' FAIL critical '接口配置格式、模型或协议无效' filesystem '从第三方 AI 菜单修复整组配置' "$start"
     doctor_skip provider.adapter 'Provider adapter' '因 Provider 配置无效未检查运行路径' docker
     doctor_skip provider.adapter_binding 'Provider adapter 运行代' '因 Provider 配置无效未核对运行容器环境' docker
     doctor_skip anything.provider_binding 'AnythingLLM Provider 运行代' '因 Provider 配置无效未核对运行容器环境' docker
@@ -1363,6 +1524,7 @@ doctor_adapter_check() {
 
 doctor_runtime_state_check() {
   local start now sessions invalid legacy human timed permanent active_workers stale_workers pending_jobs file counts deadline_reached=0
+  local feedback_pending=0 feedback_count=0
   start=$(doctor_now_ms)
   now=$(doctor_now_ms)
   sessions=0; invalid=0; legacy=0; human=0; timed=0; permanent=0; active_workers=0; stale_workers=0; pending_jobs=0
@@ -1392,11 +1554,18 @@ doctor_runtime_state_check() {
       (if .mode == "human" and .resume_at == null then 1 else 0 end),
       (if .worker != null and (.worker.until // 0) >= $now then 1 else 0 end),
       (if .worker != null and (.worker.until // 0) < ($now - 15000) then 1 else 0 end),
-      ([.jobs[] | select(.status == "received" or .status == "processing")] | length)
+      ([.jobs[] | select(.status == "received" or .status == "processing")] | length),
+      ((if .pending_feedback != null then 1 else 0 end) +
+       ([.offers[]? | select(([.kind,.purpose,.action,.type] | any(. == "feedback" or (type == "string" and startswith("feedback_")))))]|length) +
+       ([.jobs[]? | select(.status != "done" and .status != "cancelled" and .status != "failed") |
+          select(.plan.feedback_retired != true) |
+          select(.plan.feedback_event != null or ([.plan.kind,.plan.purpose,.plan.action,.plan.type] |
+            any(. == "feedback" or (type == "string" and startswith("feedback_")))))]|length))
     ] | @tsv' "$file")
-    read -r human_count timed_count permanent_count active_count stale_count job_count <<< "$counts"
+    read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count <<< "$counts"
     human=$((human+human_count)); timed=$((timed+timed_count)); permanent=$((permanent+permanent_count))
     active_workers=$((active_workers+active_count)); stale_workers=$((stale_workers+stale_count)); pending_jobs=$((pending_jobs+job_count))
+    feedback_pending=$((feedback_pending+feedback_count))
   done
   shopt -u nullglob
   if (( deadline_reached )); then
@@ -1409,6 +1578,15 @@ doctor_runtime_state_check() {
     doctor_add runtime.state '会话状态' WARN warning "新状态 ${sessions}；发现 ${legacy} 个可识别旧状态待对应会话懒迁移，人工语义保持（人工 ${human}，永久 ${permanent}）" filesystem '保留旧状态；对应会话下次受控处理时会迁移，不要自动删除或恢复 AI' "$start"
   else
     doctor_add runtime.state '会话状态' PASS critical "会话 ${sessions}；人工 ${human}（定时 ${timed} / 永久 ${permanent}）；活跃 worker ${active_workers}；待处理 ${pending_jobs}" filesystem '' "$start"
+  fi
+  if (( deadline_reached || invalid > 0 )); then
+    doctor_add runtime.feedback '自动评价邀请' WARN warning '会话扫描未完整完成，未对未检查的旧评价状态作成功判断' filesystem '修复上述会话检查问题后重试；自检不会删除任何任务' "$start"
+  elif (( feedback_pending > 0 )); then
+    doctor_add runtime.feedback '自动评价邀请' WARN warning "发现 ${feedback_pending} 项旧评价上下文；新运行时禁止派发，等待正常扫描精确退役" filesystem '检查五秒扫描心跳；保留历史反馈及人工按钮，自检不会清空状态' "$start"
+  elif jq -e '.feedback.enabled == false and .feedback.auto_invite == false' "$(doctor_config_file feedback)" >/dev/null 2>&1; then
+    doctor_add runtime.feedback '自动评价邀请' PASS warning '自动评价邀请配置已停用，未发现未退役的旧评价上下文' filesystem '' "$start"
+  else
+    doctor_add runtime.feedback '自动评价邀请' WARN warning '旧反馈配置尚未迁移；当前版本运行时不会据此重新邀请评价' filesystem '通过受管升级或资料应用完成停用迁移；不修改欢迎及人工开关' "$start"
   fi
 }
 
@@ -1494,7 +1672,7 @@ doctor_logs_check() {
   if [[ "$configured" != true ]]; then
     doctor_add logs.policy '运维日志策略' FAIL critical 'logging.yaml 缺失、损坏或字段越界' filesystem '从当前版本模板恢复，再使用日志菜单应用并回读' "$start"
   elif [[ "$(jq -r '.policy.revision == .policy.applied_revision' "$report")" != true ]]; then
-    doctor_add logs.policy '运维日志策略' WARN warning '日志策略 revision 尚未完成运行时应用' filesystem '从日志菜单重新应用；不要手工只改 Compose' "$start"
+    doctor_add logs.policy '运维日志策略' WARN warning '已保存的日志策略尚未完成运行时应用' filesystem '从日志菜单重新应用；不要手工只改 Compose' "$start"
   elif [[ "$env_match" != true ]]; then
     doctor_add logs.policy '运维日志策略' FAIL critical '权威日志配置与 .env 运行投影不一致' filesystem '从日志菜单成组重新应用配置' "$start"
   elif [[ "$compose_state" == invalid ]]; then
@@ -1556,7 +1734,7 @@ doctor_logs_check() {
 }
 
 doctor_materials_check() {
-  local start report rc=0 state source_valid projection_valid pending revision expected output binding_rc=0
+  local start report rc=0 state source_valid projection_valid pending expected output binding_rc=0
   start=$(doctor_now_ms)
   if [[ ! -f "${DOCTOR_DEPLOY_DIR}/scripts/materials.sh" \
     || -L "${DOCTOR_DEPLOY_DIR}/scripts/materials.sh" ]]; then
@@ -1593,21 +1771,20 @@ doctor_materials_check() {
   source_valid=$(jq -r '.source_valid' "$report")
   projection_valid=$(jq -r '.projection_valid' "$report")
   pending=$(jq -r '.pending' "$report")
-  revision=$(jq -r '.applied_revision' "$report")
   # status 中的 applied_sha256 是“来源语义摘要”，用于判断原文 pending；
   # 运行容器挂载对账必须使用投影文件本身的逐字节摘要。
   expected=$(sha256sum -- "${DOCTOR_DEPLOY_DIR}/config/materials-applied.json" 2>/dev/null | awk '{print $1}' || true)
   if [[ "$projection_valid" == true && "$state" == applied ]]; then
     if [[ "$source_valid" == true && "$pending" == false ]]; then
       doctor_add materials.applied '资料生效投影' PASS critical \
-        "当前生效资料 revision ${revision} 有效，可编辑原文与其一致" filesystem '' "$start"
+        '当前生效资料已核验，可编辑原文与其一致' filesystem '' "$start"
     elif [[ "$source_valid" == true ]]; then
       doctor_add materials.applied '资料生效投影' WARN warning \
-        "当前生效资料 revision ${revision} 有效；可编辑原文有尚未应用的变更" filesystem \
+        '当前生效资料有效；可编辑原文有尚未应用的变更' filesystem \
         '先预览并显式应用资料；运行时仍使用上一有效投影' "$start"
     else
       doctor_add materials.applied '资料生效投影' WARN warning \
-        "当前生效资料 revision ${revision} 有效；可编辑原文校验失败" filesystem \
+        '当前生效资料有效；可编辑原文校验失败' filesystem \
         '修复可编辑原文后再显式应用；运行时不会回退读取损坏原文' "$start"
     fi
   else
@@ -1709,6 +1886,20 @@ doctor_crisp_observation_check() {
   fi
 }
 
+doctor_provider_inference_probe() {
+  local remaining budget
+  remaining=$(doctor_remaining) || return 1
+  (( remaining > 7 )) || return 1
+  budget=$((remaining - 5))
+  (( budget <= 20 )) || budget=20
+  # 一个有独立总预算的合成问题走真实知识问答入口，不向 Crisp 发送消息。
+  # shellcheck disable=SC2016
+  doctor_timeout "$((budget + 5))" bash -c '
+    source "$1/configuration.sh"
+    configuration_query "$2" "仅作管理员连接检查，请简短回复连接正常。" "$3"
+  ' doctor-inference "$DOCTOR_DIR" "$DOCTOR_DEPLOY_DIR" "$((budget * 1000))" >/dev/null 2>&1
+}
+
 doctor_external_check() {
   local start mode webhook_url
   if [[ "$DOCTOR_SCOPE" == local || "$DOCTOR_SCOPE" == offline ]]; then
@@ -1745,8 +1936,8 @@ doctor_external_check() {
   start=$(doctor_now_ms)
   if [[ "$DOCTOR_SCOPE" != full ]]; then
     doctor_skip provider.inference 'Provider 实际推理' '默认自检不执行可能计费的模型请求；配置与 adapter 已检查' external
-  elif doctor_timeout 45 bash "${DOCTOR_DEPLOY_DIR}/scripts/provider.sh" --deploy-dir "$DOCTOR_DEPLOY_DIR" test >/dev/null 2>&1; then
-    doctor_add provider.inference 'Provider 实际推理' PASS critical '当前模型通过上游协议与 AnythingLLM 容器最终路径的非空正文验证' external '' "$start"
+  elif doctor_provider_inference_probe; then
+    doctor_add provider.inference 'Provider 实际推理' PASS critical '合成问题通过 AnythingLLM、实际推理入口并返回非空正文；未向客户发消息' external '' "$start"
   else
     doctor_add provider.inference 'Provider 实际推理' FAIL critical '当前模型、协议或最终应用容器路径调用失败' external '从第三方 AI 菜单核对协议、模型、Key 和容器地址' "$start"
   fi
@@ -1756,6 +1947,7 @@ doctor_run_checks() {
   doctor_installation_check
   doctor_system_check
   doctor_files_and_config_check
+  doctor_provider_pool_files
   if [[ "$DOCTOR_SCOPE" == offline ]]; then
     doctor_skip docker.compose 'Docker Compose' '离线范围不访问 Docker' docker
     for service in "${DOCTOR_EXPECTED_SERVICES[@]}"; do doctor_skip "container.${service}" "容器 ${service}" '离线范围未检查' docker; done

@@ -1,6 +1,6 @@
 # 配置、应用与迁移契约
 
-正常操作使用 [18 项 Shell 菜单](MENU.md)。v1.2.0 也支持管理员在稳定路径编辑已有资料，再用 `crispai apply --check` / `crispai apply` 校验和应用。本页说明哪些是可编辑原文、哪些是程序管理的生效状态；示例只含虚构内容。
+正常操作使用 [18 项 Shell 菜单](MENU.md)。管理员也可在稳定路径编辑已有资料，再用 `crispai apply --check` / `crispai apply` 校验和应用。v1.2.1 的显式总应用同时处理业务资料与主备池原文；各业务菜单仍只提交自己的修改。本页说明可编辑原文、有效投影与秘密的不同归属，示例只含虚构内容。
 
 ## 1. 权威源和生效机制
 
@@ -8,7 +8,7 @@
 
 | 菜单 | 落盘位置（相对部署目录） | 消费者/生效与验证 |
 | --- | --- | --- |
-| 3 AI | `.env`、`config/provider.yaml` | 宿主探测 + 适配器/AnythingLLM/n8n；实际容器调用后提交代次，失败恢复旧值 |
+| 3 主备接口 | `config/provider-pool.yaml`、`secrets/provider/generations` | 非秘密权威源与分代凭据；验证候选，原子发布 `provider-pool-applied.json` 并回读 adapter |
 | 4 Prompt | `config/prompt.md` | 可编辑原文；成功应用后更新 workspace openAiPrompt 和受管生效投影，下一次新问题使用该版 |
 | 5 知识 | `knowledge/catalog.json`、`kb_*/sources`、`data/knowledge-manifest.json` | 全部启用库投影到一个 workspace；实际文档/索引回读与来源映射 |
 | 6 规则 | `config/keyword.yaml` | 应用进入受管投影后由 runtime 每事件读取；schema、边界、容器回读，无需全栈重启 |
@@ -16,15 +16,17 @@
 | 8 总开关 | `config/runtime.yaml` | 应用后的投影供事件处理和发送前读取，代次使旧任务失效，不停止服务 |
 | 9 欢迎/菜单 | `config/menu.yaml` | runtime 与白名单公开配置路由；网页只读允许的 UI 字段 |
 | 10 Crisp | `.env`、受管反代片段 | n8n 重载与 REST/Hook/收件事实复核，不重生 workspace |
-| 11 标签/反馈 | `config/tags.yaml`、`config/feedback.yaml` | runtime 与 `data/analytics`，正文发送与可选标签分离 |
+| 11 知识命中与历史统计 | `config/tags.yaml`、`config/feedback.yaml`、`data/analytics` | 历史评价只读，不再发送评价邀请或消费评分回复；可调整历史保留期 |
 | 12 业务迁移 | 用户选择的受限 `.tar.gz` | schema/checksum/预览→备份→同步→回读，保留本机秘密 |
 | 13/14 本机恢复 | `backups/versions`、完整备份包 | 数据库、应用文件与镜像身份一致性恢复 |
 | 15 日志 | `config/logging.yaml`、受管日志及 systemd timer | 文件历史按天清理，Docker 容量轮转，n8n pruning；预览、确认、实际回读 |
 | 16 资料应用 | `config/materials-applied.json` | 程序维护的当前有效投影，供 runtime 消费；包含 Prompt，禁止手改或公开 |
 
-`runtime.yaml` 使用 `schema_version: 2`、布尔 `enabled`、单调 `revision`、`applied_revision`。v1.2.0 由 `materials-applied.json` 保存已验证的配置、Prompt、知识版本和状态；运行时不把尚未完成的可编辑原文当作新一代配置。实际组件回读成功才标 `applied`，失败不能只输出“文件已保存”。总开关/人工控制不等待付费模型探测，原有开关和逐会话人工状态不会被普通资料应用重置。
+`runtime.yaml` 使用 `schema_version: 2`、布尔 `enabled`、单调 `revision`、`applied_revision`。自 v1.2.0 起由 `materials-applied.json` 保存已验证的配置、Prompt、知识版本和状态；运行时不把尚未完成的可编辑原文当作新一代配置。实际组件回读成功才标 `applied`，失败不能只输出“文件已保存”。总开关/人工控制不等待付费模型探测，原有开关和逐会话人工状态不会被普通资料应用重置。
 
 配置历史保存于受限 `backups/config-history`；它可能包含旧秘密、Prompt 或知识，不能上传。维护操作共用实例锁；空闲菜单不长期持锁。会话控制使用独立短临界区，不能锁着等 LLM 请求。不要在第三方 Web UI 随意修改受管 Prompt、索引或生产 workflow；先用 doctor 定位偏离，再从对应生产维护入口恢复。
+
+普通交互按业务对象显示中文摘要；结构化自动化接口仍保留。`status`、`enable`、`disable` 和 `apply` 可在命令后加 `--json`，例如 `crispai apply --check --json`；stdout 为结构化结果，进度/错误提示走 stderr。JSON 输出不代表允许修改权限或省略操作授权，尤其 `enable/disable` 仍会改变客服总开关。
 
 ### 稳定资料路径与应用顺序
 
@@ -37,6 +39,9 @@
 | `knowledge/catalog.json` | 库名、启用状态、稳定 ID、文档登记的权威定义；保留已生成的 ID、source、projection，不把任意文件名改成路径。 |
 | `knowledge/kb_*/sources/doc_*.md` 等 | 原始知识内容；可原位更新已登记文件。新增/删除条目使用菜单 5，由程序维护登记和归属。 |
 | `config/materials-applied.json` | 已生效投影，程序管理、不可手改；包含有效 Prompt 正文，不是可公开的状态报告。 |
+| `config/provider-pool.yaml` | 主备接口的非秘密权威源；可编辑已有条目的元数据/顺序/策略，不在此填 Key 或请求头值。新增凭据用菜单 3。 |
+| `config/provider-pool-applied.json` | 程序原子发布的有效池；引用秘密代次，不可手改，不以 `.env` 的旧值替代它。 |
+| `secrets/provider/generations` | 分代 Key 与请求头值，仅由受管程序写入；含真实秘密，不上传、不手工删除历史代次。 |
 | `data/knowledge-manifest.json`、`data/runtime/knowledge-map.json` | 真实索引对账和检索归属，不是用户输入；不要手动清空。 |
 | `backups/config-history/materials.applied.tar.gz` | 上一有效资料的恢复副本；含业务原文，受限保存。 |
 
@@ -48,7 +53,11 @@ crispai apply
 crispai doctor --local
 ```
 
-`--check` 只验证候选、权限、UTF-8、schema、路径与大小，不改原文、不同步索引或调用模型。普通 `apply` 在原文未变时快速结束；有变化时验证全部候选并保存上一有效版。需要更新 Prompt/知识时进入 `applying`，使旧任务代次失效，同步完成并真实回读后发布新 revision。慢同步期间新问题不自动回复，也不在完成后补答；人工控制仍独立处理。菜单等价入口为 `16 → 6 → 1`，状态用 `16 → 8`。底层复用 `scripts/materials.sh` 的 `status | validate | initialize | apply`；`initialize` 是安装/升级建立首份投影的内部接口。
+`--check` 先验证业务资料与接口池候选的结构、权限、UTF-8、路径和大小，不改原文、不同步索引或调用模型。它不是候选接口实际可用证明。普通 `apply` 在各原文未变时快速结束；有变化时先校验，再应用业务资料，最后验证并发布接口池变化。接口验证可能计费，不能把显式应用当作纯只读检查。
+
+需要更新 Prompt/知识时进入 `applying`，使旧任务代次失效，同步完成并真实回读后发布新 revision。慢同步期间新问题不自动回复，也不在完成后补答；人工控制仍独立处理。菜单等价入口为 `16 → 6 → 1`，状态用 `16 → 8`。底层复用 `scripts/materials.sh` 的 `status | validate | initialize | apply`；内部 `apply-business` 供单项业务维护使用，不顺带发布尚未确认的接口池编辑。`initialize` 用于安装/升级建立首份投影。
+
+两个领域不是跨组件的全有或全无事务：业务已成功而接口池应用失败时，业务新值保留，接口池沿上一有效值，整体返回未完成并提示分别核查。只看到业务完成不能算全部生效；运行 adapter 回读失败时，池会以新代次恢复旧配置，使旧请求继续失效。不要手工倒退代次或把失败写成 `applied`。
 
 若 doctor 发现 AnythingLLM 中的 Prompt 或受管索引关系偏离，而原文没有变化，用 `crispai apply --force-external` 或 `16 → 6 → 2` 明确重新同步现有 Prompt 和启用知识并回读；知识仍按增量对账，不默认重建全部索引。它确认受管文档的位置和启停关系，不能证明同一远端 location 的解析正文逐字未被外部篡改，也不删除本项目 manifest 之外的文档。确需从原文重建索引用 `5 → 11`，先确认作用范围与耗时。强制同步同样先校验当前可编辑原文，未完成的修改必须先修正。生产 workflow 不属于资料应用，工作流损坏按[排障说明](TROUBLESHOOTING.md)修复。
 
@@ -58,13 +67,41 @@ crispai doctor --local
 
 ## 2. Provider、协议与网络
 
-`AI_API_PROBE_BASE_URL` 是宿主探测地址，`AI_API_BASE_URL` 是容器可达供应商地址；本机地址映射为 `host.docker.internal`，合法代理路径保留，不重复追加 `/v1`。`AI_API_KEY` 与 `AI_CUSTOM_HEADERS_JSON` 只在 `.env`；后者允许有限安全请求头，不能覆盖 Authorization/Host/Content-Length 等管理字段。
+### 主备池与唯一权威源
 
-`provider.yaml` 记录 `schema_version: 2` 与 `provider.base_url/model/api_mode/capabilities/api_key_env` 等非秘密元数据，模型列表缓存与当前候选凭据摘要绑定，不保存明文 Key。管理员选择 `chat_completions` 或 `responses` 后必须得到有效正文；HTTP 200、模型 ID 或列表成功不能代替能力测试。
+接口池是 1 主、最多 20 备，总数最多 21；停用和待补凭据条目也占名额。必须恰有一个启用主接口，没有备用合法。每项有稳定 `p_*` ID、名称、角色、顺序、地址、模型、`api_mode`、能力和上下文/输出限制；主接口位于首位，其余按配置顺序尝试。设主时原主原子转为备用，不能直接停用或删除唯一主接口。
 
-AnythingLLM 固定使用 `generic-openai`，内部 Base 为 `AI_ANYTHINGLLM_BASE_URL=http://provider-adapter:8787/v1`。适配器复用固定镜像中的 Node，仅提供项目所需 Chat→Responses 转换或 Chat 转发，不是另一套 RAG。容器内部接口仍鉴权，不公开端口；生成请求有输出/内容上限、超时与取消。实际调用必须与 `api_mode` 一致。
+`config/provider-pool.yaml` 是 `schema_version: 1` 的非秘密权威源。`config/provider-pool-applied.json` 是运行有效投影；受管程序先写齐新的秘密代次，再原子发布投影。秘密位于 `secrets/provider/generations`，文件 `root:1000 0640`、目录 `0750`；只有 adapter 容器挂载该秘密目录。接口地址和模型名虽不属于 Key，也可能识别私人网关，不能随意公开整个池。
 
-图片走同一 Provider 的已验证文本/图片协议，带当前 Prompt 与同会话公开历史；不能支持时安全请求文字补充，不转人工。图片 URL 下载保护见 [SECURITY](SECURITY.md)。默认本地 Embedder由 AnythingLLM 管理，不需要另外的 API Key，不把聊天模型当 Embedding。升级已有模型设置须考虑全索引重建，不能只改显示名称。
+旧单接口安装升级时建立主接口，保留原地址、Key、模型、协议和自定义头。`.env` 的 `AI_*` 与 `config/provider.yaml` 此后只是主接口兼容投影，不是第二个可写权威源；不要同时编辑它们和池源。`AI_API_PROBE_BASE_URL` 与容器地址投影仍保留代理前缀及受管本机网关转换，不重复追加 `/v1`。
+
+Key 和请求头值通过菜单隐藏输入保存；请求头名称可见，值不进入非秘密池源。禁止 Authorization、Host、Content-Length、Cookie、内部问题信封等受管头和控制字符。空 Key 输入保留已有值，新增接口必须补齐凭据。选择 `chat_completions` 或 `responses` 后须验证有效正文，HTTP 200、模型列表或手填模型 ID 都不等于推理可用。
+
+主菜单 `3` 的 11 项依次为：列表、主配置、添加备、编辑接口或模型、备用排序、备用启停、设主、删除备、指定接口测试、切换策略、近期记录；精确数字流程见 [菜单 3](MENU.md)。十项安装仅配置主接口，不要求 20 套真实 Key。列表、状态、空闲运行和默认 doctor 不会轮询所有上游付费；编辑验证、启用验证、切主验证及显式测试可能发少量合成请求。
+
+### 切换、时间预算与费用
+
+AnythingLLM 继续负责 RAG，使用 `generic-openai` 经项目 adapter；runtime 文本/图片走同一个池。`PROVIDER_ADAPTER_KEY` 是独立稳定的内部认证，区别于上游 Key；AnythingLLM/n8n 不接收全池上游秘密。adapter 只按顺序选择符合协议、图片能力、上下文和冷却限制的接口，不在故障时修改 workspace、重启容器或重建 Embedding。
+
+| 策略字段 | 默认值 | 允许范围 |
+| --- | --- | --- |
+| `question_timeout_ms` | 90000（90 秒） | 1000～180000 |
+| `call_timeout_ms` | 20000（20 秒） | 1000～60000 |
+| `connect_timeout_ms` | 5000（5 秒） | 100～10000 |
+| `max_attempts` | 21 | 1～21 |
+| `cooldown_initial_ms` | 60000（60 秒） | 1000～300000 |
+| `cooldown_max_ms` | 300000（300 秒） | 1000～3600000 |
+| `pool_cooldown_ms` | 3000（3 秒） | 100～60000 |
+
+连接期限≤单次期限≤问题总期限，初始冷却≤最长冷却。视觉解析和最终回答共用一个问题期限和最多 21 次调用，不是每阶段各 21 次；同一阶段每个候选至多一次。到期、预算耗尽或无可用接口即终止该问题，不靠外层重复请求重新取得预算。配置/人工/总开关变化使旧结果失效，取消不等待上游正常返回，已被第三方接受的请求仍可能计费。
+
+限流、额度、认证、模型不可用、连接和上游暂时故障按类别处理；同账户凭据范围的失败不能靠另一个模型名绕过冷却。默认暂时冷却为 60～300 秒；上游更长的 `Retry-After` 不会被 300 秒截短。没有后台持续付费健康轮询，后续正常问题在允许时有界尝试恢复。
+
+安全拒绝、内容过滤或明确输入错误不会换服务绕过。备用只接收处理所需的 Prompt、知识片段、同会话公开历史或图片上下文，但这仍是向另一受信任服务披露数据，且失败调用和后续成功调用可能分别计费；添加前确认授权、隐私要求与余额。备用上下文不足或不支持图片时跳过，不能为了切换丢弃必要知识或把原图当作已理解；无法完成时安全提示或要求文字补充，不转人工。
+
+上下文筛选是保守近似，不是模型专用 tokenizer：连续 ASCII 按字符数÷3 向上取整，汉/日/韩每字按 2，Emoji 码点按 4，其余 Unicode 按 UTF-8 字节数÷2 向上取整，文本再加 10%；另预留每消息 16、每请求 256、每图 4096，并计入本次输出上限。估算超出候选窗口就跳过，不裁掉必要知识或图片。若上游真实返回 `context_length_exceeded`，按输入错误终止，不盲目扫描更多备用。管理员应填写服务商真实支持的窗口，不能靠增大配置骗过模型限制。
+
+默认本地 Embedder 仍由 AnythingLLM 管理，不需要额外 API Key，不把聊天模型当 Embedding。变更 Embedder 须考虑全索引重建，不能只改显示名称。
 
 `data/runtime/session-*.json` 中的可选 `image_context` 保留最多 3 份视觉摘要，每份 2000 字符、24 小时；后续问答只有匹配该会话近期公开附件才使用，避免依赖模型在公开回答里复述全部细节。它是受限会话数据，不是业务配置，不导出至迁移包；旧会话无此字段仍兼容，不重置原人工状态。
 
@@ -112,7 +149,9 @@ AnythingLLM 固定使用 `generic-openai`，内部 Base 为 `AI_ANYTHINGLLM_BASE
 
 `menu.yaml` 的 welcome 默认 `enabled=true/trigger=first_message/auto_open=false/show_menu=true`。另支持 widget_load/chat_open，需无密钥 SDK + `session:sync:events`。菜单树用 root/menus/options，动作 reply/prompt/menu/show_handoff_offer；返回父级用受限 back 标记。最多 100 个节点，每节点最多 12 个选项（含配置中的返回项），从根最多向下跳转 8 次；普通下级禁止环和无效引用。
 
-`feedback.yaml` 定义启停、提示、正负文案、有效期及保留；反馈绑定已发送回答并防重复，“否”只有存在有效反馈上下文时才消费。负反馈不接管。`retention_days` 默认 30，允许 1～3650；调度检测保留期变化后执行清理，平时每小时检查，范围仅统计活动文件及五份轮转，不删除人工状态。默认 `retain_text=false`，不留明文问题，仅保留限长指纹/脱敏摘要。
+v1.2.1 不再发送任何程序自动评价邀请：不追加“是否解决”、评分链接或评价按钮，也不创建新评价等待上下文。初始化、升级和旧业务导入会将反馈的 `enabled`、`auto_invite` 规范化为 false；旧会话中的待评价状态不再消费普通消息。普通“是/否/👍/👎”照常进入咨询流程；用户自定义业务规则仍按自己的规则处理，不因评分逻辑转人工。
+
+菜单 11 保留历史评价只读查看、知识命中统计与历史保留期，不提供重新启用邀请或修改邀请正文的入口。`feedback.yaml` 的旧文案可为兼容/历史保留，但不再影响新自动出站；不为禁用邀请清空历史统计、普通待处理任务或人工 offer。`retention_days` 默认 30，允许 1～3650；已有统计保留策略仍独立生效，范围不含人工状态。默认 `retain_text=false`，不留明文问题，仅保留限长指纹/脱敏摘要。
 
 `tags.yaml` 的 `ai_replied` 表示已回复，不自动 resolved。标签读取现有 segments 后并集写回，失败跳过，不中断正文。知识命中使用实际 sources；可观察查询才参与命中分母，未知单列，按库来源归属但每问题总数只计一次。
 
@@ -124,9 +163,15 @@ Token tier 与 Hook mode 分开；Website URL Secret、Plugin Signing Secret、C
 
 ## 8. 导出、升级和恢复
 
-业务包 `ai-support-business-v2` 包含非敏感 Provider、业务配置、Prompt、多库原文、workflow模板、版本和 SHA 清单；排除 `.env`、秘密 Header、会话和本机日志策略。导入前完整校验与数字确认，保留本机秘密，自动应用后回读；失败恢复旧配置。包上限压缩 128 MiB/展开 512 MiB，不能在导入时执行其中的代码。v1.2.0 的普通 `backup.sh` 在存在 catalog 时也复用同一完整多库业务导出；`restore.sh` 识别该格式后走同一导入/应用链。`--skip-restart` 仅供旧业务包离线兼容，不会让新版业务包跳过真实应用回读。
+业务包 `ai-support-business-v2` 包含非秘密主备池元数据、业务配置、Prompt、多库原文、workflow 模板、版本和 SHA 清单；排除 `.env`、秘密代次、请求头值、会话、路由问题缓存和本机日志策略。导入前完整校验与数字确认，保留本机秘密，应用后回读。包上限压缩 128 MiB/展开 512 MiB，不能在导入时执行其中的代码。普通 `backup.sh` 在存在 catalog 时也复用完整多库业务导出；`restore.sh` 识别该格式后走同一导入/应用链。`--skip-restart` 仅供旧业务包离线兼容，不会让新版业务包跳过真实应用回读。
 
-本机快照 `ai-support-snapshot-v3` 与完整备份包含 `.env`、PostgreSQL dump、AnythingLLM/n8n/runtime、程序配置和历史镜像身份；用于可信本机一致性恢复。旧 v2 快照按原边界兼容，不假称其含后来新增的秘密和状态。升级保留旧自定义设置，将 handoff 动作迁移成按钮、单知识迁移默认库；不统一重置人工。密钥和数据恢复保护见 [SECURITY](SECURITY.md)。
+导入按稳定接口 ID 对应本机秘密，不按名称猜 Key。导入主接口没有本机 Key 时，仅保存 `config/provider-pool-import-draft.json` 草稿，当前可用池不替换；不能把草稿提示当作接口已上线。主接口 ID 有本机 Key、但新备用缺 Key 时，新备用只能以停用草稿进入池，补齐验证前不会用于回答。整池验证失败或仅部分资料完成时，按实际分项结果修复；不要把空模板写到 `.env` 来清除旧凭据。
+
+导入草稿的完整菜单闭环为 `3 → 10 → 11`：选 `1` 查看、`2` 选择条目补齐凭据/模型并在编辑页 `9` 验证保存，最后选草稿页 `3` 验证并应用整池。补齐保存仍只是草稿，旧有效池继续服务；必须完成最后一次明确应用。主接口必须有 Key，剩余缺 Key 的备用继续停用并占容量。只修改主备源文件可走 `3 → 10 → 9`，导入非秘密池结构走 `3 → 10 → 10`，不要把秘密写入源文件。
+
+自动化管理保留 `scripts/provider.sh --deploy-dir PATH` 的结构化接口：`draft`、`draft-entry ID`、`edit-draft ID FILE`、`apply-draft`。其中 `FILE` 是已由管理员安全创建的受限候选文件，不把 Key 放到命令参数或公开示例；包含原有 `provider` 对象和单独 `api_key`。空 Key 保留旧值，文本及启用的图片能力验证可能计费，成功补齐不会自动替换当前池。普通管理员优先使用上述隐藏输入菜单。
+
+本机快照 `ai-support-snapshot-v3` 与完整备份包含 `.env`、PostgreSQL dump、AnythingLLM/n8n/runtime、主备配置/秘密代次/路由状态、程序配置和历史镜像身份；用于可信本机一致性恢复。旧快照按其实际成员兼容，不假称包含后来新增状态。升级保留旧自定义设置，将 handoff 动作迁移成按钮、单知识迁移默认库、单接口迁移为主；不统一重置人工、欢迎或总开关。自动评价邀请是明确停用迁移项。密钥和数据恢复保护见 [SECURITY](SECURITY.md)。
 
 ## 9. 日志保留与实际应用
 

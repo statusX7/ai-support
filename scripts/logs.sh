@@ -1118,7 +1118,7 @@ logs_export() {
     '{schema_version:1,created_at:$created_at,version:$version,scope:"redacted-diagnostics",
       contains_secrets:false,contains_prompt_or_knowledge:false,contains_customer_transcript:false,
       status:$status,sources:$sources,
-      exclusions:[".env","Prompt 与知识正文","runtime 会话/任务/offer","analytics 业务数据","数据库/WAL/备份","Docker LogPath"]}' > "$staging/manifest.json"
+      exclusions:[".env","主备接口秘密及导入草稿","Prompt 与知识正文","runtime 会话/任务/offer","analytics 业务数据","数据库/WAL/备份","Docker LogPath"]}' > "$staging/manifest.json"
   if [[ -e "$LOGS_ROOT/doctor-last.json" || -L "$LOGS_ROOT/doctor-last.json" ]]; then
     logs_safe_regular_file "$LOGS_ROOT/doctor-last.json" || die '自检缓存路径不安全，拒绝导出'
     logs_redact export < "$LOGS_ROOT/doctor-last.json" > "$staging/doctor-last.json"
@@ -1147,7 +1147,11 @@ env = pathlib.Path(sys.argv[1]); module_path = pathlib.Path(sys.argv[2]); root =
 spec = importlib.util.spec_from_file_location("crispai_log_redact", module_path)
 if spec is None or spec.loader is None: raise SystemExit(2)
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-values = module.collect_secrets(module.parse_env(env))
+try:
+    values = module.collect_instance_secrets(env)
+except (OSError, ValueError, TypeError, UnicodeError):
+    print("无法完整核对主备接口秘密，诊断包已停止导出", file=sys.stderr)
+    raise SystemExit(2)
 for file in root.rglob("*"):
     if file.is_symlink(): raise SystemExit(2)
     if file.is_dir(): continue

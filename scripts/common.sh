@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+version_at_least() {
+  local current=$1 expected=$2 a b c x y z
+  [[ "$current" =~ ^v([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})$ ]] || return 1
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; c=${BASH_REMATCH[3]}
+  [[ "$expected" =~ ^v([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})$ ]] || return 1
+  x=${BASH_REMATCH[1]}; y=${BASH_REMATCH[2]}; z=${BASH_REMATCH[3]}
+  (( 10#$a > 10#$x || (10#$a == 10#$x && 10#$b > 10#$y) || (10#$a == 10#$x && 10#$b == 10#$y && 10#$c >= 10#$z) ))
+}
+
 COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${COMMON_DIR}/.." && pwd -P)"
 DEFAULT_DEPLOY_DIR="/opt/crisp-ai"
@@ -647,7 +656,7 @@ secure_permissions() {
   chmod 750 "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" "${deploy_dir}/scripts" "${deploy_dir}/docs" 2>/dev/null || true
   chmod 770 "${deploy_dir}/data/analytics" 2>/dev/null || true
   [[ -f "${deploy_dir}/.env" ]] && chmod 600 "${deploy_dir}/.env"
-  # provider.yaml 不含秘密，供受管容器读取；认证值仅在 0600 的 .env 中。
+  # 可编辑接口定义不含秘密；上游秘密代次只向 adapter 的受限组开放。
   [[ -f "${deploy_dir}/config/provider.yaml" ]] && chmod 640 "${deploy_dir}/config/provider.yaml"
   [[ -f "${deploy_dir}/data/analytics/events.jsonl" ]] && chmod 660 "${deploy_dir}/data/analytics/events.jsonl"
   find "${deploy_dir}/config" -maxdepth 1 -type f ! -name 'provider.yaml' -exec chmod 640 {} + 2>/dev/null || true
@@ -661,9 +670,20 @@ secure_permissions() {
     find "${deploy_dir}/${readable_tree}" -type d -exec chmod 750 {} +
     find "${deploy_dir}/${readable_tree}" -type f -exec chmod 640 {} +
   done
-  if [[ -f "${deploy_dir}/scripts/provider-adapter.js" ]]; then
-    chown root:1000 "${deploy_dir}/scripts/provider-adapter.js"
-    chmod 640 "${deploy_dir}/scripts/provider-adapter.js"
+  for readable_tree in provider-adapter.js provider-router.js provider-envelope.js; do
+    if [[ -f "${deploy_dir}/scripts/${readable_tree}" && ! -L "${deploy_dir}/scripts/${readable_tree}" ]]; then
+      chown root:1000 "${deploy_dir}/scripts/${readable_tree}"
+      chmod 640 "${deploy_dir}/scripts/${readable_tree}"
+    fi
+  done
+  if [[ -e "${deploy_dir}/secrets" || -L "${deploy_dir}/secrets" ]]; then
+    [[ -d "${deploy_dir}/secrets" && ! -L "${deploy_dir}/secrets" ]] || die '接口秘密目录不安全'
+    if find "${deploy_dir}/secrets" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
+      die '接口秘密目录包含链接或特殊文件'
+    fi
+    chown -R root:1000 "${deploy_dir}/secrets"
+    find "${deploy_dir}/secrets" -type d -exec chmod 0750 {} +
+    find "${deploy_dir}/secrets" -type f -exec chmod 0640 {} +
   fi
 }
 
@@ -676,6 +696,11 @@ set_runtime_ownership() {
     "${deploy_dir}/data/runtime" 2>/dev/null \
     || die "无法设置 n8n 或 AnythingLLM 数据目录所有权"
   chmod 0750 "${deploy_dir}/data/n8n" "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/runtime"
+  if [[ -e "${deploy_dir}/data/provider-router" || -L "${deploy_dir}/data/provider-router" ]]; then
+    [[ -d "${deploy_dir}/data/provider-router" && ! -L "${deploy_dir}/data/provider-router" ]] || die '接口运行状态目录不安全'
+    chown -R 1000:1000 "${deploy_dir}/data/provider-router" || die '无法设置接口运行状态权限'
+    chmod 0700 "${deploy_dir}/data/provider-router"
+  fi
 }
 
 repair_runtime_modules_from_source() {
@@ -731,7 +756,8 @@ copy_project_files() {
     config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
     config/logging.yaml.example
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/build-workflow.js n8n/web-chat.js
-    scripts/provider-adapter.js scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
+    scripts/provider-adapter.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
+    scripts/menu-display.py scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
     docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   )
@@ -740,7 +766,7 @@ copy_project_files() {
     scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
     scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
-    scripts/launcher.sh scripts/menu-ui.sh scripts/configuration.sh scripts/provider.sh
+    scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
     scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   )
@@ -748,10 +774,12 @@ copy_project_files() {
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
     "${deploy_dir}/scripts" "${deploy_dir}/docs" "${deploy_dir}/data/n8n" "${deploy_dir}/data/postgres" \
     "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/analytics" "${deploy_dir}/data/runtime" \
+    "${deploy_dir}/data/provider-router" "${deploy_dir}/secrets/provider/generations" \
     "${deploy_dir}/data/caddy" "${deploy_dir}/data/caddy-config" "${deploy_dir}/logs" \
     "${deploy_dir}/backups" "${deploy_dir}/backups/versions" "${deploy_dir}/tmp"
   for directory in config knowledge n8n scripts docs data data/n8n data/postgres data/anythingllm \
-    data/analytics data/runtime data/caddy data/caddy-config logs backups backups/versions tmp; do
+    data/analytics data/runtime data/provider-router secrets secrets/provider secrets/provider/generations \
+    data/caddy data/caddy-config logs backups backups/versions tmp; do
     [[ -d "${deploy_dir}/${directory}" && ! -L "${deploy_dir}/${directory}" ]] \
       || die "受管理目录缺失或是符号链接：${deploy_dir}/${directory}"
   done
@@ -866,6 +894,9 @@ migrate_runtime_env() {
   local value legacy_secret hook_mode token_tier
 
   [[ -f "$env_file" && ! -L "$env_file" ]] || die "运行配置缺失或不安全：$env_file"
+
+  # 升级的镜像预拉取也会展开新 Compose；先准备独立内部认证，绝不轮换业务 Key。
+  ensure_secret "$env_file" PROVIDER_ADAPTER_KEY
 
   # 新装 .env 模板有显式值；旧实例缺字段时保持原有 10m/3 份策略。
   value=$(env_get "$env_file" CRISPAI_LOG_MAX_SIZE 2>/dev/null || true)

@@ -123,6 +123,10 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 2 0; then
   SCRIPT_FILES+=(materials.sh logs.sh log-redact.py)
   CONFIG_FILES+=(logging.yaml.example)
 fi
+if snapshot_version_at_least "$VERSION_VALUE" 1 2 1; then
+  SCRIPT_FILES+=(provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh)
+  snapshot_pool_required=true
+fi
 
 snapshot_validate_file() {
   local relative=$1 label=$2 path="${DEPLOY_DIR}/${1}"
@@ -175,10 +179,16 @@ snapshot_validate_file 'n8n/workflow.json' '快照 workflow'
 for directory in config knowledge n8n scripts docs data/anythingllm; do
   snapshot_validate_tree "$directory"
 done
-for directory in data/n8n data/runtime; do
+for directory in data/n8n data/runtime data/provider-router secrets; do
   [[ ! -e "${DEPLOY_DIR}/${directory}" && ! -L "${DEPLOY_DIR}/${directory}" ]] \
     || snapshot_validate_tree "$directory"
 done
+if [[ ${snapshot_pool_required:-false} == true ]]; then
+  snapshot_validate_file config/provider-pool.yaml '接口池原文'
+  snapshot_validate_file config/provider-pool-applied.json '接口池生效投影'
+  snapshot_validate_tree secrets/provider/generations
+  snapshot_validate_tree data/provider-router
+fi
 snapshot_validate_optional_file 'data/knowledge-manifest.json' '知识索引清单'
 
 SNAPSHOT_SOURCE_PATHS=()
@@ -188,7 +198,7 @@ done
 for name in "${OPTIONAL_ROOT_FILES[@]}"; do
   [[ -e "${DEPLOY_DIR}/${name}" ]] && SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${name}")
 done
-for directory in config knowledge n8n scripts docs data/anythingllm data/n8n data/runtime; do
+for directory in config knowledge n8n scripts docs data/anythingllm data/n8n data/runtime data/provider-router secrets; do
   [[ -d "${DEPLOY_DIR}/${directory}" ]] || continue
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/${directory}")
 done
@@ -248,7 +258,7 @@ RUNNING_SERVICES=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=ru
 POSTGRES_WAS_RUNNING=0
 grep -Fxq postgres <<< "$RUNNING_SERVICES" && POSTGRES_WAS_RUNNING=1
 (( POSTGRES_WAS_RUNNING == 1 )) || die "PostgreSQL 容器未运行，无法创建一致的 n8n 数据库快照"
-mapfile -t PAUSED_SERVICES < <(printf '%s\n' "$RUNNING_SERVICES" | grep -E '^(n8n|anythingllm)$' || true)
+mapfile -t PAUSED_SERVICES < <(printf '%s\n' "$RUNNING_SERVICES" | grep -E '^(n8n|anythingllm|provider-adapter)$' || true)
 if (( ${#PAUSED_SERVICES[@]} )); then
   docker_compose "$DEPLOY_DIR" stop "${PAUSED_SERVICES[@]}" >/dev/null
   SERVICES_PAUSED=1
@@ -314,7 +324,7 @@ copy_snapshot_tree() {
 for directory in config knowledge n8n scripts docs; do
   copy_snapshot_tree "$directory"
 done
-for directory in data/n8n data/runtime; do
+for directory in data/n8n data/runtime data/provider-router secrets; do
   [[ ! -d "${DEPLOY_DIR}/${directory}" ]] || copy_snapshot_tree "$directory"
 done
 

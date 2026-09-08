@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
+import stat
 import sys
 import urllib.parse
 from pathlib import Path
@@ -81,8 +83,8 @@ def parse_env(path: Path) -> dict[str, str]:
     return values
 
 
-def collect_secrets(values: dict[str, str]) -> list[str]:
-    secrets: set[str] = set()
+def collect_secrets(values: dict[str, str], extra: set[str] | None = None) -> list[str]:
+    secrets: set[str] = set(extra or ())
     for key, value in values.items():
         if value and key not in NON_SECRET_ENV and (SENSITIVE_ENV.search(key) or key == "CRISP_WEBSITE_ID"):
             secrets.add(value)
@@ -95,6 +97,8 @@ def collect_secrets(values: dict[str, str]) -> list[str]:
                 for header_value in headers.values():
                     if isinstance(header_value, str) and header_value:
                         secrets.add(header_value)
+    if values.get("CRISP_TOKEN_IDENTIFIER") and values.get("CRISP_TOKEN_KEY"):
+        secrets.add(values["CRISP_TOKEN_IDENTIFIER"] + ":" + values["CRISP_TOKEN_KEY"])
     expanded: set[str] = set()
     for secret in secrets:
         if len(secret) < 3:
@@ -103,7 +107,9 @@ def collect_secrets(values: dict[str, str]) -> list[str]:
         # 常见日志可能保存 JSON 转义、URL 编码或 Base64 形式。所有变体只在
         # 内存中构造，不写入诊断文件。
         expanded.add(json.dumps(secret, ensure_ascii=False)[1:-1])
+        expanded.add(json.dumps(secret, ensure_ascii=True)[1:-1])
         expanded.add(urllib.parse.quote(secret, safe=""))
+        expanded.add(urllib.parse.quote(urllib.parse.quote(secret, safe=""), safe=""))
         expanded.add(urllib.parse.quote_plus(secret, safe=""))
         raw = secret.encode("utf-8")
         expanded.add(base64.b64encode(raw).decode("ascii"))
@@ -113,6 +119,60 @@ def collect_secrets(values: dict[str, str]) -> list[str]:
             if len(part) >= 3:
                 expanded.add(part)
     return sorted((item for item in expanded if len(item) >= 3), key=len, reverse=True)
+
+
+def provider_secret_files(env: Path) -> list[Path]:
+    directory = env.parent
+    for part in ("secrets", "provider", "generations"):
+        directory /= part
+        if directory.is_symlink():
+            raise ValueError("unsafe secret directory")
+        if not directory.exists():
+            return []
+        if not directory.is_dir():
+            raise ValueError("invalid secret directory")
+    files: list[Path] = []
+    total = 0
+    for file in directory.iterdir():
+        # 所有生效、历史和导入草稿代次均纳入，不只处理当前主接口。
+        if not re.fullmatch(r"(?:draft-)?[a-f0-9]{32}\.json", file.name):
+            continue
+        info = file.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16 * 1024 * 1024:
+            raise ValueError("unsafe secret file")
+        files.append(file)
+        total += info.st_size
+        if len(files) > 4096 or total > 64 * 1024 * 1024:
+            raise ValueError("secret scan limit")
+    return files
+
+
+def instance_fingerprint(env: Path) -> tuple:
+    files = provider_secret_files(env)
+    return tuple((str(file), file.stat().st_mtime_ns, file.stat().st_size) for file in [env, *sorted(files)] if file.exists())
+
+
+def collect_instance_secrets(env: Path) -> list[str]:
+    extra: set[str] = set()
+    for file in provider_secret_files(env):
+        fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16 * 1024 * 1024:
+                raise ValueError("unsafe secret file")
+            value = json.load(stream)
+        entries = value.get("entries") if isinstance(value, dict) else None
+        if not isinstance(entries, dict) or len(entries) > 21:
+            raise ValueError("invalid secret document")
+        for entry in entries.values():
+            if not isinstance(entry, dict) or not isinstance(entry.get("api_key"), str):
+                raise ValueError("invalid secret entry")
+            extra.add(entry["api_key"])
+            headers = entry.get("custom_headers", {})
+            if not isinstance(headers, dict) or any(not isinstance(item, str) for item in headers.values()):
+                raise ValueError("invalid secret headers")
+            extra.update(headers.values())
+    return collect_secrets(parse_env(env), extra)
 
 
 def redact_object(value: object) -> object:
@@ -205,7 +265,9 @@ def main() -> int:
     parser.add_argument("--mode", choices=("display", "export"), default="display")
     parser.add_argument("--help", action="help")
     args = parser.parse_args()
-    secrets = collect_secrets(parse_env(Path(args.env)))
+    env = Path(args.env)
+    fingerprint = instance_fingerprint(env)
+    secrets = collect_instance_secrets(env)
     stream = sys.stdin.buffer
     max_line = 256 * 1024
     while True:
@@ -220,6 +282,11 @@ def main() -> int:
                 chunk = stream.readline(max_line + 1)
             raw = prefix + "[单行已截断]".encode("utf-8")
         text = raw.decode("utf-8", errors="replace").rstrip("\n\r")
+        current = instance_fingerprint(env)
+        if current != fingerprint:
+            # 长期 follow 时也须在输出前纳入新 Key，不能沿用开启查看时的旧清单。
+            secrets = collect_instance_secrets(env)
+            fingerprint = current
         # follow 模式下 stdin 会长期保持打开；stdout 重定向文件或管道时
         # Python 默认使用块缓冲。每条脱敏记录必须立即可见，不能等待 EOF。
         print(redact_line(text, secrets, args.mode), flush=True)
@@ -233,4 +300,7 @@ if __name__ == "__main__":
         # follow 的 Ctrl+C 由外层日志入口给出中文结果；
         # 脱敏过滤器不应在管理员终端打印 Python traceback。
         status = 130
+    except (OSError, ValueError, TypeError, UnicodeError):
+        print("无法完整读取本实例秘密清单，已停止日志输出；请检查受限凭据文件后重试。", file=sys.stderr)
+        status = 1
     raise SystemExit(status)

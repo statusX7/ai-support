@@ -3,6 +3,13 @@
 .env.*
 !.env.example
 config/provider.yaml
+config/provider-pool.yaml
+config/provider-pool-applied.json
+config/provider-pool-import-draft.json
+config/provider-pool.lock
+config/materials-applied.json
+config/logging.yaml
+secrets/
 config/prompt.md
 config/Caddyfile
 config/keyword.yaml

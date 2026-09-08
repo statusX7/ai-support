@@ -609,6 +609,8 @@ if (( EXISTING == 0 )) && [[ -z "$(env_get "$ENV_FILE" CRISPAI_LOG_MAX_FILES 2>/
   env_set "$ENV_FILE" CRISPAI_LOG_MAX_FILES 5
 fi
 migrate_runtime_env "$DEPLOY_DIR"
+python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" migrate >/dev/null \
+  || die '主接口迁移失败；原配置已保留，请从同一安装入口继续'
 bash "${DEPLOY_DIR}/scripts/logs.sh" --deploy-dir "$DEPLOY_DIR" initialize
 record_maintenance_event "$DEPLOY_DIR" install start
 

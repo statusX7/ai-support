@@ -205,11 +205,16 @@ case "$COMMAND" in
     fi
     ;;
   exec)
-    if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* ]]; then
+    if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* \
+      || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
       expected=''
       IFS= read -r expected || [[ -n "$expected" ]]
       if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
         binding_file="${MOCK_PROJECT_DIR}/scripts/provider-adapter.js"
+      elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* ]]; then
+        binding_file="${MOCK_PROJECT_DIR}/scripts/provider-router.js"
+      elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
+        binding_file="${MOCK_PROJECT_DIR}/scripts/provider-envelope.js"
       else
         binding_file="${MOCK_PROJECT_DIR}/config/Caddyfile"
       fi
@@ -217,6 +222,28 @@ case "$COMMAND" in
       actual=$(sha256sum -- "$binding_file"); actual=${actual%% *}
       [[ "$actual" == "$expected" && "${MOCK_FILE_BINDING_MISMATCH:-0}" != 1 ]] || exit 1
       printf 'matched\n'
+    elif [[ "$*" == *' anythingllm '* && "$*" == *'/internal/provider/status'* ]]; then
+      python3 "${MOCK_PROJECT_DIR}/scripts/provider-pool.py" --deploy-dir "$MOCK_PROJECT_DIR" list \
+        | jq '.entries |= map(.health=(if .enabled then "unknown" else "disabled" end))'
+    elif [[ "$*" == *' provider-adapter '* && "$*" == *'127.0.0.1:8787'* ]]; then
+      # 生命周期仅模拟受管容器控制通道；真实路由另由 HTTP 协议及 VM 测试覆盖。
+      payload=$(jq -c '.')
+      route=$(jq -r '.route' <<< "$payload")
+      case "$route" in
+        /internal/provider/status)
+          [[ "$(jq -r '.method' <<< "$payload")" == GET ]] || exit 2
+          python3 "${MOCK_PROJECT_DIR}/scripts/provider-pool.py" --deploy-dir "$MOCK_PROJECT_DIR" list \
+            | jq '.entries |= map(.health=(if .enabled then "unknown" else "disabled" end))'
+          ;;
+        /internal/provider/probe)
+          jq -e '.method=="POST" and (.payload.api_key|type=="string" and length>0) and
+            (.payload.provider.model|type=="string" and length>0) and
+            (.payload.provider.api_mode=="responses" or .payload.provider.api_mode=="chat_completions")' <<< "$payload" >/dev/null || exit 2
+          [[ "${MOCK_PROVIDER_FAIL:-0}" != 1 && "${MOCK_PROVIDER_SOFT_ERROR:-0}" != 1 ]] || exit 1
+          jq '{ok:true,verified:true,api_mode:.payload.provider.api_mode,capabilities:{chat_completions:(.payload.provider.api_mode=="chat_completions"),responses:(.payload.provider.api_mode=="responses"),vision:(.payload.vision==true)}}' <<< "$payload"
+          ;;
+        *) printf '测试桩拒绝未实现的接口池管理操作\n' >&2; exit 2 ;;
+      esac
     elif [[ "$*" == *'n8n --version'* ]]; then
       printf '2.99.0-test\n'
     elif [[ "$*" == *'pg_dump'* ]]; then

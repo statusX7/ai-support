@@ -16,14 +16,18 @@ services:
       - no-new-privileges:true
     entrypoint: ["node", "/opt/crisp-ai/scripts/provider-adapter.js"]
     environment:
-      AI_API_BASE_URL: ${AI_API_BASE_URL}
-      AI_API_KEY: ${AI_API_KEY}
-      AI_MODEL: ${AI_MODEL}
-      AI_API_MODE: ${AI_API_MODE:-chat_completions}
-      AI_CUSTOM_HEADERS_JSON: ${AI_CUSTOM_HEADERS_JSON:-}
+      PROVIDER_ADAPTER_KEY: ${PROVIDER_ADAPTER_KEY:?内部接口认证尚未初始化}
+      PROVIDER_POOL_REQUIRED: "true"
+      PROVIDER_REQUIRE_ENVELOPE: "true"
+      PROVIDER_HOST_GATEWAY: host.docker.internal
     volumes:
       - ${DEPLOY_DIR:-/opt/crisp-ai}/config:/opt/crisp-ai/config:ro
       - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-adapter.js:/opt/crisp-ai/scripts/provider-adapter.js:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-router.js:/opt/crisp-ai/scripts/provider-router.js:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-envelope.js:/opt/crisp-ai/scripts/provider-envelope.js:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/secrets/provider:/opt/crisp-ai/secrets/provider:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/data/provider-router:/opt/crisp-ai/data/provider-router
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/data/runtime:/opt/crisp-ai/data/runtime:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -79,7 +83,7 @@ services:
       SIG_SALT: ${ANYTHINGLLM_SIG_SALT:?请在 .env 中设置 ANYTHINGLLM_SIG_SALT}
       LLM_PROVIDER: generic-openai
       GENERIC_OPEN_AI_BASE_PATH: ${AI_ANYTHINGLLM_BASE_URL:-http://provider-adapter:8787/v1}
-      GENERIC_OPEN_AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
+      GENERIC_OPEN_AI_API_KEY: ${PROVIDER_ADAPTER_KEY:?内部接口认证尚未初始化}
       GENERIC_OPEN_AI_MODEL_PREF: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
       GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: ${AI_MODEL_TOKEN_LIMIT:-8192}
       EMBEDDING_ENGINE: native
@@ -163,13 +167,9 @@ services:
       ANYTHINGLLM_API_KEY: ${ANYTHINGLLM_API_KEY:?请在 .env 中设置 ANYTHINGLLM_API_KEY}
       ANYTHINGLLM_WORKSPACE: ${ANYTHINGLLM_WORKSPACE:-crisp-support}
       ANYTHINGLLM_CHAT_MODE: ${ANYTHINGLLM_CHAT_MODE:-chat}
-      AI_API_BASE_URL: ${AI_API_BASE_URL:?请在 .env 中设置 AI_API_BASE_URL}
-      AI_API_KEY: ${AI_API_KEY:?请在 .env 中设置 AI_API_KEY}
-      AI_MODEL: ${AI_MODEL:?请在 .env 中设置 AI_MODEL}
-      AI_API_MODE: ${AI_API_MODE:-responses}
-      AI_CUSTOM_HEADERS_JSON: ${AI_CUSTOM_HEADERS_JSON:-}
-      AI_SUPPORTS_VISION: ${AI_SUPPORTS_VISION:-false}
-      AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-1200}
+      PROVIDER_ADAPTER_URL: http://provider-adapter:8787/v1
+      PROVIDER_ADAPTER_KEY: ${PROVIDER_ADAPTER_KEY:?内部接口认证尚未初始化}
+      PROVIDER_POOL_REQUIRED: "true"
     volumes:
       - type: bind
         source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/n8n

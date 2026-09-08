@@ -218,6 +218,17 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   if [[ -z "$restored_database_password" ]] || ! validate_env_value "$restored_database_password"; then
     die "快照数据库密码无效；未修改部署"
   fi
+  if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.2.1; then
+    for name in config/provider-pool-applied.json config/provider-pool.yaml scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh; do
+      [[ -f "${PAYLOAD}/${name}" && ! -L "${PAYLOAD}/${name}" ]] || die "主备版本快照缺少必要文件：$name"
+    done
+  fi
+  if [[ -e "${PAYLOAD}/config/provider-pool-applied.json" ]]; then
+    python3 "${SCRIPT_DIR}/provider-pool.py" --deploy-dir "$PAYLOAD" list >/dev/null \
+      || die '快照接口池与秘密代次不完整，未修改部署'
+    [[ -d "${PAYLOAD}/data/provider-router" && ! -L "${PAYLOAD}/data/provider-router" ]] \
+      || die '快照缺少主备路由的持久状态，未修改部署'
+  fi
 fi
 
 ROOT_FILES=(VERSION CHANGELOG.md README.md LICENSE AGENTS.md .env.example docker-compose.yml)
@@ -268,7 +279,7 @@ for name in "${DOC_FILES[@]}"; do
 done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py; do
+for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh; do
   validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
 done
 
@@ -361,9 +372,9 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py; do
+for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh; do
   module_mode=0750
-  [[ "$module" != log-redact.py ]] || module_mode=0640
+  case "$module" in *.js|*.py) module_mode=0640 ;; esac
   sync_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "$module_mode" "scripts/${module}"
 done
 
@@ -388,6 +399,18 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   for directory in data/runtime data/n8n; do
     mkdir -p -- "${DEPLOY_DIR}/${directory}"
     [[ ! -d "${PAYLOAD}/${directory}" ]] || restore_snapshot_tree "$directory"
+  done
+  for directory in secrets data/provider-router; do
+    if [[ -d "${PAYLOAD}/${directory}" ]]; then
+      mkdir -p -- "${DEPLOY_DIR}/${directory}"
+      restore_snapshot_tree "$directory"
+    elif [[ -e "${DEPLOY_DIR}/${directory}" || -L "${DEPLOY_DIR}/${directory}" ]]; then
+      [[ -d "${DEPLOY_DIR}/${directory}" && ! -L "${DEPLOY_DIR}/${directory}" ]] || die '降版前接口资料目录不安全'
+      provider_previous=$(mktemp -d "${DEPLOY_DIR}/backups/provider-pre-rollback.XXXXXXXX")
+      chmod 0700 "$provider_previous"
+      mv -- "${DEPLOY_DIR}/${directory}" "${provider_previous}/$(basename -- "$directory")"
+      info "旧版本不识别的主备秘密或状态已受限保留：$provider_previous"
+    fi
   done
 fi
 

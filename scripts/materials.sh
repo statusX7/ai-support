@@ -566,9 +566,56 @@ materials_apply() (
   return 1
 )
 
+materials_pool_status() {
+  local deploy_dir=$1 stage source_valid=true current_valid=true pending=false current_revision=0
+  if [[ ! -e "${deploy_dir}/config/provider-pool-applied.json" \
+    && $(env_get "${deploy_dir}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) != true ]]; then
+    printf '%s\n' '{"enabled":false,"source_valid":true,"current_valid":true,"pending":false}'
+    return
+  fi
+  stage=$(mktemp -d "${deploy_dir}/tmp/materials-pool-status.XXXXXXXX")
+  if ! python3 "${MATERIALS_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" list > "${stage}/current.json" 2>/dev/null; then
+    current_valid=false
+  else
+    current_revision=$(jq -r '.revision' "${stage}/current.json")
+  fi
+  if ! python3 "${MATERIALS_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" validate-file \
+    "${deploy_dir}/config/provider-pool.yaml" >/dev/null 2>&1 \
+    || ! configuration_decode_file "${deploy_dir}/config/provider-pool.yaml" "${stage}/source.json" >/dev/null 2>&1; then
+    source_valid=false
+  elif [[ "$current_valid" == true ]]; then
+    [[ $(jq -McS '{primary_id,entries,policy}' "${stage}/source.json") \
+      == "$(jq -McS '{primary_id,entries:(.entries|map(del(.key_status))),policy}' "${stage}/current.json")" ]] || pending=true
+  fi
+  jq -M -n --argjson source "$source_valid" --argjson current "$current_valid" --argjson pending "$pending" --argjson revision "$current_revision" \
+    '{enabled:true,source_valid:$source,current_valid:$current,pending:$pending,applied_revision:$revision}'
+  rm -rf -- "$stage"
+}
+
+materials_apply_all() (
+  local deploy_dir=$1 knowledge_mode=$2 state business result
+  acquire_maintenance_lock "$deploy_dir"
+  state=$(materials_pool_status "$deploy_dir") || return 1
+  if ! jq -e '.source_valid and .current_valid' <<< "$state" >/dev/null; then
+    materials_error '接口池原文或当前有效池未通过校验，未应用本次资料；请先从菜单 3 修复'
+    return 1
+  fi
+  business=$(materials_apply "$deploy_dir" "$knowledge_mode") || return 1
+  if jq -e '.enabled and .pending' <<< "$state" >/dev/null; then
+    if ! result=$(python3 "${MATERIALS_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" apply-file "${deploy_dir}/config/provider-pool.yaml"); then
+      materials_error '业务资料已完成应用，但接口池候选应用失败，仍使用上一有效池；请从菜单 3 重试或恢复接口配置'
+      return 1
+    fi
+    jq -e '.ok == true' <<< "$result" >/dev/null || return 1
+    jq -M --argjson provider "$result" '. + {provider_pool:{applied:true,changed:true,revision:$provider.revision}}' <<< "$business"
+  else
+    jq -M --argjson provider "$state" '. + {provider_pool:{applied:$provider.current_valid,changed:false,revision:($provider.applied_revision // null)}}' <<< "$business"
+  fi
+)
+
 materials_status() {
   local deploy_dir=$1 projection="${1}/config/materials-applied.json" stage source_valid=true applied_valid=true
-  local source_hash='' applied_hash='' state='missing' revision=0
+  local source_hash='' applied_hash='' state='missing' revision=0 pool
   if [[ -e "$projection" || -L "$projection" ]]; then
     if materials_projection_validate "$projection"; then
       applied_hash=$(jq -M -r '.source_sha256' "$projection")
@@ -585,16 +632,20 @@ materials_status() {
   else
     source_valid=false
   fi
+  pool=$(materials_pool_status "$deploy_dir") || return 1
+  jq -e '.source_valid' <<< "$pool" >/dev/null || source_valid=false
+  jq -e '.current_valid' <<< "$pool" >/dev/null || applied_valid=false
   jq -M -n --argjson source_valid "$source_valid" --argjson applied_valid "$applied_valid" \
     --arg state "$state" --argjson revision "$revision" --arg source_hash "$source_hash" --arg applied_hash "$applied_hash" \
-    --arg projection "$projection" --arg prompt "${deploy_dir}/config/prompt.md" --arg catalog "${deploy_dir}/knowledge/catalog.json" \
+    --arg projection "$projection" --arg prompt "${deploy_dir}/config/prompt.md" --arg catalog "${deploy_dir}/knowledge/catalog.json" --argjson pool "$pool" \
     '{source_valid:$source_valid,projection_valid:$applied_valid,state:$state,applied_revision:$revision,
-      pending:($source_valid and $applied_valid and ($state != "applied" or $source_hash != $applied_hash)),
+      pending:($source_valid and $applied_valid and ($state != "applied" or $source_hash != $applied_hash or $pool.pending)),provider_pool:$pool,
       source_sha256:$source_hash,applied_sha256:$applied_hash,
       paths:{projection:$projection,prompt:$prompt,knowledge_catalog:$catalog}}'
   rm -rf -- "$stage"
   [[ "$source_valid" == true && "$applied_valid" == true && "$state" == applied ]] || return 1
   [[ "$source_hash" == "$applied_hash" ]] || return 2
+  ! jq -e '.pending' <<< "$pool" >/dev/null || return 2
 }
 
 materials_main() {
@@ -611,7 +662,7 @@ materials_main() {
     esac
   done
   action=${1:-status}; shift || true
-  if [[ "$action" == apply ]]; then
+  if [[ "$action" == apply || "$action" == apply-business ]]; then
     case "${1:-}" in
       --force-external) knowledge_mode=external; shift ;;
       --sync-knowledge) knowledge_mode=sync; shift ;;
@@ -626,13 +677,17 @@ materials_main() {
   case "$action" in
     status) materials_status "$deploy_dir" ;;
     validate)
-      local stage
+      local stage pool
+      pool=$(materials_pool_status "$deploy_dir") || return 1
+      jq -e '.source_valid and .current_valid' <<< "$pool" >/dev/null \
+        || { materials_error '接口池原文或有效配置未通过校验'; return 1; }
       stage=$(mktemp -d "${deploy_dir}/tmp/materials-validate.XXXXXXXX")
       materials_prepare_candidate "$deploy_dir" "$stage" 1 applied
       jq -M -n --arg hash "$(jq -M -r '.source_sha256' "${stage}/materials-applied.json")" '{valid:true,source_sha256:$hash}'
       rm -rf -- "$stage" ;;
     initialize) materials_initialize "$deploy_dir" ;;
-    apply) materials_apply "$deploy_dir" "$knowledge_mode" ;;
+    apply) materials_apply_all "$deploy_dir" "$knowledge_mode" ;;
+    apply-business) materials_apply "$deploy_dir" "$knowledge_mode" ;;
     *) materials_error "未知资料操作：$action"; return 64 ;;
   esac
 }
