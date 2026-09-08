@@ -71,7 +71,9 @@ const makeFixture = (name) => {
     if (parsed.hostname === 'provider.invalid') {
       visionRequests.push(structuredClone(options.body));
       if (modes.visionFailure) return { status: 503, body: { error: { code: 'synthetic-vision-error' } } };
-      return { status: 200, body: { choices: [{ message: { content: modes.visionAnswer ?? '截图显示保存设置按钮。' } }] } };
+      const content = typeof modes.visionAnswer === 'function' ? modes.visionAnswer(structuredClone(options.body)) : modes.visionAnswer ?? '截图显示保存设置按钮。';
+      if (modes.onVisionResponse) await modes.onVisionResponse();
+      return { status: 200, body: options.body.input ? { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] }] } : { choices: [{ message: { content } }] } };
     }
     if (parsed.hostname === 'storage.crisp.chat') return { status: modes.imageFailure ? 404 : 200, headers: { 'content-type': 'image/png' }, body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64') };
     throw new Error('禁止非 synthetic 网络请求');
@@ -675,6 +677,72 @@ const test = async (name, action) => {
       assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, imageClarification);
       assert.equal(f.state(session).mode, 'ai'); assert.deepEqual(f.state(session).offers, {});
       assert.equal(f.events().filter(event => ['ai_reply', 'knowledge_hit', 'handoff'].includes(event.type)).length, 0);
+      f.noFeedback();
+    }
+  });
+
+  await test('F29 Chat与Responses识图只提取当前图片事实，前问格式作为引用背景而非待答消息', async () => {
+    for (const apiMode of ['chat_completions', 'responses']) {
+      const f = makeFixture('vision-stage-' + apiMode), session = 'session_vision-stage';
+      const previous = '请计算9加8，只输出这道算术题的数字。';
+      const facts = '图片可见：编号4872，左侧绿色三角形，右侧灰色圆形。';
+      f.writeConfig('provider', { provider: { ...f.readConfig('provider').provider, api_mode: apiMode } });
+      const history = [f.event(session, previous).data,
+        { ...f.event(session, '17').data, from: 'operator', automated: true }];
+      f.histories.set(session, history);
+      f.advance(1000);
+      // 这是请求契约夹具，不是视觉模型能力证据：旧活动提问会得到旧答案。
+      f.modes.visionAnswer = body => (body.messages || body.input).some(message => message.role === 'user'
+        && (typeof message.content === 'string' || !message.content.some(part => ['image_url', 'input_image'].includes(part.type)))) ? '17' : facts;
+      const input = f.event(session, { url: 'https://storage.crisp.chat/stage-image.png', type: 'image/png' }, { type: 'file' });
+      history.push(input.data);
+      await f.deliver(input);
+      assert.equal(f.visionRequests.length, 1); assert.equal(f.modelRequests.length, 1);
+      const body = f.visionRequests[0], messages = body.messages || body.input;
+      const textOf = message => typeof message.content === 'string' ? message.content : message.content.filter(part => ['text', 'input_text', 'output_text'].includes(part.type)).map(part => part.text).join('\n');
+      assert.equal(textOf(messages[0]), f.prompt);
+      assert(textOf(messages[1]).includes('不得主动邀请用户评价'));
+      assert.deepEqual(messages.map(message => message.role), ['system', 'system', 'system', 'user'], '历史客服消息也不能重新成为活动消息');
+      assert.equal(messages.filter(message => message.role === 'user').length, 1, '历史不能继续作为活动用户提问');
+      assert(messages.some(message => message.role === 'system' && textOf(message).includes('只提取当前附带图片中可见的事实')));
+      const current = messages.at(-1);
+      assert.equal(current.role, 'user'); assert(Array.isArray(current.content));
+      assert(textOf(current).includes('只读背景')); assert(textOf(current).includes(previous));
+      const image = current.content.find(part => ['image_url', 'input_image'].includes(part.type));
+      assert.match(apiMode === 'responses' ? image.image_url : image.image_url.url, /^data:image\/png;base64,/);
+      if (apiMode === 'responses') { assert.equal(body.store, false); assert.equal(body.max_output_tokens, 1200); }
+      else assert.equal(body.max_tokens, 1200);
+      assert.equal(f.state(session).image_context[0].summary, facts);
+      assert(f.modelRequests[0].message.includes(facts)); assert(f.modelRequests[0].message.includes(previous));
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, f.modes.answer);
+      f.restart(); f.advance(1000);
+      await f.deliver(f.event(session, '刚才图片左边是什么颜色和形状？'));
+      assert.equal(f.visionRequests.length, 1, '后指使用已保存事实，不重复上传识图');
+      assert(f.modelRequests[1].message.includes(facts)); assert.equal(f.sent.length, 2);
+      await f.deliver(f.event('session_other-vision', '另一会话的独立问题'));
+      assert(!f.modelRequests[2].message.includes(facts)); assert(!f.modelRequests[2].message.includes(previous));
+      assert.equal(fs.readFileSync(path.join(f.root, 'config/prompt.md'), 'utf8'), f.prompt); f.noFeedback();
+    }
+  });
+
+  await test('F30 提取图片事实期间真人介入或总开关关闭，不保存迟到摘要、不续RAG、不发送', async () => {
+    for (const action of ['human', 'disabled']) {
+      const f = makeFixture('vision-stage-cancel-' + action), session = 'session_vision-cancel';
+      f.modes.onVisionResponse = async () => {
+        if (action === 'disabled') f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 2, applied_revision: 2 });
+        else {
+          f.advance(1000);
+          const human = f.event(session, '合成真人公开处理说明', { from: 'operator', user: { user_id: 'b21e3759-21a4-4b3a-8c7a-379e803af142' } });
+          human.event = 'message:received';
+          await f.receive(human);
+          assert.equal(f.state(session).mode, 'human');
+          assert.equal(f.state(session).resume_at, f.now() + 3600000);
+        }
+      };
+      await f.deliver(f.event(session, { url: 'https://storage.crisp.chat/cancel-image.png', type: 'image/png' }, { type: 'file' }));
+      assert.equal(f.visionRequests.length, 1); assert.equal(f.modelRequests.length, 0); assert.equal(f.sent.length, 0);
+      assert.equal((f.state(session).image_context || []).length, 0);
+      assert(f.rawState(session).jobs.filter(job => job.event === 'message:send').every(job => job.status === 'cancelled'));
       f.noFeedback();
     }
   });

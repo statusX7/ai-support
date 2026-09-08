@@ -19,6 +19,7 @@ FORM_FILE=""
 CONFIG_FILE=""
 DATA_FILE=""
 REQUEST_BODY="{}"
+REQUEST_METHOD=GET
 
 while (( $# > 0 )); do
   case "$1" in
@@ -52,7 +53,11 @@ while (( $# > 0 )); do
       REQUEST_BODY=$2
       shift 2
       ;;
-    --header|-H|--connect-timeout|--max-time|--request|-X)
+    --request|-X)
+      REQUEST_METHOD=$2
+      shift 2
+      ;;
+    --header|-H|--connect-timeout|--max-time)
       shift 2
       ;;
     --fail|-f)
@@ -144,6 +149,52 @@ case "$URL" in
     ;;
   */api/v1/auth)
     BODY='{"authenticated":true,"success":true}'
+    ;;
+  */api/v1/system)
+    result=$(python3 - "${MOCK_ANYTHING_STATE:-}" "$CONFIG_FILE" "$URL" "$REQUEST_METHOD" <<'PY'
+import hashlib, json, pathlib, stat, sys, urllib.parse
+def respond(status, value):
+    print(json.dumps({"status": status, "body": value}))
+    raise SystemExit(0)
+try:
+    state_file, config = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+    url = urllib.parse.urlsplit(sys.argv[3])
+    if sys.argv[4] != "GET":
+        respond(405, {"error": "synthetic-method-not-allowed"})
+    if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost") or url.username or url.password or not url.port:
+        respond(503, {"error": "synthetic-unknown-component"})
+    if not sys.argv[1] or state_file.is_symlink() or not state_file.is_file():
+        respond(503, {"error": "synthetic-component-not-started"})
+    if not sys.argv[2] or config.is_symlink() or not config.is_file() or stat.S_IMODE(config.stat().st_mode) != 0o600:
+        respond(401, {"error": "synthetic-authentication-failed"})
+    headers = []
+    for line in config.read_text().splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == "header":
+            headers.append(json.loads(value.strip()))
+    authorization = [header[len("Authorization: Bearer "):] for header in headers if header.startswith("Authorization: Bearer ")]
+    instances = json.loads(state_file.read_text()).get("rag_instances", {})
+    candidates = [entry for entry in instances.values() if entry.get("port") == url.port]
+    if not candidates:
+        respond(503, {"error": "synthetic-component-not-started"})
+    if len(authorization) != 1:
+        respond(401, {"error": "synthetic-authentication-failed"})
+    digest = hashlib.sha256(authorization[0].encode()).hexdigest()
+    candidates = [entry for entry in candidates if entry.get("api_key_sha256") == digest]
+    if not candidates:
+        respond(401, {"error": "synthetic-authentication-failed"})
+    windows = [entry["context_window"] for entry in candidates]
+    if any(type(window) is not int or not 256 <= window <= 2097152 for window in windows):
+        raise ValueError()
+    if len(set(windows)) != 1:
+        respond(503, {"error": "synthetic-conflicting-running-state"})
+    respond(200, {"settings": {"GenericOpenAiTokenLimit": str(windows[0])}})
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    respond(503, {"error": "synthetic-invalid-running-state"})
+PY
+    )
+    STATUS=$(jq -r '.status' <<< "$result")
+    BODY=$(jq -c '.body' <<< "$result")
     ;;
   */api/v1/system/remove-documents)
     if [[ "${MOCK_REMOVE_DOCUMENTS_FAIL:-0}" == 1 ]]; then
