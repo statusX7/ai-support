@@ -593,14 +593,23 @@ materials_pool_status() {
 }
 
 materials_apply_all() (
-  local deploy_dir=$1 knowledge_mode=$2 state business result
+  local deploy_dir=$1 knowledge_mode=$2 state business result business_file status
   acquire_maintenance_lock "$deploy_dir"
   state=$(materials_pool_status "$deploy_dir") || return 1
   if ! jq -e '.source_valid and .current_valid' <<< "$state" >/dev/null; then
     materials_error '接口池原文或当前有效池未通过校验，未应用本次资料；请先从菜单 3 修复'
     return 1
   fi
-  business=$(materials_apply "$deploy_dir" "$knowledge_mode") || return 1
+  # 不用命令替换包住有中断收尾的子事务：进程组 SIGINT 会终止额外的
+  # substitution shell，丢失内层的 130。普通文件捕获仍隔离 JSON 与说明。
+  business_file=$(mktemp "${deploy_dir}/tmp/materials-result.XXXXXXXX")
+  trap 'rm -f -- "$business_file"' EXIT
+  if materials_apply "$deploy_dir" "$knowledge_mode" > "$business_file"; then
+    business=$(<"$business_file")
+  else
+    status=$?
+    return "$status"
+  fi
   if jq -e '.enabled and .pending' <<< "$state" >/dev/null; then
     if ! result=$(python3 "${MATERIALS_SCRIPT_DIR}/provider-pool.py" --deploy-dir "$deploy_dir" apply-file "${deploy_dir}/config/provider-pool.yaml"); then
       materials_error '业务资料已完成应用，但接口池候选应用失败，仍使用上一有效池；请从菜单 3 重试或恢复接口配置'
@@ -692,4 +701,10 @@ materials_main() {
   esac
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then materials_main "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  # 前台子事务自行完成受阻止投影/锁清理；CLI 保留明确中断退出码。
+  materials_cli_interrupt() { trap '' INT TERM; exit "$1"; }
+  trap 'materials_cli_interrupt 130' INT
+  trap 'materials_cli_interrupt 143' TERM
+  materials_main "$@"
+fi

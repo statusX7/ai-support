@@ -224,8 +224,10 @@ async function main() {
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applied');
     pass('显式 force-external 即使原文未变也重新同步并回读 Prompt 与启用知识，知识使用增量对账');
 
+    let interruptPrompt;
+    for(const signals of [['SIGINT'],['SIGTERM'],['SIGINT','SIGTERM']]) {
     const beforeInterrupt=JSON.parse(fs.readFileSync(projectionPath));
-    const interruptPrompt='## 中断后待恢复的 Prompt\n';
+    interruptPrompt='## 中断后待恢复的 Prompt '+signals.join('+')+'\n';
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),interruptPrompt,{mode:0o640});
     promptDelayMs=5000;
     const interruptedResult=await new Promise((resolve,reject)=>{
@@ -242,7 +244,8 @@ async function main() {
         try {
           const value=JSON.parse(fs.readFileSync(projectionPath,'utf8'));
           if(value.state==='applying') {
-            process.kill(-child.pid,'SIGINT');
+            process.kill(-child.pid,signals[0]);
+            if(signals.length>1)setTimeout(()=>{if(!finished){try{process.kill(-child.pid,signals[1]);}catch(error){if(error.code!=='ESRCH')reject(error);}}},35);
             return;
           }
         } catch {}
@@ -256,17 +259,20 @@ async function main() {
       observe();
     });
     promptDelayMs=0;
-    assert.equal(interruptedResult.code,130,interruptedResult.stderr);
+    assert.equal(interruptedResult.code,signals[0]==='SIGINT'?130:143,JSON.stringify({code:interruptedResult.code,signal:interruptedResult.signal})+'\n'+interruptedResult.stderr);
+    assert.equal(interruptedResult.signal,null);
     assert.match(interruptedResult.stderr,/资料应用已中断/);
     const afterInterrupt=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(afterInterrupt.state,'applying');
     assert.ok(afterInterrupt.revision>beforeInterrupt.revision);
     assert.equal(afterInterrupt.prompt.text,beforeInterrupt.prompt.text);
     assert.equal(fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'),interruptPrompt);
+    assert.equal(fs.readdirSync(path.join(deploy,'tmp')).filter(name=>name.startsWith('materials-result.')).length,0);
     await ok(['apply']);
     assert.equal(prompt,interruptPrompt);
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applied');
-    pass('真实进程组 SIGINT 后以更高代次保持 applying、保留候选与旧快照，重试才解除停发');
+    }
+    pass('真实进程组 SIGINT/SIGTERM/连续信号保持130/143、清理结果文件并以更高代次保持applying，保留候选且重试才解除停发');
 
     const unconfirmedPrompt='## 外部恢复失败后待重试的 Prompt\n';
     const beforeUnconfirmed=JSON.parse(fs.readFileSync(projectionPath));
