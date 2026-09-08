@@ -36,6 +36,8 @@ try:
         pending = [path]
         while pending:
             current = pending.pop()
+            if any(ord(char) < 32 or ord(char) == 127 for char in str(current)):
+                raise ValueError("member control")
             info = current.lstat()
             if stat.S_ISDIR(info.st_mode):
                 if recursive:

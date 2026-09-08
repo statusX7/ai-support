@@ -340,9 +340,21 @@ link = root / "link"
 link.symlink_to(outside)
 invoke("root:1000", link, expected=1)
 link.unlink()
+child_link = inside / "link"
+child_link.symlink_to(outside)
+invoke("-R", "root:1000", inside, expected=1)
+child_link.unlink()
 os.link(outside, root / "hardlink")
 invoke("-R", "root:1000", inside, root / "hardlink", expected=1)
 (root / "hardlink").unlink()
+os.link(outside, inside / "hardlink")
+invoke("-R", "root:1000", inside, expected=1)
+(inside / "hardlink").unlink()
+control = inside / "control\nmember"
+control.write_text("control fixture\n", encoding="utf-8")
+invoke("-R", "root:1000", inside, expected=1)
+control.unlink()
+invoke("root:1000", "--reference", outside, item, expected=1)
 os.chown(item, 0, 0)
 invoke("root:1000", item, outside, expected=1)
 assert item.stat().st_gid == 0, "必须先检查全部目标，再执行真实 chown"
