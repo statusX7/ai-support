@@ -226,6 +226,48 @@ if [[ -f "${STAGING}/config/provider.yaml" ]] \
   die "备份中的 provider.yaml 包含疑似密钥字段，拒绝恢复"
 fi
 
+preflight_current_knowledge_generation() {
+  local profile="${DEPLOY_DIR}/data/runtime/knowledge-profile.json"
+  local migration="${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
+  local manifest="${DEPLOY_DIR}/data/knowledge-manifest.json"
+  local result fingerprint
+
+  if [[ -e "$profile" || -L "$profile" ]]; then
+    [[ -f "$profile" && ! -L "$profile" ]] \
+      || die '当前知识模型代次文件类型不安全；恢复尚未修改现有资料'
+    result=$(python3 -B "${DEPLOY_DIR}/scripts/knowledge-profile.py" \
+      --deploy-dir "$DEPLOY_DIR" refresh-bindings --validate-only --require-complete) \
+      || die '当前知识模型代次、manifest 或缓存绑定不完整；恢复尚未修改现有资料'
+    jq -e '.success == true and .reason == "complete_validation_only"' <<< "$result" >/dev/null \
+      || die '当前知识模型完整性回读无效；恢复尚未修改现有资料'
+    fingerprint=$(jq -M -er '
+      select(.schema_version == 1 and .state == "applied") |
+      .fingerprint | select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$profile") || die '当前知识模型代次无效；恢复尚未修改现有资料'
+    printf '%s\n' "$fingerprint"
+    return 0
+  fi
+
+  # 只有完全没有受管 profile/migration，且旧 manifest 明确未声明 Embedding
+  # 代次时，才按 v1 遗留实例处理；不能把损坏的新格式误降级成 legacy。
+  [[ ! -e "$migration" && ! -L "$migration" ]] \
+    || die '当前知识索引仍有迁移指针；恢复尚未修改现有资料'
+  [[ -f "$manifest" && ! -L "$manifest" ]] \
+    || die '旧版知识 manifest 缺失或类型不安全；恢复尚未修改现有资料'
+  jq -e '
+    .version == 1 and (.files | type == "object") and
+    ((.pending_files // {}) | type == "object") and
+    ((.garbage_locations // []) | type == "array") and
+    ((.embedding_profile // "") == "")
+  ' "$manifest" >/dev/null \
+    || die '无 profile 的知识状态不符合明确旧版格式；恢复尚未修改现有资料'
+  printf '%s\n' legacy
+}
+
+# 在安全备份、停止服务或覆盖任何现有配置/原文之前验证当前索引代次。
+# 缓存已被篡改、迁移未完成或 profile 摘要错误时必须零恢复修改。
+INITIAL_KNOWLEDGE_GENERATION=$(preflight_current_knowledge_generation)
+
 if (( SAFETY_BACKUP )); then
   SAFETY_FILE="${DEPLOY_DIR}/backups/pre-restore-$(date -u '+%Y%m%dT%H%M%SZ').tar.gz"
   "${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$SAFETY_FILE" >/dev/null
@@ -242,6 +284,12 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     die "n8n 或 AnythingLLM 正在运行，不能使用 --skip-restart 执行恢复"
   fi
 fi
+
+# 停服可能等待正在执行的索引请求；在第一处资料覆盖前再次回读，并拒绝
+# 预检与静止状态之间发生的代次变化。
+CURRENT_KNOWLEDGE_GENERATION=$(preflight_current_knowledge_generation)
+[[ "$CURRENT_KNOWLEDGE_GENERATION" == "$INITIAL_KNOWLEDGE_GENERATION" ]] \
+  || die '知识索引代次在恢复预检期间发生变化；现有资料未覆盖'
 
 for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example; do
   if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
@@ -261,7 +309,15 @@ while IFS= read -r -d '' file; do
   is_supported_knowledge_file "$config_name" || continue
   install -m 0640 -- "$file" "${DEPLOY_DIR}/knowledge/${config_name}"
 done < <(find "${STAGING}/knowledge" -maxdepth 1 -type f -print0 | sort -z)
-printf '{"version":1,"files":{},"garbage_locations":[]}\n' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
+CURRENT_KNOWLEDGE_PROFILE=''
+[[ "$CURRENT_KNOWLEDGE_GENERATION" == legacy ]] \
+  || CURRENT_KNOWLEDGE_PROFILE=$CURRENT_KNOWLEDGE_GENERATION
+# 离线业务恢复必须失效旧文档映射，但不能把当前已验证的 Embedding
+# 代次降回“未知”。下一次同步会为恢复后的原文重新上传并逐文件绑定缓存。
+jq -M -n --arg profile "$CURRENT_KNOWLEDGE_PROFILE" '
+  {version:1,files:{},pending_files:{},garbage_locations:[]} +
+  (if $profile == "" then {} else {embedding_profile:$profile} end)
+' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
 chmod 600 "${DEPLOY_DIR}/data/knowledge-manifest.json"
 
 set_runtime_ownership "$DEPLOY_DIR"

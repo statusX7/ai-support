@@ -259,6 +259,24 @@ class ProfileFixture(unittest.TestCase):
         self.assertFalse(second["changed"])
         self.assertEqual(self.manifest_path.read_bytes(), stable)
 
+    def test_complete_validation_requires_applied_profile_and_bound_cache(self):
+        self.applied_profile()
+        self.rejects("refresh-bindings", "--validate-only", "--require-complete")
+        self.succeeds("refresh-bindings")
+        checked = self.succeeds("refresh-bindings", "--validate-only", "--require-complete")
+        self.assertEqual(checked["reason"], "complete_validation_only")
+        self.assertEqual(checked["bindings"], 1)
+
+        cache = self.cache(self.location)
+        before = cache.read_bytes()
+        cache.write_bytes(before + b"tampered")
+        self.rejects("refresh-bindings", "--validate-only", "--require-complete")
+        cache.write_bytes(before)
+
+        migration = self.root / "data/runtime/knowledge-migration.json"
+        save(migration, {"schema_version": 1, "backup": str(self.backup)})
+        self.rejects("refresh-bindings", "--validate-only", "--require-complete")
+
     def test_refresh_bindings_never_replaces_an_existing_cache_digest(self):
         self.applied_profile()
         self.succeeds("refresh-bindings")

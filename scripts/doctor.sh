@@ -196,7 +196,13 @@ if (( DOCTOR_LAST )); then
   exit $?
 fi
 
-DOCTOR_TEMP_ROOT=$(mktemp -d /tmp/crispai-doctor.XXXXXXXX)
+if [[ -d "${DOCTOR_DEPLOY_DIR}/tmp" && ! -L "${DOCTOR_DEPLOY_DIR}/tmp" ]]; then
+  # 正常实例把含短期认证配置的诊断临时文件留在受管部署根内；目录损坏时
+  # 仍回退到私有系统临时目录，使基础诊断保持可达。
+  DOCTOR_TEMP_ROOT=$(mktemp -d "${DOCTOR_DEPLOY_DIR}/tmp/doctor.XXXXXXXX")
+else
+  DOCTOR_TEMP_ROOT=$(mktemp -d /tmp/crispai-doctor.XXXXXXXX)
+fi
 chmod 0700 "$DOCTOR_TEMP_ROOT"
 DOCTOR_RESULTS="${DOCTOR_TEMP_ROOT}/results.jsonl"
 DOCTOR_FIX_RESULTS="${DOCTOR_TEMP_ROOT}/fix.jsonl"

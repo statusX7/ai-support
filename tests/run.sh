@@ -378,6 +378,52 @@ root.chmod(0o700)
 assert (outside.read_bytes(), outside.stat().st_uid, outside.stat().st_gid) == original
 PY
 pass "生命周期权限夹具仅在受限临时根真实修改属主，拒绝越界、链接与不完整校验"
+
+RUNTIME_PERMISSION_ROOT="${TEST_ROOT}/runtime-control-permissions"
+mkdir -p -- "${RUNTIME_PERMISSION_ROOT}"/{config,knowledge,n8n} \
+  "${RUNTIME_PERMISSION_ROOT}/data"/{analytics,n8n,anythingllm,runtime}
+for protected_projection in knowledge-map.json knowledge-settings.json knowledge-profile.json knowledge-lexical.json; do
+  printf '{}\n' > "${RUNTIME_PERMISSION_ROOT}/data/runtime/${protected_projection}"
+  chmod 0660 "${RUNTIME_PERMISSION_ROOT}/data/runtime/${protected_projection}"
+  /usr/bin/chown 1000:1000 "${RUNTIME_PERMISSION_ROOT}/data/runtime/${protected_projection}"
+done
+printf '{}\n' > "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-migration.json"
+chmod 0660 "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-migration.json"
+/usr/bin/chown 1000:1000 "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-migration.json"
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; set_runtime_ownership "$2"' \
+  -- "$PROJECT_ROOT" "$RUNTIME_PERMISSION_ROOT"
+for protected_projection in knowledge-map.json knowledge-settings.json knowledge-profile.json knowledge-lexical.json; do
+  [[ "$(/usr/bin/stat -c '%u:%g:%a' "${RUNTIME_PERMISSION_ROOT}/data/runtime/${protected_projection}")" == '0:1000:640' ]] \
+    || fail "受管知识运行投影没有以新 inode 恢复 root:1000/0640：${protected_projection}"
+done
+[[ "$(/usr/bin/stat -c '%u:%g:%a' "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-migration.json")" == '0:1000:600' ]] \
+  || fail '知识迁移指针被错误放宽，必须保持 root:1000/0600'
+pass "运行资料权限原子恢复并保持迁移指针 root-only"
+
+RUNTIME_PERMISSION_OUTSIDE="${RUNTIME_PERMISSION_ROOT}/data/n8n/runtime-control-alias.json"
+printf '{"sibling":true}\n' > "$RUNTIME_PERMISSION_OUTSIDE"
+chmod 0600 "$RUNTIME_PERMISSION_OUTSIDE"
+/usr/bin/chown 0:0 "$RUNTIME_PERMISSION_OUTSIDE"
+RUNTIME_PERMISSION_OUTSIDE_STATE=$(/usr/bin/stat -c '%u:%g:%a:%s' "$RUNTIME_PERMISSION_OUTSIDE")
+unlink -- "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+ln -- "$RUNTIME_PERMISSION_OUTSIDE" "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+if bash -c 'set -euo pipefail
+  # 此负例必须忠实执行生产 chown；通用测试桩本身也会拒绝硬链接，若继续
+  # 使用它，错误的“先递归 chown、后投影预检”顺序同样可能假绿。
+  chown() { /usr/bin/chown "$@"; }
+  source "$1/scripts/common.sh"
+  set_runtime_ownership "$2"
+' \
+  -- "$PROJECT_ROOT" "$RUNTIME_PERMISSION_ROOT" >/dev/null 2>&1; then
+  fail '知识运行投影硬链接被特权权限修复错误接受'
+fi
+[[ "$(/usr/bin/stat -c '%u:%g:%a:%s' "$RUNTIME_PERMISSION_OUTSIDE")" == "$RUNTIME_PERMISSION_OUTSIDE_STATE" ]] \
+  || fail '拒绝知识投影硬链接前递归修改了 AnythingLLM/n8n 同级运行树 inode'
+unlink -- "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+printf '{}\n' > "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+chmod 0640 "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+/usr/bin/chown root:1000 "${RUNTIME_PERMISSION_ROOT}/data/runtime/knowledge-map.json"
+pass "知识运行投影硬链接在递归权限修复前 fail-closed 且同级运行树 inode 不变"
 STUB_HOST_FIXTURE="${TEST_ROOT}/host-fixture"
 mkdir -p -- "${STUB_HOST_FIXTURE}/etc/ssl/certs"
 printf '%s\n' 'ID=debian' 'VERSION_ID="12"' 'VERSION_CODENAME=bookworm' \
@@ -470,6 +516,41 @@ grep -Fxq 'fact_conversation=pending' "${DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "安装未明确区分 Crisp 凭据验证与真实会话验收"
 pass "安装与 Provider 自动检测"
 
+ANYTHING_HELPER="${MOCK_DIR}/anything-cache.py"
+ANYTHING_HELPER_CONFIG=$(mktemp "${DEPLOY_DIR}/tmp/helper-security.XXXXXXXX")
+printf 'header = "Authorization: Bearer %s"\n' "$TEST_ANYTHING_KEY" > "$ANYTHING_HELPER_CONFIG"
+chmod 0600 "$ANYTHING_HELPER_CONFIG"
+ANYTHING_HELPER_PORT=$(bash -c 'source "$1/scripts/common.sh"; env_get "$1/.env" ANYTHINGLLM_PORT' \
+  -- "$DEPLOY_DIR")
+ANYTHING_HELPER_URL="http://127.0.0.1:${ANYTHING_HELPER_PORT}/api/v1/workspace/crisp-support"
+if python3 -B "$ANYTHING_HELPER" observe "$MOCK_ANYTHING_STATE" / \
+  "$ANYTHING_HELPER_URL" "$ANYTHING_HELPER_CONFIG" >/dev/null 2>&1; then
+  fail 'AnythingLLM 缓存夹具错误接受系统根作为写入范围'
+fi
+ANYTHING_SCOPE_LINK="${PROJECT_ROOT}/.test-runtime.scope-link"
+ln -s -- "$TEST_ROOT" "$ANYTHING_SCOPE_LINK"
+if python3 -B "$ANYTHING_HELPER" observe "$MOCK_ANYTHING_STATE" "$ANYTHING_SCOPE_LINK" \
+  "$ANYTHING_HELPER_URL" "$ANYTHING_HELPER_CONFIG" >/dev/null 2>&1; then
+  fail 'AnythingLLM 缓存夹具错误接受链接测试根'
+fi
+unlink -- "$ANYTHING_SCOPE_LINK"
+ANYTHING_WRONG_CONFIG=$(mktemp "${DEPLOY_DIR}/tmp/helper-wrong-key.XXXXXXXX")
+printf '%s\n' 'header = "Authorization: Bearer wrong-test-key"' > "$ANYTHING_WRONG_CONFIG"
+chmod 0600 "$ANYTHING_WRONG_CONFIG"
+if python3 -B "$ANYTHING_HELPER" observe "$MOCK_ANYTHING_STATE" "$TEST_ROOT" \
+  "$ANYTHING_HELPER_URL" "$ANYTHING_WRONG_CONFIG" >/dev/null 2>&1; then
+  fail 'AnythingLLM 缓存夹具错误接受不匹配的实例密钥'
+fi
+unlink -- "$ANYTHING_WRONG_CONFIG"
+ln -- "$MOCK_ANYTHING_STATE" "${TEST_ROOT}/anythingllm-state-hardlink.json"
+if python3 -B "$ANYTHING_HELPER" observe "$MOCK_ANYTHING_STATE" "$TEST_ROOT" \
+  "$ANYTHING_HELPER_URL" "$ANYTHING_HELPER_CONFIG" >/dev/null 2>&1; then
+  fail 'AnythingLLM 缓存夹具错误接受硬链接共享状态'
+fi
+unlink -- "${TEST_ROOT}/anythingllm-state-hardlink.json"
+unlink -- "$ANYTHING_HELPER_CONFIG"
+pass 'AnythingLLM 生命周期缓存夹具拒绝越界范围、祖先链接、错密钥与硬链接状态'
+
 : > "$MOCK_DOCKER_LOG"
 if env \
   MOCK_CRISP_FAIL=1 \
@@ -522,6 +603,15 @@ CRISP_LAYER_ENV_HASH=$(sha256sum "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.env" | a
 expect_local_ready_install "${PROJECT_ROOT}/install.sh" \
   --deploy-dir "$CRISP_EXTERNAL_FAILURE_DEPLOY_DIR" --non-interactive \
   > "${TEST_ROOT}/crisp-layer-retry.log" 2>&1
+for protected_projection in knowledge-map.json knowledge-settings.json knowledge-profile.json knowledge-lexical.json; do
+  [[ "$(/usr/bin/stat -c '%u:%g:%a' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/data/runtime/${protected_projection}")" == '0:1000:640' ]] \
+    || fail "重复安装后知识运行投影属主或权限漂移：${protected_projection}"
+done
+if [[ -e "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/data/runtime/knowledge-migration.json" \
+  || -L "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/data/runtime/knowledge-migration.json" ]]; then
+  [[ "$(/usr/bin/stat -c '%u:%g:%a' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/data/runtime/knowledge-migration.json")" == '0:1000:600' ]] \
+    || fail '重复安装错误放宽知识迁移指针权限'
+fi
 grep -Fxq 'state=local-ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "仅 Crisp API 恢复不能伪造真实会话 ready"
 grep -Fxq 'fact_crisp_api=ready' "${CRISP_EXTERNAL_FAILURE_DEPLOY_DIR}/.crisp-ai-installation" \
@@ -805,8 +895,11 @@ bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_leg
   -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.garbage_locations == []' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
   || fail "后续知识同步未重试清理孤立源文档"
-jq -e --argjson expected "$EXPECTED_SOURCE_LOCATIONS" \
-  '((.removed_documents // []) | sort) == ($expected | sort)' "$MOCK_ANYTHING_STATE" >/dev/null \
+jq -e --arg deploy "$DEPLOY_DIR" --argjson expected "$EXPECTED_SOURCE_LOCATIONS" '
+  ((.rag_instances[$deploy].removed_documents // []) | sort) == ($expected | sort) and
+  all(.rag_instances | to_entries[] | select(.key != $deploy);
+    ((.value.documents // []) | length) == 0)
+' "$MOCK_ANYTHING_STATE" >/dev/null \
   || fail "AnythingLLM remove-documents 未清理已删除知识源文档"
 install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
 # 上面独立回归仍在生产中使用的 v1.0.1 pending/garbage 算法；以下再从真实旧单库布局走新迁移。
@@ -893,6 +986,53 @@ grep -Fq '正在运行，不能使用 --skip-restart' "${TEST_ROOT}/restore-runn
   || fail "服务运行中的离线恢复没有清晰拒绝原因"
 grep -Fq '临时 Prompt，恢复后应被替换。' "${DEPLOY_DIR}/config/prompt.md" \
   || fail "拒绝运行中恢复前已修改配置"
+
+RESTORE_PRECHECK_PROMPT_HASH=$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | cut -d ' ' -f 1)
+RESTORE_PRECHECK_MANIFEST_HASH=$(sha256sum "${DEPLOY_DIR}/data/knowledge-manifest.json" | cut -d ' ' -f 1)
+assert_legacy_restore_preflight_rejected() {
+  local label=$1 log="${TEST_ROOT}/restore-preflight-${1}.log"
+  : > "$MOCK_DOCKER_LOG"
+  if env MOCK_DOCKER_NO_RUNNING=1 "${DEPLOY_DIR}/scripts/restore.sh" \
+    --deploy-dir "$DEPLOY_DIR" --input "$ARCHIVE" --skip-restart --no-safety-backup \
+    > "$log" 2>&1; then
+    fail "${label} 知识代次仍被旧格式恢复接受"
+  fi
+  [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | cut -d ' ' -f 1)" == "$RESTORE_PRECHECK_PROMPT_HASH" ]] \
+    || fail "${label} 预检失败前已覆盖 Prompt"
+  [[ "$(sha256sum "${DEPLOY_DIR}/data/knowledge-manifest.json" | cut -d ' ' -f 1)" == "$RESTORE_PRECHECK_MANIFEST_HASH" ]] \
+    || fail "${label} 预检失败前已覆盖知识 manifest"
+  [[ ! -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] \
+    || fail "${label} 预检失败前已恢复知识原文"
+  if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
+    fail "${label} 知识代次预检失败后仍停止服务"
+  fi
+}
+
+cp -- "${DEPLOY_DIR}/data/runtime/knowledge-profile.json" "${TEST_ROOT}/restore-profile.safe.json"
+PROFILE_TEMP=$(mktemp "${DEPLOY_DIR}/data/runtime/knowledge-profile.json.tmp.XXXXXXXX")
+jq '.fingerprint = ("0" * 64)' "${TEST_ROOT}/restore-profile.safe.json" > "$PROFILE_TEMP"
+chmod 0640 "$PROFILE_TEMP"
+mv -f -- "$PROFILE_TEMP" "${DEPLOY_DIR}/data/runtime/knowledge-profile.json"
+assert_legacy_restore_preflight_rejected profile-fingerprint
+install -m 0640 -- "${TEST_ROOT}/restore-profile.safe.json" \
+  "${DEPLOY_DIR}/data/runtime/knowledge-profile.json"
+
+RESTORE_CACHE=$(find "${DEPLOY_DIR}/data/anythingllm/vector-cache" -maxdepth 1 -type f -links 1 \
+  -print -quit)
+[[ -n "$RESTORE_CACHE" && -f "$RESTORE_CACHE" && ! -L "$RESTORE_CACHE" ]] \
+  || fail '缓存篡改恢复预检缺少受管向量缓存夹具'
+cp -- "$RESTORE_CACHE" "${TEST_ROOT}/restore-cache.safe"
+printf '{"tampered":true}\n' > "$RESTORE_CACHE"
+assert_legacy_restore_preflight_rejected cache-binding
+cp -- "${TEST_ROOT}/restore-cache.safe" "$RESTORE_CACHE"
+
+printf '{"schema_version":1,"backup":"/invalid/migration"}\n' \
+  > "${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
+chmod 0600 "${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
+assert_legacy_restore_preflight_rejected migration-pointer
+unlink -- "${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
+pass '旧格式恢复在修改前拒绝坏 profile、缓存篡改与迁移残留，失败零资料修改'
+
 env MOCK_DOCKER_NO_RUNNING=1 "${DEPLOY_DIR}/scripts/restore.sh" \
   --deploy-dir "$DEPLOY_DIR" --input "$ARCHIVE" --skip-restart --no-safety-backup \
   > "${TEST_ROOT}/restore.log" 2>&1
@@ -915,17 +1055,23 @@ pass "备份敏感字段拒绝"
 
 # 离线业务恢复有意清空实例索引映射；正常回滚夹具须先完成生产同步，
 # 不能把尚待同步的状态快照伪装成可直接恢复的已就绪实例。
-jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
-  || fail "离线业务恢复未失效旧实例索引映射"
+jq -e --slurpfile profile "${DEPLOY_DIR}/data/runtime/knowledge-profile.json" '
+  (.files | length) == 0 and .pending_files == {} and .garbage_locations == [] and
+  .embedding_profile == $profile[0].fingerprint
+' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
+  || fail "离线业务恢复未失效旧实例索引映射或丢失当前知识模型代次"
 bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" sync \
   > "${TEST_ROOT}/post-offline-restore-sync.log" 2>&1
-jq -en --slurpfile catalog "${DEPLOY_DIR}/knowledge/catalog.json" \
+jq -en --arg deploy "$DEPLOY_DIR" --slurpfile catalog "${DEPLOY_DIR}/knowledge/catalog.json" \
   --slurpfile manifest "${DEPLOY_DIR}/data/knowledge-manifest.json" \
   --slurpfile actual "$MOCK_ANYTHING_STATE" '
     all($catalog[0].libraries[] | select(.enabled) | .documents[]; . as $document |
       $manifest[0].files[$document.projection].sha256 == $document.sha256 and
       ($manifest[0].files[$document.projection].locations | length > 0)) and
-    ([$manifest[0].files[].locations[]] | unique | sort) == ($actual[0].documents | unique | sort)
+    ([$manifest[0].files[].locations[]] | unique | sort) ==
+      (($actual[0].rag_instances[$deploy].documents // []) | unique | sort) and
+    all($actual[0].rag_instances | to_entries[] | select(.key != $deploy);
+      ((.value.documents // []) | length) == 0)
   ' >/dev/null || fail "离线恢复后正常回滚夹具未完成真实同步接口对账"
 pass "离线业务恢复后同步并回读索引，再进入正常回滚验收"
 
@@ -1032,6 +1178,7 @@ assert_rollback_mutation_failure() {
   case_root="${TEST_ROOT}/rollback-failure-${failure_stage}"
   case_deploy="${case_root}/deploy"
   mkdir -p -- "$case_deploy"
+  chmod 0700 "$case_root"
   cp -a -- "${DEPLOY_DIR}/." "$case_deploy/"
   cp -- "$MOCK_ANYTHING_STATE" "${case_root}/anythingllm-state.json"
   local MOCK_ANYTHING_STATE="${case_root}/anythingllm-state.json"

@@ -311,7 +311,7 @@ def checked_migration_pointer(root, migration_path):
     return pointer
 
 
-def refresh_bindings(root, allow_migration=False, validate_only=False):
+def refresh_bindings(root, allow_migration=False, validate_only=False, require_complete=False):
     """核对旧摘要，并仅为同步后没有摘要的文档原子补齐缓存绑定。"""
     profile_path = safe_path(root, "data/runtime/knowledge-profile.json")
     manifest_path = safe_path(root, "data/knowledge-manifest.json")
@@ -339,6 +339,16 @@ def refresh_bindings(root, allow_migration=False, validate_only=False):
             fail("知识索引迁移提交后的缓存绑定尚未完整，未跳过刷新")
         return {"success": True, "action": "refresh-bindings", "changed": False,
                 "skipped": True, "reason": "migration_committed", "bindings": 0}
+
+    if require_complete:
+        if not validate_only or allow_migration or not current_profile_complete(root, current, key):
+            fail("知识索引代次、manifest 或缓存绑定未完整应用")
+        manifest = read(manifest_path, {}, MAX_MANIFEST_BYTES)
+        return {"success": True, "action": "refresh-bindings", "changed": False,
+                "skipped": False, "reason": "complete_validation_only",
+                "bindings": sum(len(record.get("cache_bindings", []))
+                                for record in manifest.get("files", {}).values()
+                                if isinstance(record, dict))}
 
     manifest, manifest_identity = decode_stable_json(manifest_path, MAX_MANIFEST_BYTES)
     if not isinstance(manifest, dict) or manifest.get("version") != 1 \
@@ -446,6 +456,7 @@ def main():
     parser.add_argument("--backup")
     parser.add_argument("--allow-migration", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--validate-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--require-complete", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = Path(args.deploy_dir).absolute()
     if str(root) in ("/", "/root", "/opt", "/tmp") or root.resolve() != root or not root.is_dir():
@@ -453,9 +464,10 @@ def main():
     target = safe_path(root, "data/runtime/knowledge-profile.json")
     current = read(target)
     if args.action == "refresh-bindings":
-        print(json.dumps(refresh_bindings(root, args.allow_migration, args.validate_only), ensure_ascii=False))
+        print(json.dumps(refresh_bindings(root, args.allow_migration, args.validate_only,
+                                          args.require_complete), ensure_ascii=False))
         return
-    if args.allow_migration or args.validate_only:
+    if args.allow_migration or args.validate_only or args.require_complete:
         fail("迁移内部门禁参数只能用于刷新缓存绑定")
     if args.action in ("plan", "status"):
         observed = read(Path(args.observed)) if args.observed else None

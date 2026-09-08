@@ -3,7 +3,9 @@ set -euo pipefail
 
 # 默认桩测试不改变属主；生命周期可显式启用仅限其受限临时根的真实权限操作。
 [[ -n "${MOCK_CHOWN_ROOT:-}" ]] || exit 0
-exec python3 - "$MOCK_CHOWN_ROOT" "$@" <<'PY'
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+exec python3 - "$MOCK_CHOWN_ROOT" "$PROJECT_ROOT" "$@" <<'PY'
 import os
 from pathlib import Path
 import re
@@ -12,14 +14,28 @@ import sys
 
 try:
     root = Path(sys.argv[1])
-    args = sys.argv[2:]
-    if not root.is_absolute() or not re.fullmatch(r"\.test-runtime\.[A-Za-z0-9]+", root.name):
+    project = Path(sys.argv[2])
+    args = sys.argv[3:]
+    if not root.is_absolute() \
+            or not re.fullmatch(r"\.test-runtime\.[A-Za-z0-9][A-Za-z0-9.-]*", root.name):
         raise ValueError("root")
-    if any(parent.is_symlink() for parent in (root, *root.parents)):
-        raise ValueError("root link")
-    info = root.stat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError("root permissions")
+    try:
+        relative = root.relative_to(project)
+    except ValueError:
+        raise ValueError("root scope")
+    if not relative.parts or not re.fullmatch(
+            r"\.test-runtime\.[A-Za-z0-9][A-Za-z0-9.-]*", relative.parts[0]):
+        raise ValueError("root scope")
+    current = project
+    for index, part in enumerate(relative.parts):
+        current /= part
+        info = current.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) \
+                or info.st_uid != os.geteuid() or mode & 0o022:
+            raise ValueError("root permissions")
+        if index in (0, len(relative.parts) - 1) and mode != 0o700:
+            raise ValueError("root permissions")
     recursive = bool(args and args[0] == "-R")
     parsed = args[1:] if recursive else args[:]
     if len(parsed) < 2 or not re.fullmatch(r"(?:root|[0-9]+):(?:root|[0-9]+)", parsed[0]):

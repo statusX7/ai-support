@@ -687,14 +687,156 @@ secure_permissions() {
   fi
 }
 
-set_runtime_ownership() {
+normalize_runtime_control_files() {
   local deploy_dir=$1
+  python3 -B - "$deploy_dir" <<'PY'
+import errno
+import json
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
 
+limits = {
+    "knowledge-map.json": (0o640, 16 * 1024 * 1024),
+    "knowledge-settings.json": (0o640, 65536),
+    "knowledge-profile.json": (0o640, 65536),
+    "knowledge-lexical.json": (0o640, 16 * 1024 * 1024),
+    "knowledge-migration.json": (0o600, 65536),
+}
+
+def reject_constant(_value):
+    raise ValueError("non-standard JSON")
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def directory_fd(path):
+    absolute = os.path.abspath(path)
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in Path(absolute).parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+root_fd = runtime_fd = None
+opened = {}
+temporaries = []
+try:
+    root_fd = directory_fd(sys.argv[1])
+    data_fd = os.open("data", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                      dir_fd=root_fd)
+    try:
+        runtime_fd = os.open("runtime", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=data_fd)
+    finally:
+        os.close(data_fd)
+    # 先打开并完整读取所有目标。任何链接、硬链接、特殊文件、超限或坏 JSON
+    # 都在修改前整体拒绝；不会以 root 身份改变外部 inode。
+    for name, (mode, maximum) in limits.items():
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=runtime_fd)
+        except FileNotFoundError:
+            continue
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            os.close(descriptor)
+            raise ValueError("unsafe control file")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(descriptor, min(1048576, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise ValueError("oversize control file")
+        after = os.fstat(descriptor)
+        raw = b"".join(chunks)
+        if total != before.st_size or identity(after) != identity(before):
+            raise ValueError("changed control file")
+        value = json.loads(raw.decode("utf-8", "strict"), parse_constant=reject_constant)
+        if not isinstance(value, dict):
+            raise ValueError("invalid control file")
+        opened[name] = (descriptor, identity(before), raw, mode)
+    # 内容相同也用全新 inode 原子重发；这既修复旧属主，也不会沿硬链接
+    # 对部署根以外的文件做 chown/chmod。
+    for name, (source_fd, expected, raw, mode) in opened.items():
+        temporary = ".runtime-control-" + secrets.token_hex(16) + ".tmp"
+        target_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            mode, dir_fd=runtime_fd)
+        temporaries.append(temporary)
+        try:
+            os.fchmod(target_fd, mode)
+            if os.geteuid() == 0:
+                os.fchown(target_fd, 0, 1000)
+            view = memoryview(raw)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fsync(target_fd)
+        finally:
+            os.close(target_fd)
+        current_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=runtime_fd)
+        try:
+            if identity(os.fstat(current_fd)) != expected:
+                raise ValueError("control file changed before publish")
+        finally:
+            os.close(current_fd)
+        os.replace(temporary, name, src_dir_fd=runtime_fd, dst_dir_fd=runtime_fd)
+        temporaries.remove(temporary)
+    os.fsync(runtime_fd)
+except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+finally:
+    for descriptor, _expected, _raw, _mode in opened.values():
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    if runtime_fd is not None:
+        for temporary in temporaries:
+            try:
+                os.unlink(temporary, dir_fd=runtime_fd)
+            except FileNotFoundError:
+                pass
+        os.close(runtime_fd)
+    if root_fd is not None:
+        os.close(root_fd)
+PY
+}
+
+set_runtime_ownership() {
+  local deploy_dir=$1 runtime_tree
+
+  for runtime_tree in data/n8n data/anythingllm data/runtime; do
+    [[ -d "${deploy_dir}/${runtime_tree}" && ! -L "${deploy_dir}/${runtime_tree}" ]] \
+      || die "运行数据目录类型不安全：${runtime_tree}"
+  done
+  # 必须在任何递归 chown 之前验证并以新 inode 重发受管投影。旧实例若把
+  # 投影硬链接到下面任一待修复目录，先递归改属主会在拒绝时已经触碰别名。
+  normalize_runtime_control_files "$deploy_dir" \
+    || die '知识运行投影权限或文件身份不安全；未修改其它运行树'
   chown -R root:1000 "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
     "${deploy_dir}/data/analytics" 2>/dev/null || true
-  chown -R 1000:1000 "${deploy_dir}/data/n8n" "${deploy_dir}/data/anythingllm" \
-    "${deploy_dir}/data/runtime" 2>/dev/null \
+  chown -R 1000:1000 "${deploy_dir}/data/n8n" "${deploy_dir}/data/anythingllm" 2>/dev/null \
     || die "无法设置 n8n 或 AnythingLLM 数据目录所有权"
+  # 会话、offer 和任务由 uid 1000 在目录内创建；不递归改写现有子文件，
+  # 以免把 root 签发的知识投影变成运行用户所有或触碰外部硬链接。
+  chown 1000:1000 "${deploy_dir}/data/runtime" \
+    || die "无法设置会话运行目录所有权"
   chmod 0750 "${deploy_dir}/data/n8n" "${deploy_dir}/data/anythingllm" "${deploy_dir}/data/runtime"
   if [[ -e "${deploy_dir}/data/provider-router" || -L "${deploy_dir}/data/provider-router" ]]; then
     [[ -d "${deploy_dir}/data/provider-router" && ! -L "${deploy_dir}/data/provider-router" ]] || die '接口运行状态目录不安全'

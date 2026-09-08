@@ -20,17 +20,16 @@ done
 git -C "$PROJECT_ROOT" rev-parse --verify 'v1.1.0^{commit}' >/dev/null 2>&1 \
   || fail '缺少真实 v1.1.0 tag，无法构造旧版快照'
 
-[[ ! -L "${PROJECT_ROOT}/.work" ]] || fail '测试工作区不得为符号链接'
-mkdir -p -- "${PROJECT_ROOT}/.work"
-TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.work/legacy-rollback-test.XXXXXX")
+TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.legacy-rollback.XXXXXX")
 git -C "$PROJECT_ROOT" check-ignore -q -- "$TEST_ROOT" \
   || fail '测试工作区未被 Git 忽略，拒绝生成运行资料'
+export AI_SUPPORT_TEST_SCOPE="$TEST_ROOT"
 cleanup() {
   if [[ "${AI_SUPPORT_TEST_KEEP_TMP:-0}" == 1 ]]; then
     printf '调试目录已保留：%s\n' "$TEST_ROOT" >&2
     return
   fi
-  if [[ "$TEST_ROOT" == "${PROJECT_ROOT}"/.work/legacy-rollback-test.* && -d "$TEST_ROOT" ]]; then
+  if [[ "$TEST_ROOT" == "${PROJECT_ROOT}"/.test-runtime.legacy-rollback.* && -d "$TEST_ROOT" ]]; then
     rm -rf -- "$TEST_ROOT"
   fi
 }
@@ -68,6 +67,7 @@ printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" "$TEST
 
 export PATH="${MOCK_DIR}:${ORIGINAL_PATH}"
 export MOCK_DOCKER_LOG MOCK_ANYTHING_STATE MOCK_FORBIDDEN_ARG_FILE
+export MOCK_CHOWN_ROOT="$TEST_ROOT"
 export MOCK_SYSTEMD_STATE="${TEST_ROOT}/systemd-state"
 export CRISPAI_LOGS_SYSTEMD_TEST=1
 export CRISPAI_LOGS_SYSTEMD_DIR="${TEST_ROOT}/systemd"

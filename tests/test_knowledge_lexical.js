@@ -250,5 +250,18 @@ test('L21 范围说明、否定引用、复述改问、复合问题、短泛问�
     assert.deepEqual(f.search(query).results,[],query);
   }
 });
+test('L22 相同内容的重复构建会修复受管索引属主，不因提前返回留下可写投影',()=>{
+  const f=fixture('owner-repair'); built(f);
+  if(typeof process.getuid !== 'function' || process.getuid() !== 0) throw new Error('此生产权限回归必须以 root 执行');
+  const before=fs.readFileSync(f.indexPath);
+  fs.chownSync(f.indexPath,1000,1000);
+  assert.equal(fs.statSync(f.indexPath).uid,1000);
+  const result=f.build(); assert.equal(result.status,0,result.stdout+result.stderr);
+  const current=fs.statSync(f.indexPath);
+  assert.equal(current.uid,0); assert.equal(current.gid,1000); assert.equal(current.mode & 0o777,0o640);
+  assert.deepEqual(fs.readFileSync(f.indexPath),before);
+  const verified=spawnSync('python3',[script,'verify','--deploy-dir',f.root],{encoding:'utf8',timeout:45000});
+  assert.equal(verified.status,0,verified.stdout+verified.stderr);
+});
 process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:path.relative(project,evidence),synthetic_only:true})+'\n');
 process.exitCode=failed?1:0;

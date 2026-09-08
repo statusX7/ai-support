@@ -200,7 +200,8 @@ def atomic_publish(directory, name, raw):
             if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
                 raise LexicalError("output_invalid")
             old, _ = read_relative(directory, name, MAX_INDEX_BYTES, "output_invalid")
-            if old == raw and stat.S_IMODE(current.st_mode) == 0o640 and (os.geteuid() != 0 or current.st_gid == 1000):
+            if old == raw and stat.S_IMODE(current.st_mode) == 0o640 \
+                    and (os.geteuid() != 0 or (current.st_uid == 0 and current.st_gid == 1000)):
                 return
         except FileNotFoundError:
             pass

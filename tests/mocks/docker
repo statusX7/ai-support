@@ -119,12 +119,13 @@ done
 
 mock_anything_runtime() {
   local action=$1
+  shift || true
   if [[ -z "${MOCK_ANYTHING_STATE:-}" ]]; then
     [[ "$action" == capture ]]
     return
   fi
-  python3 - "$MOCK_ANYTHING_STATE" "$MOCK_PROJECT_DIR" "$action" <<'PY'
-import hashlib, json, os, pathlib, stat, sys, tempfile
+  python3 - "$MOCK_ANYTHING_STATE" "$MOCK_PROJECT_DIR" "$action" "$@" <<'PY'
+import hashlib, json, os, pathlib, re, stat, sys, tempfile
 try:
     state_file, project, action = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
     if not project.is_absolute() or project.is_symlink() or state_file.is_symlink():
@@ -140,7 +141,7 @@ try:
         values = {}
         for line in env_file.read_text().splitlines():
             name, separator, value = line.partition("=")
-            if separator and name in ("PROVIDER_RAG_CONTEXT_WINDOW", "AI_MODEL_TOKEN_LIMIT", "ANYTHINGLLM_PORT", "ANYTHINGLLM_API_KEY"):
+            if separator and name in ("PROVIDER_RAG_CONTEXT_WINDOW", "AI_MODEL_TOKEN_LIMIT", "ANYTHINGLLM_PORT", "ANYTHINGLLM_API_KEY", "KNOWLEDGE_ACTIVE_EMBEDDING_MODEL"):
                 if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
                     value = json.loads(value.replace("$$", "$"))
                 elif len(value) >= 2 and value.startswith("'") and value.endswith("'"):
@@ -150,17 +151,86 @@ try:
         port, key = int(values.get("ANYTHINGLLM_PORT", "3001")), values.get("ANYTHINGLLM_API_KEY", "")
         if not 256 <= window <= 2097152 or not 1 <= port <= 65535 or not key:
             raise ValueError()
-        instances[str(project)] = {"context_window": window, "port": port,
-                                   "api_key_sha256": hashlib.sha256(key.encode()).hexdigest()}
+        previous = instances.get(str(project), {})
+        document_root = project / "data/anythingllm/documents/custom-documents"
+        documents = []
+        if document_root.exists():
+            if document_root.is_symlink() or not document_root.is_dir():
+                raise ValueError()
+            for document in document_root.iterdir():
+                info = document.lstat()
+                if not document.is_file() or document.is_symlink() or info.st_nlink != 1 \
+                        or not document.name.endswith(".json"):
+                    raise ValueError()
+                documents.append("custom-documents/" + document.name)
+        instances[str(project)] = {
+            "context_window": window,
+            "port": port,
+            "api_key_sha256": hashlib.sha256(key.encode()).hexdigest(),
+            "knowledge_model": values.get("KNOWLEDGE_ACTIVE_EMBEDDING_MODEL")
+                               or previous.get("knowledge_model")
+                               or "Xenova/all-MiniLM-L6-v2",
+            "knowledge_chunk_size": previous.get("knowledge_chunk_size", 1000),
+            "knowledge_chunk_overlap": previous.get("knowledge_chunk_overlap", 20),
+            "knowledge_chunk_explicit": previous.get("knowledge_chunk_explicit", False),
+            "documents": sorted(documents),
+            "removed_documents": previous.get("removed_documents", []),
+        }
         descriptor, temporary = tempfile.mkstemp(prefix=".mock-anything-", dir=state_file.parent)
         with os.fdopen(descriptor, "w") as stream:
             json.dump(state, stream)
         os.replace(temporary, state_file)
-    else:
+    elif action == "read":
         value = instances[str(project)]["context_window"]
         if type(value) is not int or not 256 <= value <= 2097152:
             raise ValueError()
         print(value)
+    elif action in ("knowledge-observe", "knowledge-probe", "knowledge-configure-chunks"):
+        workspace = sys.argv[4]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace):
+            raise ValueError()
+        instance = instances[str(project)]
+        model = instance["knowledge_model"]
+        maximum = {
+            "Xenova/all-MiniLM-L6-v2": 1000,
+            "Xenova/nomic-embed-text-v1": 16000,
+            "MintplexLabs/multilingual-e5-small": 512,
+        }.get(model)
+        if maximum is None:
+            raise ValueError()
+        if action == "knowledge-configure-chunks":
+            size, overlap = int(sys.argv[5]), int(sys.argv[6])
+            if not 1 <= size <= maximum or not 0 <= overlap < size:
+                raise ValueError()
+            instance["knowledge_chunk_size"] = size
+            instance["knowledge_chunk_overlap"] = overlap
+            instance["knowledge_chunk_explicit"] = True
+            descriptor, temporary = tempfile.mkstemp(prefix=".mock-anything-", dir=state_file.parent)
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump(state, stream)
+            os.replace(temporary, state_file)
+        documents = instance.get("documents", [])
+        if not isinstance(documents, list):
+            raise ValueError()
+        result = {
+            "engine": "native",
+            "model": model,
+            "explicit_model": False,
+            "chunk_size": instance["knowledge_chunk_size"],
+            "chunk_overlap": instance["knowledge_chunk_overlap"],
+            "explicit_chunk_size": instance["knowledge_chunk_explicit"],
+            "passage_prefix": "passage: " if model == "MintplexLabs/multilingual-e5-small" else "",
+            "query_prefix": "query: " if model == "MintplexLabs/multilingual-e5-small" else "",
+            "component_version": "1.16.1",
+            "foreign_documents": 0,
+            "workspace_documents": len(documents),
+            "workspace_exists": True,
+        }
+        if action == "knowledge-probe":
+            result["probe_dimensions"] = 3
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        raise ValueError()
 except (OSError, ValueError, KeyError, TypeError):
     print("生命周期桩未取得受管 AnythingLLM 运行窗口。", file=sys.stderr)
     sys.exit(1)
@@ -283,7 +353,10 @@ case "$COMMAND" in
     fi
     ;;
   exec)
-    if [[ "$*" == *' anythingllm '* && "$*" == *'CRISPAI_EXPECTED_RAG_CONTEXT'* ]]; then
+    if [[ "${1:-}" == -T && "${2:-}" == anythingllm && "${3:-}" == node && "${4:-}" == - \
+      && "${5:-}" =~ ^(observe|probe|configure-chunks)$ ]]; then
+      mock_anything_runtime "knowledge-${5}" "${6:-}" "${7:-}" "${8:-}"
+    elif [[ "$*" == *' anythingllm '* && "$*" == *'CRISPAI_EXPECTED_RAG_CONTEXT'* ]]; then
       expected=''
       IFS= read -r expected || [[ -n "$expected" ]]
       [[ "$expected" =~ ^[1-9][0-9]{2,6}$ && "${MOCK_RAG_CONTEXT_MISMATCH:-0}" != 1 ]] || exit 1

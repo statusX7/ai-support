@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MOCK_CURL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
 if [[ -n "${MOCK_FORBIDDEN_ARG_FILE:-}" && -f "$MOCK_FORBIDDEN_ARG_FILE" ]]; then
   while IFS= read -r forbidden || [[ -n "$forbidden" ]]; do
     [[ -n "$forbidden" ]] || continue
@@ -204,11 +206,8 @@ PY
       if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
         [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
         REMOVED_DOCUMENTS=$(jq -c '.names // []' <<< "$REQUEST_BODY")
-        STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
-        jq --argjson removed "$REMOVED_DOCUMENTS" \
-          '.removed_documents = (((.removed_documents // []) + $removed) | unique)' \
-          "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
-        mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+        python3 -B "${MOCK_CURL_DIR}/anything-cache.py" remove \
+          "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$REMOVED_DOCUMENTS"
       fi
       BODY='{"success":true}'
     fi
@@ -217,17 +216,18 @@ PY
     DOCUMENT_NAME=$(basename -- "${FORM_FILE:-test-knowledge}")
     BODY=$(jq -cn --arg location "custom-documents/${DOCUMENT_NAME}.json" \
       '{success:true,documents:[{location:$location}]}')
+    if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
+      python3 -B "${MOCK_CURL_DIR}/anything-cache.py" upload \
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$FORM_FILE" "$DOCUMENT_NAME"
+    fi
     ;;
   */api/v1/workspace/*/update-embeddings)
     if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
       [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
       ADDS=$(jq -c '.adds // []' <<< "$REQUEST_BODY")
       DELETES=$(jq -c '.deletes // []' <<< "$REQUEST_BODY")
-      STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
-      jq --argjson adds "$ADDS" --argjson deletes "$DELETES" \
-        '.documents = (((.documents // []) + $adds) - $deletes | unique)' \
-        "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
-      mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+      python3 -B "${MOCK_CURL_DIR}/anything-cache.py" update \
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$ADDS" "$DELETES"
     fi
     BODY='{"success":true}'
     ;;
@@ -257,7 +257,10 @@ PY
     DOCUMENTS='[]'
     PROMPT='""'
     if [[ -n "${MOCK_ANYTHING_STATE:-}" && -f "$MOCK_ANYTHING_STATE" ]]; then
-      DOCUMENTS=$(jq -c '[.documents[]? | {docpath:.}]' "$MOCK_ANYTHING_STATE")
+      INSTANCE_DOCUMENTS=$(python3 -B "${MOCK_CURL_DIR}/anything-cache.py" observe \
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE")
+      DOCUMENTS=$(jq -cn --argjson documents "$INSTANCE_DOCUMENTS" \
+        '[$documents[] | {docpath:.}]')
       PROMPT=$(jq -c '.prompt // ""' "$MOCK_ANYTHING_STATE")
     fi
     BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
