@@ -422,11 +422,54 @@ function createRuntime(env = {}, options = {}) {
     }
   };
   const stateKey = (website, session) => hash(website + '\0' + session);
+  const createAbortController = () => {
+    const NativeAbortController = typeof globalThis === 'object' ? globalThis.AbortController : undefined;
+    if (typeof NativeAbortController === 'function') return new NativeAbortController();
+    let aborted = false;
+    let abortReason;
+    const listeners = new Map();
+    const signal = {
+      onabort: null,
+      get aborted() { return aborted; },
+      get reason() { return abortReason; },
+      addEventListener(type, listener, options = {}) {
+        if (type !== 'abort' || aborted || !(typeof listener === 'function'
+          || listener && typeof listener.handleEvent === 'function')) return;
+        listeners.set(listener, options === true || options?.once === true);
+      },
+      removeEventListener(type, listener) { if (type === 'abort') listeners.delete(listener); },
+      throwIfAborted() { if (aborted) throw abortReason; },
+    };
+    return {
+      signal,
+      abort(reason) {
+        if (aborted) return;
+        aborted = true;
+        abortReason = reason;
+        if (abortReason === undefined) {
+          abortReason = new Error('The operation was aborted');
+          abortReason.name = 'AbortError';
+        }
+        const event = { type: 'abort', target: signal, currentTarget: signal };
+        const notify = (listener) => {
+          try {
+            if (typeof listener === 'function') listener.call(signal, event);
+            else listener.handleEvent(event);
+          } catch (_) {}
+        };
+        if (typeof signal.onabort === 'function') notify(signal.onabort);
+        for (const [listener, once] of [...listeners]) {
+          if (once) listeners.delete(listener);
+          notify(listener);
+        }
+      },
+    };
+  };
   // 网络发送不占用会话状态锁。逐会话登记尚未完成的普通出站，使真人接管
   // 在状态提交后可以立即中止仍挂起的 HTTP 请求；控制通知不受此机制影响。
   const outboundRequests = new Map();
   const beginOutbound = (key, job) => {
-    const entry = { token: crypto.randomBytes(16).toString('hex'), controller: new AbortController() };
+    const entry = { token: crypto.randomBytes(16).toString('hex'), controller: createAbortController() };
     const entries = outboundRequests.get(key) || new Set();
     entries.add(entry);
     outboundRequests.set(key, entries);

@@ -46,6 +46,7 @@ let imageMode = 'valid';
 let visualAnswer = '受控视觉协议回答';
 let modelAnswerOverride = null;
 let delayedVision;
+let abortSignalProbe;
 const sent = [];
 const histories = new Map();
 const modelRequests = [];
@@ -69,6 +70,7 @@ const request = async (url, options = {}) => {
     if (suffix === '/message') {
       const body = options.body;
       sendAttempts += 1;
+      if (abortSignalProbe) abortSignalProbe(options.signal);
       if (sendRejection) return { status: sendRejection, body: { error: true, reason: 'invalid_data' } };
       // 重现实机发现的拒绝：本项目旧版自定义 properties 键不满足 Crisp 的校验。
       // 不模拟完整第三方 schema；本项目使用官方昵称字段和本地持久 fingerprint。
@@ -172,6 +174,75 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal((await plugin.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } })).statusCode, 401);
     input.headers['X-Crisp-Request-Timestamp'] = String(now - 400000);
     assert.equal((await plugin.receive(input, { data: { data: Buffer.from(raw).toString('base64') } })).statusCode, 401);
+  });
+  await test('P0 Code sandbox 缺少原生 AbortController 时普通回复及人工中止仍有效', async () => {
+    const nativeAbortController = globalThis.AbortController;
+    try {
+      globalThis.AbortController = undefined;
+      runtime = createRuntime(env, runtimeOptions);
+      const normalSession = 'session_abort-fallback-normal';
+      const beforeNormal = sent.length;
+      let normalSignal;
+      const normalEvents = [];
+      const removed = () => normalEvents.push('removed');
+      abortSignalProbe = (signal) => {
+        normalSignal = signal;
+        signal.onabort = () => { normalEvents.push('onabort'); throw new Error('受控 onabort 异常'); };
+        signal.addEventListener('abort', removed);
+        signal.removeEventListener('abort', removed);
+        signal.addEventListener('abort', () => { normalEvents.push('throwing'); throw new Error('受控监听器异常'); });
+        signal.addEventListener('abort', () => normalEvents.push('survivor'), { once: true });
+      };
+      assert.equal((await deliver(message(normalSession, '缺少原生控制器时的普通问题'))).status, 'sent');
+      assert.equal(sent.length, beforeNormal + 1);
+      assert.equal(sent.at(-1).session_id, normalSession);
+      assert.equal(normalSignal.aborted, false, '正常完成不应伪造取消');
+      assert.equal(normalSignal.reason, undefined);
+      assert.deepEqual(normalEvents, [], '正常完成不应通知 abort 监听器');
+
+      let release;
+      delayedCrisp = new Promise((resolve) => { release = resolve; });
+      const interruptedSession = 'session_abort-fallback-human';
+      const attempts = sendAttempts;
+      const beforeInterrupted = sent.filter((entry) => entry.session_id === interruptedSession).length;
+      const interruptedEvents = [];
+      const removedInterrupted = () => interruptedEvents.push('removed');
+      abortSignalProbe = (signal) => {
+        signal.onabort = () => { interruptedEvents.push('onabort'); throw new Error('受控 onabort 异常'); };
+        signal.addEventListener('abort', () => { interruptedEvents.push('throwing'); throw new Error('受控首监听器异常'); });
+        signal.addEventListener('abort', () => interruptedEvents.push('survivor'), { once: true });
+        signal.addEventListener('abort', removedInterrupted);
+        signal.removeEventListener('abort', removedInterrupted);
+      };
+      const entry = await receive(message(interruptedSession, '人工介入前的挂起回复'));
+      const pending = runtime.process(entry.key, entry.jobId);
+      for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
+      assert.equal(sendAttempts, attempts + 1, 'fallback signal 必须真实进入挂起的 Crisp POST');
+      now += 1;
+      const controlRuntime = createRuntime(env, runtimeOptions);
+      const human = { ...message(interruptedSession, '真人介入', { from: 'operator', automated: false }), event: 'message:received' };
+      const history = histories.get(interruptedSession) || []; history.push(human.data); histories.set(interruptedSession, history);
+      const accepted = await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+      if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
+      const wasCancelled = () => Object.values(state(interruptedSession).outgoing || {})
+        .some((record) => record.cancellation_reason === 'conversation_state_changed');
+      for (let tries = 0; tries < 100 && !wasCancelled(); tries += 1) await wait(10);
+      assert.equal(wasCancelled(), true, '持久人工状态必须触发 fallback signal 的 abort 监听器');
+      await operator(interruptedSession, { content: '重复真人事件不得重复触发 abort' });
+      const result = await pending;
+      release();
+      assert.equal(result.status, 'cancelled');
+      assert.equal(state(interruptedSession).mode, 'human');
+      assert.equal(sent.filter((item) => item.session_id === interruptedSession).length, beforeInterrupted);
+      assert.equal(state(interruptedSession).jobs.find((job) => job.id === entry.jobId).status, 'cancelled');
+      assert.deepEqual(interruptedEvents, ['onabort', 'throwing', 'survivor'],
+        '重复取消只能通知一次，onabort/监听器异常不能阻断后续监听器和网络取消');
+    } finally {
+      globalThis.AbortController = nativeAbortController;
+      runtime = createRuntime(env, runtimeOptions);
+      delayedCrisp = null;
+      abortSignalProbe = undefined;
+    }
   });
   const deferredOperatorCase = async (suffix, resolved, advance = 5) => {
     const session = 'session_deferred-' + suffix;
