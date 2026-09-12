@@ -96,8 +96,10 @@ class Terminal:
         transcript = WORK / (self.name + ".log")
         transcript.write_text(self.output, encoding="utf-8")
         transcript.chmod(0o600)
-        assert self.process.returncode == expected, self.output
-        assert "bad substitution" not in self.output and "unbound variable" not in self.output, self.output
+        assert self.process.returncode == expected, f"{self.name}: 预期退出 {expected}，实际 {self.process.returncode}\n{self.output}"
+        assert "bad substitution" not in self.output and "unbound variable" not in self.output, f"{self.name}: Shell 变量错误\n{self.output}"
+        for marker in ("interrupt trap", "unexpected EOF", "syntax error"):
+            assert marker not in self.output, f"{self.name}: {marker}\n{self.output}"
         return self.output
 
 
@@ -1182,7 +1184,6 @@ def signal_menu_cases():
     protected = {path: path.read_bytes() for name in ("config", "knowledge", "data")
                  for path in (DEPLOY / name).rglob("*") if path.is_file()}
     protected[DEPLOY / ".env"] = (DEPLOY / ".env").read_bytes()
-    input_directories = set(Path("/tmp").glob("crispai-menu-input.*"))
     pending_secret = "synthetic-hidden-signal-value"
 
     def finish_interrupt(terminal, signals=(signal.SIGINT,), *, parent_only=False, hidden=False, eof=False, eof_status=0):
@@ -1220,7 +1221,8 @@ def signal_menu_cases():
                 os.close(reader)
         output = terminal.finish(eof_status if eof else 130)
         assert pending_secret not in output
-        assert not (set(Path("/tmp").glob("crispai-menu-input.*")) - input_directories), terminal.name
+        own_inputs = set(Path("/tmp").glob(f"crispai-menu-input.{terminal.process.pid}.*"))
+        assert not own_inputs, f"{terminal.name}: 输入临时目录未清理：{sorted(map(str, own_inputs))}"
         assert all(path.read_bytes() == value for path, value in protected.items()), terminal.name
 
     for index in range(30):
@@ -1249,20 +1251,24 @@ def signal_menu_cases():
             ("double", (signal.SIGINT, signal.SIGINT), False),
             ("eof", (), True),
         ):
-            terminal = Terminal(f"{name}-{suffix}")
-            for command in commands:
-                terminal.expect("请选择：")
-                terminal.send(command)
-            terminal.expect(ready)
-            # 直接传播 read 失败的子菜单为 1；候选编辑由导航包装取消，退出为 0。
-            finish_interrupt(terminal, signals, hidden=name == "hidden", eof=eof,
-                             eof_status=1 if name == "submenu" else 0)
+            # 多行说明输出后到 reader 完成 trap/PID 登记之间曾有极窄竞态；固定压力
+            # 覆盖单个 SIGINT，不能用一次通常通过的样本掩盖 reader 残留或 trap 解析错误。
+            rounds = 120 if name == "multiline" and suffix == "int" else 1
+            for attempt in range(rounds):
+                case_name = f"{name}-{suffix}" if rounds == 1 else f"{name}-{suffix}-{attempt}"
+                terminal = Terminal(case_name)
+                for command in commands:
+                    terminal.expect("请选择：")
+                    terminal.send(command)
+                terminal.expect(ready)
+                # 直接传播 read 失败的子菜单为 1；候选编辑由导航包装取消，退出为 0。
+                finish_interrupt(terminal, signals, hidden=name == "hidden", eof=eof,
+                                 eof_status=1 if name == "submenu" else 0)
 
     result = invoke(["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY)], content="2\n0\n0\n")
     assert result.returncode == 0 and "快速自检" in result.stdout, result.stdout
     assert all(path.read_bytes() == value for path, value in protected.items())
-    assert not (set(Path("/tmp").glob("crispai-menu-input.*")) - input_directories)
-    passing("SIGINT 提示瞬间30轮、子菜单/隐藏/多行/确认的INT/TERM/双信号/EOF及非TTY输入，2秒内退出且TTY/秘密/配置保持")
+    passing("SIGINT 提示瞬间30轮、多行首提示单INT 120轮及子菜单/隐藏/确认的INT/TERM/双信号/EOF，2秒内退出且TTY/秘密/配置保持")
 
 
 def main():
@@ -1335,6 +1341,9 @@ def main():
             return
         if os.environ.get("MENU_TEST_FOCUS") == "services":
             service_lifecycle_cases()
+            return
+        if os.environ.get("MENU_TEST_FOCUS") == "signals":
+            signal_menu_cases()
             return
         for argument in ("--help", "--version"):
             result = invoke(["bash", str(DEPLOY / "manage.sh"), argument])

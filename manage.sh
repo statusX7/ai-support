@@ -27,6 +27,7 @@ MANAGE_READER_PID=''
 MANAGE_READER_DIR=''
 MANAGE_READER_TTY=''
 MANAGE_INPUT_SIGNAL=0
+MANAGE_MAIN_BASHPID=$BASHPID
 
 manage_usage() {
   printf '%s\n' '用法：crispai [--deploy-dir PATH] [命令]' '无参数打开中文管理菜单。' \
@@ -128,13 +129,26 @@ manage_interrupt() {
 }
 trap manage_interrupt INT TERM
 
+manage_input_interrupt() {
+  if [[ "$BASHPID" != "$MANAGE_MAIN_BASHPID" ]]; then
+    # reader 在 fork 后、重置信号处理前会短暂继承父进程 trap。该窗口收到
+    # 进程组信号时必须直接退出；不能只修改子进程自己的 pending 标记后继续 read。
+    # 同时移除继承的 EXIT trap，避免子进程竞态清理父进程仍在使用的目录。
+    trap '' INT TERM
+    trap - EXIT
+    exit 130
+  fi
+  # 父进程可能尚未取得 reader PID；先记下信号，完成 PID 登记后由统一清理退出。
+  MANAGE_INPUT_SIGNAL=1
+}
+
 menu_input_line() {
   local input_target=$1 input_prompt=${2:-} input_hidden=${3:-0} input_status=0 input_value
   # Bash 5.2 的 read 在信号早于 read(2) 时可能延后执行 trap，read -p 也有此窗口。
   # 将读取隔离；父进程使用会检查 pending trap 的 wait，不用超时轮询。
   MANAGE_INPUT_SIGNAL=0
-  trap 'MANAGE_INPUT_SIGNAL=1' INT TERM
-  MANAGE_READER_DIR=$(mktemp -d /tmp/crispai-menu-input.XXXXXXXX) || input_status=1
+  trap manage_input_interrupt INT TERM
+  MANAGE_READER_DIR=$(mktemp -d "/tmp/crispai-menu-input.${MANAGE_MAIN_BASHPID}.XXXXXXXX") || input_status=1
   if (( input_status == 0 )); then
     : > "$MANAGE_READER_DIR/line"
     if (( input_hidden )) && [[ -t 0 ]]; then
@@ -378,11 +392,12 @@ manager_apply() { manager_action manager_apply_checked "$1" "$2"; }
 
 menu_multiline() {
   local output=$1 line bytes=0 max_bytes=${2:-262144}
+  local prompt=$'请粘贴多行正文。单独一行 ::END:: 保存，::CANCEL:: 取消。\n正文需要结束符字面量时，在行首加反斜线，例如 \\::END::。\n'
   local LC_ALL=C
-  printf '请粘贴多行正文。单独一行 ::END:: 保存，::CANCEL:: 取消。\n正文需要结束符字面量时，在行首加反斜线，例如 \\::END::。\n'
   : > "$output"
   while true; do
-    if ! menu_input_line line; then MANAGE_EOF=1; warn '输入结束，正文未应用'; return 1; fi
+    if ! menu_input_line line "$prompt"; then MANAGE_EOF=1; warn '输入结束，正文未应用'; return 1; fi
+    prompt=''
     case "$line" in ::END::) break ;; ::CANCEL::) printf '已取消正文修改。\n'; return 1 ;; '\::END::'|'\::CANCEL::') line=${line:1} ;; esac
     bytes=$((bytes+${#line}+1))
     (( bytes <= max_bytes )) || { warn '正文超过输入上限，未应用'; return 1; }
