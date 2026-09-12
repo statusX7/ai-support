@@ -120,6 +120,22 @@ grep -Fq 'bootstrap_prepare_docker_runtime' "${PROJECT_ROOT}/install.sh" \
   || fail "install.sh 未在向导确认后调用 Docker 运行时引导"
 grep -Fq 'quick_init_wizard' "${PROJECT_ROOT}/install.sh" \
   || fail "install.sh 未实际调用 quick_init_wizard"
+grep -Fq 'configure_provider_pool_primary' "${PROJECT_ROOT}/install.sh" \
+  || fail "install.sh 已有接口池重新配置仍未使用主接口候选事务"
+grep -Fq '.provider.api_mode' "${PROJECT_ROOT}/install.sh" \
+  || fail "install.sh 未消费快速初始化实际探测的 Provider 协议"
+grep -Fq '.provider.capabilities.vision' "${PROJECT_ROOT}/install.sh" \
+  || fail "install.sh 未消费快速初始化实际探测的图片能力"
+grep -Fq 'provider-pool-applied.json' "${PROJECT_ROOT}/install.sh" \
+  || fail "install.sh 未区分已有接口池和首次旧单接口迁移"
+for lifecycle_script in install.sh update.sh scripts/restore.sh scripts/rollback.sh; do
+  grep -Fq 'scheduler_scan_lock_state' "${PROJECT_ROOT}/${lifecycle_script}" \
+    || fail "${lifecycle_script} 未核对旧版 scheduler 扫描锁"
+  grep -Fq 'cleanup_legacy_scheduler_scan_lock' "${PROJECT_ROOT}/${lifecycle_script}" \
+    || fail "${lifecycle_script} 未在受管停写窗口迁移旧版 scheduler 扫描锁"
+done
+grep -Fq 'ROLLBACK_TARGET_VERSION' "${PROJECT_ROOT}/scripts/rollback.sh" \
+  || fail 'rollback.sh 未按目标 runtime 版本隔离 scheduler 旧锁迁移'
 grep -Fq 'Dpkg::Use-Pty=0' "${PROJECT_ROOT}/scripts/bootstrap.sh" \
   || fail "apt 自动安装未关闭不可审计的 PTY 动画"
 grep -Fq "COMPOSE_PROGRESS=\"\$progress\"" "${PROJECT_ROOT}/scripts/common.sh" \
@@ -340,9 +356,40 @@ for relative in scripts/common.sh docker-compose.yml n8n/workflow.json \
   docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md; do
   require_regular_file "${PACKAGE_ROOT}/${relative}"
 done
+while IFS= read -r reference; do
+  relative=${reference#\$\{SCRIPT_DIR\}/}
+  case "$relative" in
+    ..|mocks) continue ;;
+  esac
+  require_regular_file "${PACKAGE_ROOT}/tests/${relative}"
+done < <(grep -oE '\$\{SCRIPT_DIR\}/[A-Za-z0-9._/-]+' "${PACKAGE_ROOT}/tests/run.sh" | sort -u)
+python3 - "$PACKAGE_ROOT" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1]).resolve()
+missing = []
+for document in root.rglob("*.md"):
+    text = document.read_text(encoding="utf-8")
+    for raw in re.findall(r"!?\[[^]]*\]\(([^)]+)\)", text):
+        target = raw.strip()
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+        target = target.split("#", 1)[0]
+        if not target or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
+            continue
+        linked = (document.parent / target).resolve()
+        if root not in linked.parents or not linked.is_file():
+            missing.append(f"{document.relative_to(root)} -> {raw}")
+if missing:
+    print("发布包内 Markdown 存在断开的本地链接：", file=sys.stderr)
+    print("\n".join(missing), file=sys.stderr)
+    raise SystemExit(1)
+PY
 [[ ! -e "${PACKAGE_ROOT}/.git" && ! -e "${PACKAGE_ROOT}/.work" ]] \
   || fail "解压后的发布包包含 .git 或 .work"
-pass "发布包版本、生产入口、权限与必要资源完整"
+pass "发布包版本、生产入口、权限、必要资源及全量测试直接依赖完整"
 
 MINIMAL_BIN="${TEST_ROOT}/minimal-bin"
 mkdir -p -- "$MINIMAL_BIN" "${TEST_ROOT}/foreign-cwd"

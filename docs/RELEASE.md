@@ -8,7 +8,7 @@
 
 真实后台人工操作不可得等外部边界需单列，不能构造真人事件冒称通过；也不能用 `External Validation Pending` 豁免已经授权的目标机往返、欢迎状态、同包升级或故障切换检查。真实备用资源不足时准确报告验证层级，不把同一账号的多个模型当成独立账号。公共匿名取包和空机安装仍是发布后的独立门槛。
 
-先确认 main、工作树、v1.2.0 tag 与独立核验回执，检查 v1.2.1 未被其他内容占用。允许开发阶段正常本地 commit，不 force push，不移动或删除已发布 tag。详情见 [测试说明](TESTING.md)、[本轮发布说明](releases/v1.2.1.md)和保留的 [v1.2.0 报告](reports/v1.2.0-report.md)。
+先确认 main、工作树、v1.2.0 tag 与独立核验回执，检查 v1.2.1 未被其他内容占用。允许开发阶段正常本地 commit，不 force push，不移动或删除已发布 tag。详情见 [测试说明](TESTING.md)、[本轮发布说明](releases/v1.2.1.md)和公开仓库保留的 [v1.2.0 报告](https://github.com/statusX7/ai-support/blob/main/docs/reports/v1.2.0-report.md)。
 
 ## 公开面与秘密检查
 

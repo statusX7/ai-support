@@ -31,6 +31,28 @@ FORBIDDEN = {"authorization", "host", "connection", "content-length", "content-t
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,511}\Z")
 IDENTIFIER = re.compile(r"p_[a-f0-9]{24}\Z")
 
+# 适配器返回的上游正文不可信。管理面只保留这些稳定分类和本项目自有说明，
+# 既让交互层能给出准确下一步，也避免 URL、Header 或密钥随异常内容外泄。
+ADAPTER_FAILURES = {
+    "authentication_failed": ("authentication_failed", 3, "接口鉴权失败；请核对本接口的地址、Key 与调用权限，原配置未更改"),
+    "model_unavailable": ("model_unavailable", 1, "所选模型或对应推理端点不可用；请核对模型原名、请求协议与接口地址，原配置未更改"),
+    "model_not_found": ("model_unavailable", 1, "所选模型或对应推理端点不可用；请核对模型原名、请求协议与接口地址，原配置未更改"),
+    "protocol_error": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
+    "protocol_mismatch": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
+    "unsupported_protocol": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
+    "provider_adapter_error": ("protocol_error", 1, "接口适配或响应处理未通过；请核对所选协议、地址路径与响应格式，原配置未更改"),
+    "invalid_response": ("invalid_response", 1, "接口返回空正文、非 JSON 或结构不符合所选协议；原配置未更改"),
+    "rate_limited": ("rate_limited", 4, "接口触发请求频率限制；已按服务端要求进入冷却，可核对备用接口状态"),
+    "quota_exhausted": ("quota_exhausted", 4, "接口额度或余额不足；不会立即重复请求同一授权范围，可补充额度或使用独立授权的备用接口"),
+    "upstream_timeout": ("upstream_timeout", 4, "接口推理在限定时间内没有完成；请核对网络、模型响应时间与单次请求期限"),
+    "upstream_unavailable": ("upstream_unavailable", 4, "接口返回服务端故障；请核对服务状态与备用接口"),
+    "connection_failed": ("connection_failed", 4, "应用环境无法建立接口连接；请核对 DNS、TLS、接口地址与容器网络"),
+    "temporarily_unavailable": ("temporarily_unavailable", 4, "本地 Provider 适配器当前不可用；原配置未更改，请运行状态与自检"),
+    "models_unavailable": ("models_unavailable", 2, "接口未提供可用模型列表；可以手动填写模型原名后执行真实推理验证"),
+    "safety_refusal": ("safety_refusal", 1, "模型拒绝了合成验证内容；原配置未更改"),
+    "vision_unsupported": ("vision_unsupported", 1, "所选模型未通过图片能力验证；原配置未更改"),
+}
+
 
 class PoolError(Exception):
     def __init__(self, code, message, status=1):
@@ -230,14 +252,35 @@ def policy(value):
     return result
 
 
+def normalize_api_base(value):
+    require(isinstance(value, str) and 0 < len(value) <= 4096, "invalid_url", "接口地址无效")
+    base = value.rstrip("/")
+    require(bool(base) and "?" not in base and "#" not in base and not re.search(r"[\\\x00-\x20\x7f]", base), "invalid_url", "接口地址无效")
+    url = urllib.parse.urlsplit(base)
+    try:
+        port = url.port
+        decoded = urllib.parse.unquote(url.path, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        raise PoolError("invalid_url", "接口地址无效") from None
+    require(url.scheme in ("https", "http") and url.hostname and not url.username and not url.password and not url.query and not url.fragment
+            and (port is None or 1 <= port <= 65535)
+            and (url.scheme != "http" or url.hostname in ("127.0.0.1", "localhost", "host.docker.internal", "::1")),
+            "invalid_url", "接口地址必须为安全地址；明文仅限受管本机网关")
+    require("\\" not in decoded and not any(segment in (".", "..") for segment in decoded.split("/")),
+            "invalid_url", "接口地址不得包含路径穿越")
+    path = url.path.rstrip("/")
+    if not path.endswith("/v1"):
+        path += "/v1"
+    base = urllib.parse.urlunsplit((url.scheme, url.netloc, path, "", ""))
+    require(len(base) <= 4096, "invalid_url", "接口地址过长")
+    return base
+
+
 def entry(value, secret):
     require(isinstance(value, dict) and IDENTIFIER.fullmatch(value.get("id", "")) and type(value.get("enabled")) is bool,
             "invalid_entry", "接口标识或启用状态无效")
     require(isinstance(value.get("name"), str) and 0 < len(value["name"]) <= 80 and not re.search(r"[\x00-\x1f\x7f]", value["name"]), "invalid_entry", "接口名称无效")
-    require(isinstance(value.get("base_url"), str) and len(value["base_url"]) <= 4096, "invalid_url", "接口地址无效")
-    url = urllib.parse.urlsplit(value["base_url"])
-    require(url.scheme in ("https", "http") and url.hostname and not url.username and not url.password and not url.query and not url.fragment
-            and not re.search(r"[\x00-\x20\x7f]", value["base_url"]) and (url.scheme != "http" or url.hostname in ("127.0.0.1", "localhost", "host.docker.internal", "::1")), "invalid_url", "接口地址必须为安全地址；明文仅限受管本机网关")
+    value["base_url"] = normalize_api_base(value.get("base_url"))
     require(value.get("api_mode") in ("chat_completions", "responses") and MODEL.fullmatch(value.get("model", "")), "invalid_entry", "接口模型或协议无效")
     require(type(value.get("context_window")) is int and 256 <= value["context_window"] <= 2097152
             and type(value.get("max_output_tokens")) is int and 1 <= value["max_output_tokens"] < value["context_window"], "invalid_entry", "接口上下文或输出限制无效")
@@ -334,11 +377,28 @@ class Manager:
             item["key_status"] = "待填写" if item.get("draft") else "已保存"
         return result
 
+    @staticmethod
+    def verify_adapter_readback(value, observed, configuration_state="applied"):
+        expected_entries = [(item["id"], item["enabled"]) for item in value["entries"]]
+        actual = observed.get("entries") if isinstance(observed, dict) else None
+        actual_entries = [
+            (item.get("id"), item.get("enabled"))
+            for item in actual
+        ] if isinstance(actual, list) and all(isinstance(item, dict) and type(item.get("enabled")) is bool for item in actual) else None
+        require(isinstance(observed, dict) and observed.get("ok") is True
+                and observed.get("configuration_state") == configuration_state
+                and type(observed.get("revision")) is int and observed.get("revision") == value["revision"]
+                and actual_entries == expected_entries,
+                "readback_failed", "运行适配器未完整读取新接口池")
+        return observed
+
     def compatibility(self, value, secret, internal):
         primary = value["entries"][0]
         credentials = secret[primary["id"]]
         url = urllib.parse.urlsplit(primary["base_url"])
         host = "host.docker.internal" if url.hostname in ("127.0.0.1", "localhost") else url.hostname
+        if ":" in host:
+            host = "[" + host + "]"
         runtime_base = urllib.parse.urlunsplit((url.scheme, host + (":" + str(url.port) if url.port else ""), url.path, "", ""))
         values = {"PROVIDER_ADAPTER_KEY": internal, "PROVIDER_POOL_REQUIRED": "true", "PROVIDER_REQUIRE_ENVELOPE": "true",
                   "AI_API_BASE_URL": runtime_base, "AI_API_PROBE_BASE_URL": primary["base_url"], "AI_API_KEY": credentials["api_key"],
@@ -470,7 +530,7 @@ class Manager:
                 if transaction:
                     self.apply_rag_window(window)
                 observed = self.adapter("status")
-                require(observed.get("revision") == value["revision"], "readback_failed", "运行适配器未读取到新接口池")
+                self.verify_adapter_readback(value, observed, "applying" if transaction else "applied")
             except Exception as failure:
                 with open(lock_path, "a", encoding="utf-8") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -481,7 +541,7 @@ class Manager:
                 if transaction:
                     try:
                         self.apply_rag_window(transaction["previous_context_window"])
-                        require(self.adapter("status").get("revision") == restored["revision"], "readback_failed", "恢复后的接口池回读未通过")
+                        self.verify_adapter_readback(restored, self.adapter("status"), "applying")
                     except Exception:
                         with open(lock_path, "a", encoding="utf-8") as lock:
                             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -529,7 +589,7 @@ class Manager:
             self.transaction_update(pending, phase="restoring", revision=restored["revision"], context_window=window, started_at=int(time.time() * 1000), **transaction_owner())
         try:
             self.apply_rag_window(window)
-            require(self.adapter("status").get("revision") == restored["revision"], "readback_failed", "恢复后的接口池回读未通过")
+            self.verify_adapter_readback(restored, self.adapter("status"), "applying")
         except Exception:
             with open(lock_path, "a", encoding="utf-8") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -592,7 +652,10 @@ class Manager:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     result = json.load(response)
             except urllib.error.HTTPError as error:
-                result = json.load(error)
+                try:
+                    result = json.load(error)
+                except (TypeError, ValueError):
+                    raise PoolError("invalid_response", ADAPTER_FAILURES["invalid_response"][2]) from None
             except (OSError, urllib.error.URLError):
                 raise PoolError("temporarily_unavailable", "本地适配器暂时不可用，原配置未更改", 4) from None
         else:
@@ -603,18 +666,24 @@ class Manager:
                 result = json.loads(completed.stdout)
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 raise PoolError("temporarily_unavailable", "本地适配器暂时不可用，原配置未更改", 4) from None
+        if not isinstance(result, dict):
+            raise PoolError("invalid_response", ADAPTER_FAILURES["invalid_response"][2])
         if result.get("ok") is False or result.get("error"):
-            code = result.get("error", {}).get("code", "provider_error")
-            if code == "authentication_failed":
-                raise PoolError(code, "接口认证失败，请检查凭据与权限", 3)
-            if code in ("upstream_timeout", "upstream_unavailable", "rate_limited", "connection_failed", "temporarily_unavailable", "quota_exhausted"):
-                failure = PoolError("temporarily_unavailable", "接口暂时不可用，请稍后重试或检查额度", 4)
-                failure.retry_after_ms = result.get("error", {}).get("retry_after_ms", 0)
-                failure.upstream_code = code
-                raise failure
-            if action == "models":
-                raise PoolError("models_unavailable", "接口未提供可用模型列表，可以手动填写模型", 2)
-            raise PoolError(code, "接口验证未通过，原配置未更改")
+            detail = result.get("error")
+            unsafe_code = detail.get("code") if isinstance(detail, dict) else "invalid_response"
+            code = unsafe_code if isinstance(unsafe_code, str) and unsafe_code in ADAPTER_FAILURES else "provider_error"
+            # /models 的普通 404/不支持端点允许手填；推理验证的同类响应则明确为协议问题。
+            if action == "models" and (code in ("provider_error", "model_unavailable", "protocol_error")
+                                       or unsafe_code == "invalid_request"):
+                code = "models_unavailable"
+            elif code == "provider_error" and unsafe_code == "invalid_request":
+                code = "protocol_error"
+            canonical, status, message = ADAPTER_FAILURES.get(
+                code, ("provider_error", 1, "接口验证未通过；未采用上游返回的非受信任错误内容，原配置未更改"))
+            failure = PoolError(canonical, message, status)
+            retry_after = detail.get("retry_after_ms", 0) if isinstance(detail, dict) else 0
+            failure.retry_after_ms = retry_after if type(retry_after) in (int, float) and 0 <= retry_after <= 86400000 else 0
+            raise failure
         return result
 
     def candidate(self, value, secret, identifier, file=None):
@@ -661,7 +730,7 @@ class Manager:
                     last = error
                     if error.code in ("authentication_failed", "safety_refusal"):
                         raise
-                    if not models or error.status != 4 or attempt == 2 or getattr(error, "upstream_code", "") == "quota_exhausted":
+                    if not models or error.status != 4 or attempt == 2 or error.code == "quota_exhausted":
                         break
                     delay = getattr(error, "retry_after_ms", 0)
                     if type(delay) not in (int, float) or delay < 0 or delay > 2000:

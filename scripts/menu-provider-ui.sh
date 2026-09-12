@@ -1,6 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+provider_error_message() {
+  case "${1:-provider_error}" in
+    authentication_failed) printf '%s\n' '接口鉴权失败：请核对本接口的地址、API Key 与模型调用权限。' ;;
+    model_unavailable|model_not_found) printf '%s\n' '所选模型或对应推理端点不可用：请核对模型原名、请求协议与接口地址。' ;;
+    protocol_error|protocol_mismatch|unsupported_protocol) printf '%s\n' '请求协议不匹配：请核对该接口应使用 Chat Completions 还是 Responses，以及 Base URL 路径。' ;;
+    invalid_response) printf '%s\n' '接口响应无效：上游返回了空正文、非 JSON 或不符合所选协议的结构。' ;;
+    rate_limited) printf '%s\n' '接口触发请求频率限制：请按服务端要求等待冷却，或核对独立授权的备用接口。' ;;
+    quota_exhausted) printf '%s\n' '接口额度或余额不足：不会立即重复请求同一授权范围，可补充额度或使用独立授权的备用接口。' ;;
+    upstream_timeout) printf '%s\n' '接口推理超时：请核对网络、模型响应时间与主备策略中的单次请求期限。' ;;
+    upstream_unavailable) printf '%s\n' '上游服务端返回故障：请核对服务状态与备用接口。' ;;
+    connection_failed) printf '%s\n' '应用环境连接接口失败：请核对 DNS、TLS、接口地址与容器网络。' ;;
+    temporarily_unavailable) printf '%s\n' '本地 Provider 适配器不可用：请运行状态与自检，确认容器和配置已应用。' ;;
+    models_unavailable) printf '%s\n' '接口没有提供可用模型列表：可以手动填写准确模型原名，再执行真实推理验证。' ;;
+    *) printf '%s\n' '接口失败原因未能分类：未显示上游原始内容，请运行状态与自检。' ;;
+  esac
+}
+
+provider_error_code_from_file() {
+  local file=$1 fallback=${2:-provider_error}
+  jq -M -r --arg fallback "$fallback" '
+    (.error.code // $fallback) as $code |
+    if $code == "authentication_failed" or $code == "model_unavailable" or $code == "model_not_found"
+      or $code == "protocol_error" or $code == "protocol_mismatch" or $code == "unsupported_protocol"
+      or $code == "invalid_response" or $code == "rate_limited" or $code == "quota_exhausted"
+      or $code == "upstream_timeout" or $code == "upstream_unavailable" or $code == "connection_failed"
+      or $code == "temporarily_unavailable" or $code == "models_unavailable"
+    then $code else $fallback end
+  ' "$file" 2>/dev/null || printf '%s\n' "$fallback"
+}
+
 provider_pool_read() {
   local action=${1:-list}
   manager_temporary || return 1
@@ -44,17 +74,31 @@ provider_candidate() {
 }
 
 provider_model_select() {
-  local candidate=$1 id=$2 models_file choice query='' page=0 total start request_status
+  local candidate=$1 id=$2 models_file choice query='' page=0 total start request_status error_code
   manager_temporary || return 1; models_file=$MANAGE_FILE
   while true; do
     if manager_tool provider models "$id" "$candidate" > "$models_file"; then break; else request_status=$?; fi
-    if (( request_status == 3 )); then warn '模型列表鉴权失败，请修正本次地址与密钥'; return 1; fi
-    if (( request_status == 4 )); then
+    case "$request_status" in
+      2) error_code=$(provider_error_code_from_file "$models_file" models_unavailable) ;;
+      3) error_code=$(provider_error_code_from_file "$models_file" authentication_failed) ;;
+      4) error_code=$(provider_error_code_from_file "$models_file" temporarily_unavailable) ;;
+      *) error_code=$(provider_error_code_from_file "$models_file" provider_error) ;;
+    esac
+    warn "$(provider_error_message "$error_code")"
+    if [[ "$error_code" == authentication_failed ]]; then return 1; fi
+    if [[ "$error_code" == rate_limited || "$error_code" == quota_exhausted \
+      || "$error_code" == upstream_timeout || "$error_code" == upstream_unavailable \
+      || "$error_code" == connection_failed || "$error_code" == temporarily_unavailable ]]; then
       menu_read choice '模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消：' || return 1
       case "$choice" in 1) continue ;; *) return 2 ;; esac
     fi
-    if (( request_status != 2 )); then warn '模型列表读取失败，未改动任何接口'; return 1; fi
-    printf '服务商未提供可用模型列表，可以手填准确模型名称。\n'
+    if [[ "$error_code" != models_unavailable && "$error_code" != model_unavailable \
+      && "$error_code" != protocol_error && "$error_code" != protocol_mismatch \
+      && "$error_code" != unsupported_protocol && "$error_code" != invalid_response ]]; then
+      warn '模型列表读取失败，未改动任何接口'
+      return 1
+    fi
+    printf '模型列表不能证明推理能力；可以手填准确模型原名，保存前仍会执行实际推理验证。\n'
     menu_read choice '手动模型原名（0 或回车取消）：' || return 1
     [[ -n "$choice" && "$choice" != 0 ]] || return 2
     jq -M --arg model "$choice" '.provider.model=$model' "$candidate" > "$candidate.new" || return 1

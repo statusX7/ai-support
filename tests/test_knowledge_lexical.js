@@ -233,6 +233,16 @@ test('L20 完整且锚定的礼貌范围说明可剥离为完整FAQ强命中，�
     assert.equal(result.results[0].metadata.docpath,f.documents[0].location);
   }
   assert.deepEqual(fs.readFileSync(f.indexPath),before);
+
+  // 现场事故使用“问题/回答”长标签，并在同一原问中列出两个同义问法。
+  // 公开回归使用虚构事实，但保留完全相同的格式与匹配形状。
+  const pairedQuestion='能寄存苍蓝行李箱吗？可以存放苍蓝行李箱吗？';
+  const pairedQa='问题：'+pairedQuestion+'\n回答：仅可寄存带有虚构蓝羽标记的行李箱。\n';
+  const paired=fixture('prefixed-paired-question',[pairedQa]); built(paired);
+  const pairedResult=paired.search('请根据现有知识库回答：'+pairedQuestion);
+  assert.equal(pairedResult.results.length,1);
+  assert.equal(pairedResult.results[0].lexical.kind,'exact_question');
+  assert.equal(pairedResult.results[0].text,pairedQa);
 });
 test('L21 范围说明、否定引用、复述改问、复合问题、短泛问及数字冲突不能绕过门槛',()=>{
   const f=fixture('prefix-negative',[qa,'问：可以吗？\n答：请先说明具体事项。\n',

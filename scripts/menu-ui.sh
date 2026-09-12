@@ -66,7 +66,7 @@ menu_cached_diagnostic() {
 }
 
 menu_render() {
-  local version=$1 deploy_dir=$2 enabled=$3 crisp=$4 libraries=$5
+  local version=$1 deploy_dir=$2 enabled=$3 crisp=$4 libraries=$5 services=${6:-未检测}
   local columns=${COLUMNS:-0} index title left right column_width
   if [[ ! "$columns" =~ ^[1-9][0-9]{1,3}$ ]]; then
     columns=80
@@ -75,7 +75,7 @@ menu_render() {
     fi
   fi
   [[ "$columns" =~ ^[1-9][0-9]{1,3}$ ]] || columns=80
-  printf '\nCrispAI %s\n自动客服：%s    Crisp：%s    知识库：%s\n' "$version" "$enabled" "$crisp" "$libraries"
+  printf '\nCrispAI %s\n自动客服：%s    本地服务：%s    Crisp：%s    知识库：%s\n' "$version" "$enabled" "$services" "$crisp" "$libraries"
   printf '部署目录：%s\n' "$deploy_dir"
   menu_cached_diagnostic "$deploy_dir"
   printf '\n'

@@ -107,7 +107,8 @@ SHELL_FILES=(
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
   tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
-  tests/test_caddy_routing.sh tests/test_logs.sh tests/test_doctor_pool.sh
+  tests/test_caddy_routing.sh tests/test_caddy_callers.sh tests/test_logs.sh tests/test_doctor_pool.sh
+  tests/test_provider_menu.sh
   tests/test_knowledge_profile_integration.sh
   tests/fixtures/doctor/curl tests/fixtures/doctor/docker tests/fixtures/doctor/df tests/fixtures/doctor/systemctl tests/mocks/chown tests/mocks/curl tests/mocks/docker tests/mocks/stat
   tests/mocks/curl_knowledge_timeout tests/mocks/systemctl
@@ -144,6 +145,9 @@ pass "组件自检、故障注入、只读与显式修复专项"
 
 "${SCRIPT_DIR}/test_logs.sh"
 pass "日志保留、轮转、脱敏、受管调度与清理边界专项"
+
+"${SCRIPT_DIR}/test_caddy_callers.sh"
+pass "Crisp 公网配置与备份恢复的 Caddy 事务调用专项"
 
 "${SCRIPT_DIR}/test_public_distribution.sh"
 pass "公共分发入口与文档契约专项"
@@ -272,6 +276,7 @@ if command -v node >/dev/null 2>&1; then
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_provider_pool.js"
   node "${SCRIPT_DIR}/test_runtime_provider_pool.js"
+  "${SCRIPT_DIR}/test_provider_menu.sh"
   pass "主备池生产协议与管理专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_feedback_runtime.js"
   pass "取消评价与历史出站恢复专项（内部子项单列，不重复计入总数）"
@@ -1329,6 +1334,7 @@ printf '%s\n' \
   'printf "legacy-backup-should-not-run\\n" >&2' \
   'exit 97' > "${DEPLOY_DIR}/scripts/backup.sh"
 chmod 0750 "${DEPLOY_DIR}/scripts/backup.sh"
+mkdir -m 0700 -- "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update.log" 2>&1
@@ -1336,6 +1342,11 @@ if grep -Fq 'legacy-backup-should-not-run' "${TEST_ROOT}/update.log"; then
   fail "升级错误调用了旧部署中的备份脚本"
 fi
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail "更新后版本错误"
+[[ ! -e "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock" \
+  && ! -L "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock" ]] \
+  || fail '升级未在 n8n 停写窗口迁移旧版无所有权扫描空锁'
+grep -Fq '已在 n8n 停写窗口迁移旧版会话扫描空锁' "${TEST_ROOT}/update.log" \
+  || fail '升级未报告旧版扫描锁迁移结果'
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
 jq -e '
   .handoff.disable_ai == true and .handoff.notify_user.enabled == true and

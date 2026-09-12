@@ -75,9 +75,13 @@ crispai doctor --local
 
 `config/provider-pool.yaml` 是 `schema_version: 1` 的非秘密权威源。`config/provider-pool-applied.json` 是运行有效投影；受管程序先写齐新的秘密代次，再原子发布投影。秘密位于 `secrets/provider/generations`，文件 `root:1000 0640`、目录 `0750`；只有 adapter 容器挂载该秘密目录。接口地址和模型名虽不属于 Key，也可能识别私人网关，不能随意公开整个池。
 
-旧单接口安装升级时建立主接口，保留原地址、Key、模型、协议和自定义头。`.env` 的 `AI_*` 与 `config/provider.yaml` 此后只是主接口兼容投影，不是第二个可写权威源；不要同时编辑它们和池源。`AI_API_PROBE_BASE_URL` 与容器地址投影仍保留代理前缀及受管本机网关转换，不重复追加 `/v1`。
+旧单接口安装升级时建立主接口，保留原地址、Key、模型、协议和自定义头。`.env` 的 `AI_*` 与 `config/provider.yaml` 此后只是主接口兼容投影，不是第二个可写权威源；不要同时编辑它们和池源。Base URL 在向导、池校验和实际路由使用同一规则：去掉末尾斜线后，路径尚未以 `/v1` 结尾才追加一次；因此 `/api` 变为 `/api/v1`，已有 `/api/v1` 不变，其他代理前缀也保留。`AI_API_PROBE_BASE_URL` 保存宿主验证地址，容器投影只把受管本机 loopback 转为 `host.docker.internal`，不会丢前缀或形成 `/v1/v1`。
 
-Key 和请求头值通过菜单隐藏输入保存；请求头名称可见，值不进入非秘密池源。禁止 Authorization、Host、Content-Length、Cookie、内部问题信封等受管头和控制字符。空 Key 输入保留已有值，新增接口必须补齐凭据。选择 `chat_completions` 或 `responses` 后须验证有效正文，HTTP 200、模型列表或手填模型 ID 都不等于推理可用。
+Key 和请求头值通过菜单隐藏输入保存；请求头名称可见，值不进入非秘密池源。禁止 Authorization、Host、Content-Length、Cookie、内部问题信封等受管头和控制字符。空 Key 输入保留已有值，新增接口必须补齐凭据。选择 `chat_completions` 或 `responses` 后，实际 adapter 分别在规范化基址后请求 `/chat/completions` 或 `/responses` 并验证有效正文；模型列表使用同一接口自己的 `/models`。HTTP 200、模型列表或手填模型 ID 都不等于推理可用。
+
+菜单编辑始终在受限候选中完成。保存时先校验整池角色、数量、地址、模型、协议与秘密引用，再用候选自己的 Key 做所选协议验证；通过后先落盘新的秘密代次和兼容投影，再原子发布有效池，最后要求运行 adapter 回读相同 revision。应用或回读失败会恢复上一有效整组并增加代次，使旧请求继续失效；旧地址和新 Key 不会被拼成混合配置。涉及知识预处理窗口的修改另有受管事务，恢复未确认时保持推理保护，不能手删事务文件伪造成功。
+
+交互层只接受 adapter 的固定安全分类，不采用上游返回的任意 message、URL 或 Header：`authentication_failed`、`model_unavailable`、`protocol_error`、`invalid_response`、`rate_limited`、`quota_exhausted`、`upstream_timeout`、`upstream_unavailable`、`connection_failed`、`temporarily_unavailable`。前九类分别表示鉴权、模型/端点、协议、响应结构、频率、额度、超时、上游服务端和连接问题；最后一类表示本地 adapter 当前不可用。模型列表端点缺失另记为 `models_unavailable`，允许手填但仍须实际推理验证。未知上游代码收敛为不含原文的通用失败，避免把凭据或私有地址带进菜单和日志。
 
 主菜单 `3` 的 11 项依次为：列表、主配置、添加备、编辑接口或模型、备用排序、备用启停、设主、删除备、指定接口测试、切换策略、近期记录；精确数字流程见 [菜单 3](MENU.md)。十项安装仅配置主接口，不要求 20 套真实 Key。列表、状态、空闲运行和默认 doctor 不会轮询所有上游付费；编辑验证、启用验证、切主验证及显式测试可能发少量合成请求。
 
@@ -180,6 +184,12 @@ v1.2.1 不再发送任何程序自动评价邀请：不追加“是否解决”�
 Token tier 与 Hook mode 分开；Website URL Secret、Plugin Signing Secret、Crisp API Key互不替用。`.env` 中 PUBLIC_WEBHOOK_URL 为 base，WEBHOOK_PRODUCTION_URL 为最终生产路由。受管 HTTPS/已有反代仅公开 Hook 与无秘密 SDK/UI 配置，详见 [CRISP](CRISP.md)。
 
 安装 marker 保存单一分层 facts；runtime 收件/往返观察绑定当前凭据与 Hook，不能拿旧账户记录或协议模拟端点变成真实 Crisp 通过。菜单 10→12 读取观察，doctor 合并实际结果。收到 Hook、REST 可用、公网可达、真实回答成功是不同检查。
+
+`WEBHOOK_ACCESS_MODE=managed_https` 时，程序把 `config/Caddyfile` 作为受管候选，但不会直接假设宿主文件已经被容器采用。安装、Crisp 公网配置修改、恢复及服务启动/重启会先检查候选是单链接普通文件且不可由组/其他用户写，再用本项目固定 Caddy 镜像执行 `caddy validate`。运行后会在容器内同时核对实际 `/etc/caddy/Caddyfile` 摘要和容器创建时取得的 `WEBHOOK_DOMAIN`，只返回固定的匹配结果而不输出真实域名；文件 inode 未刷新或 `.env` 域名已变而旧容器仍使用旧值时，都会只强制重建本实例 Caddy。
+
+每次成功运行对账后保存 `config/Caddyfile.last-good`。候选无法启动、摘要不一致或域名代次不一致时，程序尝试恢复最近验证代并再次对账，但调用方仍得到失败，不能把回滚成功写成本次候选成功。Crisp 设置应用会连同旧 `.env`、Caddyfile、两份受管代理片段和运行模式恢复；完整恢复在停服务和覆盖资料前验证备份中的受管 Caddy，恢复后再对账。
+
+从 `managed_https` 切到 `external_proxy` 时，程序先在独立目录生成并校验候选 `.env` 与 Nginx/Caddy 代理片段，再以可回滚方式提交整组文件，最后才停止和移除本项目受管 Caddy。任一环境文件、片段提交或停止/移除动作失败，都会恢复原文件和原运行代；首次安装只准备候选，不会由该配置步骤提前启动长期运行的 Caddy。切换不改管理员的外部 Nginx/Caddy；切回 `managed_https` 才重新校验并由后续安装/服务流程启动。服务菜单的停止动作不执行会重新拉起 Caddy 的对账。
 
 ## 8. 导出、升级和恢复
 

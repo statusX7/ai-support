@@ -311,6 +311,25 @@ function createRuntime(env = {}, options = {}) {
     for (const field of ['ai', 'outcome', 'sources', 'welcome', 'welcome_menu']) delete result[field];
     return result;
   };
+  const administratorFailurePlan = (job, code) => safeErrorPlan(job,
+    options.allowAdmin === true && job.administrator === true ? { diagnostic_code: code } : {});
+  const providerDiagnosticCode = (response, error) => {
+    const allowed = new Set(['authentication_failed', 'rate_limited', 'quota_exhausted', 'model_unavailable',
+      'upstream_timeout', 'upstream_unavailable', 'connection_failed', 'invalid_response', 'invalid_input',
+      'context_preparation_incomplete', 'configuration_applying', 'pool_cooling', 'pool_exhausted',
+      'no_capable_provider', 'question_budget_exhausted', 'question_cancelled', 'safety_refusal', 'protocol_error']);
+    const upstream = String(response?.body?.error?.code || '');
+    if (allowed.has(upstream)) return upstream;
+    const status = Number(response?.status || 0);
+    if (status === 401 || status === 403) return 'authentication_failed';
+    if (status === 429) return 'rate_limited';
+    if (status === 404) return 'model_unavailable';
+    if (status >= 500) return 'upstream_unavailable';
+    if (error?.message === '请求超时' || error?.name === 'AbortError') return 'upstream_timeout';
+    if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPROTO',
+      'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT'].includes(error?.code)) return 'connection_failed';
+    return 'invalid_response';
+  };
   const normalizeSafeErrors = (state) => {
     for (const job of state.jobs || []) {
       if (job.plan?.purpose !== 'safe_error' || ['done', 'cancelled', 'failed'].includes(job.status)) continue;
@@ -403,6 +422,41 @@ function createRuntime(env = {}, options = {}) {
     }
   };
   const stateKey = (website, session) => hash(website + '\0' + session);
+  // 网络发送不占用会话状态锁。逐会话登记尚未完成的普通出站，使真人接管
+  // 在状态提交后可以立即中止仍挂起的 HTTP 请求；控制通知不受此机制影响。
+  const outboundRequests = new Map();
+  const beginOutbound = (key, job) => {
+    const entry = { token: crypto.randomBytes(16).toString('hex'), controller: new AbortController() };
+    const entries = outboundRequests.get(key) || new Set();
+    entries.add(entry);
+    outboundRequests.set(key, entries);
+    // n8n 的接收 Hook 与任务发送可能位于不同 Code 执行实例；内存 abort 仅是
+    // 快速路径，持久 generation/mode 才是跨实例权威 fence。
+    entry.timer = setInterval(() => {
+      if (entry.controller.signal.aborted) return;
+      try {
+        const state = readState(key);
+        const global = settings();
+        if (!global.enabled || global.revision !== job.revision || state.generation !== job.generation
+          || state.mode !== 'ai' || state.uncertain_events.length || !providerGenerationCurrent(job)) entry.controller.abort();
+      } catch (_) { entry.controller.abort(); }
+    }, 100);
+    if (typeof entry.timer.unref === 'function') entry.timer.unref();
+    return entry;
+  };
+  const finishOutbound = (key, entry) => {
+    if (!entry) return;
+    clearInterval(entry.timer);
+    const entries = outboundRequests.get(key);
+    if (!entries) return;
+    entries.delete(entry);
+    if (!entries.size) outboundRequests.delete(key);
+  };
+  const cancelOutbound = (key) => {
+    for (const entry of outboundRequests.get(key) || []) {
+      if (!entry.controller.signal.aborted) entry.controller.abort();
+    }
+  };
   const statePath = (key) => {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('会话标识无效');
     return directory + '/session-' + key + '.json';
@@ -557,10 +611,13 @@ function createRuntime(env = {}, options = {}) {
     if (!locked) throw new Error('会话状态忙，请重试');
     try {
       const state = expire(readState(key, website, session));
+      const previousMode = state.mode;
+      const previousGeneration = state.generation;
       const result = mutate(state);
       if (result && typeof result.then === 'function') throw new Error('状态事务不能等待网络');
       state.updated_at = clock();
       atomic(file, state);
+      if (state.mode === 'human' && (previousMode !== 'human' || state.generation !== previousGeneration)) cancelOutbound(key);
       return result;
     } finally { fs.rmdirSync(lock); }
   };
@@ -609,6 +666,13 @@ function createRuntime(env = {}, options = {}) {
     let parsed;
     try { parsed = new URL(url); } catch (_) { reject(new Error('请求地址无效')); return; }
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) { reject(new Error('请求地址不安全')); return; }
+    const cancelled = () => {
+      const error = new Error('请求已取消');
+      error.name = 'AbortError';
+      error.code = 'ABORT_ERR';
+      return error;
+    };
+    if (request.signal?.aborted) { reject(cancelled()); return; }
     const transport = parsed.protocol === 'https:' ? https : http;
     const body = request.body === undefined ? null : Buffer.from(JSON.stringify(request.body));
     const headers = { ...(request.headers || {}) };
@@ -632,18 +696,24 @@ function createRuntime(env = {}, options = {}) {
         }
       });
     });
+    const abort = () => client.destroy(cancelled());
+    request.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => client.destroy(new Error('请求超时')), request.timeout || 10000);
-    client.on('close', () => clearTimeout(timer));
+    client.on('close', () => {
+      clearTimeout(timer);
+      request.signal?.removeEventListener('abort', abort);
+    });
     client.on('error', reject);
     if (body) client.write(body);
     client.end();
   }));
-  const crisp = async (state, suffix, method = 'GET', body) => {
+  const crisp = async (state, suffix, method = 'GET', body, requestOptions = {}) => {
     const base = String(env.CRISP_API_BASE_URL || 'https://api.crisp.chat/v1').replace(/\/+$/, '');
     const url = base + '/website/' + encodeURIComponent(state.website_id) + '/conversation/' + encodeURIComponent(state.session_id) + suffix;
     const tier = env.CRISP_TOKEN_TIER || 'website';
     if (!['website', 'plugin'].includes(tier) || !env.CRISP_AUTH_B64 || /[\r\n]/.test(env.CRISP_AUTH_B64)) throw new Error('Crisp 认证配置无效');
-    const response = await network(url, { method, body, timeout: 7000, headers: { Authorization: 'Basic ' + String(env.CRISP_AUTH_B64), 'X-Crisp-Tier': tier } });
+    const response = await network(url, { method, body, timeout: 7000, signal: requestOptions.signal,
+      headers: { Authorization: 'Basic ' + String(env.CRISP_AUTH_B64), 'X-Crisp-Tier': tier } });
     if (response.status < 200 || response.status >= 300 || !response.body || response.body.error !== false) {
       const error = new Error('Crisp 请求失败（' + response.status + '）');
       if (Number.isInteger(response.status)) error.crispStatus = response.status;
@@ -1041,11 +1111,11 @@ function createRuntime(env = {}, options = {}) {
     };
     if (!await current()) return null;
     const policy = handoff();
-    const fail = () => safeErrorPlan(job);
+    const fail = (code = 'provider_inference_failed') => administratorFailurePlan(job, code);
     const base = String(env.ANYTHINGLLM_INTERNAL_URL || 'http://anythingllm:3001').replace(/\/+$/, '');
     let prepared, temperature;
     try {
-      if (!inferenceRemaining(job)) return fail();
+      if (!inferenceRemaining(job)) return fail('question_budget_exhausted');
       const workspaceSlug = String(env.ANYTHINGLLM_WORKSPACE || 'crisp-support');
       const workspaceUrl = base + '/api/v1/workspace/' + encodeURIComponent(workspaceSlug);
       const authorization = { Authorization: 'Bearer ' + String(env.ANYTHINGLLM_API_KEY || '') };
@@ -1107,7 +1177,7 @@ function createRuntime(env = {}, options = {}) {
     } catch (error) {
       const reason = ['retrieval_error', 'retrieval_invalid', 'source_unmapped', 'source_ambiguous', 'context_invalid'].includes(error?.code) ? error.code : 'retrieval_unavailable';
       if (!administrator) appendEvent('retrieval_failed', { reason });
-      return fail();
+      return fail(reason);
     }
     const sources = prepared.sources;
     const outcome = sources.length ? 'knowledge_hit' : 'knowledge_miss';
@@ -1119,7 +1189,7 @@ function createRuntime(env = {}, options = {}) {
     if (miss) return plan(defaultClarification(policy.no_answer_message, ['知识库暂时没有足够信息，请换一种方式描述问题。', '目前知识还不足以确认，请补充您遇到的具体情况。']));
     try {
       if (!await current()) return null;
-      if (!inferenceRemaining(job)) return fail();
+      if (!inferenceRemaining(job)) return fail('question_budget_exhausted');
       const pool = providerPool();
       const selected = provider();
       const providerBase = String(pool ? env.PROVIDER_ADAPTER_URL || 'http://provider-adapter:8787/v1' : selected.base_url || env.AI_API_BASE_URL || '').replace(/\/+$/, '');
@@ -1139,30 +1209,46 @@ function createRuntime(env = {}, options = {}) {
       });
       if (!await current()) return null;
       const payload = response.body;
-      if (response.status < 200 || response.status >= 300 || !payload || payload.error || ['failed', 'queued', 'in_progress', 'cancelled'].includes(payload.status)) return fail();
+      if (response.status < 200 || response.status >= 300 || !payload || payload.error || ['failed', 'queued', 'in_progress', 'cancelled'].includes(payload.status)) {
+        return fail(providerDiagnosticCode(response));
+      }
       const choice = payload.choices?.[0];
       const parts = Array.isArray(payload.output) ? payload.output.flatMap((entry) => Array.isArray(entry.content) ? entry.content : []) : [];
       const refusal = choice?.message?.refusal || parts.filter((part) => part.type === 'refusal').map((part) => part.refusal || '').join('\n');
       const answer = choice?.message?.content || payload.output_text || parts.filter((part) => part.type === 'output_text').map((part) => part.text || '').join('\n') || refusal;
-      if (typeof answer !== 'string' || !answer.trim() || legacyFailureMessages.includes(answer.trim())) return fail();
+      if (typeof answer !== 'string' || !answer.trim() || legacyFailureMessages.includes(answer.trim())) return fail('invalid_response');
       if (low && !refusal) return plan(defaultClarification(policy.low_confidence_message, ['当前答案可信度不足，请补充更多问题细节。', '现有资料还不足以确定答案，请补充更多细节。']));
       return plan(answer.trim());
-    } catch (_) { return fail(); }
+    } catch (error) { return fail(providerDiagnosticCode(null, error)); }
   };
   const administratorQuery = async (question, budgetMs = 0) => {
     // 仅本机受控 CLI 显式启用；Webhook 的 runtime 从不启用此选项，也不创建客户任务。
     if (options.allowAdmin !== true || typeof question !== 'string' || !question.trim() || question.includes('\0') || Buffer.byteLength(question) > 8000
       || !Number.isSafeInteger(budgetMs) || budgetMs < 0 || budgetMs > 180000) throw new Error('管理员测试输入或授权无效');
     const applied = appliedMaterials();
-    if (applied === null || !knowledgeRuntimeReady(applied)) throw new Error('知识问答测试未完成；请检查当前检索、接口或配置应用状态');
-    const pool = providerPool();
+    if (applied === null || !knowledgeRuntimeReady(applied)) {
+      const error = new Error('知识问答测试所需资料尚未完成应用');
+      error.code = 'materials_not_ready';
+      throw error;
+    }
+    let pool;
+    try { pool = providerPool(); }
+    catch (_) {
+      const error = new Error('接口池配置尚未正确应用');
+      error.code = 'provider_configuration_invalid';
+      throw error;
+    }
     const revision = settings().revision;
     const prompt = applied.prompt.text;
     const maximum = pool?.policy.question_timeout_ms ?? 90000;
     const job = {id: crypto.randomBytes(32).toString('hex'), administrator: true, revision, data: {type: 'text'},
       inference: {pool_revision: pool?.revision ?? null, deadline_at: clock() + Math.min(budgetMs || maximum, maximum)}};
     const plan = await queryKnowledge('', job, question, '', [], 'admin_query', prompt);
-    if (!plan || plan.purpose === 'safe_error') throw new Error('知识问答测试未完成；请检查当前检索、接口或配置应用状态');
+    if (!plan || plan.purpose === 'safe_error') {
+      const error = new Error('知识问答测试未完成');
+      error.code = plan?.diagnostic_code || (!plan ? 'state_changed' : 'provider_inference_failed');
+      throw error;
+    }
     return {answer: plan.content, sources: plan.sources, verified: true, retrieval_state: plan.outcome};
   };
   const actionPlan = async (key, job, action) => {
@@ -1246,19 +1332,26 @@ function createRuntime(env = {}, options = {}) {
       await crisp(state, '/meta', 'PATCH', { segments: [...new Set([...existing, ...additions])] });
     } catch (_) { appendEvent('tag_failed'); }
   };
-  const rememberSent = async (key, job, plan, fingerprint) => transaction(key, (state) => {
+  const rememberSent = async (key, job, plan, fingerprint, attemptToken = '') => transaction(key, (state) => {
     const record = state.outgoing[String(fingerprint)];
-    if (!record || record.status === 'sent') return;
+    if (!record || attemptToken && record.attempt_token !== attemptToken) return { recorded: false, current: false };
+    const global = settings();
+    const current = global.enabled && global.revision === job.revision && state.generation === job.generation
+      && (plan.ordinary === false || state.mode === 'ai') && state.uncertain_events.length === 0 && providerGenerationCurrent(job);
+    if (record.status === 'sent') return { recorded: true, current };
     record.status = 'sent';
     record.sent_at = clock();
+    if (!current) record.state_changed_before_receipt = true;
     delete record.body;
-    if (record.feedback_retired || job.feedback_retired || feedbackOnly(job) || feedbackOnly(plan)) return;
+    if (record.feedback_retired || job.feedback_retired || feedbackOnly(job) || feedbackOnly(plan)) return { recorded: true, current };
     if (plan.welcome) state.welcome_sent = true;
-    if (plan.ai) {
+    if (!current) appendEvent('delivery_after_state_change');
+    else if (plan.ai) {
       appendEvent('ai_reply');
       if (state.observations?.binding !== connectionBinding()) state.observations = { binding: connectionBinding() };
       state.observations.ai_reply_sent_at = clock();
     }
+    return { recorded: true, current };
   });
   const send = async (key, job, plan) => {
     if (plan?.purpose === 'safe_error') plan = safeErrorPlan(job, plan);
@@ -1273,8 +1366,8 @@ function createRuntime(env = {}, options = {}) {
       let history;
       try { history = await messagesFor(state); } catch (_) { return 'retry'; }
       if (history.some((message) => String(message.fingerprint) === String(fingerprint))) {
-        await rememberSent(key, job, plan, fingerprint);
-        return retired ? 'cancelled' : 'sent';
+        const receipt = await rememberSent(key, job, plan, fingerprint, outgoing.attempt_token || '');
+        return retired ? 'cancelled' : receipt.current ? 'sent' : 'dispatched_after_cancel';
       }
       if (clock() - outgoing.created_at < 10000) return 'retry';
       if (retired || clock() - job.received_at > 300000) {
@@ -1302,25 +1395,59 @@ function createRuntime(env = {}, options = {}) {
     // 不伪造真人账号，也不依赖昵称或可见标签判断是否为本项目出站。
     const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, user: { type: 'website', nickname: '在线客服' } };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
-    const registered = await transaction(key, (current) => {
-      const global = settings();
-      if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai' || !providerGenerationCurrent(job)) return false;
-      registerOwnedMessage(current, fingerprint);
-      const previous = current.outgoing[String(fingerprint)];
-      current.outgoing[String(fingerprint)] = { status: 'sending', body, created_at: previous?.created_at || clock(), attempts: (previous?.attempts || 0) + 1, job_id: job.id, generation: current.generation };
-      return true;
-    });
-    if (!registered) return 'cancelled';
+    const outbound = plan.ordinary !== false ? beginOutbound(key, job) : null;
+    const attemptToken = outbound?.token || crypto.randomBytes(16).toString('hex');
     try {
-      const result = await crisp(state, '/message', 'POST', body);
+      const registered = await transaction(key, (current) => {
+        const global = settings();
+        if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai' || !providerGenerationCurrent(job)) return false;
+        registerOwnedMessage(current, fingerprint);
+        const previous = current.outgoing[String(fingerprint)];
+        current.outgoing[String(fingerprint)] = { status: 'sending', body, created_at: previous?.created_at || clock(), attempts: (previous?.attempts || 0) + 1, job_id: job.id, generation: current.generation, attempt_token: attemptToken };
+        return true;
+      });
+      if (!registered || outbound?.controller.signal.aborted) {
+        if (registered) await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (record?.status === 'sending' && record.attempt_token === attemptToken) { record.status = 'cancelled'; record.cancelled_at = clock(); delete record.body; }
+        });
+        return 'cancelled';
+      }
+      // 登记出站后再次核对，再把字节交给 HTTP 层；之后的真人事件通过 signal
+      // 中止仍挂起的请求。远端若已收到字节，最终回执仍会如实标记。
+      if (plan.ordinary !== false && !await active(key, job)) {
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (record?.status === 'sending' && record.attempt_token === attemptToken) { record.status = 'cancelled'; record.cancelled_at = clock(); delete record.body; }
+        });
+        return 'cancelled';
+      }
+      const result = await crisp(state, '/message', 'POST', body, { signal: outbound?.controller.signal });
       if (result.reason !== 'dispatched' || result.data?.fingerprint !== undefined && String(result.data.fingerprint) !== String(fingerprint)) throw new Error('发送未获得确定回执');
-      await rememberSent(key, job, plan, fingerprint);
-      return 'sent';
+      const receipt = await rememberSent(key, job, plan, fingerprint, attemptToken);
+      if (!receipt.recorded) appendEvent('delivery_after_state_change', { reason: 'attempt_superseded' });
+      return receipt.current ? 'sent' : 'dispatched_after_cancel';
     } catch (error) {
+      if (outbound?.controller.signal.aborted) {
+        // abort 发生前 HTTP 层可能已经写出部分字节；保留未知回执供指纹对账，
+        // 但人工状态已取消该任务，绝不再次推理或补发。
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (record?.status === 'sending' && record.attempt_token === attemptToken) {
+            record.status = 'cancelled';
+            record.cancelled_at = clock();
+            record.cancellation_reason = 'conversation_state_changed';
+            record.delivery_uncertain = true;
+            delete record.body;
+          }
+        });
+        return 'cancelled';
+      }
       // 明确的请求/权限拒绝不是“发送结果未知”，不再对同一坏正文重试或反复调用模型。
       const rejected = [400, 401, 403, 404, 405, 410, 413, 415, 422].includes(error.crispStatus);
       await transaction(key, (current) => {
         const record = current.outgoing[String(fingerprint)];
+        if (!record || record.attempt_token !== attemptToken) return;
         record.status = rejected ? 'failed' : 'unknown';
         if (rejected) { record.failure = 'crisp_http_' + error.crispStatus; delete record.body; }
       });
@@ -1329,7 +1456,7 @@ function createRuntime(env = {}, options = {}) {
         return 'failed';
       }
       return 'retry';
-    }
+    } finally { finishOutbound(key, outbound); }
   };
   const process = async (key, requestedId = '') => {
     let job;
@@ -1375,8 +1502,8 @@ function createRuntime(env = {}, options = {}) {
         const stored = state.jobs.find((entry) => entry.id === job.id);
         if (stored) {
           stored.lease_until = 0;
-          stored.status = delivery === 'retry' && stored.attempts < 4 ? 'received' : delivery === 'retry' || delivery === 'failed' ? 'failed' : delivery === 'cancelled' ? 'cancelled' : 'done';
-          stored.retry_at = delivery === 'retry' ? clock() + 5000 : null;
+          if (stored.status !== 'cancelled') stored.status = delivery === 'retry' && stored.attempts < 4 ? 'received' : delivery === 'retry' || delivery === 'failed' ? 'failed' : delivery === 'cancelled' ? 'cancelled' : 'done';
+          stored.retry_at = stored.status === 'received' ? clock() + 5000 : null;
           if (['done', 'cancelled', 'failed'].includes(stored.status)) { delete stored.data; delete stored.plan; }
         }
         if (state.worker?.token === token) state.worker = null;
@@ -1390,7 +1517,7 @@ function createRuntime(env = {}, options = {}) {
       if (job) {
         try { await transaction(key, (state) => {
           const stored = state.jobs.find((entry) => entry.id === job.id);
-          if (stored) { stored.status = stored.attempts >= 3 ? 'failed' : 'received'; stored.retry_at = clock() + 5000; stored.lease_until = 0; }
+          if (stored && stored.status !== 'cancelled') { stored.status = stored.attempts >= 3 ? 'failed' : 'received'; stored.retry_at = clock() + 5000; stored.lease_until = 0; }
           if (state.worker?.token === token) state.worker = null;
         }); } catch (_) {}
       }
@@ -1409,25 +1536,182 @@ function createRuntime(env = {}, options = {}) {
     }
     return result;
   };
+  const safeErrorNeedsNormalization = (state, job) => {
+    if (job?.plan?.purpose !== 'safe_error' || ['done', 'cancelled', 'failed'].includes(job.status)) return false;
+    const expected = safeErrorPlan(job, job.plan);
+    if (job.plan.type !== expected.type || job.plan.ordinary !== expected.ordinary
+      || job.plan.safe_error_context !== expected.safe_error_context || job.plan.content !== expected.content
+      || JSON.stringify(job.plan.tags) !== JSON.stringify(expected.tags)) return true;
+    return Object.entries(state.outgoing || {}).some(([fingerprint, record]) => {
+      if (!record || ['unknown', 'sending', 'sent', 'cancelled', 'failed'].includes(record.status) || !record.body) return false;
+      if (record.job_id !== job.id && (!job.plan.fingerprint || String(job.plan.fingerprint) !== fingerprint)) return false;
+      return record.body.type !== expected.type || record.body.content !== expected.content;
+    });
+  };
+  const scanNeedsTransaction = (state, at) => {
+    if (!state || state.schema_version !== 2 || !Array.isArray(state.jobs)
+      || !state.offers || typeof state.offers !== 'object' || Array.isArray(state.offers)
+      || !state.outgoing || typeof state.outgoing !== 'object' || Array.isArray(state.outgoing)) return true;
+    if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= at) return true;
+    if (state.pending_feedback !== null && state.pending_feedback !== undefined) return true;
+    if (Object.values(state.offers).some((offer) => feedbackOnly(offer)
+      || Number.isFinite(offer?.expires_at) && offer.expires_at < at - 86400000)) return true;
+    if (state.jobs.some((job) => {
+      if (!job || typeof job !== 'object') return true;
+      if ((feedbackOnly(job) || feedbackOnly(job.plan) || feedbackOnly(job.choice_action))
+        && job.feedback_retired !== true) return true;
+      if (safeErrorNeedsNormalization(state, job)) return true;
+      if (job.status === 'processing' && !(job.lease_until > at)) return true;
+      if (job.status === 'received' && !(job.retry_at > at)) return true;
+      return ['done', 'cancelled', 'failed'].includes(job.status) && !(job.received_at > at - 604800000);
+    })) return true;
+    if (Object.values(state.outgoing).some((record) => record && record.feedback_retired !== true
+      && feedbackOnly(record) && !['sent', 'cancelled', 'failed'].includes(record.status))) return true;
+    if (Object.values(state.outgoing).some((record) => record && ['sent', 'cancelled', 'failed'].includes(record.status)
+      && !(record.created_at > at - 604800000))) return true;
+    if (Array.isArray(state.image_context) && state.image_context.some((entry) => !entry
+      || !(entry.created_at > at - 86400000 && entry.created_at <= at + 60000))) return true;
+    return false;
+  };
+  const processIdentity = (pid = 'self') => {
+    try {
+      const value = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+      const end = value.lastIndexOf(') ');
+      if (end < 1) return null;
+      const actualPid = Number(value.slice(0, value.indexOf(' ')));
+      const fields = value.slice(end + 2).trim().split(/\s+/);
+      const started = fields[19];
+      return Number.isSafeInteger(actualPid) && actualPid > 0 && /^[0-9]+$/.test(started || '')
+        ? { pid: actualPid, process_start: started } : null;
+    } catch (error) { return error.code === 'ENOENT' ? { dead: true } : null; }
+  };
+  const bootIdentity = () => {
+    try {
+      const value = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim().toLowerCase();
+      return /^[a-f0-9-]{16,64}$/.test(value) ? value : '';
+    } catch (_) { return ''; }
+  };
+  const readScanOwner = (lock) => {
+    let value;
+    try { value = safeRead(lock + '/owner.json', null, 4096); }
+    catch (_) { return null; }
+    return value?.schema_version === 1 && /^[a-f0-9]{32}$/.test(value.token || '')
+      && Number.isSafeInteger(value.pid) && value.pid > 0 && /^[a-f0-9-]{16,64}$/.test(value.boot_id || '')
+      && /^[0-9]+$/.test(value.process_start || '') && Number.isFinite(value.started_at)
+      && Number.isFinite(value.heartbeat_at) ? value : null;
+  };
+  const writeScanOwner = (lock, owner) => {
+    const file = lock + '/owner.json';
+    const temporary = lock + '/.owner-' + owner.token;
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(temporary, file);
+    } finally { try { fs.unlinkSync(temporary); } catch (_) {} }
+  };
+  const scanLockContainsOnlyOwner = (lock) => {
+    try {
+      const directoryStat = fs.lstatSync(lock);
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0) return false;
+      const names = fs.readdirSync(lock);
+      if (names.length !== 1 || names[0] !== 'owner.json') return false;
+      const ownerStat = fs.lstatSync(lock + '/owner.json');
+      return ownerStat.isFile() && !ownerStat.isSymbolicLink() && ownerStat.nlink === 1
+        && (ownerStat.mode & 0o077) === 0;
+    } catch (_) { return false; }
+  };
+  const removeOwnedScanLock = (lock, token) => {
+    if (!scanLockContainsOnlyOwner(lock)) return false;
+    const owner = readScanOwner(lock);
+    if (!owner || owner.token !== token) return false;
+    try { fs.unlinkSync(lock + '/owner.json'); } catch (_) { return false; }
+    try { fs.rmdirSync(lock); return true; } catch (_) { return false; }
+  };
+  const acquireScanLock = (lock) => {
+    const identity = processIdentity();
+    const bootId = bootIdentity();
+    if (!identity || !bootId) throw new Error('无法建立调度锁进程身份');
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const token = crypto.randomBytes(16).toString('hex');
+      const at = Date.now();
+      const owner = { schema_version: 1, token, pid: identity.pid, boot_id: bootId,
+        process_start: identity.process_start, started_at: at, heartbeat_at: at };
+      try {
+        fs.mkdirSync(lock, { mode: 0o700 });
+        try { writeScanOwner(lock, owner); }
+        catch (error) { try { fs.rmdirSync(lock); } catch (_) {} throw error; }
+        return owner;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+      let stat;
+      try { stat = fs.lstatSync(lock); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('扫描锁不安全');
+      const existing = readScanOwner(lock);
+      // 缺少或损坏的旧锁不能仅凭 mtime 自动删除；由自检明确提示后人工修复。
+      // 即使 owner 有效，目录中存在额外成员、链接或宽松权限也必须原位退让，
+      // 不能先改名后留下隔离残骸并在原路径并发启动第二个扫描器。
+      if (!existing || !scanLockContainsOnlyOwner(lock) || Date.now() - existing.heartbeat_at <= 60000) return null;
+      const sameBoot = existing.boot_id === bootId;
+      const running = sameBoot ? processIdentity(existing.pid) : null;
+      if (sameBoot && (!running || !running.dead && running.process_start === existing.process_start)) return null;
+      const quarantine = lock + '.stale-' + token;
+      try { fs.renameSync(lock, quarantine); } catch (error) {
+        if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) continue;
+        throw error;
+      }
+      if (!removeOwnedScanLock(quarantine, existing.token)) {
+        try { fs.renameSync(quarantine, lock); } catch (_) {}
+        return null;
+      }
+    }
+    return null;
+  };
+  const refreshScanLock = (lock, owner) => {
+    const current = readScanOwner(lock);
+    if (!current || current.token !== owner.token || current.pid !== owner.pid
+      || current.boot_id !== owner.boot_id || current.process_start !== owner.process_start) return false;
+    owner.heartbeat_at = Date.now();
+    writeScanOwner(lock, owner);
+    return true;
+  };
   const scan = async () => {
     ensureDirectory();
     const healthPath = directory + '/scheduler-health.json';
+    const scanLock = directory + '/scheduler-scan.lock';
     const previousHealth = safeRead(healthPath, {});
+    // 重叠执行只允许一个扫描器进入；历史会话的纯读取不会再触发逐文件 fsync，
+    // 因此排队的调度执行也能快速排空而不会饿死 Webhook Code runner。
+    const owner = acquireScanLock(scanLock);
+    if (!owner) return [];
     const startedAt = clock();
-    atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0 });
-    pruneAnalytics();
-    const sessions = await list();
-    const jobs = [];
-    for (const session of sessions) {
-      await transaction(session.key, (state) => {
-        for (const job of state.jobs) {
-          if (job.status === 'processing' && job.lease_until <= clock()) { job.status = 'received'; job.lease_until = 0; }
-          if (job.status === 'received' && (!job.retry_at || job.retry_at <= clock())) jobs.push({ key: session.key, jobId: job.id, control: job.control });
-        }
-      });
+    const heartbeat = setInterval(() => { try { refreshScanLock(scanLock, owner); } catch (_) {} }, 10000);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+    try {
+      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0 });
+      pruneAnalytics();
+      if (!refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
+      const jobs = [];
+      const filenames = fs.readdirSync(directory).filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name));
+      for (let index = 0; index < filenames.length; index += 1) {
+        if (index % 32 === 0 && !refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
+        const filename = filenames[index];
+        const key = filename.slice(8, -5);
+        const snapshot = safeRead(statePath(key), null);
+        if (!snapshot?.website_id || snapshot.schema_version !== 2 || !scanNeedsTransaction(snapshot, clock())) continue;
+        await transaction(key, (state) => {
+          for (const job of state.jobs) {
+            if (job.status === 'processing' && !(job.lease_until > clock())) { job.status = 'received'; job.lease_until = 0; }
+            if (job.status === 'received' && !(job.retry_at > clock())) jobs.push({ key, jobId: job.id, control: job.control });
+          }
+        });
+      }
+      if (!refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
+      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: clock() });
+      return jobs.sort((left, right) => Number(right.control) - Number(left.control)).slice(0, 16);
+    } finally {
+      clearInterval(heartbeat);
+      removeOwnedScanLock(scanLock, owner.token);
     }
-    atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: clock() });
-    return jobs.sort((left, right) => Number(right.control) - Number(left.control)).slice(0, 16);
   };
   const pruneAnalytics = () => {
     const retention = bounded(config('feedback.yaml', {}).feedback?.retention_days, 30, 3650) || 30;

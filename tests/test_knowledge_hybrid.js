@@ -20,6 +20,9 @@ const question = '曜石灯塔补给箱的启封口令是什么？';
 const overlapQuestion = '曜石灯塔补给箱 启封口令';
 const answer = '启封口令是翠羽环-4831，核对箱体编号后使用。';
 const qa = '问：' + question + '\n答：' + answer + '\n';
+const pairedQuestion = '能寄存苍蓝行李箱吗？可以存放苍蓝行李箱吗？';
+const pairedAnswer = '仅可寄存带有虚构蓝羽标记的行李箱。';
+const pairedQa = '问题：' + pairedQuestion + '\n回答：' + pairedAnswer + '\n';
 const clarification = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
 const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
 
@@ -358,14 +361,19 @@ async function test(name, action) {
     assert.equal(f.generated[0].messages.at(-1).content, event.data.content);
   });
   await test('H16 完整且锚定的礼貌范围说明剥离后跳过向量，完整问答及用户原句进入唯一生成', async () => {
-    const queries = ['请根据现有知识库回答：' + question,
-      '  请根据现有知识库回答：\n' + question + '\n'];
-    for(const [index, query] of queries.entries()) {
-      const f = fixture('prefix-strong-' + index); f.vectorError = new Error('此分支不应调用向量');
+    const cases = [
+      {query:'请根据现有知识库回答：' + question, contents:[qa], expected:qa},
+      {query:'  请根据现有知识库回答：\n' + question + '\n', contents:[qa], expected:qa},
+      // 现场事故的同构格式：长标签“问题/回答”及同一行中的两个同义问法。
+      {query:'请根据现有知识库回答：' + pairedQuestion, contents:[pairedQa], expected:pairedQa},
+    ];
+    for(const [index, item] of cases.entries()) {
+      const {query, contents, expected} = item;
+      const f = fixture('prefix-strong-' + index, {contents}); f.vectorError = new Error('此分支不应调用向量');
       const session = 'session_hybrid-prefixed-' + index;
       await f.deliver(f.event(session, query)); successful(f, session);
       assert.equal(f.search(query).results[0].lexical.kind, 'exact_question');
-      assert.deepEqual(citations(f.generated[0]).map(item => item.text), [qa]);
+      assert.deepEqual(citations(f.generated[0]).map(item => item.text), [expected]);
       assert.equal(f.generated[0].messages.at(-1).content, query);
     }
   });

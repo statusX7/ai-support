@@ -110,6 +110,9 @@ case "$URL" in
       BODY='{"error":{"message":"测试 Provider 不可用"}}'
     elif [[ "${MOCK_PROVIDER_SOFT_ERROR:-0}" == 1 ]]; then
       BODY='{"error":{"message":"HTTP 200 测试错误"}}'
+    elif [[ "${MOCK_PROVIDER_REASONING_MINIMUM:-0}" == 1 ]] \
+      && [[ "$(jq -r '.max_output_tokens // 0' <<< "$REQUEST_BODY")" -lt 64 ]]; then
+      BODY='{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","status":"incomplete","content":[{"type":"reasoning_text","text":"synthetic reasoning"}]}]}'
     else
       BODY='{"id":"test-response","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}'
     fi

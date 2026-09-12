@@ -413,7 +413,7 @@ quick_initialization() {
 }
 
 show_installation_facts() {
-  local fact label value state_file
+  local fact label value state_file live_state live_label
   if [[ ! -f "$DEPLOY_DIR/$INSTALL_MARKER" ]]; then printf '本地尚未初始化；运行 crispai init。\n'; return; fi
   printf '安装状态：%s\n' "$(installation_state "$DEPLOY_DIR")"
   for fact in dependencies local_services app_config provider crisp_api webhook conversation; do
@@ -424,6 +424,14 @@ show_installation_facts() {
     value=$(installation_fact "$DEPLOY_DIR" "$fact" 2>/dev/null || true)
     printf '%s：%s\n' "$label" "${value:-未检测}"
   done
+  live_state=$(managed_services_live_state "$DEPLOY_DIR")
+  live_label=$(managed_services_state_label "$live_state")
+  printf '本地服务（实时）：%s\n' "$live_label"
+  case "$live_state" in
+    stopped|partial|unhealthy|unavailable)
+      printf '修复入口：crispai → 16 → 1 启动本项目服务；或运行 crispai doctor --local 查看具体组件。\n'
+      ;;
+  esac
   state_file="$DEPLOY_DIR/config/runtime.yaml"
   if [[ -f "$DEPLOY_DIR/config/materials-applied.json" ]]; then state_file="$DEPLOY_DIR/config/materials-applied.json"; fi
   if [[ -f "$state_file" && ! -L "$state_file" ]]; then
@@ -431,6 +439,74 @@ show_installation_facts() {
       (.configuration.runtime // .) | select(.enabled|type=="boolean") |
       "客服总开关（已应用）：\(if .enabled then "启用" else "停用" end)" end' \
       "$state_file" 2>/dev/null || printf '客服配置：无法解析；请从菜单 2 检查，未修改当前配置。\n'
+  fi
+}
+
+managed_services_state_label() {
+  case "$1" in
+    ready) printf '正常运行' ;;
+    starting) printf '正在启动' ;;
+    stopped) printf '已停止' ;;
+    partial) printf '部分运行' ;;
+    unhealthy) printf '运行异常' ;;
+    unavailable) printf 'Docker 不可用' ;;
+    *) printf '未检测' ;;
+  esac
+}
+
+# 只读取本实例的 Compose 状态；不访问外部 API，也不读取容器环境或日志。
+managed_services_live_state() {
+  local deploy_dir=$1 mode service result state health running=0 missing=0 unhealthy=0 starting=0
+  local -a compose expected=(postgres anythingllm n8n provider-adapter)
+  [[ -f "$deploy_dir/.env" && ! -L "$deploy_dir/.env" \
+    && -f "$deploy_dir/docker-compose.yml" && ! -L "$deploy_dir/docker-compose.yml" ]] \
+    || { printf unknown; return 0; }
+  if ! command -v docker >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+    printf unavailable
+    return 0
+  fi
+  timeout --signal=TERM --kill-after=2s 4 docker info >/dev/null 2>&1 \
+    || { printf unavailable; return 0; }
+  compose=(docker compose --project-directory "$deploy_dir" --env-file "$deploy_dir/.env" -f "$deploy_dir/docker-compose.yml")
+  mode=$(env_get "$deploy_dir/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  if [[ "$mode" == managed_https ]]; then
+    compose+=(--profile managed-https)
+    expected+=(caddy)
+  fi
+  if ! timeout --signal=TERM --kill-after=2s 5 "${compose[@]}" config --quiet >/dev/null 2>&1; then
+    printf unhealthy
+    return 0
+  fi
+  if ! result=$(timeout --signal=TERM --kill-after=2s 5 "${compose[@]}" ps --all --format json 2>/dev/null); then
+    printf unknown
+    return 0
+  fi
+  for service in "${expected[@]}"; do
+    state=$(jq -Msr --arg service "$service" '
+      (if length == 1 and (.[0] | type) == "array" then .[0] else . end)
+      | map(select((.Service // .Name // "") | contains($service)))
+      | first | (.State // .Status // "") | ascii_downcase' <<< "$result" 2>/dev/null || true)
+    health=$(jq -Msr --arg service "$service" '
+      (if length == 1 and (.[0] | type) == "array" then .[0] else . end)
+      | map(select((.Service // .Name // "") | contains($service)))
+      | first | (.Health // "") | ascii_downcase' <<< "$result" 2>/dev/null || true)
+    case "$state" in
+      running)
+        ((running += 1))
+        case "$health" in
+          unhealthy) ((unhealthy += 1)) ;;
+          starting) ((starting += 1)) ;;
+        esac
+        ;;
+      restarting) ((unhealthy += 1)) ;;
+      *) ((missing += 1)) ;;
+    esac
+  done
+  if (( unhealthy > 0 )); then printf unhealthy
+  elif (( running == 0 )); then printf stopped
+  elif (( missing > 0 )); then printf partial
+  elif (( starting > 0 )); then printf starting
+  else printf ready
   fi
 }
 
@@ -1046,8 +1122,89 @@ diagnostics_menu() {
 }
 
 maintain_services() (
+  local action=${1:-} mode live_state timeout_seconds
+  local -a profile=() operation=()
+  case "$action" in
+    start|stop|restart) ;;
+    *) warn '服务维护动作无效；未改变本项目服务'; return 64 ;;
+  esac
   acquire_maintenance_lock "$DEPLOY_DIR"
-  docker_compose "$DEPLOY_DIR" "$@"
+  record_maintenance_event "$DEPLOY_DIR" "services_${action}" start
+  mode=$(env_get "$DEPLOY_DIR/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  [[ "$mode" != managed_https ]] || profile=(--profile managed-https)
+
+  if ! docker_compose "$DEPLOY_DIR" "${profile[@]}" config --quiet; then
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn 'Compose 配置校验失败；服务未被标记为正常，请先查看菜单 2 或 15 的具体原因'
+    return 1
+  fi
+  if [[ "$action" != stop ]] && ! validate_managed_caddy_configuration "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn '受管 HTTPS 配置校验失败；保留现有服务，未用无效配置重建 Caddy'
+    return 1
+  fi
+
+  case "$action" in
+    start) operation=(up -d --remove-orphans) ;;
+    restart) operation=(up -d --force-recreate --remove-orphans) ;;
+    stop) operation=(stop) ;;
+  esac
+  if ! docker_compose "$DEPLOY_DIR" "${profile[@]}" "${operation[@]}"; then
+    [[ "$action" == stop ]] || set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn '本项目服务操作未完成；现有配置与数据未被清理，请查看本次 Compose 错误'
+    return 1
+  fi
+
+  if [[ "$action" == stop ]]; then
+    set_installation_fact "$DEPLOY_DIR" local_services pending
+    live_state=$(managed_services_live_state "$DEPLOY_DIR")
+    if [[ "$live_state" != stopped ]]; then
+      record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+      warn "停止命令已返回，但实时状态为：$(managed_services_state_label "$live_state")；未报告停机完成"
+      return 1
+    fi
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" complete
+    printf '本项目服务已停止；配置、知识、人工状态与数据均已保留。\n'
+    return 0
+  fi
+
+  # Compose 启动成功并不证明 Caddy 已读取当前文件绑定，也不能证明从受管
+  # HTTPS 切换到外部反代后没有遗留本项目的 Caddy。只对账反代运行态；这里
+  # 不调用 refresh_program_file_mounts，避免把 adapter 无故再重建一次。
+  if ! reconcile_caddy_runtime "$DEPLOY_DIR"; then
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn '反向代理运行态对账失败；未报告服务启动完成。请查看上方 Caddy 具体原因，业务配置与数据未被清理'
+    return 1
+  fi
+
+  timeout_seconds=$(env_get "$DEPLOY_DIR/.env" SERVICE_MAINTENANCE_HEALTH_TIMEOUT_SECONDS 2>/dev/null || true)
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]{0,3}$ ]] || (( 10#$timeout_seconds > 1800 )); then
+    timeout_seconds=180
+  fi
+  if ! wait_for_local_health "$DEPLOY_DIR" "$timeout_seconds" 3; then
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn '基础服务未在维护时限内恢复健康；未修改业务配置，请从菜单 2 查看失败组件'
+    return 1
+  fi
+  live_state=$(managed_services_live_state "$DEPLOY_DIR")
+  if [[ "$live_state" != ready ]]; then
+    set_installation_fact "$DEPLOY_DIR" local_services failed || true
+    record_maintenance_event "$DEPLOY_DIR" "services_${action}" failed 1
+    warn "基础探针通过，但应启用组件实时状态为：$(managed_services_state_label "$live_state")；未报告启动成功"
+    return 1
+  fi
+  set_installation_fact "$DEPLOY_DIR" local_services ready
+  record_maintenance_event "$DEPLOY_DIR" "services_${action}" complete
+  if [[ "$action" == restart ]]; then
+    printf '本项目服务已重建并通过本地健康回读；业务配置与会话状态已保留。\n'
+  else
+    printf '本项目服务已启动并通过本地健康回读。\n'
+  fi
 )
 
 services_menu() {
@@ -1057,7 +1214,7 @@ services_menu() {
     printf '\n1. 启动本项目服务\n2. 停止本项目服务\n3. 重启本项目服务\n4. 检查依赖与 Docker\n5. 自动修复依赖\n6. 校验并应用已编辑资料\n7. 修复 crispai / crisp 入口\n8. 查看用户资料路径与未应用变更\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
-      1) manager_action maintain_services up -d ;;
+      1) manager_action maintain_services start ;;
       2) if menu_confirm '停机时无法接收 Hook/真人事件。停止本项目？'; then manager_action maintain_services stop; fi ;;
       3) if menu_confirm '重启本项目服务？人工状态会保留。'; then manager_action maintain_services restart; fi ;;
       4) manager_action bash "$DEPLOY_DIR/scripts/bootstrap.sh" --check ;; 5) manager_action bash "$DEPLOY_DIR/scripts/bootstrap.sh" --all ;;
@@ -1131,7 +1288,7 @@ esac
 
 while (( MANAGE_EOF == 0 )); do
   CURRENT_VERSION=$(<"${SCRIPT_DIR}/VERSION")
-  MENU_ENABLED=未配置 MENU_CRISP=未检测 MENU_KNOWLEDGE=0
+  MENU_ENABLED=未配置 MENU_CRISP=未检测 MENU_KNOWLEDGE=0 MENU_SERVICES=未检测
   if [[ -f "$DEPLOY_DIR/config/materials-applied.json" && ! -L "$DEPLOY_DIR/config/materials-applied.json" ]]; then
     MENU_ENABLED=$(jq -M -er 'if .state == "applying" then "应用中" elif .state == "applied" and (.configuration.runtime.enabled|type=="boolean") then
       (if .configuration.runtime.enabled then "启用" else "停用" end) else error("invalid") end' "$DEPLOY_DIR/config/materials-applied.json" 2>/dev/null || printf 未检测)
@@ -1140,9 +1297,10 @@ while (( MANAGE_EOF == 0 )); do
   fi
   if [[ -f "$DEPLOY_DIR/$INSTALL_MARKER" ]]; then
     case "$(installation_fact "$DEPLOY_DIR" conversation 2>/dev/null || true)" in ready) MENU_CRISP=已验证 ;; *) MENU_CRISP=待验证 ;; esac
+    MENU_SERVICES=$(managed_services_state_label "$(managed_services_live_state "$DEPLOY_DIR")")
   fi
   if [[ -f "$DEPLOY_DIR/knowledge/catalog.json" ]]; then MENU_KNOWLEDGE=$(jq -M '[.libraries[]? | select(.enabled)] | length' "$DEPLOY_DIR/knowledge/catalog.json" 2>/dev/null || printf 0); fi
-  menu_render "$CURRENT_VERSION" "$DEPLOY_DIR" "$MENU_ENABLED" "$MENU_CRISP" "$MENU_KNOWLEDGE"
+  menu_render "$CURRENT_VERSION" "$DEPLOY_DIR" "$MENU_ENABLED" "$MENU_CRISP" "$MENU_KNOWLEDGE" "$MENU_SERVICES"
   CHOICE=''
   if ! menu_read CHOICE '请选择：'; then printf '\n输入结束，已退出。\n'; exit 0; fi
   case "$CHOICE" in

@@ -260,12 +260,80 @@ wizard_load_state() {
   WIZARD_KNOWLEDGE_LIBRARIES=$(jq -c '.knowledge.libraries // []' "$state_file")
 }
 
+wizard_cleanup_owned_drafts() {
+  local output_file=$1 state_file=$2 output_dir resolved_dir draft resolved basename mode owner links
+  local -a drafts=()
+
+  # 只接受向导自己在状态中显式标记的粘贴稿；普通知识路径即使位于 tmp 也不删除。
+  [[ "$state_file" == "$output_file" ]] || return 0
+  [[ -e "$state_file" || -L "$state_file" ]] || return 0
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  mode=$(stat -c '%a' -- "$state_file" 2>/dev/null || true)
+  owner=$(stat -c '%u' -- "$state_file" 2>/dev/null || true)
+  links=$(stat -c '%h' -- "$state_file" 2>/dev/null || true)
+  [[ "$mode" == 600 && "$owner" == "$EUID" && "$links" == 1 ]] || return 1
+  output_dir=$(dirname -- "$output_file")
+  resolved_dir=$(realpath -e -- "$output_dir") || return 1
+  mapfile -d '' -t drafts < <(jq -j '
+    .knowledge.libraries[]?
+    | select(.wizard_draft == true and (.source | type) == "string")
+    | .source, "\u0000"
+  ' "$state_file" 2>/dev/null) || return 1
+  for draft in "${drafts[@]}"; do
+    [[ "$draft" == /* && -f "$draft" && ! -L "$draft" ]] || {
+      wizard_warn '向导草稿不是安全普通文件，已保留供人工检查'
+      continue
+    }
+    resolved=$(realpath -e -- "$draft" 2>/dev/null || true)
+    [[ -n "$resolved" && "$resolved" == "$draft" \
+      && "$(dirname -- "$resolved")" == "$resolved_dir" ]] || {
+      wizard_warn '向导草稿路径已偏离工作目录，已保留供人工检查'
+      continue
+    }
+    basename=$(basename -- "$resolved")
+    [[ "$basename" =~ ^wizard-knowledge\.[A-Za-z0-9]{6}\.md$ ]] || {
+      wizard_warn '向导草稿名称不符合受管格式，已保留供人工检查'
+      continue
+    }
+    mode=$(stat -c '%a' -- "$resolved" 2>/dev/null || true)
+    owner=$(stat -c '%u' -- "$resolved" 2>/dev/null || true)
+    links=$(stat -c '%h' -- "$resolved" 2>/dev/null || true)
+    if [[ "$mode" != 600 || "$owner" != "$EUID" || "$links" != 1 ]]; then
+      wizard_warn '向导草稿权限或文件身份异常，已保留供人工检查'
+      continue
+    fi
+    # 删除原始目录项；即使检查后被换成符号链接，也不会跟随链接删除目标。
+    rm -f -- "$draft" || return 1
+  done
+}
+
+wizard_restart_collecting_state() {
+  local output_file=$1 state_file=$2
+
+  wizard_cleanup_owned_drafts "$output_file" "$state_file" || {
+    wizard_error '无法安全清理本向导草稿；未重新开始'
+    return 1
+  }
+  wizard_init_values
+  printf -v WIZARD_CREATED_AT '%(%Y-%m-%dT%H:%M:%SZ)T' -1
+  wizard_write_state "$output_file" collecting 1 || return 1
+  wizard_info '已重新开始快速初始化；仅清理本向导草稿，未改动已部署配置或业务数据'
+}
+
 wizard_write_value_file() {
   local directory=$1
   local name=$2
   local value=$3
   printf '%s' "$value" > "${directory}/${name}"
   chmod 600 "${directory}/${name}"
+}
+
+wizard_directory_path_is_safe() {
+  local directory=$1 resolved literal
+  literal=$(realpath -ms -- "$directory" 2>/dev/null) || return 1
+  resolved=$(realpath -m -- "$directory" 2>/dev/null) || return 1
+  [[ "$literal" == "$resolved" ]] || return 1
+  [[ ! -e "$directory" || ( -d "$directory" && ! -L "$directory" ) ]]
 }
 
 wizard_write_state() {
@@ -298,8 +366,12 @@ wizard_write_state() {
     return 1
   }
   output_dir=$(dirname -- "$output_file")
+  wizard_directory_path_is_safe "$output_dir" || {
+    wizard_error "向导状态目录或其父级包含符号链接：$output_dir"
+    return 1
+  }
   mkdir -p -- "$output_dir"
-  [[ -d "$output_dir" && ! -L "$output_dir" ]] || {
+  wizard_directory_path_is_safe "$output_dir" || {
     wizard_error "向导状态目录不安全：$output_dir"
     return 1
   }
@@ -610,8 +682,10 @@ wizard_probe_selected_model() {
     WIZARD_CHAT_CAPABILITY=false
   fi
 
+  # 推理型模型可能先输出 reasoning；16 token 会得到 HTTP 200 + incomplete，
+  # 却没有任何可交付正文。64 仍是有界小样本，同时足以验证最终 Responses 正文。
   responses_payload=$(jq -cn --arg model "$WIZARD_MODEL" \
-    '{model:$model,input:"Reply only OK.",max_output_tokens:16}')
+    '{model:$model,input:"Reply only OK.",max_output_tokens:64}')
   if wizard_probe_json_endpoint "$work_dir" responses "$responses_payload" \
     '((has("error") | not) or .error == null or .error == false) and (((.output_text // "") | length > 0) or any(.output[]?.content[]?; .type=="output_text" and (.text | type=="string" and length>0)))'; then
     WIZARD_RESPONSES_CAPABILITY=true
@@ -625,7 +699,7 @@ wizard_probe_selected_model() {
   tiny_image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
   if [[ "$WIZARD_API_MODE" == responses ]]; then
     vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
-      '{model:$model,input:[{role:"user",content:[{type:"input_text",text:"Reply only OK."},{type:"input_image",image_url:$image}]}],max_output_tokens:16}')
+      '{model:$model,input:[{role:"user",content:[{type:"input_text",text:"Reply only OK."},{type:"input_image",image_url:$image}]}],max_output_tokens:64}')
     if wizard_probe_json_endpoint "$work_dir" responses "$vision_payload" \
       '((has("error") | not) or .error == null or .error == false) and (((.output_text // "") | length > 0) or any(.output[]?.content[]?; .type=="output_text" and (.text | type=="string" and length>0)))'; then
       WIZARD_VISION_CAPABILITY=true
@@ -923,10 +997,12 @@ wizard_collect_step() {
             if [[ "$value" == ::PASTE:: ]]; then library_path=::PASTE::
             else wizard_read_value library_path '文件/目录路径，或 ::PASTE:: 粘贴正文（0 完成添加）：' || return $?; fi
             [[ "$library_path" != 0 ]] || break
+            library_is_draft=false
             if [[ "$library_path" == ::PASTE:: ]]; then
               if wizard_read_multiline library_temp 8388608; then
                 library_path=$(mktemp "$work_dir/wizard-knowledge.XXXXXX.md") || return 1
                 printf '%s' "$library_temp" > "$library_path"; chmod 0600 "$library_path"
+                library_is_draft=true
               else
                 multiline_status=$?
                 (( multiline_status != 2 )) || return 2
@@ -938,7 +1014,9 @@ wizard_collect_step() {
               continue
             fi
             library_path=$(realpath -e -- "$library_path") || return 1
-            WIZARD_KNOWLEDGE_LIBRARIES=$(jq -cn --argjson libraries "$WIZARD_KNOWLEDGE_LIBRARIES" --arg name "$library_name" --arg source "$library_path" '$libraries+[{name:$name,source:$source}]')
+            WIZARD_KNOWLEDGE_LIBRARIES=$(jq -cn --argjson libraries "$WIZARD_KNOWLEDGE_LIBRARIES" \
+              --arg name "$library_name" --arg source "$library_path" --argjson wizard_draft "$library_is_draft" \
+              '$libraries+[{name:$name,source:$source,wizard_draft:$wizard_draft}]')
             count=$(jq -er '.supported_files' <<< "$knowledge_summary") || return 1
             ((WIZARD_KNOWLEDGE_FILES+=count))
             wizard_write_state "$output_file" collecting 9
@@ -1048,6 +1126,20 @@ wizard_offer_existing() {
   done
 }
 
+wizard_offer_resume() {
+  local next_step=$1 choice
+  printf '检测到上次未完成的快速初始化（将从第 %s 步恢复，敏感值不会显示）。\n' "$next_step"
+  while true; do
+    wizard_read_value choice '1 继续上次 / 2 重新开始 / 0 取消：' || return $?
+    case "$choice" in
+      1) return 0 ;;
+      2) return 3 ;;
+      0) return 2 ;;
+      *) wizard_warn '请选择 1、2 或 0' ;;
+    esac
+  done
+}
+
 wizard_result_is_confirmed() {
   local result_file=$1
   [[ -f "$result_file" && ! -L "$result_file" ]] \
@@ -1071,6 +1163,17 @@ quick_init_wizard() {
     return 1
   }
 
+  work_dir=$(dirname -- "$output_file")
+  wizard_directory_path_is_safe "$work_dir" || {
+    wizard_error "向导工作目录或其父级包含符号链接：$work_dir"
+    return 1
+  }
+  mkdir -p -- "$work_dir"
+  wizard_directory_path_is_safe "$work_dir" || {
+    wizard_error "向导工作目录不安全：$work_dir"
+    return 1
+  }
+
   wizard_init_values
   source_file=''
   if [[ -e "$output_file" || -L "$output_file" ]]; then
@@ -1088,28 +1191,26 @@ quick_init_wizard() {
         result=$?
         case "$result" in
           2) return 2 ;;
-          3)
-            WIZARD_STATUS=collecting
-            WIZARD_NEXT_STEP=1
-            wizard_write_state "$output_file" collecting 1 || return 1
-            ;;
+          3) wizard_restart_collecting_state "$output_file" "$source_file" || return 1 ;;
           *) return "$result" ;;
         esac
       fi
     else
-      wizard_info "检测到未完成的快速初始化，将从第 ${WIZARD_NEXT_STEP} 步继续"
+      if wizard_offer_resume "$WIZARD_NEXT_STEP"; then
+        wizard_info "已选择继续上次，将从第 ${WIZARD_NEXT_STEP} 步继续快速初始化"
+      else
+        result=$?
+        case "$result" in
+          2) return 2 ;;
+          3) wizard_restart_collecting_state "$output_file" "$source_file" || return 1 ;;
+          *) return "$result" ;;
+        esac
+      fi
     fi
   fi
   if [[ -z "$WIZARD_CREATED_AT" ]]; then
     printf -v WIZARD_CREATED_AT '%(%Y-%m-%dT%H:%M:%SZ)T' -1
   fi
-
-  work_dir=$(dirname -- "$output_file")
-  mkdir -p -- "$work_dir"
-  [[ -d "$work_dir" && ! -L "$work_dir" ]] || {
-    wizard_error "向导工作目录不安全：$work_dir"
-    return 1
-  }
 
   while true; do
     step=$WIZARD_NEXT_STEP

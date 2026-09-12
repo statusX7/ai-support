@@ -95,6 +95,56 @@ acquire_maintenance_lock() {
   export CRISP_AI_MAINTENANCE_LOCK_PATH="$lock_file"
 }
 
+# v1.2.1 以前的扫描锁只是一个空目录。新运行时要求 owner.json，且会拒绝
+# 仅凭 mtime 删除无所有权目录；升级/显式修复只能在 n8n 已停写时迁移这种
+# 精确形态。其他目录、链接、非空锁和带 owner 的新锁一律不动。
+scheduler_scan_lock_state() {
+  local deploy_dir=$1 lock="${1}/data/runtime/scheduler-scan.lock"
+  local owner mode links
+  [[ -d "${deploy_dir}/data/runtime" && ! -L "${deploy_dir}/data/runtime" ]] \
+    || { printf '%s\n' unsafe; return; }
+  if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+    printf '%s\n' absent
+    return
+  fi
+  if [[ -L "$lock" || ! -d "$lock" ]]; then
+    printf '%s\n' unsafe
+    return
+  fi
+  mode=$(stat -c '%a' -- "$lock" 2>/dev/null || true)
+  links=$(stat -c '%h' -- "$lock" 2>/dev/null || true)
+  if [[ ! "$mode" =~ ^[0-7]{3,4}$ || "$links" != 2 ]] \
+    || (( (8#${mode:-777} & 077) != 0 )) \
+    || [[ ! "$(stat -c '%u' -- "$lock" 2>/dev/null || true)" =~ ^(0|1000)$ ]]; then
+    printf '%s\n' unsafe
+    return
+  fi
+  owner="${lock}/owner.json"
+  if [[ -e "$owner" || -L "$owner" ]]; then
+    if [[ -f "$owner" && ! -L "$owner" ]] \
+      && [[ -z "$(find "$lock" -mindepth 1 -maxdepth 1 ! -name owner.json -print -quit 2>/dev/null)" ]]; then
+      printf '%s\n' owned
+    else
+      printf '%s\n' nonempty
+    fi
+    return
+  fi
+  if [[ -n "$(find "$lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    printf '%s\n' nonempty
+    return
+  fi
+  printf '%s\n' legacy-ownerless-empty
+}
+
+cleanup_legacy_scheduler_scan_lock() {
+  local deploy_dir=$1 lock="${1}/data/runtime/scheduler-scan.lock" running
+  [[ "$(scheduler_scan_lock_state "$deploy_dir")" == legacy-ownerless-empty ]] || return 1
+  running=$(docker_compose "$deploy_dir" ps --status running -q n8n 2>/dev/null) || return 1
+  [[ -z "$running" ]] || return 1
+  rmdir -- "$lock" || return 1
+  [[ "$(scheduler_scan_lock_state "$deploy_dir")" == absent ]]
+}
+
 validate_deploy_dir() {
   local requested=${1:-}
   local resolved
@@ -339,20 +389,142 @@ webhook_ports_available() {
   ! ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)(80|443)$'
 }
 
-configure_webhook_access() {
+webhook_access_install_file() {
+  local source=$1 target=$2 mode=$3 temporary
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  [[ "$(stat -c '%h' -- "$source" 2>/dev/null || true)" == 1 ]] || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    [[ -f "$target" && ! -L "$target" ]] || return 1
+    [[ "$(stat -c '%h' -- "$target" 2>/dev/null || true)" == 1 ]] || return 1
+  fi
+  temporary=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! install -m "$mode" -- "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+webhook_proxy_snippet_target_is_replaceable() {
+  local target=$1
+  [[ ! -L "$target" ]] || return 1
+  [[ ! -e "$target" ]] && return 0
+  [[ -f "$target" ]] || return 1
+  [[ "$(stat -c '%h' -- "$target" 2>/dev/null || true)" == 1 ]] || return 1
+  grep -Fxq '# ai-support-managed-proxy' "$target"
+}
+
+configure_webhook_access() (
   local deploy_dir=$1
   local mode=$2
   local public_base=$3
   local production_url=$4
   local domain=$5
   local env_file="${deploy_dir}/.env"
-  local previous_mode
-
-  previous_mode=$(env_get "$env_file" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  local previous_mode webhook_work candidate_root candidate_env candidate_caddy running status
+  local committed=0 completed=0 runtime_touched=0 rollback_status=0
+  local old_env=0 old_caddy=0 old_nginx=0 old_proxy_caddy=0 created_caddy=0
+  local previous_caddy_running=0
 
   validate_public_url "$public_base" || die "Webhook 公网 Base URL 无效"
   [[ "$production_url" == https://*'/webhook/crisp-webhook' ]] \
     || die "生产 Webhook 地址必须使用 HTTPS 并以 /webhook/crisp-webhook 结尾"
+  mkdir -p -- "${deploy_dir}/config" "${deploy_dir}/tmp"
+  [[ -d "${deploy_dir}/config" && ! -L "${deploy_dir}/config" \
+    && -d "${deploy_dir}/tmp" && ! -L "${deploy_dir}/tmp" ]] \
+    || die 'Webhook 配置目录或临时目录不安全'
+  webhook_work=$(mktemp -d "${deploy_dir}/tmp/webhook-access.XXXXXX") \
+    || die '无法创建 Webhook 候选配置目录'
+  chmod 0700 "$webhook_work"
+  candidate_root="$webhook_work/candidate"
+  candidate_env="$candidate_root/.env"
+  mkdir -p "$candidate_root/config"
+
+  # shellcheck disable=SC2317 # 由 EXIT trap 调用。
+  configure_webhook_access_cleanup() {
+    status=$?
+    trap - EXIT
+    if (( committed && ! completed )); then
+      if (( old_env )); then
+        webhook_access_install_file "$webhook_work/original.env" "$env_file" 0600 \
+          || rollback_status=1
+      else
+        rm -f -- "$env_file" || rollback_status=1
+      fi
+      if (( old_caddy )); then
+        webhook_access_install_file "$webhook_work/original.Caddyfile" \
+          "${deploy_dir}/config/Caddyfile" 0640 || rollback_status=1
+      elif (( created_caddy )); then
+        rm -f -- "${deploy_dir}/config/Caddyfile" || rollback_status=1
+      fi
+      if (( old_nginx )); then
+        webhook_access_install_file "$webhook_work/original.crispai-nginx.conf" \
+          "${deploy_dir}/config/crispai-nginx.conf" 0640 || rollback_status=1
+      else
+        rm -f -- "${deploy_dir}/config/crispai-nginx.conf" || rollback_status=1
+      fi
+      if (( old_proxy_caddy )); then
+        webhook_access_install_file "$webhook_work/original.crispai-caddy.conf" \
+          "${deploy_dir}/config/crispai-caddy.conf" 0640 || rollback_status=1
+      else
+        rm -f -- "${deploy_dir}/config/crispai-caddy.conf" || rollback_status=1
+      fi
+      if (( runtime_touched && previous_caddy_running )); then
+        reconcile_caddy_runtime "$deploy_dir" >/dev/null 2>&1 || rollback_status=1
+      fi
+      if (( rollback_status == 0 )); then
+        warn 'Webhook 接入切换失败；原环境、反代片段与 Caddy 运行代已恢复'
+      else
+        warn 'Webhook 接入切换失败且自动恢复未完整通过；请保留当前数据并运行 crispai doctor'
+      fi
+    fi
+    [[ "$webhook_work" == "${deploy_dir}/tmp/webhook-access."* \
+      && -d "$webhook_work" && ! -L "$webhook_work" ]] \
+      && find "$webhook_work" -depth -delete
+    exit "$status"
+  }
+  trap configure_webhook_access_cleanup EXIT
+
+  if [[ -e "$env_file" || -L "$env_file" ]]; then
+    [[ -f "$env_file" && ! -L "$env_file" \
+      && "$(stat -c '%h' -- "$env_file" 2>/dev/null || true)" == 1 ]] \
+      || die '当前环境配置不是安全的普通文件'
+    install -m 0600 -- "$env_file" "$webhook_work/original.env"
+    install -m 0600 -- "$env_file" "$candidate_env"
+    old_env=1
+  else
+    : > "$candidate_env"
+    chmod 0600 "$candidate_env"
+  fi
+  previous_mode=$(env_get "$candidate_env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+
+  for status in Caddyfile crispai-nginx.conf crispai-caddy.conf; do
+    if [[ -e "${deploy_dir}/config/${status}" || -L "${deploy_dir}/config/${status}" ]]; then
+      if [[ "$status" == Caddyfile ]]; then
+        caddy_configuration_file_is_safe "${deploy_dir}/config/${status}" \
+          || die '当前受管 Caddy 配置不安全'
+        old_caddy=1
+        install -m 0600 -- "${deploy_dir}/config/${status}" "$webhook_work/original.${status}"
+      else
+        webhook_proxy_snippet_target_is_replaceable "${deploy_dir}/config/${status}" \
+          || die '同名反代片段非本项目所有或文件不安全，原文件已保留'
+        if [[ "$status" == crispai-nginx.conf ]]; then old_nginx=1; else old_proxy_caddy=1; fi
+        install -m 0600 -- "${deploy_dir}/config/${status}" "$webhook_work/original.${status}"
+      fi
+    fi
+  done
+
+  # 旧配置为受管 HTTPS 时，要在修改候选前记录当前运行代。这个检查不能只
+  # 放在切到 external_proxy 的分支：managed_https 内修改域名也会让旧容器
+  # 继续持有创建时的 WEBHOOK_DOMAIN。仅当旧 Caddy 本来就在运行时，提交后
+  # 才立即对账；首次安装或原本已停止的实例不会被此步骤提前启动。
+  if [[ "$previous_mode" == managed_https ]] \
+    && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    running=$(docker_compose "$deploy_dir" --profile managed-https \
+      ps --services --filter status=running 2>/dev/null) \
+      || die '无法读取当前受管 Caddy 运行状态；未提交 Webhook 候选配置'
+    grep -Fxq caddy <<< "$running" && previous_caddy_running=1
+  fi
+
   case "$mode" in
     domain|managed_https)
       validate_hostname "$domain" || die "自动 HTTPS 域名无效"
@@ -360,33 +532,81 @@ configure_webhook_access() {
         || die "80 或 443 端口已被其他服务占用；安装器不会停止现有网站，请重新配置并填写现有 HTTPS 完整 Webhook 地址"
       [[ -f "${deploy_dir}/config/Caddyfile.example" \
         && ! -L "${deploy_dir}/config/Caddyfile.example" ]] || die "受管 HTTPS 模板缺失或不安全"
-      if [[ ! -e "${deploy_dir}/config/Caddyfile" ]]; then
-        install -m 0640 -- "${deploy_dir}/config/Caddyfile.example" "${deploy_dir}/config/Caddyfile"
+      if (( old_caddy )); then
+        install -m 0640 -- "${deploy_dir}/config/Caddyfile" "$candidate_root/config/Caddyfile"
+      else
+        install -m 0640 -- "${deploy_dir}/config/Caddyfile.example" "$candidate_root/config/Caddyfile"
+        created_caddy=1
       fi
-      [[ -f "${deploy_dir}/config/Caddyfile" && ! -L "${deploy_dir}/config/Caddyfile" ]] \
+      caddy_configuration_file_is_safe "$candidate_root/config/Caddyfile" \
         || die "受管 HTTPS 配置不安全"
-      env_set "$env_file" WEBHOOK_ACCESS_MODE managed_https
-      env_set "$env_file" WEBHOOK_DOMAIN "$domain"
-      env_set "$env_file" COMPOSE_PROFILES managed-https
+      env_set "$candidate_env" WEBHOOK_ACCESS_MODE managed_https
+      env_set "$candidate_env" WEBHOOK_DOMAIN "$domain"
+      env_set "$candidate_env" COMPOSE_PROFILES managed-https
       ;;
     existing_url|external_proxy)
-      # 关闭本实例此前托管的 HTTPS 容器，避免 profile 取消后留下 80/443 孤儿。
-      # 只按当前 Compose 项目和服务名操作，不触碰宿主机其他反向代理。
-      if [[ "$previous_mode" == managed_https ]] && command -v docker >/dev/null 2>&1 \
-        && docker info >/dev/null 2>&1; then
-        docker_compose "$deploy_dir" --profile managed-https stop caddy >/dev/null 2>&1 || true
-        docker_compose "$deploy_dir" --profile managed-https rm -f caddy >/dev/null 2>&1 || true
+      if [[ "$previous_mode" == managed_https ]]; then
+        if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+          die '当前实例仍登记受管 HTTPS，但 Docker 不可用；未提交外部反代模式'
+        fi
       fi
-      env_set "$env_file" WEBHOOK_ACCESS_MODE external_proxy
-      env_set "$env_file" WEBHOOK_DOMAIN "$domain"
-      env_unset "$env_file" COMPOSE_PROFILES
+      env_set "$candidate_env" WEBHOOK_ACCESS_MODE external_proxy
+      env_set "$candidate_env" WEBHOOK_DOMAIN "$domain"
+      env_unset "$candidate_env" COMPOSE_PROFILES
       ;;
     *) die "Webhook 接入模式无效：$mode" ;;
   esac
-  env_set "$env_file" PUBLIC_WEBHOOK_URL "$public_base"
-  env_set "$env_file" WEBHOOK_PRODUCTION_URL "$production_url"
-  write_webhook_proxy_snippets "$deploy_dir"
-}
+  env_set "$candidate_env" PUBLIC_WEBHOOK_URL "$public_base"
+  env_set "$candidate_env" WEBHOOK_PRODUCTION_URL "$production_url"
+  if ! write_webhook_proxy_snippets "$candidate_root"; then
+    die 'Webhook 反代片段候选生成失败；原配置与运行服务保持'
+  fi
+
+  # Compose 与 Caddy 均使用同一候选 env 做预检；--skip-start 且宿主尚无
+  # Docker 时只落安全候选，真正启动前仍由安装器的强制预检把关。
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    docker_compose_command --project-directory "$deploy_dir" --env-file "$candidate_env" \
+      -f "${deploy_dir}/docker-compose.yml" config --quiet \
+      || die 'Webhook 候选环境未通过 Compose 配置校验；原配置与运行服务保持'
+    if [[ "$(env_get "$candidate_env" WEBHOOK_ACCESS_MODE)" == managed_https \
+      && "${SKIP_START:-0}" != 1 && $created_caddy -eq 0 ]] \
+      && command -v docker >/dev/null 2>&1 \
+      && docker info >/dev/null 2>&1; then
+      candidate_caddy="$candidate_root/config/Caddyfile"
+      caddy_validate_configuration_file "$deploy_dir" "$candidate_caddy" "$candidate_env" \
+        || die '受管 HTTPS 候选未通过 Caddy 配置校验；原配置与运行服务保持'
+    fi
+  fi
+
+  # 从第一项落盘起开启整套回滚；只有 env、两份外部反代片段及必要的
+  # Caddyfile 全部提交成功后，才允许停止/重建当前 Caddy。
+  committed=1
+  webhook_access_install_file "$candidate_env" "$env_file" 0600 \
+    || die 'Webhook 环境配置原子提交失败；正在恢复原配置'
+  if (( created_caddy )); then
+    webhook_access_install_file "$candidate_root/config/Caddyfile" \
+      "${deploy_dir}/config/Caddyfile" 0640 \
+      || die '受管 Caddy 配置提交失败；正在恢复原配置'
+  fi
+  webhook_access_install_file "$candidate_root/config/crispai-nginx.conf" \
+    "${deploy_dir}/config/crispai-nginx.conf" 0640 \
+    || die 'Nginx 反代片段提交失败；正在恢复原配置'
+  webhook_access_install_file "$candidate_root/config/crispai-caddy.conf" \
+    "${deploy_dir}/config/crispai-caddy.conf" 0640 \
+    || die 'Caddy 反代片段提交失败；正在恢复原配置'
+
+  if [[ "$previous_mode" == managed_https ]]; then
+    runtime_touched=1
+    if [[ "$(env_get "$env_file" WEBHOOK_ACCESS_MODE)" == external_proxy ]]; then
+      retire_managed_caddy "$deploy_dir" \
+        || die '未能停止并移除当前实例的受管 Caddy；正在恢复原配置与运行代'
+    elif (( previous_caddy_running )); then
+      reconcile_caddy_runtime "$deploy_dir" \
+        || die '受管 Caddy 新运行代未通过对账；正在恢复原配置与运行代'
+    fi
+  fi
+  completed=1
+)
 
 write_webhook_proxy_snippets() {
   local deploy_dir=$1 production port prefix suffix target temporary
@@ -397,12 +617,11 @@ write_webhook_proxy_snippets() {
   prefix=${production#https://}; prefix=/${prefix#*/}; prefix=${prefix%/webhook/crisp-webhook}
   [[ "$prefix" =~ ^(/[A-Za-z0-9._~-]+)*$ ]] || { warn '公网路径无法安全生成反代片段'; return 1; }
   target="${deploy_dir}/config/crispai-nginx.conf"
-  [[ ! -L "$target" ]] || return 1
-  if [[ -e "$target" ]] && ! grep -Fxq '# ai-support-managed-proxy' "$target"; then
+  if ! webhook_proxy_snippet_target_is_replaceable "$target"; then
     warn '同名反代片段非本项目所有，已保留'; return 1
   fi
-  temporary=$(mktemp "${target}.tmp.XXXXXX")
-  {
+  temporary=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! {
     printf '# ai-support-managed-proxy\n# 放入已有 HTTPS server 中；不会修改、重启现有网站。\n'
     for suffix in crisp-webhook crispai-public-config crispai-web-chat; do
       printf 'location = %s/webhook/%s {\n' "$prefix" "$suffix"
@@ -416,13 +635,16 @@ write_webhook_proxy_snippets() {
       printf '  # 使用 crispai doctor 和应用脱敏日志诊断，不影响其他站点的日志。\n'
       printf '  error_log /dev/null;\n}\n'
     done
-  } > "$temporary"
-  chmod 640 "$temporary"; mv -f -- "$temporary" "$target"
+  } > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chmod 640 "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$target" || { rm -f -- "$temporary"; return 1; }
   target="${deploy_dir}/config/crispai-caddy.conf"
-  [[ ! -L "$target" ]] || return 1
-  if [[ -e "$target" ]] && ! grep -Fxq '# ai-support-managed-proxy' "$target"; then return 1; fi
-  temporary=$(mktemp "${target}.tmp.XXXXXX")
-  {
+  webhook_proxy_snippet_target_is_replaceable "$target" || return 1
+  temporary=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! {
     printf '# ai-support-managed-proxy\n# 放入已有 HTTPS 站点；不启用含 URL Secret 的访问日志。\n'
     printf '# 仅关闭访问日志不保护 Caddy 运行时错误日志！站点管理员还需在全局\n'
     printf '# log default 的 format filter 中设置 request>uri replace [REDACTED]，\n'
@@ -431,8 +653,12 @@ write_webhook_proxy_snippets() {
     printf 'handle @crispai {\n'
     [[ -z "$prefix" ]] || printf '  uri strip_prefix %s\n' "$prefix"
     printf '  reverse_proxy 127.0.0.1:%s\n}\n' "$port"
-  } > "$temporary"
-  chmod 640 "$temporary"; mv -f -- "$temporary" "$target"
+  } > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chmod 640 "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$target" || { rm -f -- "$temporary"; return 1; }
 }
 
 env_set() {
@@ -562,40 +788,208 @@ docker_compose() {
 }
 
 validate_managed_caddy_configuration() {
-  local deploy_dir=$1 mode
+  local deploy_dir=$1 mode candidate
   mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
   [[ "$mode" == managed_https ]] || return 0
+  candidate="${deploy_dir}/config/Caddyfile"
+  if caddy_validate_configuration_file "$deploy_dir" "$candidate"; then
+    return 0
+  fi
+  if caddy_restore_last_good_configuration "$deploy_dir"; then
+    warn '受管 Caddy 候选配置验证失败；宿主文件已回滚到最近已验证代，正在运行的旧反代未被替换'
+  else
+    warn '受管 Caddy 候选配置验证失败且没有可验证的回滚代；未替换正在运行的反代'
+  fi
+  return 1
+}
+
+caddy_configuration_file_is_safe() {
+  local file=$1 mode
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  [[ "$(stat -c '%h' -- "$file" 2>/dev/null || true)" == 1 ]] || return 1
+  mode=$(stat -c '%a' -- "$file" 2>/dev/null || true)
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 022) == 0 ))
+}
+
+caddy_validate_configuration_file() {
+  local deploy_dir=$1 candidate=$2 env_file=${3:-${1}/.env} container_path=/etc/caddy/Caddyfile
   local -a compose_command=(docker compose --project-directory "$deploy_dir"
-    --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
+    --env-file "$env_file" -f "${deploy_dir}/docker-compose.yml")
+  local -a volume=()
+
+  caddy_configuration_file_is_safe "$candidate" || return 1
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 1
+  if [[ "$candidate" != "${deploy_dir}/config/Caddyfile" ]]; then
+    container_path=/tmp/crispai-Caddyfile-candidate
+    volume=(--volume "${candidate}:${container_path}:ro")
+  fi
   # 必须早于可能重建 Caddy 的第一次 up，而不只在刷新旧 inode 时校验。
-  if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
+  COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
     "${compose_command[@]}" --profile managed-https run --rm --no-deps --entrypoint caddy \
-    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-    warn '受管 Caddy 候选配置验证失败；未替换正在运行的反代'
+    "${volume[@]}" caddy validate --config "$container_path" --adapter caddyfile >/dev/null 2>&1
+}
+
+caddy_install_configuration_copy() {
+  local source=$1 target=$2 temporary
+  caddy_configuration_file_is_safe "$source" || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    [[ -f "$target" && ! -L "$target" ]] || return 1
+    [[ "$(stat -c '%h' -- "$target" 2>/dev/null || true)" == 1 ]] || return 1
+  fi
+  temporary=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! install -m 0640 -- "$source" "$temporary"; then
+    rm -f -- "$temporary"
     return 1
   fi
+  mv -f -- "$temporary" "$target"
+}
+
+caddy_record_last_good_configuration() {
+  local deploy_dir=$1
+  caddy_install_configuration_copy "${deploy_dir}/config/Caddyfile" \
+    "${deploy_dir}/config/Caddyfile.last-good"
+}
+
+caddy_restore_last_good_configuration() {
+  local deploy_dir=$1 backup
+  for backup in "${deploy_dir}/config/Caddyfile.last-good" \
+    "${deploy_dir}/config/Caddyfile.previous"; do
+    caddy_configuration_file_is_safe "$backup" || continue
+    caddy_validate_configuration_file "$deploy_dir" "$backup" || continue
+    caddy_install_configuration_copy "$backup" "${deploy_dir}/config/Caddyfile" || return 1
+    caddy_record_last_good_configuration "$deploy_dir" || return 1
+    return 0
+  done
+  return 1
+}
+
+caddy_runtime_matches_configuration() {
+  local deploy_dir=$1 running expected expected_domain output
+  local -a compose_command=(docker compose --project-directory "$deploy_dir"
+    --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml"
+    --profile managed-https)
+
+  caddy_configuration_file_is_safe "${deploy_dir}/config/Caddyfile" || return 1
+  running=$(COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=2s 10 \
+    "${compose_command[@]}" ps --services --filter status=running 2>/dev/null) || return 1
+  grep -Fxq caddy <<< "$running" || return 1
+  expected=$(sha256sum -- "${deploy_dir}/config/Caddyfile" 2>/dev/null | cut -d ' ' -f 1) || return 1
+  [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || return 1
+  expected_domain=$(env_get "${deploy_dir}/.env" WEBHOOK_DOMAIN 2>/dev/null) || return 1
+  validate_env_value "$expected_domain" || return 1
+  # 期望域名与摘要只经 stdin 进入容器；容器只返回固定 matched，不输出
+  # 配置或实际 WEBHOOK_DOMAIN，避免诊断路径泄漏真实站点信息。
+  # shellcheck disable=SC2016 # $1、环境变量和 shell 变量由 Caddy 容器内展开。
+  output=$(printf '%s\n%s\n' "$expected_domain" "$expected" | COMPOSE_PROGRESS=plain \
+    timeout --signal=TERM --kill-after=2s 10 "${compose_command[@]}" exec -T caddy sh -ec '
+      marker="CRISPAI_EXPECTED_FILE_BINDING_CADDY"
+      IFS= read -r expected_domain
+      IFS= read -r expected
+      actual=$(sha256sum "$1")
+      actual=${actual%% *}
+      if [ -z "$marker" ] || [ "${WEBHOOK_DOMAIN+x}" != x ] \
+        || [ "$WEBHOOK_DOMAIN" != "$expected_domain" ] || [ "$actual" != "$expected" ]; then
+        exit 1
+      fi
+      printf "matched\n"
+    ' sh /etc/caddy/Caddyfile 2>/dev/null) || return 1
+  [[ "$output" == matched ]]
+}
+
+caddy_wait_for_runtime_match() {
+  local deploy_dir=$1 deadline=$((SECONDS + 15))
+  while (( SECONDS <= deadline )); do
+    caddy_runtime_matches_configuration "$deploy_dir" && return 0
+    (( SECONDS < deadline )) || break
+    sleep 1
+  done
+  return 1
+}
+
+retire_managed_caddy() {
+  local deploy_dir=$1 container_ids
+  local -a compose_command=(docker compose --project-directory "$deploy_dir"
+    --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml"
+    --profile managed-https)
+
+  container_ids=$(COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=2s 10 \
+    "${compose_command[@]}" ps --all -q caddy 2>/dev/null) || return 1
+  [[ -n "$container_ids" ]] || return 0
+  COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=5s 30 \
+    "${compose_command[@]}" stop caddy >/dev/null || return 1
+  COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=5s 30 \
+    "${compose_command[@]}" rm -f caddy >/dev/null || return 1
+  container_ids=$(COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=2s 10 \
+    "${compose_command[@]}" ps --all -q caddy 2>/dev/null) || return 1
+  [[ -z "$container_ids" ]]
+}
+
+reconcile_caddy_runtime() {
+  local deploy_dir=$1 mode
+  local -a compose_command=(docker compose --project-directory "$deploy_dir"
+    --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
+  mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  case "$mode" in
+    ""|external_proxy)
+      # v1.0.0 及少量早期恢复包没有该字段；当时没有受管 Caddy，
+      # 因而只能按外部反代兼容。非空未知值仍必须失败，不能掩盖损坏配置。
+      retire_managed_caddy "$deploy_dir" || {
+        warn '当前使用外部反代，但本项目遗留的受管 Caddy 无法移除'
+        return 1
+      }
+      return 0
+      ;;
+    managed_https)
+      validate_managed_caddy_configuration "$deploy_dir" || return 1
+      if caddy_runtime_matches_configuration "$deploy_dir"; then
+        caddy_record_last_good_configuration "$deploy_dir" || {
+          warn '无法记录当前 Caddy 已验证配置代'
+          return 1
+        }
+        return 0
+      fi
+      if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 120 \
+        "${compose_command[@]}" --profile managed-https up -d --no-deps --force-recreate caddy; then
+        warn '受管 Caddy 配置挂载刷新失败；正在尝试恢复最近已验证代'
+      elif caddy_wait_for_runtime_match "$deploy_dir"; then
+        caddy_record_last_good_configuration "$deploy_dir" || {
+          warn 'Caddy 新运行代已启动，但无法记录最近已验证配置'
+          return 1
+        }
+        return 0
+      else
+        warn '受管 Caddy 新运行代未通过启动与文件绑定回读；正在尝试恢复最近已验证代'
+      fi
+      if caddy_restore_last_good_configuration "$deploy_dir" \
+        && COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 120 \
+          "${compose_command[@]}" --profile managed-https up -d --no-deps --force-recreate caddy \
+        && caddy_wait_for_runtime_match "$deploy_dir"; then
+        warn '受管 Caddy 已恢复最近验证代；本次候选未应用，调用方仍收到失败'
+      else
+        warn '受管 Caddy 候选与最近验证代均未能恢复运行；未宣称反代可用'
+      fi
+      return 1
+      ;;
+    *)
+      warn 'Webhook 接入模式无效；未启动、停止或替换本项目 Caddy'
+      return 1
+      ;;
+  esac
 }
 
 refresh_program_file_mounts() {
-  local deploy_dir=$1 mode services
+  local deploy_dir=$1 services
   local -a compose_command=(docker compose --project-directory "$deploy_dir"
     --env-file "${deploy_dir}/.env" -f "${deploy_dir}/docker-compose.yml")
-  mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
   services=$(docker_compose "$deploy_dir" config --services) || return 1
-  validate_managed_caddy_configuration "$deploy_dir" || return 1
   # install/原子替换会更换 inode；相同 Compose 路径不代表旧容器已加载新文件。
-  # 只刷新本项目的单文件程序挂载，目录挂载/数据库不为此重建。
+  # 先收敛 Caddy 并回读文件绑定，再刷新其余单文件程序挂载。
+  reconcile_caddy_runtime "$deploy_dir" || return 1
   if grep -Fxq provider-adapter <<< "$services"; then
     if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 120 \
       "${compose_command[@]}" up -d --no-deps --force-recreate provider-adapter; then
       warn 'Provider adapter 程序挂载刷新失败；未确认新程序已运行'
-      return 1
-    fi
-  fi
-  if [[ "$mode" == managed_https ]]; then
-    if ! COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 120 \
-      "${compose_command[@]}" --profile managed-https up -d --no-deps --force-recreate caddy; then
-      warn '受管 Caddy 配置挂载刷新失败；请检查本实例反代'
       return 1
     fi
   fi
@@ -1427,7 +1821,9 @@ configure_provider() {
   validate_model_identifier "$selected_model" || die "模型名称格式无效"
 
   local responses_payload chat_payload
-  responses_payload=$(jq -cn --arg model "$selected_model" '{model:$model,input:"ping",max_output_tokens:16}')
+  # 与十项向导及适配器管理探针保持一致；推理型模型可能把 16 token
+  # 全部用于 reasoning，形成没有最终正文的 HTTP 200 incomplete 假阴性。
+  responses_payload=$(jq -cn --arg model "$selected_model" '{model:$model,input:"ping",max_output_tokens:64}')
   chat_payload=$(jq -cn --arg model "$selected_model" '{model:$model,messages:[{role:"user",content:"Reply only OK."}]}')
   if probe_api_endpoint "${base}/responses" "$api_key" "$responses_payload" "${deploy_dir}/tmp"; then responses=true; fi
   if probe_api_endpoint "${base}/chat/completions" "$api_key" "$chat_payload" "${deploy_dir}/tmp"; then chat=true; fi
@@ -1485,6 +1881,94 @@ configure_provider() {
     info "Provider 已配置：模型 ${selected_model}，模式 ${api_mode}"
   fi
 }
+
+# 已存在接口池时，快速初始化重新配置只能通过当前主接口的候选事务。
+# 这样地址、Key、模型与协议作为同一快照验证，并由接口池负责兼容投影、
+# 运行适配器回读和失败恢复；不能先改旧 AI_* 再让 migrate 忽略这些新值。
+configure_provider_pool_primary() (
+  set -euo pipefail
+  umask 077
+
+  local deploy_dir=$1 base=$2 api_key=$3 model=$4 api_mode=${5:-auto}
+  local vision=${6:-false} normalized primary before_layout after_layout message
+  local candidate result observed
+
+  require_command jq
+  require_command python3
+  normalized=$(normalize_api_base "$base") \
+    || { warn '主接口地址无效；接口池和原兼容配置未更改'; return 1; }
+  validate_env_value "$api_key" \
+    || { warn '主接口 Key 包含不安全字符或为空；接口池和原兼容配置未更改'; return 1; }
+  validate_model_identifier "$model" \
+    || { warn '主接口模型名称无效；接口池和原兼容配置未更改'; return 1; }
+  [[ "$api_mode" == auto || "$api_mode" == chat_completions || "$api_mode" == responses ]] \
+    || { warn '主接口协议无效；接口池和原兼容配置未更改'; return 1; }
+  [[ "$vision" == true || "$vision" == false ]] \
+    || { warn '主接口图片能力状态无效；接口池和原兼容配置未更改'; return 1; }
+  [[ -f "${deploy_dir}/config/provider-pool-applied.json" \
+    && ! -L "${deploy_dir}/config/provider-pool-applied.json" ]] \
+    || { warn '已有接口池有效投影缺失或不安全；未用旧单接口配置覆盖'; return 1; }
+
+  candidate=$(mktemp "${deploy_dir}/tmp/provider-primary-candidate.XXXXXX")
+  result=$(mktemp "${deploy_dir}/tmp/provider-primary-result.XXXXXX")
+  observed=$(mktemp "${deploy_dir}/tmp/provider-primary-observed.XXXXXX")
+  trap 'rm -f -- "$candidate" "$result" "$observed"' EXIT
+  chmod 600 "$candidate" "$result" "$observed"
+
+  if ! python3 "${deploy_dir}/scripts/provider-pool.py" --deploy-dir "$deploy_dir" list > "$observed"; then
+    warn '无法安全读取当前接口池；原配置未更改'
+    return 1
+  fi
+  primary=$(jq -er '.primary_id | select(type == "string" and length > 0)' "$observed") \
+    || { warn '当前接口池缺少唯一主接口；原配置未更改'; return 1; }
+  before_layout=$(jq -cer '[.entries[] | [.id, .role, .order]]' "$observed") \
+    || { warn '当前接口池顺序无法核对；原配置未更改'; return 1; }
+
+  jq -n --arg base "$normalized" --arg key "$api_key" --arg model "$model" \
+    --arg mode "$api_mode" --argjson vision "$vision" '
+      {
+        provider: {
+          base_url: $base,
+          model: $model,
+          api_mode: $mode,
+          capabilities: {
+            chat_completions: ($mode == "auto" or $mode == "chat_completions"),
+            responses: ($mode == "auto" or $mode == "responses"),
+            vision: $vision
+          }
+        },
+        api_key: $key
+      }
+    ' > "$candidate"
+
+  if ! python3 "${deploy_dir}/scripts/provider-pool.py" --deploy-dir "$deploy_dir" \
+    edit "$primary" "$candidate" > "$result"; then
+    message=$(jq -r '.error.message // "主接口候选未通过验证"' "$result" 2>/dev/null || true)
+    warn "${message:-主接口候选未通过验证}；接口池、秘密和原兼容配置未更改"
+    return 1
+  fi
+  if ! python3 "${deploy_dir}/scripts/provider-pool.py" --deploy-dir "$deploy_dir" list > "$observed"; then
+    warn '主接口提交后无法完成权威回读；请运行状态与自检'
+    return 1
+  fi
+  after_layout=$(jq -cer '[.entries[] | [.id, .role, .order]]' "$observed") \
+    || { warn '主接口提交后的接口顺序无法回读'; return 1; }
+  [[ "$after_layout" == "$before_layout" ]] \
+    || { warn '主接口提交后的稳定 ID 或备用顺序不一致'; return 1; }
+  if ! jq -e --arg id "$primary" --arg base "$normalized" --arg model "$model" \
+    --arg mode "$api_mode" --argjson vision "$vision" '
+      .ok == true and .primary_id == $id and
+      (.entries[] | select(.id == $id) |
+        .base_url == $base and .model == $model and
+        (if $mode == "auto" then (.api_mode == "chat_completions" or .api_mode == "responses")
+         else .api_mode == $mode end) and
+        .capabilities[.api_mode] == true and .capabilities.vision == $vision)
+    ' "$observed" >/dev/null; then
+    warn '主接口提交后的地址、模型、协议或能力回读不一致'
+    return 1
+  fi
+  info "主接口已完成候选验证、原子应用和运行回读：模型 ${model}"
+)
 
 anythingllm_api_ready() {
   local deploy_dir=$1

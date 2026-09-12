@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 const {signEnvelope,envelopeMarker} = require('../scripts/provider-envelope.js');
-const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens} = require('../scripts/provider-router.js');
+const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens,normalizeApiBase} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
 async function until(condition,message,timeout=3000) {
@@ -85,6 +85,13 @@ let count=0;
 async function test(name,work) { await work();count++;process.stdout.write('通过 UNIT/PROTOCOL：'+name+'\n'); }
 
 function testCooldownJitter() {
+  assert.equal(normalizeApiBase('https://EXAMPLE.invalid/'),'https://example.invalid/v1');
+  assert.equal(normalizeApiBase('https://example.invalid/api/'),'https://example.invalid/api/v1');
+  assert.equal(normalizeApiBase('https://example.invalid/api/v1'),'https://example.invalid/api/v1');
+  for(const invalid of ['https://example.invalid/api?x=1','https://example.invalid/api#fragment','https://example.invalid/api/../admin',
+    'https://example.invalid/api/%2e%2e/admin','https://example.invalid:99999/api','http://example.invalid/api','https://example.invalid\\api']) {
+    assert.throws(()=>normalizeApiBase(invalid));
+  }
   const nearLimit={cooldown_initial_ms:295000,cooldown_max_ms:300000};
   const atLimit={cooldown_initial_ms:1000,cooldown_max_ms:1000};
   const rounding={cooldown_initial_ms:1001,cooldown_max_ms:2000};
@@ -438,10 +445,50 @@ print(json.dumps({'ok':True,'maintenance_conflict_rejected':True,'inherited_pare
   } finally {await f.close();}
 }
 
+async function testManagementErrorClassification() {
+  const f=await fixture();
+  let current='upstream_unavailable';
+  const management=http.createServer((_request,response)=>{
+    response.writeHead(503,{'content-type':'application/json'});
+    response.end(JSON.stringify({ok:false,error:{
+      code:current,
+      message:'untrusted Bearer fixture-management-secret https://upstream.invalid/path?token=fixture-token',
+      headers:{authorization:'Bearer fixture-management-secret'}
+    }}));
+  });
+  await new Promise(resolve=>management.listen(0,'127.0.0.1',resolve));
+  const managementBase=`http://127.0.0.1:${management.address().port}`;
+  try {
+    const cases=new Map([
+      ['authentication_failed',3],['model_unavailable',1],['protocol_error',1],['invalid_response',1],
+      ['rate_limited',4],['quota_exhausted',4],['upstream_timeout',4],['upstream_unavailable',4],['connection_failed',4]
+    ]);
+    for(const [code,status] of cases) {
+      current=code;
+      const result=await f.cli(['status'],{PROVIDER_ADAPTER_MANAGEMENT_URL:managementBase});
+      assert.equal(result.code,status,`${code}: ${result.stdout}`);
+      assert.equal(result.value.error.code,code,result.stdout);
+      assert.ok(typeof result.value.error.message==='string'&&result.value.error.message.length>4,result.stdout);
+      assert.ok(!/fixture-management-secret|fixture-token|upstream\.invalid|authorization|Bearer/i.test(result.stdout),result.stdout);
+    }
+    current='Bearer fixture-management-secret https://upstream.invalid/?token=fixture-token';
+    const unknown=await f.cli(['status'],{PROVIDER_ADAPTER_MANAGEMENT_URL:managementBase});
+    assert.equal(unknown.code,1,unknown.stdout);
+    assert.equal(unknown.value.error.code,'provider_error',unknown.stdout);
+    assert.ok(!/fixture-management-secret|fixture-token|upstream\.invalid|authorization|Bearer/i.test(unknown.stdout),unknown.stdout);
+    process.stdout.write('通过 UNIT/CONFIG：管理接口保留安全故障分类并拒绝透传上游错误内容（1组，不计入HTTP协议组数）\n');
+  } finally {
+    management.closeAllConnections();
+    await new Promise(resolve=>management.close(resolve));
+    await f.close();
+  }
+}
+
 async function main() {
   testCooldownJitter();
   await testMaintenanceTransactions();
   await testRagContextTransactions();
+  await testManagementErrorClassification();
   await test('幂等单接口迁移、独立内部Key、非敏感池与同代秘密',async()=>{
     const f=await fixture();try {
       const before=fs.readFileSync(f.poolFile,'utf8');const result=await f.cli(['migrate']);assert.equal(result.code,0);assert.equal(fs.readFileSync(f.poolFile,'utf8'),before);
@@ -538,6 +585,50 @@ async function main() {
     }finally{await g.close();}
     assert.equal(retryAfterMilliseconds('900'),900000);assert.ok(retryAfterMilliseconds(new Date(Date.now()+900000).toUTCString())>899000);
     for(const code of ['credit_balance_exhausted','project_spend_limit_exceeded','organization_spend_limit_exceeded','organization_usage_limit_exceeded'])assert.equal(classifyFailure(429,{error:{code}}).kind,'quota_exhausted');
+  });
+  await test('普通404按接口协议故障切换备用，单接口保留结构化诊断',async()=>{
+    assert.deepEqual(classifyFailure(404,{error:{message:'route not found'}}),{
+      kind:'protocol_error',fallback:true,scope:'entryScope',retryAfter:0,status:404
+    });
+    const fallback=await fixture(2);try {
+      fallback.behavior=async(call,response)=>{
+        if(call.index===0){response.writeHead(404,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'route not found'}}));return true;}
+        return false;
+      };
+      const result=await fallback.post();assert.equal(result.status,200,result.text);
+      assert.deepEqual(fallback.calls.map(call=>call.index),[0,1]);
+    }finally{await fallback.close();}
+    const single=await fixture();try {
+      single.behavior=async(_call,response)=>{response.writeHead(404,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'route not found'}}));return true;};
+      const result=await single.post();assert.equal(result.status,400,result.text);
+      assert.equal(result.value.error.code,'protocol_error',result.text);
+      assert.equal(single.calls.length,1);
+      assert.ok(!result.text.includes('route not found'),result.text);
+    }finally{await single.close();}
+  });
+  await test('实际推理失败保留可操作类别，多类故障才汇总为接口池耗尽',async()=>{
+    const cases=[
+      [401,{error:{code:'invalid_api_key'}},'authentication_failed'],
+      [404,{error:{code:'model_not_found'}},'model_unavailable'],
+      [429,{error:{code:'project_spend_limit_exceeded'}},'quota_exhausted'],
+      [503,{error:{code:'synthetic_unavailable'}},'upstream_unavailable'],
+      [200,{choices:[]},'invalid_response'],
+    ];
+    for(const [status,body,expected] of cases) {
+      const f=await fixture();try {
+        f.behavior=async(_call,response)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(body));return true;};
+        const result=await f.post();assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,expected,result.text);
+        assert.equal(f.calls.length,1);assert.ok(!result.text.includes('synthetic_unavailable'));
+      }finally{await f.close();}
+    }
+    const same=await fixture(2);try {
+      same.behavior=async(_call,response)=>{response.writeHead(503,{'content-type':'application/json'});response.end('{}');return true;};
+      const result=await same.post();assert.equal(result.value.error.code,'upstream_unavailable',result.text);assert.equal(same.calls.length,2);
+    }finally{await same.close();}
+    const mixed=await fixture(2);try {
+      mixed.behavior=async(call,response)=>{response.writeHead(call.index===0?401:503,{'content-type':'application/json'});response.end(JSON.stringify({error:{code:call.index===0?'invalid_api_key':'synthetic_unavailable'}}));return true;};
+      const result=await mixed.post();assert.equal(result.value.error.code,'pool_exhausted',result.text);assert.equal(mixed.calls.length,2);
+    }finally{await mixed.close();}
   });
   await test('Responses拒绝/不完整usage保持、业务不知道与输入错误不切备用',async()=>{
     const f=await fixture(2);try {
@@ -638,6 +729,55 @@ async function main() {
       result=await f.cli(['edit',f.pool.primary_id,f.file({provider:{remove_header:'X-Fixture'}})]);assert.equal(result.code,0,result.stdout);await f.post();assert.equal(f.calls.at(-1).headers['x-fixture'],undefined);
     }finally{await f.close();}
   });
+  await test('A29 /api编辑与旧投影统一到/api/v1，候选验证、秘密提交、热加载及Chat/Responses实际路径同核',async()=>{
+    const f=await fixture();try {
+      const primary=f.pool.primary_id,apiBase=f.upstreamBase+'/p0/api',canonical=apiBase+'/v1',
+        runtimeCanonical=canonical.replace('127.0.0.1','host.docker.internal'),canonicalPath='/p0/api/v1';
+      for(const suffix of ['?x=1','#fragment','/../escape','/%2e%2e/escape']) {
+        const source=copy(f.pool);delete source.secrets_generation;source.entries[0].base_url=apiBase+suffix;
+        const rejected=await f.cli(['validate-file',f.file(source)]);assert.notEqual(rejected.code,0,rejected.stdout);
+      }
+      const allowed=new Set([canonicalPath+'/models',canonicalPath+'/chat/completions',canonicalPath+'/responses']);
+      f.behavior=async(call,response)=>{
+        response.setHeader('content-type','application/json');
+        if(call.path===canonicalPath+'/models'){response.end(JSON.stringify({data:[{id:'fixture-path-chat'},{id:'fixture-path-responses'}]}));return true;}
+        if(call.path===canonicalPath+'/chat/completions'){response.end(JSON.stringify(chat('Chat 路径回答')));return true;}
+        if(call.path===canonicalPath+'/responses'){response.end(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'Responses 回答'}]}]}));return true;}
+        assert.ok(!allowed.has(call.path));response.writeHead(404);response.end(JSON.stringify({error:{code:'fixture_wrong_path'}}));return true;
+      };
+      let result=await f.cli(['models',primary,f.file({provider:{base_url:apiBase},api_key:'fixture-path-chat-key'})]);
+      assert.equal(result.code,0,result.stdout);assert.equal(f.calls.at(-1).path,canonicalPath+'/models');
+      assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-path-chat-key');
+      result=await f.cli(['edit',primary,f.file({provider:{base_url:apiBase,model:'fixture-path-chat',api_mode:'chat_completions',
+        capabilities:{chat_completions:true,responses:false,vision:false}},api_key:'fixture-path-chat-key'})]);
+      assert.equal(result.code,0,result.stdout);f.reload();
+      assert.equal(f.pool.entries[0].base_url,canonical);assert.equal(f.pool.entries[0].api_mode,'chat_completions');
+      assert.equal(f.secret[primary].api_key,'fixture-path-chat-key');
+      assert.equal(read(path.join(f.directory,'config/provider-pool.yaml')).entries[0].base_url,canonical);
+      assert.equal(read(path.join(f.directory,'config/provider.yaml')).provider.base_url,runtimeCanonical);
+      assert.match(fs.readFileSync(path.join(f.directory,'.env'),'utf8'),new RegExp('^AI_API_PROBE_BASE_URL='+canonical.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'$','m'));
+      assert.match(fs.readFileSync(path.join(f.directory,'.env'),'utf8'),new RegExp('^AI_API_BASE_URL='+runtimeCanonical.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'$','m'));
+      assert.equal((await f.get('status')).revision,f.pool.revision);
+      let answer=await f.post();assert.equal(answer.status,200,answer.text);assert.equal(f.calls.at(-1).path,canonicalPath+'/chat/completions');
+      assert.equal(f.calls.at(-1).body.model,'fixture-path-chat');assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-path-chat-key');
+
+      result=await f.cli(['edit',primary,f.file({provider:{base_url:apiBase+'/',model:'fixture-path-responses',api_mode:'responses',
+        capabilities:{chat_completions:false,responses:true,vision:false}},api_key:'fixture-path-responses-key'})]);
+      assert.equal(result.code,0,result.stdout);f.reload();
+      assert.equal(f.pool.entries[0].base_url,canonical);assert.equal(f.pool.entries[0].api_mode,'responses');
+      assert.equal(f.secret[primary].api_key,'fixture-path-responses-key');
+      answer=await f.post();assert.equal(answer.status,200,answer.text);assert.equal(answer.value.choices[0].message.content,'Responses 回答');
+      assert.equal(f.calls.at(-1).path,canonicalPath+'/responses');assert.equal(f.calls.at(-1).body.model,'fixture-path-responses');
+      assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-path-responses-key');
+      const visible=await f.cli(['entry',primary]);assert.equal(visible.code,0,visible.stdout);assert.equal(visible.value.entry.base_url,canonical);
+      assert.ok(!visible.stdout.includes('fixture-path-responses-key'));
+
+      // 兼容已由旧编辑器发布为 /api 的投影：运行中 adapter 也使用同一规范化，不请求错误路径。
+      f.publish(pool=>{pool.entries[0].base_url=apiBase;});
+      answer=await f.post();assert.equal(answer.status,200,answer.text);assert.equal(f.calls.at(-1).path,canonicalPath+'/responses');
+      assert.equal(f.calls.at(-1).headers.authorization,'Bearer fixture-path-responses-key');
+    }finally{await f.close();}
+  });
   await test('429真实HTTP共享额度冷却及秒数/HTTP日期Retry-After均不截短',async()=>{
     for(const retry of ['900',new Date(Date.now()+900000).toUTCString()]) {
       const f=await fixture(3);try {
@@ -684,6 +824,29 @@ async function main() {
       assert.equal((await f.post(sample,envelope)).status,400);assert.equal(f.calls.length,1);
       assert.ok(fs.existsSync(path.join(f.directory,'backups/config-history/provider-pool',before.revision+'.json')));
     }finally{await f.close();}
+  });
+  await test('适配器仅回显新revision不得冒充已应用，原池与Key必须成套恢复',async()=>{
+    const f=await fixture(2);let liar;
+    try {
+      liar=http.createServer((_request,response)=>{
+        response.setHeader('content-type','application/json');
+        response.end(JSON.stringify({revision:read(f.poolFile).revision}));
+      });
+      await new Promise(resolve=>liar.listen(0,'127.0.0.1',resolve));
+      const beforePool=copy(f.pool),beforeSecret=copy(f.secret);
+      const result=await f.cli(['enable',f.pool.entries[1].id,'false'],{
+        PROVIDER_ADAPTER_MANAGEMENT_URL:`http://127.0.0.1:${liar.address().port}`
+      });
+      assert.notEqual(result.code,0,result.stdout);
+      assert.equal(result.value.error.code,'readback_failed');
+      f.reload();
+      assert.ok(f.pool.revision>beforePool.revision+1);
+      assert.deepEqual(f.pool.entries,beforePool.entries);
+      assert.deepEqual(f.secret,beforeSecret);
+    }finally{
+      if(liar){liar.closeAllConnections();await new Promise(resolve=>liar.close(resolve));}
+      await f.close();
+    }
   });
   await test('未知主导入草稿可补Key、保持稳定ID并完整验证应用',async()=>{
     const f=await fixture(2);try {

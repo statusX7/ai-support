@@ -65,8 +65,12 @@ fixture_env() {
     DOCTOR_FIXTURE_WORKFLOW_FAIL="${DOCTOR_FIXTURE_WORKFLOW_FAIL:-0}" \
     DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE="${DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE:-${DEPLOY}/n8n/knowledge-lexical.js}" \
     DOCTOR_FIXTURE_N8N_CODE_FAIL="${DOCTOR_FIXTURE_N8N_CODE_FAIL:-0}" \
+    DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS="${DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS:-0}" \
+    DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES="${DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES:-0}" \
+    DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES="${DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES:-0}" \
     DOCTOR_FIXTURE_ADAPTER_FAIL="${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" \
     DOCTOR_FIXTURE_PROVIDER_FAIL="${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" \
+    DOCTOR_FIXTURE_PROVIDER_MODE="${DOCTOR_FIXTURE_PROVIDER_MODE:-}" \
     DOCTOR_FIXTURE_RETRIEVAL_FAIL="${DOCTOR_FIXTURE_RETRIEVAL_FAIL:-0}" \
     DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN="${DOCTOR_FIXTURE_RETRIEVAL_UNKNOWN:-0}" \
     DOCTOR_FIXTURE_ADMIN_INVALID_RESULT="${DOCTOR_FIXTURE_ADMIN_INVALID_RESULT:-0}" \
@@ -606,6 +610,7 @@ assert_result database.n8n_binding PASS
 assert_result anything.workspace PASS
 assert_result knowledge.catalog PASS
 assert_result n8n.runtime PASS
+assert_result n8n.execution_backlog PASS
 assert_result provider.adapter PASS
 assert_result provider.adapter_binding PASS
 assert_result provider.adapter_code_binding PASS
@@ -1026,6 +1031,39 @@ jq -M -n --argjson now "$(date -u '+%s%3N')" \
 unset DOCTOR_TEST_PRESERVE_HEARTBEAT
 pass '独立 scheduler 心跳区分无流量健康、延迟警告和扫描停滞'
 
+SCHEDULER_LOCK="${DEPLOY}/data/runtime/scheduler-scan.lock"
+mkdir -m 0700 -- "$SCHEDULER_LOCK"
+invoke --local
+(( LAST_RC == 1 )) || fail '旧版无所有权扫描空锁应阻断新调度运行'
+assert_result runtime.scheduler_lock FAIL
+invoke --local --fix
+(( LAST_RC == 0 )) || fail '显式安全修复未在停写窗口迁移旧版扫描空锁'
+assert_result runtime.scheduler_lock PASS
+jq -e 'any(.fix.actions[]; .id == "fix.runtime.scheduler_lock" and .status == "PASS")' "$OUT" >/dev/null \
+  || fail '旧版扫描锁修复缺少结构化动作结果'
+[[ ! -e "$SCHEDULER_LOCK" && ! -L "$SCHEDULER_LOCK" ]] || fail '旧版扫描空锁仍残留'
+grep -Eq ' stop n8n$' "$FIXTURE_LOG" || fail '扫描锁修复未先停止 n8n 写入'
+grep -Eq ' up -d n8n$' "$FIXTURE_LOG" || fail '扫描锁修复后未恢复 n8n'
+
+mkdir -m 0700 -- "$SCHEDULER_LOCK"
+jq -M -n --arg boot "$(tr -d '\n' < /proc/sys/kernel/random/boot_id)" --arg start '1' \
+  '{schema_version:1,token:("a"*32),pid:1,boot_id:$boot,process_start:$start,
+    started_at:1,heartbeat_at:1}' > "${SCHEDULER_LOCK}/owner.json"
+chmod 0600 "${SCHEDULER_LOCK}/owner.json"
+invoke --local --fix
+[[ -f "${SCHEDULER_LOCK}/owner.json" ]] || fail 'doctor --fix 错误删除带所有权扫描锁'
+rm -f -- "${SCHEDULER_LOCK}/owner.json"; rmdir -- "$SCHEDULER_LOCK"
+
+mkdir -m 0700 -- "$SCHEDULER_LOCK"; printf '保留\n' > "${SCHEDULER_LOCK}/unknown"
+! cleanup_legacy_scheduler_scan_lock "$DEPLOY" || fail '清理函数错误接受非空扫描锁'
+[[ -f "${SCHEDULER_LOCK}/unknown" ]] || fail '清理函数错误删除非空扫描锁内容'
+rm -f -- "${SCHEDULER_LOCK}/unknown"; rmdir -- "$SCHEDULER_LOCK"
+mkdir -m 0700 -- "${TEST_ROOT}/scheduler-link-target"; ln -s -- "${TEST_ROOT}/scheduler-link-target" "$SCHEDULER_LOCK"
+! cleanup_legacy_scheduler_scan_lock "$DEPLOY" || fail '清理函数错误接受链接扫描锁'
+[[ -L "$SCHEDULER_LOCK" ]] || fail '清理函数错误删除扫描锁链接'
+unlink -- "$SCHEDULER_LOCK"; rmdir -- "${TEST_ROOT}/scheduler-link-target"
+pass '旧版 ownerless 空锁仅由维护锁与 n8n 停写修复，带 owner、非空和链接锁均保留'
+
 state_tmp="${TEST_ROOT}/session-state.tmp"
 jq --argjson until "$(( $(date -u '+%s%3N') - 20000 ))" '.worker={token:"fixture",until:$until}' \
   "$SESSION_FILE" > "$state_tmp"
@@ -1080,10 +1118,20 @@ assert_result n8n.workflow FAIL
 unset DOCTOR_FIXTURE_WORKFLOW_FAIL
 doctor_workflow_lexical_cases
 export DOCTOR_FIXTURE_N8N_CODE_FAIL=1
+export DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS=40
+export DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES=25
+export DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES=7
 invoke --local
 (( LAST_RC == 1 )) || fail '通用 401 不能冒充 n8n Code 健康'
 assert_result n8n.runtime FAIL
+assert_result n8n.execution_backlog FAIL
 unset DOCTOR_FIXTURE_N8N_CODE_FAIL
+invoke --local
+(( LAST_RC == 2 )) || fail 'Code runner 已恢复时历史执行积压应保留警告而非假装全绿或阻断'
+assert_result n8n.runtime PASS
+assert_result n8n.execution_backlog WARN
+unset DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES
+pass 'n8n 执行积压结合生产 Code runner 状态定位调度饥饿，恢复后保留历史告警'
 export DOCTOR_FIXTURE_ADAPTER_FAIL=1
 invoke --local
 (( LAST_RC == 1 )) || fail 'adapter 容器路径故障应退出 1'
@@ -1127,12 +1175,43 @@ assert_result database.authentication SKIP
 unset DOCTOR_FIXTURE_DAEMON_FAIL
 pass 'daemon 故障与下游未检查状态明确分离'
 
-export DOCTOR_FIXTURE_PROVIDER_FAIL=1
+while IFS='|' read -r mode expected_summary expected_remediation; do
+  export DOCTOR_FIXTURE_PROVIDER_MODE=$mode
+  invoke --full
+  (( LAST_RC == 1 )) || fail "Provider ${mode} 路径应在 full 退出 1"
+  assert_result provider.inference FAIL
+  jq -e --arg summary "$expected_summary" --arg remediation "$expected_remediation" '
+    any(.results[]; .id == "provider.inference" and .status == "FAIL"
+      and .summary == $summary and (.remediation | contains($remediation)))
+  ' "$OUT" >/dev/null || fail "Provider ${mode} 没有显示对应的安全中文分类"
+  ! jq -e 'any(.results[]; .id == "provider.inference"
+    and .summary == "当前模型、协议或最终应用容器路径调用失败")' "$OUT" >/dev/null \
+    || fail "Provider ${mode} 仍退化为笼统故障提示"
+  ! grep -q 'doctor-fixture-ai_api_key-do-not-print' "$OUT" "$ERR" "$FIXTURE_LOG" \
+    || fail "Provider ${mode} 诊断输出泄露 Provider Key"
+done <<'PROVIDER_DIAGNOSTIC_CASES'
+authentication|当前接口鉴权失败|地址与 Key
+model|当前模型原名或推理端点不可用|模型、协议及 Base URL
+upstream|上游服务或容器网络连接不可用|DNS/TLS
+protocol|接口协议、地址路径或请求格式不兼容|Chat Completions / Responses
+timeout|实际推理在限定时间内未完成|主备总预算
+empty|上游返回空正文、非 JSON 或与所选协议不符|Chat/Responses
+error-json|上游返回空正文、非 JSON 或与所选协议不符|Chat/Responses
+PROVIDER_DIAGNOSTIC_CASES
+unset DOCTOR_FIXTURE_PROVIDER_MODE
+
+export DOCTOR_FIXTURE_RETRIEVAL_FAIL=1
 invoke --full
-(( LAST_RC == 1 )) || fail 'Provider 空/错误路径应在 full 退出 1'
+(( LAST_RC == 1 )) || fail '知识检索错误应在 full 退出 1'
 assert_result provider.inference FAIL
-! grep -q 'doctor-fixture-ai_api_key-do-not-print' "$OUT" "$ERR" "$FIXTURE_LOG" || fail '诊断输出泄露 Provider Key'
-unset DOCTOR_FIXTURE_PROVIDER_FAIL
+jq -e 'any(.results[]; .id == "provider.inference" and .status == "FAIL"
+  and .summary == "知识检索或启用资料映射未通过"
+  and (.remediation | contains("索引")))' "$OUT" >/dev/null \
+  || fail '检索错误被笼统归类为 Provider 推理故障'
+! grep -q '^admin-query generation ' "$FIXTURE_LOG" || fail 'full 检索错误后仍调用 Provider'
+unset DOCTOR_FIXTURE_RETRIEVAL_FAIL
+pass 'full 自检区分鉴权、模型、协议路径、上游、超时、无效响应和检索故障，且不输出原始错误或秘密'
+
 invoke --full
 (( LAST_RC == 0 )) || fail "健康 full 自检退出码应为 0，实际 ${LAST_RC}"
 assert_result provider.inference PASS
@@ -1171,7 +1250,10 @@ jq -e '.answer == "合成协议连接正常" and .sources == ["custom-documents/
 ! grep -Fq "$query" "$FIXTURE_LOG" "$ERR" || fail '管理员问题泄露到日志或命令参数'
 DOCTOR_FIXTURE_ADMIN_INVALID_RESULT=1 invoke_query "$query" 1000
 [[ "$LAST_RC" == 1 && ! -s "$OUT" ]] || fail '未验证管理员响应不能冒充成功'
-grep -Fq '知识问答测试未完成' "$ERR" || fail '管理员错误没有固定中文说明'
+grep -Fq 'Provider 返回了空正文、非 JSON 或不符合所选协议的响应' "$ERR" \
+  || fail '管理员无效响应没有对应的安全中文说明'
+! grep -Fq '当前模型、协议或最终应用容器路径调用失败' "$ERR" \
+  || fail '管理员无效响应仍退化为笼统故障说明'
 ! find "${DEPLOY}/tmp" -maxdepth 1 -name 'configuration-query.*' -print -quit | grep -q . \
   || fail '管理员成功或失败遗留含答案的临时文件'
 pass '管理员 stdin 保留原问题，验证输出结构并清理受限临时结果'

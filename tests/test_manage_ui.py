@@ -304,6 +304,184 @@ printf '受管匿名在线更新入口已调用\n'
         online_entry.chmod(0o750)
 
 
+def service_lifecycle_cases():
+    """真实生产菜单不能让已停止的项目仍沿用 ready 假绿。"""
+    marker = DEPLOY / ".crisp-ai-installation"
+    state_file = DEPLOY / "tmp/configuration-services-state"
+    state_file.unlink(missing_ok=True)
+
+    terminal = Terminal("services-stop")
+    terminal.expect("本地服务：正常运行")
+    terminal.expect("请选择："); terminal.send("16")
+    terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("2")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("本项目服务已停止；配置、知识、人工状态与数据均已保留")
+    terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("本地服务：已停止"); terminal.expect("请选择："); terminal.send("0")
+    terminal.finish()
+    assert "fact_local_services=pending" in marker.read_text(encoding="utf-8")
+    assert state_file.exists() and not state_file.read_text(encoding="utf-8").strip()
+    status = invoke(["bash", str(DEPLOY / "manage.sh"), "--deploy-dir", str(DEPLOY), "status"])
+    assert status.returncode == 0 and "本地服务（实时）：已停止" in status.stdout, status.stdout
+    assert "16 → 1" in status.stdout
+
+    terminal = Terminal("services-start")
+    terminal.expect("本地服务：已停止")
+    terminal.expect("请选择："); terminal.send("16")
+    terminal.expect("请选择："); terminal.send("1")
+    terminal.expect("本项目服务已启动并通过本地健康回读")
+    terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("本地服务：正常运行"); terminal.expect("请选择："); terminal.send("0")
+    terminal.finish()
+    assert "fact_local_services=ready" in marker.read_text(encoding="utf-8")
+    assert set(state_file.read_text(encoding="utf-8").splitlines()) == {
+        "postgres", "anythingllm", "n8n", "provider-adapter"
+    }
+    maintenance = (DEPLOY / "logs/maintenance.jsonl").read_text(encoding="utf-8")
+    assert '"action":"services_stop"' in maintenance and '"phase":"complete"' in maintenance
+    assert '"action":"services_start"' in maintenance
+    passing("服务停止/启动写入维护事件并实时回读，停止后不沿用 ready 假绿")
+
+    terminal = Terminal("services-restart")
+    terminal.expect("请选择："); terminal.send("16")
+    terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("3")
+    terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+    terminal.expect("本项目服务已重建并通过本地健康回读；业务配置与会话状态已保留")
+    terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("0")
+    terminal.expect("请选择："); terminal.send("0"); terminal.finish()
+    maintenance = (DEPLOY / "logs/maintenance.jsonl").read_text(encoding="utf-8")
+    assert '"action":"services_restart"' in maintenance
+    passing("服务重启使用受管重建路径并完成健康回读")
+
+    terminal = Terminal("services-unhealthy-header", extra={"CONFIGURATION_FIXTURE_UNHEALTHY_SERVICE": "n8n"})
+    terminal.expect("本地服务：运行异常")
+    terminal.expect("请选择："); terminal.send("0"); terminal.finish()
+    assert "fact_local_services=ready" in marker.read_text(encoding="utf-8")
+    passing("主菜单用实时容器健康覆盖陈旧事实，但只读刷新不篡改安装标记")
+
+    # common.sh 的 Caddy 状态机由独立测试覆盖；这里给部署副本追加无副作用探针，
+    # 验证生产菜单的调用顺序、模式分流和失败语义，不改源码公共模块或 Docker mock。
+    common = DEPLOY / "scripts/common.sh"
+    common_before = common.read_bytes()
+    env_file = DEPLOY / ".env"
+    env_before = env_file.read_bytes()
+    marker_before = marker.read_bytes()
+    state_before = state_file.read_bytes()
+    trace = DEPLOY / "tmp/manage-caddy-trace"
+    probe = r'''
+manage_caddy_test_trace() {
+  printf '%s\n' "$1" >> "${CONFIGURATION_FIXTURE_CADDY_TRACE:?}"
+}
+docker_compose() {
+  local deploy_dir=$1
+  shift
+  manage_caddy_test_trace "compose:$*"
+  docker_compose_command --project-directory "$deploy_dir" --env-file "${deploy_dir}/.env" \
+    -f "${deploy_dir}/docker-compose.yml" "$@"
+}
+validate_managed_caddy_configuration() {
+  manage_caddy_test_trace "validate:$(env_get "$1/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)"
+}
+reconcile_caddy_runtime() {
+  manage_caddy_test_trace "reconcile:$(env_get "$1/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)"
+  [[ ${CONFIGURATION_FIXTURE_CADDY_RECONCILE_FAIL:-0} != 1 ]]
+}
+refresh_program_file_mounts() {
+  manage_caddy_test_trace refresh
+  return 97
+}
+wait_for_local_health() {
+  manage_caddy_test_trace health
+}
+'''
+
+    def set_access_mode(value):
+        lines = [line for line in env_file.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("WEBHOOK_ACCESS_MODE=")]
+        if value is not None:
+            lines.append("WEBHOOK_ACCESS_MODE=" + value)
+        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        env_file.chmod(0o600)
+
+    def traced_action(name, action, expected, *, extra=None):
+        trace.unlink(missing_ok=True)
+        terminal = Terminal(name, extra={"CONFIGURATION_FIXTURE_CADDY_TRACE": str(trace), **(extra or {})})
+        terminal.expect("请选择："); terminal.send("16")
+        terminal.expect("启动本项目服务"); terminal.expect("请选择：")
+        terminal.send({"start": "1", "stop": "2", "restart": "3"}[action])
+        if action != "start":
+            terminal.expect("1 确认 / 0 返回："); terminal.send("1")
+        terminal.expect(expected)
+        terminal.expect("启动本项目服务"); terminal.expect("请选择："); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0"); output = terminal.finish()
+        return output, trace.read_text(encoding="utf-8").splitlines()
+
+    try:
+        common.write_bytes(common_before + probe.encode("utf-8"))
+        common.chmod(0o750)
+
+        set_access_mode("external_proxy")
+        _, lines = traced_action(
+            "services-caddy-external-restart", "restart",
+            "本项目服务已重建并通过本地健康回读；业务配置与会话状态已保留")
+        assert lines == [
+            "compose:config --quiet", "validate:external_proxy",
+            "compose:up -d --force-recreate --remove-orphans",
+            "reconcile:external_proxy", "health",
+        ], lines
+        assert "refresh" not in lines
+
+        set_access_mode(None)
+        _, lines = traced_action(
+            "services-caddy-disabled-start", "start",
+            "本项目服务已启动并通过本地健康回读")
+        assert lines == [
+            "compose:config --quiet", "validate:",
+            "compose:up -d --remove-orphans", "reconcile:", "health",
+        ], lines
+        assert "refresh" not in lines
+
+        _, lines = traced_action(
+            "services-caddy-stop-no-reconcile", "stop",
+            "本项目服务已停止；配置、知识、人工状态与数据均已保留")
+        assert not any(line.startswith(("validate:", "reconcile:")) or line in ("health", "refresh")
+                       for line in lines), lines
+
+        set_access_mode("managed_https")
+        output, lines = traced_action(
+            "services-caddy-reconcile-failure", "start",
+            "反向代理运行态对账失败；未报告服务启动完成",
+            extra={"CONFIGURATION_FIXTURE_CADDY_RECONCILE_FAIL": "1"})
+        assert lines == [
+            "compose:--profile managed-https config --quiet", "validate:managed_https",
+            "compose:--profile managed-https up -d --remove-orphans",
+            "reconcile:managed_https",
+        ], lines
+        assert "health" not in lines and "refresh" not in lines
+        assert "fact_local_services=failed" in marker.read_text(encoding="utf-8")
+        last_event = json.loads((DEPLOY / "logs/maintenance.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        assert last_event["action"] == "services_start" and last_event["phase"] == "failed"
+        assert "业务配置与数据未被清理" in output
+
+        source = (ROOT / "manage.sh").read_text(encoding="utf-8")
+        section = source.split("maintain_services() (", 1)[1].split("\n)\n\nservices_menu", 1)[0]
+        assert "reconcile_caddy_runtime" in section
+        assert not re.search(r"(?m)^\s*(?:if\s+!\s+)?refresh_program_file_mounts\b", section)
+        assert section.index("if [[ \"$action\" == stop ]]") < section.index("reconcile_caddy_runtime")
+        assert section.index("reconcile_caddy_runtime") < section.index("wait_for_local_health")
+        passing("启动/重启在 Compose 后、健康检查前按模式对账 Caddy；停止不对账且不重复重建 adapter")
+        passing("Caddy 运行态对账失败写入失败事实和维护事件，保留业务数据且不假报启动成功")
+    finally:
+        common.write_bytes(common_before)
+        common.chmod(0o750)
+        env_file.write_bytes(env_before)
+        env_file.chmod(0o600)
+        marker.write_bytes(marker_before)
+        marker.chmod(0o600)
+        state_file.write_bytes(state_before)
+        state_file.chmod(0o600)
+
+
 
 
 def provider_pool():
@@ -1155,6 +1333,9 @@ def main():
             presentation_cases()
             renderer_cases()
             return
+        if os.environ.get("MENU_TEST_FOCUS") == "services":
+            service_lifecycle_cases()
+            return
         for argument in ("--help", "--version"):
             result = invoke(["bash", str(DEPLOY / "manage.sh"), argument])
             assert result.returncode == 0, result.stdout
@@ -1163,6 +1344,7 @@ def main():
         for number, label in enumerate(labels, 1):
             menu_case(number, label)
         online_update_menu_case()
+        service_lifecycle_cases()
         log_menu_cases()
         material_menu_cases()
         welcome_presentation_cases()

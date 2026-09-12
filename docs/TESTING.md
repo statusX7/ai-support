@@ -1,6 +1,6 @@
 # 测试与验收
 
-本章供维护者复现测试；正常管理员使用[在线安装命令](INSTALL.md)和 `crispai doctor`，不需要准备开发用 E2E 环境变量。v1.2.1 当前完成度见[发布说明](releases/v1.2.1.md)，最终数量由该版报告及独立发布回执记录；[v1.2.0 报告](reports/v1.2.0-report.md)仅是历史证据，数字不累计。
+本章供维护者复现测试；正常管理员使用[在线安装命令](INSTALL.md)和 `crispai doctor`，不需要准备开发用 E2E 环境变量。v1.2.1 当前完成度见[发布说明](releases/v1.2.1.md)，最终数量由该版报告及独立发布回执记录；公开仓库中的 [v1.2.0 报告](https://github.com/statusX7/ai-support/blob/main/docs/reports/v1.2.0-report.md)仅是历史证据，数字不累计。
 
 ## 层级与门禁
 
@@ -29,6 +29,10 @@ bash tests/test_get.sh
 bash tests/test_doctor.sh
 bash tests/test_public_distribution.sh --local
 bash tests/test_manage_contract.sh
+bash tests/test_wizard.sh
+bash tests/test_provider_menu.sh
+bash tests/test_caddy_callers.sh
+bash tests/test_caddy_routing.sh
 node tests/test_configuration_protocol.js
 bash tests/test_workflow_contract.sh
 bash tests/test_workflow_runtime.sh
@@ -56,6 +60,10 @@ bash tests/test_logs.sh
 ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服运行依赖。普通安装所需的 Python 3/PyYAML、jq、Docker/Compose 等仍由生产安装器补齐。
 
 `test_docs_acceptance.py` 独立核对活跃链接、唯一推荐命令原样、18 项菜单标题、帮助/版本的无副作用执行，以及资料限制和反代日志文档接线；不执行在线安装，也不能替代真实组件与 Crisp 验收。资料应用及强制同步的生产 PTY 分支由 `test_manage_contract.sh` 覆盖。
+
+`test_wizard.sh` 覆盖 `collecting` 状态再次进入时的继续、重新开始和取消：继续必须从记录步骤恢复；重新开始只能删除身份、权限、链接数、命名和目录都属于该向导的临时草稿，不能碰正式配置、知识或外部链接目标。`test_provider_pool.js` 与 `test_provider_menu.sh` 分别核对 `/api`→`/api/v1`、已有 `/api/v1` 不重复、候选验证/原子回读/失败恢复，以及九类安全中文错误；模型列表夹具不能替代最终 Chat/Responses 推理验证。
+
+`test_caddy_callers.sh` 以调用契约检查 Crisp 设置与恢复流程：候选须在提交/停服前验证，运行对账失败须恢复旧 `.env`、Caddyfile 与模式，恢复完成前不能报告成功。`test_caddy_routing.sh` 使用真实 Caddy 容器核对配置语法、路由、last-good、原子替换后的挂载摘要、失败回滚和 `managed_https`↔`external_proxy` 转换；这只证明本项目受管反代，不替代公网 DNS、ACME 证书或管理员已有外部站点验收。
 
 `test_provider_log_redaction.py` 只用虚构秘密核对有效/历史/草稿代次的原文与编码、持续查看轮换、读取上限及异常失败关闭；`test_logs.sh` 通过生产导出路径验证诊断包排除秘密，并在隔离副本故意关闭首道过滤，确认二次扫描独立拒绝。它们不是实机日志或真实凭据泄漏测试。
 
@@ -145,7 +153,7 @@ bash tests/run.sh
 
 ## 保留的历史验收矩阵
 
-v1.1.1 的 I01～I15、D01～D16、R01～R07、P01～P07 在[历史报告](reports/v1.1.1-report.md)记录。它们作为回归继续保留，不与本轮重用编号混淆，主要驱动如下：
+v1.1.1 的 I01～I15、D01～D16、R01～R07、P01～P07 在公开仓库的 [v1.1.1 历史报告](https://github.com/statusX7/ai-support/blob/main/docs/reports/v1.1.1-report.md)记录。它们作为回归继续保留，不与本轮重用编号混淆，主要驱动如下：
 
 | 验收组 | 实际入口与断言 |
 | --- | --- |

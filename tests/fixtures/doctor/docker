@@ -175,7 +175,16 @@ const request = async (url, options) => {
   log("generation path=" + (legacy && env.AI_API_MODE === "responses" ? "/responses" : "/chat/completions")
     + " prompt-complete=true knowledge-complete=true scope=" + (legacy ? "legacy" : "admin"));
   if (process.env.DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS) await new Promise(resolve => setTimeout(resolve, Number(process.env.DOCTOR_FIXTURE_ADMIN_DELAY_SECONDS) * 1000));
-  if (process.env.DOCTOR_FIXTURE_PROVIDER_FAIL === "1") return {status: 503, body: {error: "synthetic_provider_failure"}};
+  const providerMode = process.env.DOCTOR_FIXTURE_PROVIDER_MODE
+    || (process.env.DOCTOR_FIXTURE_PROVIDER_FAIL === "1" ? "upstream" : "healthy");
+  if (providerMode === "authentication") return {status: 401, body: {error: {message: "synthetic authentication failure"}}};
+  if (providerMode === "model") return {status: 404, body: {error: {message: "synthetic model failure"}}};
+  if (providerMode === "upstream") return {status: 503, body: {error: {message: "synthetic upstream failure"}}};
+  if (providerMode === "protocol") return {status: 400, body: {error: {code: "protocol_error", message: "synthetic route mismatch"}}};
+  if (providerMode === "empty") return {status: 200, body: {choices: []}};
+  if (providerMode === "error-json") return {status: 200, body: {error: {message: "synthetic protocol failure"}}};
+  if (providerMode === "timeout") { const error = new Error("请求超时"); error.name = "AbortError"; throw error; }
+  assert.equal(providerMode, "healthy");
   return {status: 200, body: legacy && env.AI_API_MODE === "responses"
     ? {output_text: "合成协议连接正常"} : {choices: [{message: {role: "assistant", content: "合成协议连接正常"}}]}};
 };
@@ -222,6 +231,17 @@ require(root + "/n8n/admin-query.js");
       [[ "${DOCTOR_FIXTURE_CADDY_FILE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
       [[ "$expected" == "$actual" ]] || exit 1
       printf 'matched\n'
+    elif [[ "$joined" == *' postgres '* && "$joined" == *'execution_entity'* ]]; then
+      IFS= read -r managed_user
+      IFS= read -r managed_db
+      IFS= read -r managed_password
+      IFS= read -r workflow_id
+      [[ "$managed_user" == crisp_ai && "$managed_db" == n8n \
+        && "$workflow_id" == 5d2c37c9-1c8e-45d0-8f53-c0a6e79b3a40 \
+        && -f "${DOCTOR_FIXTURE_DB_PASSWORD_FILE:-}" \
+        && "$managed_password" == "$(<"$DOCTOR_FIXTURE_DB_PASSWORD_FILE")" ]] || exit 1
+      printf '%s|%s|%s\n' "${DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS:-0}" \
+        "${DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES:-0}" "${DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES:-0}"
     elif [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
       [[ "${DOCTOR_FIXTURE_DB_FAIL:-0}" != 1 ]] || exit 1
       [[ "$joined" == *'-h postgres'* ]] || exit 1
@@ -334,6 +354,17 @@ PY
           temporary=$(mktemp "${DOCTOR_FIXTURE_STOPPED_FILE}.tmp.XXXXXX")
           awk -v wanted="$service" '$0 != wanted' "$DOCTOR_FIXTURE_STOPPED_FILE" > "$temporary"
           mv -f -- "$temporary" "$DOCTOR_FIXTURE_STOPPED_FILE"
+          ;;
+      esac
+    done
+    ;;
+  stop)
+    [[ -n "${DOCTOR_FIXTURE_STOPPED_FILE:-}" && -f "$DOCTOR_FIXTURE_STOPPED_FILE" ]] || exit 0
+    for service in "$@"; do
+      case "$service" in
+        postgres|anythingllm|n8n|provider-adapter|caddy)
+          grep -Fxq -- "$service" "$DOCTOR_FIXTURE_STOPPED_FILE" \
+            || printf '%s\n' "$service" >> "$DOCTOR_FIXTURE_STOPPED_FILE"
           ;;
       esac
     done

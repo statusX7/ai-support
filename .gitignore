@@ -22,6 +22,7 @@ config/.crispai-launcher
 config/crispai-nginx.conf
 config/crispai-caddy.conf
 config/Caddyfile.previous
+config/Caddyfile.last-good
 config/*.local.yaml
 *.pem
 *.key

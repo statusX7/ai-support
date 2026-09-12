@@ -39,6 +39,19 @@ printf '只根据受控知识回答。\n' > "$PROMPT_FILE"
 printf '虚构产品编号：DEMO-4827。\n' > "${KNOWLEDGE_DIR}/产品 说明.MD"
 printf '虚构排障资料。\n' > "${KNOWLEDGE_DIR}/排障.TXT"
 
+# 输出状态目录的任一父级都不能是符号链接；拒绝必须发生在 mkdir 产生越界目录之前。
+mkdir -p -- "${TEST_ROOT}/state-real"
+ln -s -- "${TEST_ROOT}/state-real" "${TEST_ROOT}/state-link"
+if printf '' | "$WIZARD" --output "${TEST_ROOT}/state-link/nested/result.json" \
+  >"${TEST_ROOT}/unsafe-state.stdout" 2>"${TEST_ROOT}/unsafe-state.stderr"; then
+  fail '向导接受了含符号链接父级的状态输出路径'
+fi
+[[ ! -e "${TEST_ROOT}/state-real/nested" ]] \
+  || fail '拒绝符号链接父级前已在目标外创建状态目录'
+grep -Fq '父级包含符号链接' "${TEST_ROOT}/unsafe-state.stderr" \
+  || fail '向导未说明状态目录父级不安全'
+pass '向导状态路径在创建目录前拒绝符号链接父级'
+
 TEST_PROVIDER_SECRET="test only \$provider#=\"\\=value"
 TEST_PROVIDER_REPLACEMENT="replacement \$provider#=\"\\=value"
 TEST_CRISP_IDENTIFIER='test-only identifier#="\=value'
@@ -180,7 +193,10 @@ normal_steps = [
     ("[9/10] 知识库文件或目录", knowledge_dir, False),
     ("1 开始安装 / 2 返回修改 / 0 取消", "1", False),
 ]
-resume_steps = normal_steps[2:]
+resume_choice = ("1 继续上次 / 2 重新开始 / 0 取消", "1", False)
+restart_choice = ("1 继续上次 / 2 重新开始 / 0 取消", "2", False)
+resume_steps = [resume_choice] + normal_steps[2:]
+restart_steps = [restart_choice] + normal_steps
 manual_steps = list(normal_steps)
 manual_steps[0] = (normal_steps[0][0], base_url, False)
 manual_steps[2] = ("[3/10] 模型列表不可用", "manual-chat-model", False)
@@ -218,6 +234,9 @@ if scenario == "normal" or scenario == "manual":
 elif scenario == "resume":
     argv = [wizard, "--output", output_file]
     steps = resume_steps
+elif scenario == "restart":
+    argv = [wizard, "--output", output_file]
+    steps = restart_steps
 elif scenario == "reuse":
     argv = [wizard, "--output", output_file]
     steps = [("1 使用现有配置 / 2 重新配置 / 0 取消", "1", False)]
@@ -233,6 +252,12 @@ elif scenario == "port_conflict":
 elif scenario == "paste":
     argv = [wizard, "--output", output_file]
     steps = paste_steps
+elif scenario in ("pty_eof", "sigint"):
+    argv = [wizard, "--output", output_file]
+    steps = normal_steps[:2]
+elif scenario == "resume_eof":
+    argv = [wizard, "--output", output_file]
+    steps = []
 else:
     raise SystemExit(f"unknown scenario: {scenario}")
 
@@ -277,6 +302,16 @@ try:
         # 等待 read -s 已关闭终端回显，防止测试转录包含测试密钥。
         time.sleep(0.12 if hidden else 0.03)
         os.write(fd, answer.encode("utf-8") + b"\n")
+
+    if scenario in ("pty_eof", "sigint"):
+        wait_for("[3/10] 选择模型")
+        if scenario == "pty_eof":
+            os.write(fd, b"\x04")
+        else:
+            os.kill(pid, signal.SIGINT)
+    elif scenario == "resume_eof":
+        wait_for("1 继续上次 / 2 重新开始 / 0 取消")
+        os.write(fd, b"\x04")
 
     deadline = time.monotonic() + 30
     child_status = None
@@ -379,6 +414,19 @@ jq -e '.status == "confirmed" and .provider.api_mode == "responses" and .provide
   || fail 'Responses-only 的真实探测结果未正确保存为 Responses 运行模式'
 pass 'Responses-only 协议探测通过，运行模式明确交给受管适配器'
 
+# 推理型 Responses 服务在过小输出预算下会返回 200/incomplete 且只有 reasoning。
+# 向导必须以有界但足够的正文探针识别它，而不是把“能列模型”误判成最终不可用。
+REASONING_RESULT="${TEST_ROOT}/responses-reasoning-result.json"
+export MOCK_PROVIDER_RESPONSES_ONLY=1 MOCK_PROVIDER_REASONING_MINIMUM=1
+run_pty_case normal "$REASONING_RESULT" "${TEST_ROOT}/responses-reasoning.log" \
+  "${TEST_ROOT}/responses-reasoning.count"
+unset MOCK_PROVIDER_RESPONSES_ONLY MOCK_PROVIDER_REASONING_MINIMUM
+jq -e '.status == "confirmed" and .provider.api_mode == "responses" and
+  .provider.capabilities.responses == true and .provider.capabilities.chat_completions == false' \
+  "$REASONING_RESULT" >/dev/null \
+  || fail '推理型 Responses 的有界正文探针仍被误判为不可用'
+pass '推理型 Responses 在 16 token 只有 reasoning 时，64 token 有界探针取得最终正文'
+
 # 已确认配置只需要一次“复用”选择，不重新询问十项。
 REUSE_TRANSCRIPT="${TEST_ROOT}/reuse-transcript.log"
 REUSE_COUNT="${TEST_ROOT}/reuse-count"
@@ -388,28 +436,92 @@ run_pty_case reuse "$NORMAL_RESULT" "$REUSE_TRANSCRIPT" "$REUSE_COUNT"
 jq -e '.status == "confirmed"' "$NORMAL_RESULT" >/dev/null || fail '复用后配置状态损坏'
 pass '已有已确认配置直接复用'
 
-# 输入在第三步前结束时必须保留前两步，重跑从第三步继续。
+# 真实 PTY 在第三步收到 EOF 时必须保留前两步；恢复入口先明确选择，再从第三步继续。
 PARTIAL_RESULT="${TEST_ROOT}/partial-result.json"
 PARTIAL_LOG="${TEST_ROOT}/partial.log"
+PARTIAL_COUNT="${TEST_ROOT}/partial-count"
 set +e
-printf '%s\n' 'https://provider.invalid/v1' "$TEST_PROVIDER_SECRET" \
-  | env PATH="${MOCK_DIR}:${PATH}" TERM=dumb "$WIZARD" --output "$PARTIAL_RESULT" \
-    > "$PARTIAL_LOG" 2>&1
+run_pty_case pty_eof "$PARTIAL_RESULT" "$PARTIAL_LOG" "$PARTIAL_COUNT"
 PARTIAL_STATUS=$?
 set -e
-[[ "$PARTIAL_STATUS" == 2 ]] || fail 'EOF 没有以可恢复状态退出'
+[[ "$PARTIAL_STATUS" == 2 ]] || fail '真实 PTY EOF 没有以可恢复状态退出'
 jq -e '.status == "collecting" and .next_step == 3' "$PARTIAL_RESULT" >/dev/null \
-  || fail 'EOF 没有保存准确的恢复步骤'
+  || fail '真实 PTY EOF 没有保存准确的恢复步骤'
 [[ "$(jq -r '.provider.api_key' "$PARTIAL_RESULT")" == "$TEST_PROVIDER_SECRET" ]] \
   || fail '恢复状态没有保留已输入 API Key'
+PARTIAL_DIGEST=$(sha256sum "$PARTIAL_RESULT"); PARTIAL_DIGEST=${PARTIAL_DIGEST%% *}
+set +e
+run_pty_case resume_eof "$PARTIAL_RESULT" "${TEST_ROOT}/resume-eof.log" \
+  "${TEST_ROOT}/resume-eof.count"
+RESUME_EOF_STATUS=$?
+set -e
+[[ "$RESUME_EOF_STATUS" == 2 ]] || fail '恢复选择处的真实 PTY EOF 未安全退出'
+AFTER_RESUME_EOF_DIGEST=$(sha256sum "$PARTIAL_RESULT"); AFTER_RESUME_EOF_DIGEST=${AFTER_RESUME_EOF_DIGEST%% *}
+[[ "$AFTER_RESUME_EOF_DIGEST" == "$PARTIAL_DIGEST" ]] \
+  || fail '恢复选择处 EOF 改写了已有草稿'
+grep -Fq '1 继续上次 / 2 重新开始 / 0 取消' "${TEST_ROOT}/resume-eof.log" \
+  || fail '未完成草稿没有显示明确的继续/重新开始选择'
 RESUME_TRANSCRIPT="${TEST_ROOT}/resume-transcript.log"
 RESUME_COUNT="${TEST_ROOT}/resume-count"
 run_pty_case resume "$PARTIAL_RESULT" "$RESUME_TRANSCRIPT" "$RESUME_COUNT"
-[[ "$(<"$RESUME_COUNT")" == 8 ]] || fail '第三步恢复路径输入次数错误'
+[[ "$(<"$RESUME_COUNT")" == 9 ]] || fail '含明确选择的第三步恢复路径输入次数错误'
 grep -Fq '从第 3 步继续' "$RESUME_TRANSCRIPT" || fail '未提示恢复步骤'
 ! grep -Fq '[1/10]' "$RESUME_TRANSCRIPT" || fail '恢复时错误地重问第一步'
 jq -e '.status == "confirmed"' "$PARTIAL_RESULT" >/dev/null || fail '恢复后未确认配置'
-pass 'EOF 安全退出与中断续跑'
+pass '真实 PTY EOF、恢复选择 EOF 与准确续跑'
+
+# SIGINT 也必须落在准确恢复点；重新开始只清理该向导引用的草稿，不碰部署配置或无关文件。
+SIGNAL_RESULT="${TEST_ROOT}/signal-result.json"
+set +e
+run_pty_case sigint "$SIGNAL_RESULT" "${TEST_ROOT}/signal.log" "${TEST_ROOT}/signal.count"
+SIGNAL_STATUS=$?
+set -e
+[[ "$SIGNAL_STATUS" == 2 ]] || fail "真实 PTY SIGINT 退出码错误：${SIGNAL_STATUS}"
+jq -e '.status == "collecting" and .next_step == 3' "$SIGNAL_RESULT" >/dev/null \
+  || fail '真实 PTY SIGINT 后恢复步骤不准确'
+grep -Fq '快速初始化已中断' "${TEST_ROOT}/signal.log" \
+  || fail '真实 PTY SIGINT 缺少恢复说明'
+
+RESTART_ROOT="${TEST_ROOT}/restart-deploy"
+RESTART_RESULT="${RESTART_ROOT}/tmp/quick-init.json"
+RESTART_DRAFT="${RESTART_ROOT}/tmp/wizard-knowledge.ABC123.md"
+RESTART_UNRELATED="${RESTART_ROOT}/tmp/wizard-knowledge.UNRELATED.md"
+RESTART_LINK="${RESTART_ROOT}/tmp/wizard-knowledge.LINK12.md"
+RESTART_LINK_TARGET="${RESTART_ROOT}/tmp/wizard-knowledge.SAFE12.md"
+mkdir -p -- "${RESTART_ROOT}/config" "${RESTART_ROOT}/tmp"
+install -m 0600 -- "$SIGNAL_RESULT" "$RESTART_RESULT"
+printf '合法部署秘密占位，仅测试不得被向导删除。\n' > "${RESTART_ROOT}/.env"
+printf '{"enabled":true}\n' > "${RESTART_ROOT}/config/runtime.yaml"
+printf '应由重新开始清理的向导粘贴草稿。\n' > "$RESTART_DRAFT"
+printf '未被状态引用，不得清理。\n' > "$RESTART_UNRELATED"
+printf '符号链接指向的同格式普通文件，不得清理。\n' > "$RESTART_LINK_TARGET"
+ln -s -- "$RESTART_LINK_TARGET" "$RESTART_LINK"
+chmod 0600 "${RESTART_ROOT}/.env" "$RESTART_DRAFT" "$RESTART_UNRELATED" "$RESTART_LINK_TARGET"
+chmod 0640 "${RESTART_ROOT}/config/runtime.yaml"
+jq --arg draft "$RESTART_DRAFT" --arg unsafe_link "$RESTART_LINK" \
+  '.knowledge={mode:"libraries",source:"",libraries:[
+    {name:"旧草稿",source:$draft,wizard_draft:true},
+    {name:"异常链接",source:$unsafe_link,wizard_draft:true}
+  ],supported_files:2}' \
+  "$RESTART_RESULT" > "${RESTART_RESULT}.tmp"
+chmod 0600 "${RESTART_RESULT}.tmp"
+mv -f -- "${RESTART_RESULT}.tmp" "$RESTART_RESULT"
+ENV_DIGEST=$(sha256sum "${RESTART_ROOT}/.env"); ENV_DIGEST=${ENV_DIGEST%% *}
+CONFIG_DIGEST=$(sha256sum "${RESTART_ROOT}/config/runtime.yaml"); CONFIG_DIGEST=${CONFIG_DIGEST%% *}
+run_pty_case restart "$RESTART_RESULT" "${TEST_ROOT}/restart.log" "${TEST_ROOT}/restart.count"
+[[ ! -e "$RESTART_DRAFT" ]] || fail '重新开始没有清理状态明确引用的向导草稿'
+[[ -f "$RESTART_UNRELATED" ]] || fail '重新开始误删了未被状态引用的文件'
+[[ -L "$RESTART_LINK" && -f "$RESTART_LINK_TARGET" ]] \
+  || fail '重新开始跟随异常符号链接删除了同格式普通文件'
+AFTER_ENV_DIGEST=$(sha256sum "${RESTART_ROOT}/.env"); AFTER_ENV_DIGEST=${AFTER_ENV_DIGEST%% *}
+AFTER_CONFIG_DIGEST=$(sha256sum "${RESTART_ROOT}/config/runtime.yaml"); AFTER_CONFIG_DIGEST=${AFTER_CONFIG_DIGEST%% *}
+[[ "$AFTER_ENV_DIGEST" == "$ENV_DIGEST" && "$AFTER_CONFIG_DIGEST" == "$CONFIG_DIGEST" ]] \
+  || fail '重新开始改动了已部署合法配置'
+grep -Fq '已重新开始快速初始化；仅清理本向导草稿' "${TEST_ROOT}/restart.log" \
+  || fail '重新开始没有说明清理边界'
+jq -e '.status == "confirmed"' "$RESTART_RESULT" >/dev/null \
+  || fail '重新开始后未形成新的已确认结果'
+pass '真实 PTY SIGINT、受限重新开始与部署配置保护'
 
 # /models 不支持时允许在同一个第 3 项直接手动输入，仍必须实际验证 Chat。
 MANUAL_MOCK_DIR="${TEST_ROOT}/manual-mock"

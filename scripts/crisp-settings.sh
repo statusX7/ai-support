@@ -41,7 +41,8 @@ crisp_settings_test() {
 
 crisp_settings_apply() (
   local deploy_dir=$1 input=$2 work env_candidate history key value identifier token auth hook_mode changed_credentials=false
-  local committed=0 completed=0 previous_caddy=0 old_access_mode
+  local committed=0 completed=0 previous_caddy=0 created_caddy=0 candidate_access_mode rollback_status=0
+  local previous_nginx_snippet=0 previous_caddy_snippet=0
   [[ -f "$input" && ! -L "$input" && $(stat -c '%a' "$input") == 600 && $(stat -c '%s' "$input") -le 65536 ]] \
     || die 'Crisp 候选配置必须是权限 0600 的受限普通 JSON 文件'
   jq -M -e 'type=="object" and all(keys[]; IN("website_id","token_tier","hook_mode","token_identifier","token_key","plugin_signing_secret","rotate_secret","webhook_input")) and all(to_entries[]; if .key=="rotate_secret" then (.value|type)=="boolean" else (.value|type)=="string" end)' "$input" >/dev/null || die 'Crisp 候选字段无效'
@@ -54,9 +55,22 @@ crisp_settings_apply() (
   env_candidate="$work/.env"
   install -m 0600 -- "$deploy_dir/.env" "$env_candidate"
   install -m 0600 -- "$deploy_dir/.env" "$history/.env"
-  old_access_mode=$(env_get "$env_candidate" WEBHOOK_ACCESS_MODE)
   if [[ -f "$deploy_dir/config/Caddyfile" ]]; then
     previous_caddy=1; install -m 0600 -- "$deploy_dir/config/Caddyfile" "$history/Caddyfile"
+  fi
+  if [[ -e "$deploy_dir/config/crispai-nginx.conf" \
+    || -L "$deploy_dir/config/crispai-nginx.conf" ]]; then
+    webhook_proxy_snippet_target_is_replaceable "$deploy_dir/config/crispai-nginx.conf" \
+      || die '当前 Nginx 反代片段非本项目所有或文件不安全，原文件已保留'
+    previous_nginx_snippet=1
+    install -m 0600 -- "$deploy_dir/config/crispai-nginx.conf" "$history/crispai-nginx.conf"
+  fi
+  if [[ -e "$deploy_dir/config/crispai-caddy.conf" \
+    || -L "$deploy_dir/config/crispai-caddy.conf" ]]; then
+    webhook_proxy_snippet_target_is_replaceable "$deploy_dir/config/crispai-caddy.conf" \
+      || die '当前 Caddy 反代片段非本项目所有或文件不安全，原文件已保留'
+    previous_caddy_snippet=1
+    install -m 0600 -- "$deploy_dir/config/crispai-caddy.conf" "$history/crispai-caddy.conf"
   fi
   # shellcheck disable=SC2317
   crisp_settings_cleanup() {
@@ -65,10 +79,33 @@ crisp_settings_apply() (
     if (( committed && ! completed )); then
       install -m 0600 -- "$history/.env" "$work/restore.env"
       mv -f -- "$work/restore.env" "$deploy_dir/.env"
-      if (( previous_caddy )); then install -m 0640 -- "$history/Caddyfile" "$deploy_dir/config/Caddyfile"; fi
-      docker_compose "$deploy_dir" up -d --force-recreate n8n >/dev/null 2>&1 || true
-      if [[ "$old_access_mode" == managed_https ]]; then docker_compose "$deploy_dir" up -d caddy >/dev/null 2>&1 || true; fi
-      warn 'Crisp 配置应用失败，原配置已恢复；服务状态可从诊断菜单复核'
+      if (( previous_caddy )); then
+        install -m 0640 -- "$history/Caddyfile" "$deploy_dir/config/Caddyfile" || rollback_status=1
+      elif (( created_caddy )); then
+        rm -f -- "$deploy_dir/config/Caddyfile" || rollback_status=1
+      fi
+      if (( previous_nginx_snippet )); then
+        webhook_access_install_file "$history/crispai-nginx.conf" \
+          "$deploy_dir/config/crispai-nginx.conf" 0640 || rollback_status=1
+      else
+        rm -f -- "$deploy_dir/config/crispai-nginx.conf" || rollback_status=1
+      fi
+      if (( previous_caddy_snippet )); then
+        webhook_access_install_file "$history/crispai-caddy.conf" \
+          "$deploy_dir/config/crispai-caddy.conf" 0640 || rollback_status=1
+      else
+        rm -f -- "$deploy_dir/config/crispai-caddy.conf" || rollback_status=1
+      fi
+      docker_compose "$deploy_dir" up -d --remove-orphans >/dev/null 2>&1 || rollback_status=1
+      docker_compose "$deploy_dir" up -d --force-recreate n8n >/dev/null 2>&1 || rollback_status=1
+      reconcile_caddy_runtime "$deploy_dir" >/dev/null 2>&1 || rollback_status=1
+      if (( rollback_status == 0 )); then
+        warn 'Crisp 配置应用失败，原配置与反向代理运行代已恢复'
+      else
+        warn 'Crisp 配置应用失败且自动恢复未完整通过；请保留当前数据并从菜单 2 查看具体组件'
+      fi
+    elif (( ! completed && created_caddy && ! previous_caddy )); then
+      rm -f -- "$deploy_dir/config/Caddyfile" || true
     fi
     [[ "$work" == "$deploy_dir"/tmp/crisp-settings.* ]] && find "$work" -depth -delete
     exit "$status"
@@ -121,19 +158,24 @@ crisp_settings_apply() (
   if [[ "$changed_credentials" == true ]] && ! crisp_api_check "$work"; then
     die "Crisp 候选凭据未通过验证（HTTP ${CRISP_API_STATUS:-000}），原配置保持"
   fi
+  candidate_access_mode=$(env_get "$env_candidate" WEBHOOK_ACCESS_MODE)
+  if [[ "$candidate_access_mode" == managed_https && ! -e "$deploy_dir/config/Caddyfile" ]]; then
+    install -m 0640 -- "$deploy_dir/config/Caddyfile.example" "$deploy_dir/config/Caddyfile"
+    created_caddy=1
+  fi
   docker_compose_command --project-directory "$deploy_dir" --env-file "$env_candidate" -f "$deploy_dir/docker-compose.yml" config --quiet
+  if [[ "$candidate_access_mode" == managed_https ]] \
+    && ! caddy_validate_configuration_file "$deploy_dir" "$deploy_dir/config/Caddyfile" "$env_candidate"; then
+    die '受管 HTTPS 候选未通过 Caddy 配置校验；原配置与运行服务保持'
+  fi
   committed=1
   install -m 0600 -- "$env_candidate" "$work/commit.env"
   mv -f -- "$work/commit.env" "$deploy_dir/.env"
   write_webhook_proxy_snippets "$deploy_dir"
-  if [[ "$(env_get "$env_candidate" WEBHOOK_ACCESS_MODE)" == managed_https && ! -f "$deploy_dir/config/Caddyfile" ]]; then
-    install -m 0640 -- "$deploy_dir/config/Caddyfile.example" "$deploy_dir/config/Caddyfile"
-  fi
-  if [[ "$old_access_mode" == managed_https && "$(env_get "$env_candidate" WEBHOOK_ACCESS_MODE)" != managed_https ]]; then
-    docker_compose "$deploy_dir" --profile managed-https stop caddy >&2
-  fi
   docker_compose "$deploy_dir" up -d --remove-orphans >&2
   docker_compose "$deploy_dir" up -d --force-recreate n8n >&2
+  reconcile_caddy_runtime "$deploy_dir" >&2 \
+    || die 'Crisp 配置已写入但反向代理运行态未通过对账；正在恢复原配置'
   wait_for_local_health "$deploy_dir" >&2
   import_and_publish_workflow "$deploy_dir" >&2
   completed=1

@@ -361,9 +361,42 @@ configuration_prompt_apply() (
   jq -M -n --arg hash "$(sha256sum "$target" | awk '{print $1}')" '{applied:true,sha256:$hash}'
 )
 
+configuration_query_failure() {
+  local code=${1:-admin_query_failed} status=${2:-1} message
+  case "$code" in
+    materials_not_ready) message='当前 Prompt、知识或索引代次尚未完成应用；请先执行资料同步并回读' ;;
+    provider_configuration_invalid) message='接口池配置尚未完整应用；请从菜单 3 检查主接口与运行代次' ;;
+    state_changed|question_cancelled) message='测试期间客服或接口配置发生变化，本次结果已作废；请刷新状态后重试' ;;
+    retrieval_error|retrieval_invalid|retrieval_unavailable) message='知识检索接口或返回结构异常；模型请求未被冒充为成功' ;;
+    source_unmapped|source_ambiguous|context_invalid) message='检索来源与当前启用知识资料不一致；请重新同步并核对索引' ;;
+    authentication_failed) message='Provider 鉴权失败；请核对该接口的地址、Key 和权限' ;;
+    rate_limited) message='Provider 当前限流；该接口会按策略冷却，可检查备用接口状态' ;;
+    quota_exhausted) message='Provider 返回额度或余额不足；不会立即重复请求同一授权范围' ;;
+    model_unavailable) message='当前接口的模型或推理端点不可用；请核对模型原名、协议和 Base URL' ;;
+    protocol_error) message='Provider 协议、地址路径或请求格式不兼容；请核对 Chat Completions / Responses 模式、Base URL 前缀及实际推理端点' ;;
+    upstream_timeout) message='Provider 请求在本次限定时间内未完成；请检查网络、上游状态或超时策略' ;;
+    upstream_unavailable|connection_failed) message='Provider 上游或容器到接口的网络连接不可用；请检查服务状态、DNS/TLS 和容器地址' ;;
+    invalid_response) message='Provider 返回了空正文、非 JSON 或不符合所选协议的响应' ;;
+    invalid_input|context_preparation_incomplete) message='最终推理请求的上下文、协议字段或模型容量不兼容；未发送不完整答案' ;;
+    configuration_applying) message='接口配置正在应用或恢复，尚不能验证新配置；请等待完成后回读' ;;
+    pool_cooling) message='全部可用接口处于短暂保护期；请查看近期切换记录和各接口状态' ;;
+    pool_exhausted) message='本题预算内已启用接口均未成功；请查看近期切换记录定位每次失败类别' ;;
+    no_capable_provider) message='没有同时满足当前协议、上下文或图片能力的已启用接口' ;;
+    question_budget_exhausted) message='本次测试已达到总时间或调用次数上限；不会继续放大请求' ;;
+    safety_refusal) message='模型对合成检查作出安全拒绝；这不是连接成功证据，也不会改用接口规避安全限制' ;;
+    *) code=admin_query_failed; message='知识问答测试未完成；请分别检查检索、接口池、协议和组件状态' ;;
+  esac
+  if [[ ${CRISPAI_DIAGNOSTIC_JSON:-0} == 1 ]]; then
+    jq -M -n --arg code "$code" '{verified:false,error:{code:$code}}'
+  else
+    configuration_error "$message"
+  fi
+  return "$status"
+}
+
 configuration_query() (
   local deploy_dir=$1 question=$2 response='' question_bytes request_timeout maximum=90000
-  local budget_ms=${3:-0} effective_budget
+  local budget_ms=${3:-0} effective_budget query_status=0 error_code=''
   trap '[[ -z "$response" ]] || rm -f -- "$response"' EXIT
   question_bytes=$(printf '%s' "$question" | wc -c | tr -d ' ')
   if (( question_bytes < 1 || question_bytes > 8000 )) \
@@ -393,22 +426,30 @@ configuration_query() (
   chmod 600 "$response" || return 1
   # 问题只经 stdin 进入容器，不写进命令参数；与客服共用检索、完整上下文和签名生成链。
   # shellcheck disable=SC2016
-  if ! printf '%s' "$question" | jq -M -Rsc --argjson budget "$budget_ms" '{question:.,budget_ms:$budget}' \
+  printf '%s' "$question" | jq -M -Rsc --argjson budget "$budget_ms" '{question:.,budget_ms:$budget}' \
     | timeout --signal=TERM --kill-after=2s "${request_timeout}s" bash -c '
       set -euo pipefail
       source "$1/common.sh"
       docker_compose "$2" exec -T n8n node /opt/crisp-ai/n8n/admin-query.js
-    ' configuration-query "$CONFIGURATION_DIR" "$deploy_dir" > "$response" 2>/dev/null; then
-    configuration_error '知识问答测试未完成；请检查当前检索、接口或配置应用状态'
-    return 1
+    ' configuration-query "$CONFIGURATION_DIR" "$deploy_dir" > "$response" 2>/dev/null || query_status=$?
+  if (( query_status != 0 )); then
+    error_code=$(jq -M -er 'select(.verified == false and (.error.code | type == "string")) | .error.code' "$response" 2>/dev/null || true)
+    if [[ -z "$error_code" && ( "$query_status" == 124 || "$query_status" == 137 ) ]]; then
+      error_code=upstream_timeout
+    fi
+    if [[ "$query_status" == 130 || "$query_status" == 143 ]]; then
+      configuration_query_failure "${error_code:-state_changed}" "$query_status" || return $?
+    else
+      configuration_query_failure "${error_code:-admin_query_failed}" 1 || return $?
+    fi
   fi
   if [[ $(stat -c '%s' -- "$response") -gt 1048576 ]] \
     || ! jq -M -e '.verified == true and (.answer | type == "string" and test("\\S"))
       and (.sources | type == "array" and all(type == "string"))
       and (.retrieval_state == "knowledge_hit" or .retrieval_state == "knowledge_miss")
       and (.error == null or .error == false)' "$response" >/dev/null 2>&1; then
-    configuration_error '知识问答测试未完成；请检查当前检索、接口或配置应用状态'
-    return 1
+    error_code=$(jq -M -er 'select(.verified == false and (.error.code | type == "string")) | .error.code' "$response" 2>/dev/null || true)
+    configuration_query_failure "${error_code:-invalid_response}" 1 || return $?
   fi
   jq -M '{answer,sources,verified,retrieval_state}' "$response"
 )

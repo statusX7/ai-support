@@ -37,6 +37,8 @@ let crispFailure = false;
 let unknownSend = false;
 let sendRejection = 0;
 let sendAttempts = 0;
+let delayedCrisp;
+let ignoreCrispAbort = false;
 let unknownSources = false;
 let miss = false;
 let low = false;
@@ -72,6 +74,22 @@ const request = async (url, options = {}) => {
       // 不模拟完整第三方 schema；本项目使用官方昵称字段和本地持久 fingerprint。
       if (body.properties && ('ai_support' in body.properties || 'ai_support_version' in body.properties)) {
         return { status: 400, body: { error: true, reason: 'invalid_data' } };
+      }
+      if (delayedCrisp) {
+        const pending = delayedCrisp;
+        delayedCrisp = null;
+        if (ignoreCrispAbort) await pending;
+        else await new Promise((resolve, reject) => {
+          const abort = () => {
+            const error = new Error('受控出站已取消');
+            error.name = 'AbortError';
+            error.code = 'ABORT_ERR';
+            reject(error);
+          };
+          if (options.signal?.aborted) { abort(); return; }
+          options.signal?.addEventListener('abort', abort, { once: true });
+          pending.then(resolve, reject).finally(() => options.signal?.removeEventListener('abort', abort));
+        });
       }
       sent.push({ ...body, session_id: session });
       history.push({ ...body, timestamp: now }); histories.set(session, history);
@@ -235,6 +253,89 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     finish(); await pending;
     assert.equal(sent.filter((entry) => entry.session_id === 'session_slowmodel1').length, before);
     assert.equal(sent.at(-1).session_id, 'session_parallel-b');
+  });
+  await test('P0 人工接管中止已登记但仍挂起的 Crisp 出站，A 不补发且 B 独立', async () => {
+    let release;
+    delayedCrisp = new Promise((resolve) => { release = resolve; });
+    const session = 'session_crisp-send-race';
+    const attempts = sendAttempts;
+    const beforeA = sent.filter((entry) => entry.session_id === session).length;
+    const entry = await receive(message(session, '等待发送的普通问题'));
+    const pending = runtime.process(entry.key, entry.jobId);
+    for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
+    assert.equal(sendAttempts, attempts + 1, '普通回答必须已经进入受控 Crisp POST');
+    now += 5;
+    const controlRuntime = createRuntime(env, runtimeOptions);
+    const human = { ...message(session, '另一运行时实例收到真人公开回复', { from: 'operator', automated: false }), event: 'message:received' };
+    const history = histories.get(session) || []; history.push(human.data); histories.set(session, history);
+    const accepted = await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    assert.equal(accepted.accepted, true);
+    if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
+    for (let tries = 0; tries < 100 && !Object.values(state(session).outgoing)
+      .some(record => record.cancellation_reason === 'conversation_state_changed'); tries += 1) await wait(10);
+    const result = await pending;
+    release();
+    assert.equal(result.status, 'cancelled');
+    assert.equal(state(session).mode, 'human');
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeA, '挂起出站必须在写入远端记录前中止');
+    const outgoing = Object.values(state(session).outgoing).at(-1);
+    assert.equal(outgoing.status, 'cancelled', '人工接管后本地发送尝试必须终止，不能继续作为待对账发送');
+    assert.equal(outgoing.delivery_uncertain, true, '已经进入 HTTP 层的尝试仍须如实标记远端收包不确定');
+    assert.equal(outgoing.cancellation_reason, 'conversation_state_changed');
+    assert.equal(Object.hasOwn(outgoing, 'body'), false, '取消后的记录不得长期保留待发送正文');
+    assert.equal(state(session).jobs.find((job) => job.id === entry.jobId).status, 'cancelled');
+    await deliver(message('session_crisp-send-race-b', '另一会话继续工作'));
+    assert.equal(sent.at(-1).session_id, 'session_crisp-send-race-b');
+  });
+  await test('P0 远端已收字节的迟到回执如实隔离，不记正常 AI 回复且旧 attempt 不覆盖新记录', async () => {
+    const analytics = path.join(root, 'data/analytics/events.jsonl');
+    const countEvents = type => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
+      .map(line => JSON.parse(line)).filter(event => event.type === type).length : 0;
+    const normalReplies = countEvents('ai_reply');
+    const lateDeliveries = countEvents('delivery_after_state_change');
+    let release;
+    ignoreCrispAbort = true;
+    delayedCrisp = new Promise((resolve) => { release = resolve; });
+    const session = 'session_crisp-receipt-race';
+    const attempts = sendAttempts;
+    const entry = await receive(message(session, '模拟已写出字节的普通问题'));
+    const pending = runtime.process(entry.key, entry.jobId);
+    for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
+    assert.equal(sendAttempts, attempts + 1);
+    const controlRuntime = createRuntime(env, runtimeOptions);
+    now += 5;
+    const human = { ...message(session, '另一实例确认人工已经接管', { from: 'operator', automated: false }), event: 'message:received' };
+    const history = histories.get(session) || []; history.push(human.data); histories.set(session, history);
+    await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    release();
+    const result = await pending;
+    ignoreCrispAbort = false;
+    assert.equal(result.status, 'dispatched_after_cancel');
+    const outgoing = Object.values(state(session).outgoing).find((record) => record.job_id === entry.jobId);
+    assert.equal(outgoing.status, 'sent');
+    assert.equal(outgoing.state_changed_before_receipt, true);
+    assert.equal(countEvents('delivery_after_state_change'), lateDeliveries + 1);
+    assert.equal(countEvents('ai_reply'), normalReplies, '状态变化后的迟到回执不能登记为正常 AI 回复');
+
+    delayedCrisp = new Promise((resolve) => { release = resolve; });
+    const fencedSession = 'session_crisp-attempt-fence';
+    const fencedAttempts = sendAttempts;
+    const fenced = await receive(message(fencedSession, '模拟旧实例迟到回执'));
+    const fencedPending = runtime.process(fenced.key, fenced.jobId);
+    for (let tries = 0; tries < 200 && sendAttempts === fencedAttempts; tries += 1) await wait(5);
+    const replacement = 'e'.repeat(32);
+    await runtime.transaction(fenced.key, current => {
+      const record = Object.values(current.outgoing).find(value => value.job_id === fenced.jobId);
+      record.attempt_token = replacement;
+      record.status = 'sending';
+    });
+    release();
+    const fencedResult = await fencedPending;
+    ignoreCrispAbort = false;
+    assert.equal(fencedResult.status, 'dispatched_after_cancel');
+    const fencedRecord = Object.values(state(fencedSession).outgoing).find(record => record.job_id === fenced.jobId);
+    assert.equal(fencedRecord.attempt_token, replacement);
+    assert.equal(fencedRecord.status, 'sending', '旧实例不得用迟到回执覆盖新 attempt 的状态');
   });
   await test('T29/T30 十秒截止、真人追加、访客与乱序不改时间', async () => {
     const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 10; writeConfig('handoff', handoff);
@@ -432,6 +533,127 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'schema_version', 'started_at']);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(state('session_permanent1').mode, 'human');
+  });
+  await test('P0 大量历史会话不放大周期扫描，重叠调度退让且到期人工仍恢复', async () => {
+    const bulk = [];
+    for (let index = 0; index < 500; index += 1) {
+      const session = 'session_archived-' + String(index).padStart(4, '0');
+      const filename = path.join(root, 'data/runtime/session-' + key(session) + '.json');
+      const value = {
+        schema_version: 2, website_id: env.CRISP_WEBSITE_ID, session_id: session,
+        mode: index === 0 ? 'human' : 'ai', generation: 0,
+        resume_at: index === 0 ? now + 4000 : null, pause_reason: index === 0 ? 'operator_reply' : '',
+        last_human_at: index === 0 ? now : 0, human_event_id: '', control_watermark: 0, sequence: 0,
+        welcome_sent: false, menu_node: null, offers: {}, cooldowns: {}, jobs: [], outgoing: {},
+        worker: null, uncertain_events: [], pending_feedback: null, updated_at: now,
+      };
+      if (index === 1) {
+        value.jobs.push({ id: 'a'.repeat(64), event: 'message:send', control: false, status: 'received',
+          received_at: now, retry_at: now + 60000, lease_until: 0, attempts: 1, data: { type: 'text' },
+          plan: { type: 'text', ordinary: true, purpose: 'safe_error', safe_error_context: 'text',
+            content: '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。', tags: ['low_confidence'] } });
+      }
+      if (index === 2) {
+        value.jobs.push({ id: 'b'.repeat(64), event: 'message:send', purpose: 'feedback', feedback_retired: true,
+          control: false, status: 'done', received_at: now, retry_at: null, lease_until: 0, attempts: 1 });
+      }
+      fs.writeFileSync(filename, JSON.stringify(value), { mode: 0o600 });
+      bulk.push(filename);
+    }
+    const before = new Map(bulk.map((file) => [file, fs.readFileSync(file)]));
+    now += 5000;
+    const started = process.hrtime.bigint();
+    const recovered = await runtime.scan();
+    assert(recovered.every((job) => !bulk.includes(path.join(root, 'data/runtime/session-' + job.key + '.json'))));
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert(elapsedMs < 2000, '500 个历史会话扫描耗时异常：' + elapsedMs + 'ms');
+    assert.equal(state('session_archived-0000').mode, 'ai');
+    const changed = bulk.filter((file) => !fs.readFileSync(file).equals(before.get(file)));
+    assert.deepEqual(changed, [bulk[0]], '只允许到期人工会话发生持久状态写入');
+
+    const health = path.join(root, 'data/runtime/scheduler-health.json');
+    const healthBefore = fs.readFileSync(health, 'utf8');
+    fs.mkdirSync(path.join(root, 'data/runtime/scheduler-scan.lock'), { mode: 0o700 });
+    now += 5000;
+    assert.deepEqual(await runtime.scan(), []);
+    assert.equal(fs.readFileSync(health, 'utf8'), healthBefore, '重叠扫描不能覆盖活动扫描心跳');
+    fs.rmdirSync(path.join(root, 'data/runtime/scheduler-scan.lock'));
+
+    const lock = path.join(root, 'data/runtime/scheduler-scan.lock');
+    const old = new Date(Date.now() - 120000);
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.utimesSync(lock, old, old);
+    assert.deepEqual(await runtime.scan(), []);
+    assert(fs.existsSync(lock), '没有所有权资料的旧活动锁不能只凭 mtime 被删除');
+    assert.equal(fs.readFileSync(health, 'utf8'), healthBefore);
+    fs.rmdirSync(lock);
+
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim().toLowerCase();
+    const statText = fs.readFileSync('/proc/self/stat', 'utf8');
+    const statEnd = statText.lastIndexOf(') ');
+    const ownPid = Number(statText.slice(0, statText.indexOf(' ')));
+    const ownStart = statText.slice(statEnd + 2).trim().split(/\s+/)[19];
+    const owner = (token, pid = ownPid, start = ownStart) => ({ schema_version: 1, token, pid,
+      boot_id: bootId, process_start: start, started_at: Date.now() - 120000, heartbeat_at: Date.now() - 120000 });
+
+    fs.mkdirSync(lock, { mode: 0o700 });
+    const activeOwner = owner('a'.repeat(32));
+    fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify(activeOwner), { mode: 0o600 });
+    fs.utimesSync(lock, old, old);
+    assert.deepEqual(await runtime.scan(), []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')), activeOwner,
+      '同一 boot/pid/start 的活动所有者即使心跳较旧也不能被另一扫描器覆盖');
+    fs.unlinkSync(path.join(lock, 'owner.json')); fs.rmdirSync(lock);
+
+    for (const kind of ['extra-file', 'extra-link']) {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      const unsafeOwner = owner(kind === 'extra-file' ? 'c'.repeat(32) : 'd'.repeat(32), 2147483647, '1');
+      fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify(unsafeOwner), { mode: 0o600 });
+      if (kind === 'extra-file') fs.writeFileSync(path.join(lock, 'unexpected'), 'must-remain', { mode: 0o600 });
+      else fs.symlinkSync('../scheduler-health.json', path.join(lock, 'unexpected'));
+      const unsafeHealth = fs.readFileSync(health, 'utf8');
+      assert.deepEqual(await runtime.scan(), []);
+      assert(fs.existsSync(lock), kind + ' 的旧锁必须保留原路径');
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')), unsafeOwner);
+      if (kind === 'extra-file') assert.equal(fs.readFileSync(path.join(lock, 'unexpected'), 'utf8'), 'must-remain');
+      else assert(fs.lstatSync(path.join(lock, 'unexpected')).isSymbolicLink(), '额外链接不得被移动或跟随');
+      assert.equal(fs.readFileSync(health, 'utf8'), unsafeHealth, '不安全旧锁不能允许第二个扫描器启动');
+      assert(!fs.readdirSync(path.dirname(lock)).some((name) => name.startsWith('scheduler-scan.lock.stale-')),
+        '额外成员或链接存在时不能先把锁移入 quarantine');
+      fs.unlinkSync(path.join(lock, 'unexpected'));
+      fs.unlinkSync(path.join(lock, 'owner.json'));
+      fs.rmdirSync(lock);
+    }
+
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify(owner('b'.repeat(32), 2147483647, '1')), { mode: 0o600 });
+    const staleHealth = fs.readFileSync(health, 'utf8');
+    now += 5000;
+    await runtime.scan();
+    assert(!fs.existsSync(lock), '心跳超时且进程身份不存在的锁必须安全回收');
+    assert.notEqual(fs.readFileSync(health, 'utf8'), staleHealth);
+
+    const originalReaddir = fs.readdirSync;
+    let replacedOwner = false;
+    fs.readdirSync = function (target, ...args) {
+      const values = originalReaddir.call(this, target, ...args);
+      if (!replacedOwner && path.resolve(String(target)) === path.join(root, 'data/runtime')) {
+        const file = path.join(lock, 'owner.json');
+        if (fs.existsSync(file)) {
+          const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+          value.token = 'f'.repeat(32);
+          fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+          replacedOwner = true;
+        }
+      }
+      return values;
+    };
+    try { await assert.rejects(runtime.scan(), /调度锁所有权已变化/); }
+    finally { fs.readdirSync = originalReaddir; }
+    assert(replacedOwner);
+    assert(fs.existsSync(lock), 'finally 不能删除已不再属于自己的扫描锁');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')).token, 'f'.repeat(32));
+    fs.unlinkSync(path.join(lock, 'owner.json')); fs.rmdirSync(lock);
   });
   await test('W03/W04 生效投影隔离未完成编辑，同一会话的新问按新版本规则回答', async () => {
     const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));

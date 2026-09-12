@@ -107,11 +107,13 @@ DOCTOR_RESULTS=''
 DOCTOR_FIX_RESULTS=''
 DOCTOR_BEFORE_SUMMARY='null'
 DOCTOR_DOCKER_READY=0
+DOCTOR_DB_READY=0
 DOCTOR_N8N_READY=0
 DOCTOR_ANYTHING_READY=0
 DOCTOR_PREBOOTSTRAP_JQ_FIXED=0
 DOCTOR_POOL_ENABLED=0
 DOCTOR_POOL_READY=0
+DOCTOR_PROVIDER_INFERENCE_STATUS=not_checked
 DOCTOR_EXPECTED_SERVICES=(postgres anythingllm n8n provider-adapter)
 
 # shellcheck disable=SC2317
@@ -453,6 +455,7 @@ doctor_reset_results() {
   DOCTOR_PASSES=0
   DOCTOR_SKIPS=0
   DOCTOR_DOCKER_READY=0
+  DOCTOR_DB_READY=0
   DOCTOR_N8N_READY=0
   DOCTOR_ANYTHING_READY=0
   DOCTOR_EXPECTED_SERVICES=(postgres anythingllm n8n provider-adapter)
@@ -924,6 +927,7 @@ doctor_db_check() {
       ' > "$output" 2>/dev/null \
     && [[ "$(tr -d '[:space:]' < "$output")" == 1 ]]; then
     doctor_add database.authentication 'PostgreSQL 应用认证' PASS critical '使用当前受管密码经 backend 网络完成应用角色 SELECT 1' docker '' "$start"
+    DOCTOR_DB_READY=1
   else
     doctor_add database.authentication 'PostgreSQL 应用认证' FAIL critical '当前受管密码无法完成数据库应用角色认证/查询' docker '核对成套恢复的数据库角色密码；不要只看容器内旧环境或 pg_isready' "$start"
   fi
@@ -1474,6 +1478,72 @@ NODE
   fi
 }
 
+doctor_n8n_execution_backlog_check() {
+  local start managed_user managed_db managed_password output rc=0 active older_two older_ten runtime_status
+  start=$(doctor_now_ms)
+  if (( DOCTOR_DOCKER_READY == 0 )); then
+    doctor_skip n8n.execution_backlog 'n8n 生产执行积压' '因 Docker daemon 不可用未检查' docker
+    return
+  fi
+  if (( DOCTOR_DB_READY == 0 )); then
+    doctor_skip n8n.execution_backlog 'n8n 生产执行积压' '因数据库应用认证未通过未检查' docker
+    return
+  fi
+  if ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add n8n.execution_backlog 'n8n 生产执行积压' docker "$start"
+    return
+  fi
+  managed_user=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" POSTGRES_USER 2>/dev/null || printf crisp_ai)
+  managed_db=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" POSTGRES_DB 2>/dev/null || printf n8n)
+  managed_password=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" POSTGRES_PASSWORD 2>/dev/null || true)
+  output="${DOCTOR_TEMP_ROOT}/n8n-execution-backlog.txt"
+  # 只按本项目固定 workflow 统计状态与年龄，不读取 execution_data、客户消息或节点输入。
+  # 数据库密码只经 stdin 进入容器；workflow id 在容器内再次限制为 UUID。
+  # shellcheck disable=SC2016
+  printf '%s\n%s\n%s\n%s\n' "$managed_user" "$managed_db" "$managed_password" "$WORKFLOW_ID" \
+    | doctor_compose_timeout 15 exec -T postgres sh -ec '
+        IFS= read -r managed_user
+        IFS= read -r managed_db
+        IFS= read -r managed_password
+        IFS= read -r workflow_id
+        case "$workflow_id" in
+          ????????-????-????-????-????????????) ;;
+          *) exit 64 ;;
+        esac
+        export PGPASSWORD="$managed_password"
+        psql -h postgres -U "$managed_user" -d "$managed_db" -AtF "|" -v ON_ERROR_STOP=1 -c "
+          SELECT
+            count(*),
+            count(*) FILTER (WHERE COALESCE(\"startedAt\", \"createdAt\") < CURRENT_TIMESTAMP - INTERVAL '\''2 minutes'\''),
+            count(*) FILTER (WHERE COALESCE(\"startedAt\", \"createdAt\") < CURRENT_TIMESTAMP - INTERVAL '\''10 minutes'\'')
+          FROM execution_entity
+          WHERE \"workflowId\" = '\''${workflow_id}'\''
+            AND status IN ('\''new'\'', '\''running'\'', '\''waiting'\'');"
+      ' > "$output" 2>/dev/null || rc=$?
+  if (( rc != 0 )) || ! IFS='|' read -r active older_two older_ten < "$output" \
+    || [[ ! "$active" =~ ^[0-9]+$ || ! "$older_two" =~ ^[0-9]+$ || ! "$older_ten" =~ ^[0-9]+$ ]]; then
+    doctor_add n8n.execution_backlog 'n8n 生产执行积压' WARN warning '无法只读统计生产 workflow 的执行积压，未将未知结果判为正常' docker '检查 n8n 数据库 schema、应用权限及自检时限；不要读取 execution 正文排障' "$start"
+    return
+  fi
+  runtime_status=$(doctor_result_status n8n.runtime)
+  if [[ "$runtime_status" == FAIL ]] && (( active >= 20 || older_ten > 0 )); then
+    doctor_add n8n.execution_backlog 'n8n 生产执行积压' FAIL critical \
+      "生产 Code runner 不可用且有 ${active} 个未终止执行（超过 2 分钟 ${older_two}，超过 10 分钟 ${older_ten}）" docker \
+      '检查五秒调度扫描是否重复排队或阻塞；先修 workflow/runtime，不能只因容器 running 判正常' "$start"
+  elif (( older_ten > 0 || older_two >= 20 || active > 32 )); then
+    doctor_add n8n.execution_backlog 'n8n 生产执行积压' WARN warning \
+      "发现 ${active} 个未终止执行（超过 2 分钟 ${older_two}，超过 10 分钟 ${older_ten}）；当前 Code runner ${runtime_status}" docker \
+      '观察数量是否继续增长并检查调度心跳；历史异常记录按 n8n 受管保留策略清理，不手写删除业务记录' "$start"
+  elif (( active > 16 || older_two > 0 )); then
+    doctor_add n8n.execution_backlog 'n8n 生产执行积压' WARN warning \
+      "当前有 ${active} 个未终止执行，其中 ${older_two} 个超过 2 分钟；尚未达到明确阻塞门槛" docker \
+      '稍后复查 Code runner 和调度心跳；自检不会取消正在处理的任务' "$start"
+  else
+    doctor_add n8n.execution_backlog 'n8n 生产执行积压' PASS critical \
+      "当前未终止执行 ${active} 个，未发现超过 2 分钟的异常积压" docker '' "$start"
+  fi
+}
+
 doctor_provider_pool_files() {
   local start count desired actual internal aggregate configured valid_files=false
   DOCTOR_POOL_READY=0
@@ -1920,7 +1990,33 @@ doctor_runtime_state_check() {
 }
 
 doctor_runtime_scheduler_check() {
-  local start file now started completed age
+  local start file now started completed age lock_state lock_file
+  start=$(doctor_now_ms)
+  lock_file="${DOCTOR_DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
+  lock_state=$(scheduler_scan_lock_state "$DOCTOR_DEPLOY_DIR")
+  case "$lock_state" in
+    absent)
+      doctor_add runtime.scheduler_lock '会话扫描互斥锁' PASS critical '当前没有重叠扫描锁' filesystem '' "$start"
+      ;;
+    legacy-ownerless-empty)
+      doctor_add runtime.scheduler_lock '会话扫描互斥锁' FAIL critical '发现旧版无所有权空锁；新运行时会拒绝在线删除' filesystem '运行 crispai doctor --fix，在维护锁及 n8n 停写窗口精确迁移' "$start"
+      ;;
+    owned)
+      if [[ "$(stat -c '%a' -- "${lock_file}/owner.json" 2>/dev/null || true)" == 600 ]] \
+        && jq -e '.schema_version == 1 and (.token | type == "string" and test("^[a-f0-9]{32}$")) and
+          (.pid | type == "number" and . > 0) and (.boot_id | type == "string" and length >= 16) and
+          (.process_start | type == "string" and test("^[0-9]+$")) and
+          (.started_at | type == "number") and (.heartbeat_at | type == "number")' \
+          "${lock_file}/owner.json" >/dev/null 2>&1; then
+        doctor_add runtime.scheduler_lock '会话扫描互斥锁' PASS critical '重叠扫描锁包含受管所有权记录' filesystem '' "$start"
+      else
+        doctor_add runtime.scheduler_lock '会话扫描互斥锁' FAIL critical '扫描锁所有权记录无效或权限不安全' filesystem '停止 n8n 后人工核对；安全修复不会删除非空或无效所有权锁' "$start"
+      fi
+      ;;
+    *)
+      doctor_add runtime.scheduler_lock '会话扫描互斥锁' FAIL critical '扫描锁为链接、特殊文件、非空未知目录或权限归属不安全' filesystem '停止 n8n 后人工核对；不要按时间直接删除未知锁' "$start"
+      ;;
+  esac
   start=$(doctor_now_ms)
   file="${DOCTOR_DEPLOY_DIR}/data/runtime/scheduler-health.json"
   now=$(doctor_now_ms)
@@ -2216,17 +2312,56 @@ doctor_crisp_observation_check() {
 }
 
 doctor_provider_inference_probe() {
-  local remaining budget
+  local remaining budget result status=0
+  DOCTOR_PROVIDER_INFERENCE_STATUS=unknown
   remaining=$(doctor_remaining) || return 1
   (( remaining > 7 )) || return 1
   budget=$((remaining - 5))
   (( budget <= 20 )) || budget=20
+  result=$(mktemp "${DOCTOR_TEMP_ROOT}/provider-inference.XXXXXX") || return 1
   # 一个有独立总预算的合成问题走真实知识问答入口，不向 Crisp 发送消息。
   # shellcheck disable=SC2016
-  doctor_timeout "$((budget + 5))" bash -c '
+  CRISPAI_DIAGNOSTIC_JSON=1 doctor_timeout "$((budget + 5))" bash -c '
     source "$1/configuration.sh"
     configuration_query "$2" "仅作管理员连接检查，请简短回复连接正常。" "$3"
-  ' doctor-inference "$DOCTOR_DIR" "$DOCTOR_DEPLOY_DIR" "$((budget * 1000))" >/dev/null 2>&1
+  ' doctor-inference "$DOCTOR_DIR" "$DOCTOR_DEPLOY_DIR" "$((budget * 1000))" > "$result" 2>/dev/null || status=$?
+  if (( status == 0 )); then
+    DOCTOR_PROVIDER_INFERENCE_STATUS=success
+    rm -f -- "$result"
+    return 0
+  fi
+  DOCTOR_PROVIDER_INFERENCE_STATUS=$(jq -M -er '
+    select(.verified == false and (.error.code | type == "string")) | .error.code
+  ' "$result" 2>/dev/null || true)
+  if [[ -z "$DOCTOR_PROVIDER_INFERENCE_STATUS" ]]; then
+    if (( status == 124 || status == 137 )); then DOCTOR_PROVIDER_INFERENCE_STATUS=upstream_timeout
+    else DOCTOR_PROVIDER_INFERENCE_STATUS=admin_query_failed; fi
+  fi
+  rm -f -- "$result"
+  return 1
+}
+
+doctor_provider_inference_failure() {
+  local code=$1
+  case "$code" in
+    materials_not_ready) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前 Prompt、知识或索引代次尚未完成应用'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 16 → 6 应用资料，再核对知识索引状态' ;;
+    provider_configuration_invalid|configuration_applying) DOCTOR_PROVIDER_FAILURE_SUMMARY='接口池配置尚未完整应用或仍在恢复'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 查看应用状态；未完成事务使用主备策略中的恢复入口' ;;
+    authentication_failed) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前接口鉴权失败'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 编辑对应地址与 Key，候选验证成功后再应用' ;;
+    model_unavailable) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前模型原名或推理端点不可用'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 核对该接口模型、协议及 Base URL；模型列表成功不代表推理成功' ;;
+    rate_limited) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回请求频率限制'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='查看菜单 3 的冷却与备用状态，按 Retry-After 后再验证' ;;
+    quota_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回额度或余额不足'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='处理该授权范围的额度，或配置有独立授权的备用接口' ;;
+    upstream_timeout) DOCTOR_PROVIDER_FAILURE_SUMMARY='实际推理在限定时间内未完成'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='检查容器到上游的网络、接口响应时间及主备总预算' ;;
+    upstream_unavailable|connection_failed) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游服务或容器网络连接不可用'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='检查 DNS/TLS、上游状态和容器实际地址；宿主可连不等于容器可连' ;;
+    protocol_error) DOCTOR_PROVIDER_FAILURE_SUMMARY='接口协议、地址路径或请求格式不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 核对该接口的 Chat Completions / Responses 模式、Base URL 前缀及实际推理端点' ;;
+    invalid_response) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回空正文、非 JSON 或与所选协议不符'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对 Chat/Responses 协议及地址路径；不要只依据 /models 判定可用' ;;
+    retrieval_error|retrieval_invalid|retrieval_unavailable|source_unmapped|source_ambiguous|context_invalid) DOCTOR_PROVIDER_FAILURE_SUMMARY='知识检索或启用资料映射未通过'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 5 核对索引与来源，再执行菜单 16 → 6 资料应用' ;;
+    context_preparation_incomplete|invalid_input|no_capable_provider) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前接口能力、上下文容量或最终请求结构不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对模型协议/容量/图片能力和已应用 Prompt；未发送不完整请求' ;;
+    pool_cooling|pool_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本题预算内没有接口成功返回'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 查看近期切换记录，逐项定位鉴权、限流、超时或响应格式' ;;
+    question_budget_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本次推理已达到总时间或调用次数上限'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='查看近期切换记录并修复前序故障；不会继续放大请求' ;;
+    state_changed|question_cancelled) DOCTOR_PROVIDER_FAILURE_SUMMARY='检测期间配置或控制状态发生变化，结果已作废'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='刷新当前状态后重新执行完整自检' ;;
+    safety_refusal) DOCTOR_PROVIDER_FAILURE_SUMMARY='模型对合成检查作出安全拒绝'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='这不是连接成功证据，也不会切换接口规避模型安全限制' ;;
+    *) DOCTOR_PROVIDER_FAILURE_SUMMARY='实际推理未完成，错误类别未能安全确认'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='依次核对菜单 5 的知识、菜单 3 的接口及菜单 2 的组件结果' ;;
+  esac
 }
 
 doctor_external_check() {
@@ -2268,7 +2403,8 @@ doctor_external_check() {
   elif doctor_provider_inference_probe; then
     doctor_add provider.inference 'Provider 实际推理' PASS critical '合成问题通过 AnythingLLM、实际推理入口并返回非空正文；未向客户发消息' external '' "$start"
   else
-    doctor_add provider.inference 'Provider 实际推理' FAIL critical '当前模型、协议或最终应用容器路径调用失败' external '从第三方 AI 菜单核对协议、模型、Key 和容器地址' "$start"
+    doctor_provider_inference_failure "$DOCTOR_PROVIDER_INFERENCE_STATUS"
+    doctor_add provider.inference 'Provider 实际推理' FAIL critical "$DOCTOR_PROVIDER_FAILURE_SUMMARY" external "$DOCTOR_PROVIDER_FAILURE_SUGGESTION" "$start"
   fi
 }
 
@@ -2288,6 +2424,7 @@ doctor_run_checks() {
     doctor_skip n8n.health 'n8n 服务' '离线范围未检查' local-api
     doctor_skip n8n.workflow 'n8n 生产工作流' '离线范围未检查' docker
     doctor_skip n8n.runtime 'n8n Code runner' '离线范围未检查' local-api
+    doctor_skip n8n.execution_backlog 'n8n 生产执行积压' '离线范围不访问数据库' docker
     doctor_skip provider.adapter 'Provider adapter' '离线范围未检查' docker
     doctor_skip provider.adapter_code_binding 'Provider adapter 程序运行代' '离线范围未检查单文件挂载' docker
     doctor_skip caddy.file_binding 'Caddy 配置运行代' '离线范围未检查单文件挂载' docker
@@ -2300,6 +2437,7 @@ doctor_run_checks() {
     doctor_db_check
     doctor_anything_check
     doctor_n8n_check
+    doctor_n8n_execution_backlog_check
     doctor_adapter_check
   fi
   doctor_materials_check
@@ -2316,7 +2454,7 @@ doctor_result_status() {
 }
 
 doctor_safe_fix() {
-  local launcher_path access_mode service service_status permissions_status dependency_status daemon_status compose_status install_state
+  local launcher_path access_mode service service_status permissions_status dependency_status daemon_status compose_status install_state scheduler_state
   if (( EUID != 0 )); then
     doctor_fix_add fix.authorization '修复授权' FAIL '安全修复需要 root；未执行任何修复'
     return
@@ -2326,6 +2464,7 @@ doctor_safe_fix() {
     doctor_fix_add fix.generation-guard '安装代际保护' FAIL "当前状态 ${install_state:-未知} 不是稳定运行代；未补依赖、改权限/入口或启动任何服务"
     return
   fi
+  acquire_maintenance_lock "$DOCTOR_DEPLOY_DIR"
   if (( DOCTOR_PREBOOTSTRAP_JQ_FIXED )); then
     doctor_fix_add fix.bootstrap-jq '结构化诊断依赖' PASS '已通过受管依赖引导器补齐 jq，未改动业务配置'
   fi
@@ -2374,6 +2513,21 @@ doctor_safe_fix() {
 
   if command -v docker >/dev/null 2>&1 && doctor_timeout 10 docker info >/dev/null 2>&1 \
     && doctor_compose_timeout 15 config --quiet >/dev/null 2>&1; then
+    scheduler_state=$(scheduler_scan_lock_state "$DOCTOR_DEPLOY_DIR")
+    if [[ "$scheduler_state" == legacy-ownerless-empty ]]; then
+      if doctor_compose_timeout 30 stop n8n >/dev/null 2>&1 \
+        && cleanup_legacy_scheduler_scan_lock "$DOCTOR_DEPLOY_DIR" \
+        && doctor_compose_timeout 45 up -d n8n >/dev/null 2>&1; then
+        doctor_fix_add fix.runtime.scheduler_lock '迁移旧版会话扫描锁' PASS '已在维护锁与 n8n 停写窗口删除本实例无所有权空锁，并恢复 n8n'
+      else
+        doctor_compose_timeout 45 up -d n8n >/dev/null 2>&1 || true
+        doctor_fix_add fix.runtime.scheduler_lock '迁移旧版会话扫描锁' FAIL '未能完成停写、精确空目录删除及服务恢复；非空、链接或带所有权锁未删除'
+      fi
+    elif [[ "$scheduler_state" == absent || "$scheduler_state" == owned ]]; then
+      doctor_fix_add fix.runtime.scheduler_lock '迁移旧版会话扫描锁' SKIP '未发现需要迁移的旧版无所有权空锁'
+    else
+      doctor_fix_add fix.runtime.scheduler_lock '迁移旧版会话扫描锁' FAIL '锁形态不符合旧版空目录；为保护调度所有权未自动删除'
+    fi
     access_mode=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
     for service in postgres anythingllm n8n provider-adapter; do
       service_status=$(doctor_result_status "container.${service}")

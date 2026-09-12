@@ -18,7 +18,10 @@ MAX_PARSED_BYTES = 256 * 1024 * 1024
 MAX_PASSAGE_BYTES = 512 * 1024
 ALGORITHM = "crispai-lexical-v1"
 QUESTION = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:问(?:题)?|q(?:uestion)?)[ \t]*[:：][ \t]*([^\r\n]+)")
-ANSWER = re.compile(r"(?im)^[ \t]*(?:答(?:案)?|a(?:nswer)?)[ \t]*[:：]")
+# 用户原文常见两种中文标签都是受支持格式：`答/答案` 与 `回答`。
+# 缺少 `回答` 会让整段退化成普通窗口，索引中没有可供精确命中的 question 字段；
+# 文件虽然已上传，真实 FAQ 原问仍可能排不到向量 top-k。
+ANSWER = re.compile(r"(?im)^[ \t]*(?:答(?:案)?|回答|a(?:nswer)?)[ \t]*[:：]")
 
 
 class LexicalError(Exception):

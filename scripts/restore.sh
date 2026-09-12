@@ -276,6 +276,11 @@ fi
 
 if (( SKIP_RESTART == 0 )); then
   require_docker_runtime
+  if [[ "$(env_get "$DEPLOY_DIR/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)" == managed_https \
+    && -f "${STAGING}/config/Caddyfile" ]] \
+    && ! caddy_validate_configuration_file "$DEPLOY_DIR" "${STAGING}/config/Caddyfile"; then
+    die '备份中的受管 Caddy 配置未通过实际版本校验；尚未停止服务或覆盖现有资料'
+  fi
   docker_compose "$DEPLOY_DIR" stop n8n anythingllm
   SERVICES_STOPPED=1
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -284,6 +289,20 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     die "n8n 或 AnythingLLM 正在运行，不能使用 --skip-restart 执行恢复"
   fi
 fi
+
+# v1.2.0 及更早的 runtime 可能在异常中断后留下没有 owner.json 的空扫描锁。
+# 恢复脚本已经持有维护锁；这里只在 n8n 已停止且形态精确匹配旧锁时迁移。
+# 带所有者、非空、链接或权限异常的目录一律保留并中止，避免恢复时误删活锁。
+SCHEDULER_LOCK_STATE=$(scheduler_scan_lock_state "$DEPLOY_DIR")
+case "$SCHEDULER_LOCK_STATE" in
+  absent|owned) ;;
+  legacy-ownerless-empty)
+    cleanup_legacy_scheduler_scan_lock "$DEPLOY_DIR" \
+      || die '旧版会话扫描空锁未能在恢复停写窗口安全迁移；现有资料尚未覆盖'
+    info '已在恢复停写窗口迁移旧版会话扫描空锁'
+    ;;
+  *) die '会话扫描锁不是可安全迁移的旧版空目录；未删除该锁或覆盖现有资料' ;;
+esac
 
 # 停服可能等待正在执行的索引请求；在第一处资料覆盖前再次回读，并拒绝
 # 预检与静止状态之间发生的代次变化。
@@ -326,6 +345,10 @@ secure_permissions "$DEPLOY_DIR"
 if (( SKIP_RESTART == 0 )); then
   docker_compose "$DEPLOY_DIR" config --quiet
   docker_compose "$DEPLOY_DIR" up -d n8n anythingllm
+  if [[ "$(env_get "$DEPLOY_DIR/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)" == managed_https ]]; then
+    reconcile_caddy_runtime "$DEPLOY_DIR" \
+      || die '恢复后的反向代理配置或运行代未通过对账；未宣称恢复完成'
+  fi
   wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"

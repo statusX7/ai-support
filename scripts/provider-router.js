@@ -50,12 +50,28 @@ function validatePolicy(value = {}) {
   return result;
 }
 
+function normalizeApiBase(value) {
+  if (typeof value !== 'string' || !value || value.length > 4096 || value.includes('?') || value.includes('#') || /[\\\x00-\x20\x7f]/.test(value)) throw terminal('invalid_pool','接口地址无效');
+  const normalized = value.replace(/\/+$/,'');
+  let base;
+  try { base = new URL(normalized); } catch (_) { throw terminal('invalid_pool','接口地址无效'); }
+  if (!['https:','http:'].includes(base.protocol) || base.username || base.password || base.search || base.hash
+    || base.protocol === 'http:' && !['127.0.0.1','localhost','host.docker.internal','[::1]'].includes(base.hostname)) throw terminal('invalid_pool','接口地址无效');
+  const rawPath = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*(\/.*)?$/.exec(normalized)?.[1] || '';
+  let decoded; try { decoded = decodeURIComponent(rawPath); } catch (_) { throw terminal('invalid_pool','接口地址无效'); }
+  if (decoded.includes('\\') || decoded.split('/').some(part => part === '.' || part === '..')) throw terminal('invalid_pool','接口地址无效');
+  let pathname = base.pathname.replace(/\/+$/,'');
+  if (!pathname.endsWith('/v1')) pathname += '/v1';
+  base.pathname = pathname;
+  const result = base.href.replace(/\/$/,'');
+  if (result.length > 4096) throw terminal('invalid_pool','接口地址无效');
+  return result;
+}
+
 function validateEntry(entry, secret) {
   if (!entry || !/^p_[a-f0-9]{24}$/.test(entry.id || '') || typeof entry.enabled !== 'boolean'
     || !['chat_completions','responses'].includes(entry.api_mode) || !/^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,511}$/.test(entry.model || '')) throw terminal('invalid_pool','接口定义无效');
-  const base = new URL(entry.base_url);
-  if (!['https:','http:'].includes(base.protocol) || base.username || base.password || base.search || base.hash || /[\x00-\x20\x7f]/.test(entry.base_url)
-    || base.protocol === 'http:' && !['127.0.0.1','localhost','host.docker.internal','[::1]'].includes(base.hostname)) throw terminal('invalid_pool','接口地址无效');
+  const baseUrl = normalizeApiBase(entry.base_url), base = new URL(baseUrl);
   if (!Number.isSafeInteger(entry.context_window) || entry.context_window < 256 || entry.context_window > 2097152
     || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens < 1 || entry.max_output_tokens >= entry.context_window) throw terminal('invalid_pool','接口上下文限制无效');
   if (!entry.capabilities || !['chat_completions','responses','vision'].every(name => typeof entry.capabilities[name] === 'boolean')) throw terminal('invalid_pool','接口能力定义无效');
@@ -64,8 +80,8 @@ function validateEntry(entry, secret) {
   if (!secret || typeof secret.api_key !== 'string' || !secret.api_key && entry.draft !== true || secret.api_key.length > 16384 || /[\x00-\x1f\x7f]/.test(secret.api_key)) throw terminal('invalid_pool','接口秘密缺失或无效');
   const headers = parseHeaders(secret.custom_headers || {});
   const authScope = hash(base.origin + '\0' + secret.api_key + '\0' + JSON.stringify(Object.entries(headers).sort()));
-  const entryIdentity = hash(entry.id + '\0' + entry.base_url + '\0' + entry.api_mode + '\0' + entry.model + '\0' + authScope);
-  return {...entry, base:base.href.replace(/\/$/,''), model:entry.model, mode:entry.api_mode, key:secret.api_key, headers,
+  const entryIdentity = hash(entry.id + '\0' + baseUrl + '\0' + entry.api_mode + '\0' + entry.model + '\0' + authScope);
+  return {...entry, base_url:baseUrl, base:base.href.replace(/\/$/,''), model:entry.model, mode:entry.api_mode, key:secret.api_key, headers,
     authScope:'auth:' + authScope, modelScope:'model:' + hash(authScope + '\0' + entry.model), entryScope:'entry:' + entryIdentity, visionScope:'vision:' + entryIdentity};
 }
 
@@ -130,6 +146,9 @@ function classifyFailure(status, body, headers = {}) {
   if (status === 401 || status === 403 || /invalid_api_key|authentication_error|invalid_authentication/.test(code)) return {kind:'authentication_failed',fallback:true,scope:'authScope',retryAfter,status};
   if (status === 429 || /insufficient_quota|billing_hard_limit|quota_exceeded|billing_not_active|usage_limit|credit_balance_exhausted|spend_limit_exceeded/.test(code)) return {kind:/insufficient_quota|billing|quota_exceeded|usage_limit|credit_balance_exhausted|spend_limit_exceeded/.test(code) ? 'quota_exhausted' : 'rate_limited',fallback:true,scope:'authScope',retryAfter,status};
   if (status >= 500 || status === 408 || status === 409) return {kind:'upstream_unavailable',fallback:true,scope:'entryScope',retryAfter,status};
+  // 没有可识别模型错误结构的 404 表示当前接口路径/协议端点不可用，而不是客户输入错误。
+  // 仅冷却这个独立接口并允许备用继续；明确的 model_not_found 已在上方按模型范围隔离。
+  if (status === 404) return {kind:'protocol_error',fallback:true,scope:'entryScope',retryAfter,status};
   // 仅接受明确模型能力错误；unsupported_image 的格式/坏数据含义仍是输入终态。
   const modelVisionUnsupported = /^(?:this|the(?: selected)?) model does not support (?:images?|image inputs?|vision)[.!]?$/.test(message.trim())
     || /^(?:image inputs?|images?|vision) (?:is|are) not supported by (?:this|the(?: selected)?) model[.!]?$/.test(message.trim());
@@ -274,6 +293,7 @@ function createRouter(environment, invoke) {
     // 近似估算而非模型专用 tokenizer；保留消息开销、256 token 余量与每图4096，不裁剪知识或图片。
     const inputTokens = 256 + body.messages.reduce((sum,message) => sum + 16 + (typeof message.content === 'string' ? estimateTextTokens(message.content) : message.content.reduce((total,part) => total + (part.type === 'image_url' ? 4096 : estimateTextTokens(part.text || '')),0)),0);
     let candidates = 0;
+    const attemptFailures = [];
     try {
       if (state.pool_until > Date.now()) throw terminal('pool_cooling','接口池正在短暂保护期，请稍后再发起新问题');
       for (const entry of pool.entries) {
@@ -308,10 +328,20 @@ function createRouter(environment, invoke) {
           const failure = error.failure || {kind:error.name === 'AbortError' ? 'upstream_timeout':'connection_failed',fallback:true,scope:'entryScope',status:0};
           if (!failure.fallback || failure.scope === 'visionScope' && !visual) { release(entry,visual); save(); throw terminal(failure.kind === 'vision_unsupported' ? 'invalid_request' : failure.kind,failure.kind === 'safety_refusal' ? '模型拒绝处理该内容':'模型拒绝本次请求的输入格式'); }
           fault(entry,failure,pool.policy,visual);
+          attemptFailures.push(failure.kind);
           record({at:Date.now(),question_id:id,stage,entry_id:entry.id,pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,attempt:question.attempts,duration_ms:Date.now()-start});
         } finally { clearInterval(monitor); signal?.removeEventListener('abort',cancel); }
       }
       if (candidates && !pool.entries.some(entry => entry.enabled && allowed(entry,Date.now()))) { state.pool_until = Date.now() + pool.policy.pool_cooldown_ms; save(); }
+      const diagnosticKinds = new Set(['authentication_failed','model_unavailable','rate_limited','quota_exhausted',
+        'upstream_timeout','upstream_unavailable','connection_failed','protocol_error','invalid_response']);
+      const distinctFailures = [...new Set(attemptFailures)];
+      // 单接口，或本轮所有真正发出的尝试都是同一类故障时，直接向管理员返回该安全类别。
+      // 多类故障仍保留 pool_exhausted，详情由受限的近期切换记录展示，不透传上游正文。
+      if (attemptFailures.length === candidates && distinctFailures.length === 1 && diagnosticKinds.has(distinctFailures[0])) {
+        throw terminal(distinctFailures[0],'已确认本轮推理失败类别');
+      }
+      if (candidates && attemptFailures.length === 0) throw terminal('pool_cooling','当前候选接口处于冷却或半开保护状态');
       throw terminal(candidates ? 'pool_exhausted':'no_capable_provider',candidates ? '本次问题可用的接口已用尽':'没有满足协议、图片能力或上下文限制的可用接口');
     } catch (error) {
       question.terminal = {code:error.code || 'question_failed',message:error.terminal ? error.message:'本次问题处理已终止'};
@@ -342,4 +372,4 @@ function createRouter(environment, invoke) {
   return {route,status,recent:() => ({ok:true,records:state.recent.slice().reverse()}),loadPool:currentPool,clearHealth:entry => { for (const key of scopes(entry,true)) delete state.health[key]; state.pool_until = 0; save(); }};
 }
 
-module.exports = {createRouter,loadPool,validateEntry,validatePolicy,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};
+module.exports = {createRouter,loadPool,validateEntry,validatePolicy,normalizeApiBase,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};

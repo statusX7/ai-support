@@ -99,9 +99,9 @@ RELEASE_FILES=(
   tests/test_deployment_integration.sh tests/test_external_e2e.sh tests/test_health_wait.sh
   tests/test_knowledge_timeout.sh tests/test_manage_contract.sh tests/test_manage_ui.py
   tests/test_get.sh tests/test_doctor.sh tests/test_doctor_pool.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
-  tests/test_crisp_auth.js tests/test_caddy_routing.sh tests/fixtures/caddy-order-v111.conf
+  tests/test_crisp_auth.js tests/test_caddy_routing.sh tests/test_caddy_callers.sh tests/fixtures/caddy-order-v111.conf
   tests/test_launcher.py tests/test_materials_apply.js tests/test_material_limits.js tests/test_logs.sh tests/test_docs_acceptance.py
-  tests/test_provider_adapter.js tests/test_release_package.sh tests/test_release_gate.py tests/test_static_security.sh tests/test_web_chat_browser.js
+  tests/test_provider_adapter.js tests/test_provider_menu.sh tests/test_release_package.sh tests/test_release_gate.py tests/test_static_security.sh tests/test_web_chat_browser.js
   tests/test_wizard.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/workflow-local-integration.js tests/workflow-runtime.test.js tests/runtime-protocol-server.js
   tests/fixtures/knowledge.md tests/mocks/chown tests/mocks/configuration_docker

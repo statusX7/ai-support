@@ -55,6 +55,8 @@ function fixture(label, allowAdmin = false) {
       const text = JSON.stringify(messages);
       const answer = text.includes(reference) ? reference : '请说明要查询的展馆信息。';
       if (f.beforeModelResponse) await f.beforeModelResponse();
+      if (f.providerError) throw f.providerError;
+      if (f.providerResponse) return structuredClone(f.providerResponse);
       return {status: 200, body: {choices: [{message: {role: 'assistant', content: answer}}]}};
     }
     assert.equal(parsed.hostname, 'api.crisp.chat');
@@ -240,6 +242,41 @@ async function test(name, action) {
     fs.mkdirSync(path.join(f.root, 'data/runtime/knowledge-migration.json'));
     await f.deliver(f.event('session_knowledge-migration-directory', question));
     assert.equal(f.queries.length, 0); assert.equal(f.generated.length, 0); assert.equal(f.sent.length, 0);
+  });
+  await test('K15 管理员推理按鉴权、模型、上游、超时及无效响应返回安全类别', async () => {
+    const cases = [
+      ['authentication', {status: 401, body: {error: {message: 'synthetic authentication failure'}}}, null, 'authentication_failed'],
+      ['model', {status: 404, body: {error: {message: 'synthetic model failure'}}}, null, 'model_unavailable'],
+      ['upstream', {status: 503, body: {error: {message: 'synthetic upstream failure'}}}, null, 'upstream_unavailable'],
+      ['empty', {status: 200, body: {choices: []}}, null, 'invalid_response'],
+      ['error-json', {status: 200, body: {error: {message: 'synthetic protocol failure'}}}, null, 'invalid_response'],
+      ['protocol-error', {status: 400, body: {error: {code: 'protocol_error', message: 'synthetic adapter detail'}}}, null, 'protocol_error'],
+      ['timeout', null, Object.assign(new Error('请求超时'), {name: 'AbortError'}), 'upstream_timeout'],
+    ];
+    for (const [label, response, providerError, expected] of cases) {
+      const f = fixture('admin-provider-' + label, true); f.applyKnowledgeSettings(0.2);
+      f.providerResponse = response; f.providerError = providerError;
+      await assert.rejects(f.admin(question, 1000), error => {
+        assert.equal(error.code, expected, label + ' 应返回白名单诊断类别');
+        assert(!String(error.message).includes('synthetic'), label + ' 不得向管理员透传上游正文');
+        return true;
+      });
+      assert.equal(f.queries.length, 1, label + ' 应先走实际检索链');
+      assert.equal(f.generated.length, 1, label + ' 应只发起一次模型尝试');
+      assert.equal(f.sent.length, 0, label + ' 管理员检查不得向客户发消息');
+    }
+  });
+  await test('K16 管理员检索错误与推理错误分层，检索失败时不调用模型', async () => {
+    const f = fixture('admin-retrieval-diagnostic', true); f.applyKnowledgeSettings(0.2);
+    f.retrievalResponse = {error: 'synthetic retrieval failure'};
+    await assert.rejects(f.admin(question, 1000), error => {
+      assert.equal(error.code, 'retrieval_invalid');
+      assert(!String(error.message).includes('synthetic'), '不得透传检索服务原始错误正文');
+      return true;
+    });
+    assert.equal(f.queries.length, 1);
+    assert.equal(f.generated.length, 0, '检索错误不得被归类为 Provider 推理错误后继续调用模型');
+    assert.equal(f.sent.length, 0);
   });
   console.log(JSON.stringify({layer: 'UNIT/PROTOCOL', passed, failed}));
   process.exitCode = failed ? 1 : 0;

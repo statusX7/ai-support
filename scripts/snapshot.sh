@@ -166,7 +166,10 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 2 0; then
   CONFIG_FILES+=(logging.yaml.example)
 fi
 if snapshot_version_at_least "$VERSION_VALUE" 1 2 1; then
-  SCRIPT_FILES+=(provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh)
+  # 这些文件共同组成 Compose 实际推理入口和管理入口。只保存 router/pool
+  # 而漏掉 adapter 会让回滚保留目标机旧文件，形成难以识别的混合代。
+  SCRIPT_FILES+=(provider-adapter.js provider-router.js provider-envelope.js provider-pool.py \
+    provider.sh configuration.sh menu-display.py menu-provider-ui.sh)
   N8N_FILES+=(runtime.js)
   knowledge_snapshot_modules_check "$DEPLOY_DIR"
   if (( KNOWLEDGE_SNAPSHOT_HAS_P0 )); then

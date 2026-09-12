@@ -299,7 +299,7 @@ done
 
 if [[ $EUID -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
-    exec sudo --preserve-env=AI_API_BASE_URL,AI_API_KEY,AI_MODEL,DEFAULT_AI_MODEL,CRISP_WEBSITE_ID,CRISP_TOKEN_TIER,CRISP_TOKEN_IDENTIFIER,CRISP_TOKEN_KEY,CRISP_HOOK_MODE,CRISP_PLUGIN_SIGNING_SECRET,PUBLIC_WEBHOOK_URL,WEBHOOK_PRODUCTION_URL,WEBHOOK_ACCESS_MODE,N8N_HOST,TIMEZONE,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,ANYTHINGLLM_CHAT_MODE,BIND_ADDRESS,N8N_PORT,ANYTHINGLLM_PORT,N8N_IMAGE,POSTGRES_IMAGE,ANYTHINGLLM_IMAGE,CADDY_IMAGE,AI_MODEL_TOKEN_LIMIT,AI_MAX_OUTPUT_TOKENS,SNAPSHOT_MIN_FREE_MB,SNAPSHOT_RETENTION_COUNT \
+    exec sudo --preserve-env=AI_API_BASE_URL,AI_API_KEY,AI_MODEL,AI_API_MODE,AI_SUPPORTS_VISION,DEFAULT_AI_MODEL,CRISP_WEBSITE_ID,CRISP_TOKEN_TIER,CRISP_TOKEN_IDENTIFIER,CRISP_TOKEN_KEY,CRISP_HOOK_MODE,CRISP_PLUGIN_SIGNING_SECRET,PUBLIC_WEBHOOK_URL,WEBHOOK_PRODUCTION_URL,WEBHOOK_ACCESS_MODE,N8N_HOST,TIMEZONE,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,ANYTHINGLLM_CHAT_MODE,BIND_ADDRESS,N8N_PORT,ANYTHINGLLM_PORT,N8N_IMAGE,POSTGRES_IMAGE,ANYTHINGLLM_IMAGE,CADDY_IMAGE,AI_MODEL_TOKEN_LIMIT,AI_MAX_OUTPUT_TOKENS,SNAPSHOT_MIN_FREE_MB,SNAPSHOT_RETENTION_COUNT \
       bash "$SCRIPT_DIR/install.sh" "${ORIGINAL_ARGS[@]}"
   fi
   die "安装需要 root 权限；请使用 sudo bash ./install.sh，或由 root 直接运行"
@@ -327,7 +327,7 @@ if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -
     case "$PREVIOUS_STATE" in
       ready|local-ready) EXISTING=1 ;;
       collecting)
-        warn "检测到未完成的快速初始化，本次将从保存的步骤继续"
+        warn "检测到未完成的快速初始化；进入向导后可明确选择继续上次或重新开始"
         ;;
       installing|failed)
         if (( RECONFIGURE )); then
@@ -506,6 +506,8 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     AI_API_BASE_URL=$(jq -er '.provider.base_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     AI_API_KEY=$(jq -er '.provider.api_key | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     AI_MODEL=$(jq -er '.provider.model | select(type == "string" and length > 0)' "$WIZARD_RESULT")
+    AI_API_MODE=$(jq -er '.provider.api_mode | select(. == "chat_completions" or . == "responses")' "$WIZARD_RESULT")
+    AI_SUPPORTS_VISION=$(jq -er '.provider.capabilities.vision | select(type == "boolean")' "$WIZARD_RESULT")
     PUBLIC_URL_VALUE=$(jq -er '.webhook.public_base_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     WEBHOOK_PRODUCTION_VALUE=$(jq -er '.webhook.production_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     WEBHOOK_MODE_VALUE=$(jq -er '.webhook.mode | select(type == "string" and length > 0)' "$WIZARD_RESULT")
@@ -557,10 +559,19 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     env_set "$ENV_FILE" CRISP_PLUGIN_SIGNING_SECRET "$CRISP_PLUGIN_SECRET_VALUE"
   fi
   env_set "$ENV_FILE" ANYTHINGLLM_API_KEY "$ANYTHING_KEY_VALUE"
-  if (( NON_INTERACTIVE )); then
-    configure_provider "$DEPLOY_DIR" 1
+  if [[ -e "${DEPLOY_DIR}/config/provider-pool-applied.json" \
+    || -L "${DEPLOY_DIR}/config/provider-pool-applied.json" ]]; then
+    configure_provider_pool_primary "$DEPLOY_DIR" "${AI_API_BASE_URL:-}" \
+      "${AI_API_KEY:-}" "${AI_MODEL:-}" "${AI_API_MODE:-auto}" \
+      "${AI_SUPPORTS_VISION:-false}" \
+      || die '新主接口未通过真实适配器验证或运行回读；原接口池、秘密及兼容配置已保留'
   else
+    [[ ! -e "${DEPLOY_DIR}/config/provider-pool.yaml" \
+      && ! -L "${DEPLOY_DIR}/config/provider-pool.yaml" ]] \
+      || die '检测到主备池源但有效投影缺失；未用旧单接口流程覆盖，请先恢复有效配置'
     configure_provider "$DEPLOY_DIR" 1
+  fi
+  if (( NON_INTERACTIVE == 0 )); then
     PROMPT_MODE_VALUE=$(jq -r '.prompt.mode // "default"' "$WIZARD_RESULT")
     case "$PROMPT_MODE_VALUE" in
       default) ;;
@@ -636,6 +647,19 @@ if (( SKIP_START == 0 )); then
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   bash "${DEPLOY_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" ensure \
     || die '中文知识检索模型或索引代次迁移未完成；原资料已保全，请用同一入口继续'
+  SCHEDULER_LOCK_STATE=$(scheduler_scan_lock_state "$DEPLOY_DIR")
+  case "$SCHEDULER_LOCK_STATE" in
+    absent|owned) ;;
+    legacy-ownerless-empty)
+      docker_compose "$DEPLOY_DIR" stop n8n
+      if ! cleanup_legacy_scheduler_scan_lock "$DEPLOY_DIR"; then
+        docker_compose "$DEPLOY_DIR" up -d n8n >/dev/null 2>&1 || true
+        die '旧版会话扫描空锁未能在 n8n 停写窗口安全迁移；原服务已尝试恢复'
+      fi
+      info '已在 n8n 停写窗口迁移旧版会话扫描空锁'
+      ;;
+    *) die '会话扫描锁不是可安全迁移的旧版空目录；未删除该锁或启动可能混用的运行代' ;;
+  esac
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR"
   sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"
@@ -683,6 +707,8 @@ if (( SKIP_START == 0 )); then
     write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
   fi
   # 确认结果含外部凭据；配置与本地应用初始化成功后删除第二份明文副本。
+  wizard_cleanup_owned_drafts "$WIZARD_RESULT" "$WIZARD_RESULT" \
+    || warn '个别向导粘贴草稿无法安全清理，已保留供人工检查'
   rm -f -- "$WIZARD_RESULT"
 else
   if [[ "$PREVIOUS_STATE" == ready && "$PREVIOUS_VERSION" == "$VERSION" && $RECONFIGURE -eq 0 ]]; then
@@ -690,6 +716,8 @@ else
   else
     write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" staged
   fi
+  wizard_cleanup_owned_drafts "$WIZARD_RESULT" "$WIZARD_RESULT" \
+    || warn '个别向导粘贴草稿无法安全清理，已保留供人工检查'
   rm -f -- "$WIZARD_RESULT"
 fi
 

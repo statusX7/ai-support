@@ -171,6 +171,16 @@ docker_compose_command --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DI
   -f "${SOURCE_DIR}/docker-compose.yml" pull
 docker_compose "$DEPLOY_DIR" stop n8n anythingllm
 SERVICES_STOPPED=1
+SCHEDULER_LOCK_STATE=$(scheduler_scan_lock_state "$DEPLOY_DIR")
+case "$SCHEDULER_LOCK_STATE" in
+  absent|owned) ;;
+  legacy-ownerless-empty)
+    cleanup_legacy_scheduler_scan_lock "$DEPLOY_DIR" \
+      || die '旧版会话扫描空锁未能在 n8n 停写窗口安全迁移；升级将回滚'
+    info '已在 n8n 停写窗口迁移旧版会话扫描空锁'
+    ;;
+  *) die '会话扫描锁不是可安全迁移的旧版空目录；升级将回滚且不会删除该锁' ;;
+esac
 
 write_installation_marker "$DEPLOY_DIR" "$SOURCE_DIR" "$OLD_VERSION" installing
 copy_project_files "$SOURCE_DIR" "$DEPLOY_DIR"

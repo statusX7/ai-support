@@ -77,6 +77,9 @@ async function fixture() {
   write(path.join(deploy,'.env'),f.initialEnv);
   write(path.join(deploy,'config/provider.yaml'),{schema_version:2,provider:{base_url:f.base,model:'synthetic-primary-model',api_mode:'chat_completions',api_key_env:'AI_API_KEY'}});
   f.invoke=(script,args=[],overrides={})=>command('bash',[path.join(project,'scripts',script),'--deploy-dir',deploy,...args],{env:{PATH:deploy+'/bin:'+process.env.PATH,CONFIGURATION_FIXTURE_DEPLOY:deploy,PROVIDER_ADAPTER_MANAGEMENT_URL:f.adapterBase,...overrides}});
+  f.reconfigurePrimary=(base,key,model,mode='chat_completions',vision='false')=>command('bash',['-c',
+    'set -euo pipefail\nsource "$1/scripts/common.sh"\nconfigure_provider_pool_primary "$1" "$2" "$3" "$4" "$5" "$6"',
+    '--',deploy,base,key,model,mode,vision],{env:{PATH:deploy+'/bin:'+process.env.PATH,PROVIDER_ADAPTER_MANAGEMENT_URL:f.adapterBase}});
   f.ok=async(script,args=[],overrides={})=>{const result=await f.invoke(script,args,overrides);assert.equal(result.code,0,script+' '+args.join(' ')+'\n'+result.stderr+result.stdout);return result;};
   f.pool=()=>read(path.join(deploy,'config/provider-pool-applied.json'));
   f.source=()=>read(path.join(deploy,'config/provider-pool.yaml'));
@@ -172,6 +175,45 @@ async function main(){
         const status=await f.invoke('materials.sh',['status']);assert.equal(status.code,2);assert.equal(JSON.parse(status.stdout).provider_pool.pending,true);
       }finally{f.rejectModel='';write(path.join(f.deploy,'config/provider-pool.yaml'),before['config/provider-pool.yaml']);}
     });
+    await test('PL07A 已有池快速初始化原子替换当前主接口，失败保留投影且重复操作不丢备用',async()=>{
+      const original=f.pool(),primary=original.primary_id,originalSecret=f.secretEntries()[primary];
+      const layout=value=>value.entries.map(item=>({id:item.id,role:item.role,order:item.order}));
+      const expectedLayout=layout(original),replacementBase=`http://127.0.0.1:${f.port}/upstream/reconfigured/v1`;
+      const replacementKey='synthetic-reconfigured-primary-key',replacementModel='synthetic-reconfigured-model';
+      let callStart=f.calls.length;
+      let result=await f.reconfigurePrimary(replacementBase,replacementKey,replacementModel);
+      assert.equal(result.code,0,result.stderr+result.stdout);
+      assert.equal(f.pool().primary_id,primary);assert.deepEqual(layout(f.pool()),expectedLayout);
+      assert.equal(f.pool().entries[0].base_url,replacementBase);assert.equal(f.pool().entries[0].model,replacementModel);
+      assert.equal(f.secretEntries()[primary].api_key,replacementKey);
+      assert.match(fs.readFileSync(path.join(f.deploy,'.env'),'utf8'),new RegExp('^AI_API_KEY='+replacementKey+'$','m'));
+      assert.equal(read(path.join(f.deploy,'config/provider.yaml')).provider.model,replacementModel);
+      await f.ok('provider.sh',['test',primary]);
+      const replacementCalls=f.calls.slice(callStart);
+      assert(replacementCalls.some(call=>call.path==='/upstream/reconfigured/v1/chat/completions' && call.body.model===replacementModel
+        && call.headers.authorization==='Bearer '+replacementKey));
+
+      const protectedFiles=['.env','config/provider.yaml','config/provider-pool.yaml','config/provider-pool-applied.json'];
+      const beforeFailure=Object.fromEntries(protectedFiles.map(name=>[name,fs.readFileSync(path.join(f.deploy,name))]));
+      const secretsBeforeFailure=structuredClone(f.secretEntries());
+      f.rejectModel='synthetic-reconfigure-rejected-model';
+      try{
+        result=await f.reconfigurePrimary(`http://127.0.0.1:${f.port}/upstream/rejected/v1`,
+          'synthetic-rejected-primary-key',f.rejectModel);
+        assert.notEqual(result.code,0);assert.match(result.stderr,/原配置未更改/);
+        for(const [name,content] of Object.entries(beforeFailure))assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),content,name);
+        assert.deepEqual(f.secretEntries(),secretsBeforeFailure);
+      }finally{f.rejectModel='';}
+
+      result=await f.reconfigurePrimary(replacementBase,replacementKey,replacementModel);
+      assert.equal(result.code,0,result.stderr+result.stdout);assert.equal(f.pool().primary_id,primary);
+      assert.deepEqual(layout(f.pool()),expectedLayout);assert.equal(f.pool().entries.length,original.entries.length);
+      assert.equal(new Set(f.pool().entries.map(item=>item.id)).size,original.entries.length);
+
+      result=await f.reconfigurePrimary(original.entries[0].base_url,originalSecret.api_key,
+        original.entries[0].model,original.entries[0].api_mode,String(original.entries[0].capabilities.vision));
+      assert.equal(result.code,0,result.stderr+result.stdout);assert.deepEqual(layout(f.pool()),expectedLayout);
+    });
     await test('PL11 任何知识迁移标记在容量及完整快照停服务前拒绝，不改池或调用模型',async()=>{
       const marker=path.join(f.deploy,'data/runtime/knowledge-migration.json'),before=f.capture(),callCount=f.calls.length;
       assert(!fs.existsSync(marker));
@@ -196,13 +238,20 @@ async function main(){
     await test('PL08 本机完整快照包含同代secret/router并保持受限权限',async()=>{
       await f.ok('logs.sh',['initialize','--profile','new'],f.snapshotEnv);
       write(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'),{synthetic:true,state:'旧路由状态必须成套恢复'});
+      const adapter=path.join(f.deploy,'scripts/provider-adapter.js'),held=adapter+'.held';
+      fs.renameSync(adapter,held);write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+      try {
+        const missing=await f.invoke('snapshot.sh',['--quiet','--check-capacity'],f.snapshotEnv);
+        assert.notEqual(missing.code,0);assert.match(missing.stderr,/provider-adapter/);
+        assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+      } finally { fs.renameSync(held,adapter); }
       const result=await f.ok('snapshot.sh',['--quiet','--reason','synthetic-provider-lifecycle'],f.snapshotEnv);const id=result.stdout.trim();
       fullSnapshot=path.join(f.deploy,'backups/versions',id);const archive=path.join(fullSnapshot,'snapshot.tar.gz');
       assert.equal(fs.statSync(archive).mode&0o777,0o600);const directory=path.join(work,'snapshot-extracted');fs.mkdirSync(directory);await checked('tar',['-xzf',archive,'-C',directory]);
       const payload=path.join(directory,'payload'),pool=read(path.join(payload,'config/provider-pool-applied.json'));
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
-      for(const name of ['provider-router.js','provider-envelope.js','provider-pool.py'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
+      for(const name of ['provider-adapter.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
       for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert.equal(fs.statSync(path.join(payload,'data/knowledge-projection.json')).mode&0o777,0o600);
@@ -234,6 +283,7 @@ async function main(){
         ['malformed-pending',payload=>write(path.join(payload,'data/runtime/knowledge-migration.json'),'{'),/未完成知识迁移/],
         ['partial-module',payload=>fs.unlinkSync(path.join(payload,knowledgeModules[0])),/知识快照模块不完整/],
         ['missing-runtime',payload=>fs.unlinkSync(path.join(payload,'n8n/runtime.js')),/缺少必要文件.*runtime/],
+        ['missing-adapter',payload=>fs.unlinkSync(path.join(payload,'scripts/provider-adapter.js')),/主备版本快照缺少必要文件.*provider-adapter/],
         ['linked-module',payload=>{fs.unlinkSync(path.join(payload,knowledgeModules[0]));fs.symlinkSync('synthetic-missing',path.join(payload,knowledgeModules[0]));},/链接或特殊文件/],
         ['declared-lexical',payload=>clearNewModules(payload),/声明了缺失的词法/],
         ['retained-profile',payload=>{clearNewModules(payload);clearLexicalMetadata(payload);write(path.join(payload,'data/runtime/knowledge-profile.json'),{state:'applied'});},/保留新索引代次/],

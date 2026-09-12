@@ -242,6 +242,7 @@ PAYLOAD="${STAGING}/payload"
 [[ -f "${PAYLOAD}/VERSION" && -f "${PAYLOAD}/docker-compose.yml" && -f "${PAYLOAD}/n8n/workflow.json" ]] || die "版本快照缺少必要文件"
 [[ -s "${PAYLOAD}/data/postgres/n8n.dump" && ! -L "${PAYLOAD}/data/postgres/n8n.dump" ]] || die "版本快照缺少 n8n 数据库备份"
 [[ "$(<"${PAYLOAD}/VERSION")" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "快照 VERSION 格式无效"
+ROLLBACK_TARGET_VERSION=$(<"${PAYLOAD}/VERSION")
 jq empty "${PAYLOAD}/n8n/workflow.json" || die "快照 workflow 无效"
 for name in runtime.yaml keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
   if [[ -f "${PAYLOAD}/config/${name}" ]]; then
@@ -261,7 +262,9 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   fi
   if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.2.1; then
     for name in config/provider-pool-applied.json config/provider-pool.yaml \
-      scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/runtime.js; do
+      scripts/provider-adapter.js scripts/provider-router.js scripts/provider-envelope.js \
+      scripts/provider-pool.py scripts/provider.sh scripts/configuration.sh \
+      scripts/menu-display.py scripts/menu-provider-ui.sh n8n/runtime.js; do
       [[ -f "${PAYLOAD}/${name}" && ! -L "${PAYLOAD}/${name}" ]] || die "主备版本快照缺少必要文件：$name"
     done
     knowledge_snapshot_modules_check "$PAYLOAD"
@@ -323,7 +326,7 @@ done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
 validate_optional_version_file "${PAYLOAD}/data/knowledge-projection.json" "${DEPLOY_DIR}/data/knowledge-projection.json" data/knowledge-projection.json
-for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh \
+for module in materials.sh logs.sh log-redact.py provider-adapter.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
 done
@@ -420,7 +423,7 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py provider-router.js provider-envelope.js provider-pool.py menu-display.py menu-provider-ui.sh \
+for module in materials.sh logs.sh log-redact.py provider-adapter.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   module_mode=0750
   case "$module" in *.js|*.py) module_mode=0640 ;; esac
@@ -464,6 +467,22 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
       info "旧版本不识别的主备秘密或状态已受限保留：$provider_previous"
     fi
   done
+fi
+
+# 只有目标 runtime 已采用 owner.json 所有权协议时才迁移旧空锁。降回旧版本时
+# 必须保留目标版本自己的锁语义；新版本则在 n8n 已停止、维护锁仍持有的窗口中
+# 仅删除精确的 ownerless 空目录。任何不安全或非空形态均保持应用停止并失败。
+if version_at_least "$ROLLBACK_TARGET_VERSION" v1.2.1; then
+  SCHEDULER_LOCK_STATE=$(scheduler_scan_lock_state "$DEPLOY_DIR")
+  case "$SCHEDULER_LOCK_STATE" in
+    absent|owned) ;;
+    legacy-ownerless-empty)
+      cleanup_legacy_scheduler_scan_lock "$DEPLOY_DIR" \
+        || die '旧版会话扫描空锁未能在回滚停写窗口安全迁移；应用保持停止'
+      info '已在回滚停写窗口迁移旧版会话扫描空锁'
+      ;;
+    *) die '目标快照的会话扫描锁不是可安全迁移的旧版空目录；应用保持停止' ;;
+  esac
 fi
 
 ANYTHING_RESTORE="${DEPLOY_DIR}/data/.anythingllm-restore-${SNAPSHOT_ID}"

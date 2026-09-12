@@ -6,6 +6,7 @@ fixture_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 [[ ${CONFIGURATION_FIXTURE_DEPLOY:?} == "$fixture_dir" && -f "$fixture_dir/.crisp-ai-installation" ]] || exit 64
 fixture_container=feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface
 fixture_running="$fixture_dir/tmp/configuration-rag-running.json"
+fixture_services="$fixture_dir/tmp/configuration-services-state"
 fixture_compose_owned() {
   [[ $# -ge 8 && "$1" == compose && "$2" == --project-directory && "$3" == "$fixture_dir" \
     && "$4" == --env-file && "$5" == "$fixture_dir/.env" && "$6" == -f && "$7" == "$fixture_dir/docker-compose.yml" \
@@ -13,6 +14,11 @@ fixture_compose_owned() {
 }
 if [[ $# -eq 4 && "$1" == context && "$2" == inspect && "$3" == --format && "$4" == '{{(index .Endpoints "docker").Host}}' ]]; then
   printf 'unix:///var/run/docker.sock\n'
+  exit 0
+fi
+if [[ "${1:-}" == info ]]; then
+  [[ "${CONFIGURATION_FIXTURE_DAEMON_FAIL:-0}" != 1 ]] || exit 1
+  printf 'Docker daemon 测试桩可用\n'
   exit 0
 fi
 if [[ $# -eq 4 && "$1" == inspect && "$2" == --format && "$4" == "$fixture_container" \
@@ -36,6 +42,36 @@ if [[ "${*:8}" == 'up -d --no-deps --force-recreate anythingllm' ]]; then
     '{context_window:$window,recreates:$recreates,service:"anythingllm",scope:"synthetic-docker-protocol"}' > "$fixture_temporary"
   chmod 600 "$fixture_temporary"
   mv -f -- "$fixture_temporary" "$fixture_running"
+  exit 0
+fi
+if fixture_compose_owned "$@" && [[ "${8:-}" == ps && " $* " == *' --all --format json '* ]]; then
+  for fixture_service in postgres anythingllm n8n provider-adapter; do
+    fixture_state=running fixture_health=healthy
+    if [[ -f "$fixture_services" && ! -L "$fixture_services" ]] \
+      && ! grep -Fxq "$fixture_service" "$fixture_services"; then
+      fixture_state=exited fixture_health=''
+    fi
+    [[ "${CONFIGURATION_FIXTURE_UNHEALTHY_SERVICE:-}" != "$fixture_service" ]] || fixture_health=unhealthy
+    jq -cn --arg service "$fixture_service" --arg state "$fixture_state" --arg health "$fixture_health" \
+      '{ID:("fixture-"+$service),Service:$service,State:$state,Health:$health,ExitCode:(if $state=="running" then 0 else 1 end)}'
+  done
+  exit 0
+fi
+# 该夹具模拟外部反代实例，受管 Caddy 不存在。生产生命周期会在启动前
+# 精确查询并收敛可能遗留的本项目 Caddy；测试桩必须实现同一只读查询，
+# 不能用“未实现命令”制造反向代理故障。
+if fixture_compose_owned "$@" \
+  && [[ " $* " == *' --profile managed-https ps --all -q caddy '* ]]; then
+  exit 0
+fi
+if fixture_compose_owned "$@" && [[ "${8:-}" == stop ]]; then
+  : > "$fixture_services"
+  chmod 600 "$fixture_services"
+  exit 0
+fi
+if fixture_compose_owned "$@" && [[ "${8:-}" == up && " $* " == *' --remove-orphans '* ]]; then
+  printf '%s\n' postgres anythingllm n8n provider-adapter > "$fixture_services"
+  chmod 600 "$fixture_services"
   exit 0
 fi
 if [[ "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == anythingllm && "${11:-}" == node && "${12:-}" == -e \
@@ -64,7 +100,11 @@ if [[ "$*" == *" config --quiet"* || "$*" == *" up -d "* ]]; then
   exit 0
 fi
 if [[ "$*" == *" ps --services --filter status=running"* ]]; then
-  printf '%s\n' postgres anythingllm n8n provider-adapter
+  if [[ -f "$fixture_services" && ! -L "$fixture_services" ]]; then
+    cat -- "$fixture_services"
+  else
+    printf '%s\n' postgres anythingllm n8n provider-adapter
+  fi
   exit 0
 fi
 if [[ "$*" == *materials-applied.json* ]]; then

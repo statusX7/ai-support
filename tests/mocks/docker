@@ -328,19 +328,28 @@ case "$COMMAND" in
       exit 0
     fi
     if [[ " $* " == *' --format json '* ]]; then
-      service=${!#}
-      state=running
-      if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" == 1 ]]; then
-        state=exited
-      elif [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
-        [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
-        grep -Fxq -- "$service" "$MOCK_DOCKER_SERVICE_STATE" || state=exited
-      fi
-      if [[ "$state" == running ]]; then
-        jq -cn --arg service "$service" '{ID:("mock-"+$service),Service:$service,State:"running",Health:"healthy",ExitCode:0}'
-      else
-        jq -cn --arg service "$service" '{ID:("mock-"+$service),Service:$service,State:"exited",Health:"",ExitCode:1}'
-      fi
+      requested_services=()
+      for argument in "$@"; do
+        case "$argument" in postgres|anythingllm|n8n|provider-adapter|caddy) requested_services+=("$argument") ;; esac
+      done
+      (( ${#requested_services[@]} )) || requested_services=(postgres anythingllm n8n provider-adapter)
+      for service in "${requested_services[@]}"; do
+        state=running
+        if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" == 1 ]]; then
+          state=exited
+        elif [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
+          [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
+          grep -Fxq -- "$service" "$MOCK_DOCKER_SERVICE_STATE" || state=exited
+        fi
+        if [[ "$state" == running ]]; then
+          health=healthy
+          [[ "${MOCK_DOCKER_UNHEALTHY_SERVICE:-}" != "$service" ]] || health=unhealthy
+          jq -cn --arg service "$service" --arg health "$health" \
+            '{ID:("mock-"+$service),Service:$service,State:"running",Health:$health,ExitCode:0}'
+        else
+          jq -cn --arg service "$service" '{ID:("mock-"+$service),Service:$service,State:"exited",Health:"",ExitCode:1}'
+        fi
+      done
       exit 0
     fi
     if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]]; then

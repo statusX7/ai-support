@@ -229,7 +229,9 @@ const test = async (name, action) => {
       assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
       assert.equal(f.rawState(session).outgoing['71001'].status, 'sent');
       assert.deepEqual(f.histories.get(session), [historical]);
-      assert.equal(f.events().filter((event) => event.type === 'ai_reply').length, 1);
+      assert.equal(f.events().filter((event) => event.type === 'ai_reply').length, disabled ? 0 : 1);
+      assert.equal(f.events().filter((event) => event.type === 'delivery_after_state_change').length, disabled ? 1 : 0,
+        '状态已变化的历史回执必须单列，不能冒充当前正常 AI 回复');
       assert.equal(f.state(session).pending_feedback, null); f.noFeedback();
     }
   });
