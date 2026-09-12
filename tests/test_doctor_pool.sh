@@ -36,7 +36,6 @@ jq --arg key "$internal" '{
   n8n:(.n8n[0:10]+["http://provider-adapter:8787/v1",$key,"true"])
 }' "$RUNTIME_ENV_FILE" > "${RUNTIME_ENV_FILE}.new"
 mv -- "${RUNTIME_ENV_FILE}.new" "$RUNTIME_ENV_FILE"
-revision=$(jq .revision "${DEPLOY}/config/provider-pool-applied.json")
 write_health() {
   jq --arg state "$1" \
     '{ok:true,configuration_state:"applied",revision,entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \

@@ -123,7 +123,20 @@ pass "全部 Bash 脚本语法"
 pass "Git 忽略规则与密钥扫描"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x "${SHELL_FILES[@]/#/${PROJECT_ROOT}/}"
+  # ShellCheck 0.9 递归展开两个大型 doctor 验收夹具时会重复载入同一套生产
+  # 模块，在 4 GiB 验收机上形成数 GiB 峰值。所有生产脚本仍逐文件使用 -x
+  # 检查；这两个夹具本身改用非递归检查，并忽略仅表示“未跟随外部 source”
+  # 的 SC1091。随后动态专项仍会真实执行夹具及其引用的生产代码。
+  for file in "${SHELL_FILES[@]}"; do
+    case "$file" in
+      tests/test_doctor.sh|tests/test_doctor_pool.sh)
+        shellcheck -e SC1091 "${PROJECT_ROOT}/${file}"
+        ;;
+      *)
+        shellcheck -x "${PROJECT_ROOT}/${file}"
+        ;;
+    esac
+  done
   pass "shellcheck"
 else
   critical_skip "系统未安装 shellcheck"

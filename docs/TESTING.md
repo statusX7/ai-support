@@ -57,7 +57,7 @@ bash tests/test_logs.sh
 
 生产发布归档包含可复现的测试源码，不包含开发工具二进制、运行日志或私密测试配置；普通安装不执行测试驱动。主驱动自行枚举当前正式专项，避免人工漏跑。
 
-ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服运行依赖。普通安装所需的 Python 3/PyYAML、jq、Docker/Compose 等仍由生产安装器补齐。
+ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服运行依赖。普通安装所需的 Python 3/PyYAML、jq、Docker/Compose 等仍由生产安装器补齐。主驱动对全部生产脚本逐文件执行 ShellCheck `-x`；两个会递归载入整套 doctor 夹具的测试驱动改做非递归静态检查，其引用的生产模块仍独立 `-x` 检查，且后续动态专项会真实执行完整夹具。这样可避免 4 GiB 验收机与真实组件并存时出现分析器内存峰值，同时不减少生产文件、规则或动态失败项。
 
 `test_docs_acceptance.py` 独立核对活跃链接、唯一推荐命令原样、18 项菜单标题、帮助/版本的无副作用执行，以及资料限制和反代日志文档接线；不执行在线安装，也不能替代真实组件与 Crisp 验收。资料应用及强制同步的生产 PTY 分支由 `test_manage_contract.sh` 覆盖。
 
