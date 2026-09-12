@@ -48,13 +48,16 @@ const makeFixture = (name) => {
   let sequence = 1000;
   let runtime;
   const sent = [];
+  const postAttempts = [];
   const modelRequests = [];
   const visionRequests = [];
   const retrievalRequests = [];
   const workspaceRequests = [];
   const histories = new Map();
+  const exactRequests = [];
   const patches = [];
-  const modes = { modelFailure: false, imageFailure: false, historyFailure: false, answer: '受控业务答案：请在设置中保存后重试。' };
+  const modes = { modelFailure: false, imageFailure: false, historyFailure: false, exactFailure: false,
+    answer: '受控业务答案：请在设置中保存后重试。' };
   const request = async (url, options = {}) => {
     const parsed = new URL(url);
     const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
@@ -62,14 +65,30 @@ const makeFixture = (name) => {
       const session = decodeURIComponent(match[1]);
       const suffix = match[2];
       const history = histories.get(session) || [];
-      if (suffix === '/messages') return { status: modes.historyFailure ? 503 : 200, body: { error: modes.historyFailure, data: history } };
-      if (suffix.startsWith('/message/')) return { status: 200, body: { error: false, data: history.find((item) => String(item.fingerprint) === suffix.slice(9)) || {} } };
+      if (suffix === '/messages') {
+        const listed = modes.listHistoryOverride === undefined ? history
+          : typeof modes.listHistoryOverride === 'function' ? modes.listHistoryOverride(session, history) : modes.listHistoryOverride;
+        return { status: modes.historyFailure ? 503 : 200, body: { error: modes.historyFailure, data: listed } };
+      }
+      if (suffix.startsWith('/message/')) {
+        exactRequests.push({ session_id: session, fingerprint: suffix.slice(9) });
+        const status = modes.exactStatus ?? (modes.exactFailure ? 503 : 200);
+        return { status, body: { error: status < 200 || status >= 300,
+          data: history.find((item) => String(item.fingerprint) === suffix.slice(9)) || {} } };
+      }
       if (suffix === '/meta' && options.method === 'GET') return { status: 200, body: { error: false, data: { segments: ['existing-manual-segment'] } } };
       if (suffix === '/meta' && options.method === 'PATCH') { patches.push(options.body); return { status: 200, body: { error: false } }; }
       if (suffix === '/message' && options.method === 'POST') {
         const body = structuredClone(options.body);
+        postAttempts.push({ ...body, session_id: session });
+        if (modes.crispDropBeforeAccept) {
+          if (modes.onCrispPost) await modes.onCrispPost({ body, signal: options.signal });
+          throw Object.assign(new Error('synthetic-crisp-post-dropped'), { code: 'ECONNRESET' });
+        }
         sent.push({ ...body, session_id: session });
         history.push({ ...body, timestamp: now }); histories.set(session, history);
+        if (modes.onCrispPost) await modes.onCrispPost({ body, signal: options.signal });
+        if (modes.crispPostThrow || options.signal?.aborted) throw Object.assign(new Error('synthetic-crisp-post-uncertain'), { code: 'ECONNRESET' });
         return { status: 200, body: { error: false, reason: 'dispatched', data: { fingerprint: body.fingerprint } } };
       }
       throw new Error('未知 synthetic Crisp 路径：' + suffix);
@@ -132,7 +151,7 @@ const makeFixture = (name) => {
     assert(!sent.some((item) => typeof item.content === 'string' && item.content.includes(invitation)), '不能发送系统自动评价邀请');
     assert(!events().some((item) => item.type === 'feedback'), '不能新登记自动评价');
   };
-  return { root, prompt, env, sent, patches, histories, modelRequests, visionRequests, retrievalRequests, workspaceRequests, modes, key, state, rawState, seed, makeJob, makeOutgoing, event, receive, deliver, readConfig, writeConfig, restart, events, noFeedback, runtime: () => runtime, advance: (milliseconds) => { now += milliseconds; }, now: () => now };
+  return { root, prompt, env, sent, postAttempts, patches, histories, exactRequests, modelRequests, visionRequests, retrievalRequests, workspaceRequests, modes, key, state, rawState, seed, makeJob, makeOutgoing, event, receive, deliver, readConfig, writeConfig, restart, events, noFeedback, runtime: () => runtime, advance: (milliseconds) => { now += milliseconds; }, now: () => now };
 };
 
 let passed = 0;
@@ -240,7 +259,10 @@ const test = async (name, action) => {
     const f = makeFixture('unknown-absent'); const session = 'session_absent0001';
     const job = f.makeJob(session, 'unknown', { type: 'text', purpose: 'ai_text', ordinary: true, ai: true, feedback: true, content: f.modes.answer, fingerprint: 72001 });
     await f.seed(session, (state) => { state.jobs.push(job); state.outgoing['72001'] = f.makeOutgoing(job, f.modes.answer + '\n\n' + invitation); });
-    f.restart(); await f.runtime().scan(); await f.runtime().process(f.key(session));
+    f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session))).status, 'retry', '一次精确负查不能立即重发');
+    assert.equal(f.sent.length, 0); assert.equal(f.postAttempts.length, 0);
+    f.advance(5000); f.restart(); await f.runtime().scan(); await f.runtime().process(f.key(session));
     assert.equal(f.modelRequests.length, 0); assert.equal(f.sent.length, 1);
     assert.equal(f.sent[0].fingerprint, 72001); assert.equal(f.sent[0].content, f.modes.answer); f.noFeedback();
   });
@@ -332,19 +354,26 @@ const test = async (name, action) => {
       outgoing.created_at = f.now() - 590000;
       await f.seed(session, (state) => { state.jobs.push(job); state.outgoing['76001'] = outgoing; });
       if (found) f.histories.set(session, [{ ...outgoing.body, timestamp: f.now() - 589000 }]);
-      f.restart(); await f.runtime().scan(); await f.runtime().process(f.key(session));
-      assert.equal(f.rawState(session).outgoing['76001'].status, found ? 'sent' : 'cancelled');
+      f.restart(); await f.runtime().scan();
+      const first = await f.runtime().process(f.key(session));
+      if (!found && purpose === 'ai_text') {
+        assert.equal(first.status, 'retry');
+        f.advance(5000); f.restart(); await f.runtime().scan();
+        assert.equal((await f.runtime().process(f.key(session))).status, 'failed');
+      }
+      assert.equal(f.rawState(session).outgoing['76001'].status, found ? 'sent' : purpose === 'ai_text' ? 'failed' : 'cancelled');
       const restoredJob = f.rawState(session).jobs.find((entry) => entry.id === job.id);
       if (purpose === 'ai_text') {
         assert.notEqual(restoredJob.feedback_retired, true, '超时普通答案不能误标为评价');
-        assert.equal(restoredJob.status, found ? 'done' : 'cancelled');
+        assert.equal(restoredJob.status, found ? 'done' : 'failed');
+        assert.equal(f.events().filter(event => event.type === 'delivery_failed' && event.reason === 'delivery_unknown').length, found ? 0 : 1);
       }
       assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
       assert.equal(f.state(session).pending_feedback, null);
     }
   });
 
-  await test('F13 发送注册前接口池代次改变时丢弃迟到正文', async () => {
+  await test('F13 发送注册前接口池代次改变时不发旧正文并持久延后重规划', async () => {
     const f = makeFixture('provider-register-race'); const session = 'session_poolrace1';
     const poolFile = path.join(f.root, 'config/provider-pool-applied.json');
     const pool = { schema_version: 1, revision: 1, primary_id: 'synthetic-primary', policy: { question_timeout_ms: 90000 }, entries: [{ id: 'synthetic-primary', enabled: true, model: 'synthetic-model' }] };
@@ -359,10 +388,14 @@ const test = async (name, action) => {
         if (file === poolFile && ++poolReads === 2) fs.writeFileSync(poolFile, JSON.stringify({ ...pool, revision: 2 }));
         return result;
       };
-      assert.equal((await f.runtime().process(f.key(session))).status, 'cancelled');
+      assert.equal((await f.runtime().process(f.key(session))).status, 'deferred');
     } finally { fs.readFileSync = originalRead; }
     assert(poolReads >= 3); assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
     assert.equal(Object.keys(f.rawState(session).outgoing).length, 0);
+    const deferred = f.rawState(session).jobs.find(item => item.id === job.id);
+    assert.equal(deferred.status, 'received'); assert.equal(deferred.deferred_configuration, true);
+    assert(deferred.data, '访客原始问题必须保留供新代重新规划');
+    assert.equal(deferred.plan, undefined); assert.equal(deferred.inference, undefined);
   });
 
   await test('F14 所有已知系统错误出口使用受控澄清，不消费旧自定义失败句或误计成功', async () => {
@@ -431,7 +464,12 @@ const test = async (name, action) => {
       if (found) f.histories.set(session, structuredClone(historical));
       f.restart(); await f.runtime().scan();
       assert.equal(f.rawState(session).outgoing['79001'].body.content, legacyFailure, '未知回执正文在核实前保留');
-      assert.equal((await f.runtime().process(f.key(session))).status, 'sent');
+      const first = await f.runtime().process(f.key(session));
+      if (!found) {
+        assert.equal(first.status, 'retry'); assert.equal(f.sent.length, 0);
+        f.advance(5000); f.restart(); await f.runtime().scan();
+      }
+      assert.equal(found ? first.status : (await f.runtime().process(f.key(session))).status, 'sent');
       assert.equal(f.sent.length, found ? 0 : 1);
       if (found) assert.deepEqual(f.histories.get(session), historical);
       else { assert.equal(f.sent[0].content, clarification); assert.equal(f.sent[0].fingerprint, 79001); }
@@ -446,9 +484,11 @@ const test = async (name, action) => {
       const job = f.makeJob(session, 'cancel-safe-error', { type: 'text', purpose: 'safe_error', ordinary: true, content: legacyFailure, fingerprint: 80001 });
       await f.seed(session, state => { state.jobs.push(job); if (mode === 'human') { state.mode = 'human'; state.resume_at = null; } });
       if (mode === 'disabled') f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 1, applied_revision: 1 });
-      f.restart(); assert.equal((await f.runtime().process(f.key(session))).status, 'cancelled');
+      f.restart(); assert(['idle', 'cancelled'].includes((await f.runtime().process(f.key(session))).status));
       assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
       assert.equal(fs.readdirSync(path.join(f.root, 'data/runtime')).filter(name => name.startsWith('owned-')).length, 0);
+      const cancelled = f.rawState(session).jobs.find(item => item.id === job.id);
+      assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.data, undefined);
       assert.equal(f.state(session).mode, mode === 'human' ? 'human' : 'ai');
     }
   });
@@ -590,7 +630,7 @@ const test = async (name, action) => {
     }
   });
 
-  await test('F23 窗口事务存在或不安全时接收即取消普通任务，不读受限marker且清除后旧消息不复活', async () => {
+  await test('F23 窗口事务期间持久延后普通任务，清除marker后按最新revision恰好回复一次', async () => {
     for (const kind of ['applying', 'restore_failed', 'malformed', 'directory', 'symlink', 'permission']) {
       const f = makeFixture('window-marker-' + kind), session = 'session_window-marker';
       const marker = path.join(f.root, 'config/provider-pool-transaction.json');
@@ -605,19 +645,27 @@ const test = async (name, action) => {
         received = await f.receive(input);
         assert.equal(received.accepted, true); assert.equal(received.route, 'ignore', kind);
         const job = f.rawState(session).jobs.find(item => item.id === received.jobId);
-        assert.equal(job.status, 'cancelled'); assert.equal(job.data, undefined);
+        assert.equal(job.status, 'received'); assert.equal(job.deferred_configuration, true);
+        assert.equal(job.data.content, '窗口应用期间的普通合成问题');
         assert.equal(markerReads, 0); assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
       } finally { fs.readFileSync = read; fs.lstatSync = lstat; }
+      f.writeConfig('runtime', { schema_version: 2, enabled: true, revision: 2, applied_revision: 2 });
       if (kind === 'directory') fs.rmdirSync(marker);
       else if (kind !== 'permission') fs.unlinkSync(marker);
-      f.restart(); assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
-      assert.equal((await f.receive(input)).route, 'ignore'); assert.equal(f.modelRequests.length, 0);
-      await f.deliver(f.event(session, '事务完成后的新合成问题'));
+      f.advance(5000); f.restart();
+      const pending = await f.runtime().scan();
+      assert(pending.some(item => item.key === f.key(session) && item.jobId === received.jobId), kind);
+      const rebound = f.rawState(session).jobs.find(item => item.id === received.jobId);
+      assert.equal(rebound.status, 'received'); assert.equal(rebound.revision, 2);
+      assert.equal(rebound.deferred_configuration, undefined); assert.equal(rebound.retry_at, null);
+      assert.equal((await f.runtime().process(f.key(session), received.jobId)).status, 'sent');
       assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, 1); assert.equal(f.state(session).mode, 'ai');
+      assert.equal((await f.receive(input)).route, 'ignore');
+      assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, 1, '重复Hook不得二次生成');
     }
   });
 
-  await test('F24 窗口维护拦截缓存答案、错误澄清及最后注册竞态，不新增模型调用或自有指纹', async () => {
+  await test('F24 窗口维护只延后依赖接口的旧AI计划，本地澄清当场自然回复一次', async () => {
     for (const kind of ['cached-answer', 'cached-error', 'model-error', 'register-race']) {
       const f = makeFixture('window-send-' + kind), session = 'session_window-send';
       const marker = path.join(f.root, 'config/provider-pool-transaction.json');
@@ -627,7 +675,8 @@ const test = async (name, action) => {
         f.modes.onModelResponse = createMarker; f.modes.modelFailure = true;
         result = await f.deliver(f.event(session, '窗口事务在网络返回前开始'));
       } else {
-        const job = f.makeJob(session, kind, { type: 'text', purpose: kind === 'cached-error' ? 'safe_error' : 'ai_text', ordinary: true, content: legacyFailure, fingerprint: 82001 });
+        const job = f.makeJob(session, kind, { type: 'text', purpose: kind === 'cached-error' ? 'safe_error' : 'ai_text', ordinary: true,
+          content: kind === 'cached-error' ? legacyFailure : '旧代缓存AI正文不得发送', fingerprint: 82001 });
         await f.seed(session, state => state.jobs.push(job));
         if (kind === 'register-race') {
           const lstat = fs.lstatSync; let checks = 0;
@@ -641,16 +690,41 @@ const test = async (name, action) => {
           } finally { fs.lstatSync = lstat; }
         } else { createMarker(); result = await f.runtime().process(f.key(session)); }
       }
-      assert.equal(result.status, 'cancelled', kind);
+      const local = kind === 'cached-error';
+      if (local) {
+        assert.equal(result.status, 'sent', kind);
+        assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+        assert.equal(f.modelRequests.length, 0);
+        assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
+        fs.unlinkSync(marker); f.modes.onModelResponse = null; f.modes.modelFailure = false;
+        assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
+        assert.equal(f.sent.length, 1, '本地澄清不得因marker清除再发一次');
+        continue;
+      }
+      assert(['idle', 'deferred'].includes(result.status), kind + ':' + result.status);
       assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, kind === 'model-error' ? 1 : 0);
       assert.equal(fs.readdirSync(path.join(f.root, 'data/runtime')).filter(name => name.startsWith('owned-')).length, 0);
       assert.equal(f.events().filter(event => event.type === 'ai_reply' || event.type === 'handoff').length, 0);
-      fs.unlinkSync(marker); f.modes.onModelResponse = null; f.modes.modelFailure = false;
-      assert.equal((await f.runtime().process(f.key(session))).status, 'idle');
+      const deferred = f.rawState(session).jobs.find(job => job.event === 'message:send');
+      assert.equal(deferred.status, 'received'); assert.equal(deferred.deferred_configuration, true);
+      assert(deferred.data, '延后任务必须保留原始访客数据');
+      assert.equal(deferred.plan, undefined, '旧代AI正文必须丢弃后重新规划');
+      f.writeConfig('runtime', { schema_version: 2, enabled: true, revision: 2, applied_revision: 2 });
+      f.modes.onModelResponse = null; f.modes.modelFailure = false;
+      fs.unlinkSync(marker); f.advance(5000); f.restart();
+      assert((await f.runtime().scan()).some(item => item.jobId === deferred.id));
+      const rebound = f.rawState(session).jobs.find(job => job.id === deferred.id);
+      assert.equal(rebound.revision, 2); assert.equal(rebound.deferred_configuration, undefined);
+      assert.equal((await f.runtime().process(f.key(session), deferred.id)).status, 'sent');
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, f.modes.answer);
+      assert.equal(f.modelRequests.length, kind === 'model-error' ? 2 : 1,
+        '旧代推理结果丢弃，按新代且只重新规划一次');
+      assert.equal((await f.runtime().process(f.key(session), deferred.id)).status, 'idle');
+      assert.equal(f.sent.length, 1, '恢复只能有一次最终出站');
     }
   });
 
-  await test('F25 窗口事务仍立即接收A人工控制，B自有回流与人工offer不受混淆', async () => {
+  await test('F25 窗口事务延后B普通问题，A人工与总开关仍立即取消各自任务', async () => {
     const f = makeFixture('window-control'), sessionA = 'session_window-human', sessionB = 'session_window-own';
     await f.deliver(f.event(sessionB, '建立真实合成自有发送记录'));
     const own = structuredClone(f.sent[0]);
@@ -668,14 +742,35 @@ const test = async (name, action) => {
     await f.receive({ website_id: f.env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: f.now(), data: { ...own, automated: false, timestamp: f.now() } });
     assert.equal(f.state(sessionB).mode, 'ai'); assert.equal(f.state(sessionB).generation, 0);
     assert.deepEqual(f.state(sessionB).offers[offer.id], offer);
-    await f.deliver(f.event(sessionB, '维护期间不能补发这条问题'));
+    const delayedInput = f.event(sessionB, '维护期间需要持久等待的问题');
+    const delayed = await f.receive(delayedInput);
+    assert.equal(delayed.accepted, true); assert.equal(delayed.route, 'ignore');
+    const delayedJob = f.rawState(sessionB).jobs.find(job => job.id === delayed.jobId);
+    assert.equal(delayedJob.status, 'received'); assert.equal(delayedJob.deferred_configuration, true);
     assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, 1);
-    fs.unlinkSync(marker); f.restart();
+    fs.unlinkSync(marker); f.advance(5000); f.restart();
+    assert((await f.runtime().scan()).some(item => item.jobId === delayed.jobId));
+    assert.equal((await f.runtime().process(f.key(sessionB), delayed.jobId)).status, 'sent');
+    assert.equal(f.sent.filter(message => message.session_id === sessionB).length, 2);
+    assert.equal(f.modelRequests.length, 2);
     await f.deliver(f.event(sessionA, '人工期间的新访客消息'));
-    await f.deliver(f.event(sessionB, '维护完成后B的独立新消息'));
     assert.equal(f.sent.filter(message => message.session_id === sessionA).length, 0);
     assert.equal(f.sent.filter(message => message.session_id === sessionB).length, 2);
     assert.equal(f.state(sessionA).mode, 'human'); assert.equal(f.state(sessionB).mode, 'ai');
+
+    const sessionC = 'session_window-disabled';
+    fs.writeFileSync(marker, JSON.stringify({ phase: 'applying' }), { mode: 0o600 });
+    const disabledInput = f.event(sessionC, '窗口期间接收但稍后管理员关闭的问题');
+    const disabled = await f.receive(disabledInput);
+    assert.equal(f.rawState(sessionC).jobs.find(job => job.id === disabled.jobId).deferred_configuration, true);
+    f.writeConfig('runtime', { schema_version: 2, enabled: false, revision: 2, applied_revision: 2 });
+    fs.unlinkSync(marker); f.advance(5000); f.restart(); await f.runtime().scan();
+    const cancelled = f.rawState(sessionC).jobs.find(job => job.id === disabled.jobId);
+    assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.data, undefined);
+    assert.equal(f.sent.filter(message => message.session_id === sessionC).length, 0);
+    f.writeConfig('runtime', { schema_version: 2, enabled: true, revision: 3, applied_revision: 3 });
+    f.restart(); assert.equal((await f.receive(disabledInput)).route, 'ignore');
+    assert.equal(f.sent.filter(message => message.session_id === sessionC).length, 0, '总开关关闭期间的旧问题不得恢复补发');
   });
 
   await test('F26 上游200完整答案恰为已知旧系统失败句时硬性自然澄清，不能计AI成功', async () => {
@@ -814,6 +909,400 @@ const test = async (name, action) => {
       assert.equal(f.state('session_workspace-invalid').mode, 'ai');
       assert.equal(f.events().filter(event => ['ai_reply', 'knowledge_hit', 'knowledge_miss', 'handoff'].includes(event.type)).length, 0);
       f.noFeedback();
+    }
+  });
+
+  await test('F32 人工词冷却期重复输入仍有一次自然响应，不暴露机器身份', async () => {
+    const f = makeFixture('handoff-cooldown-reply'), session = 'session_handoff-cooldown';
+    await f.deliver(f.event(session, '人工'));
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].type, 'picker');
+    const offerIds = Object.keys(f.state(session).offers);
+    assert.equal(offerIds.length, 1); assert.equal(f.state(session).mode, 'ai');
+    f.advance(1000);
+    const result = await f.deliver(f.event(session, '转人工'));
+    assert.equal(result.status, 'sent'); assert.equal(f.sent.length, 2);
+    assert.equal(f.sent[1].type, 'text'); assert.equal(typeof f.sent[1].content, 'string');
+    assert(f.sent[1].content.trim(), '冷却期不能以空计划静默结束');
+    assert.doesNotMatch(f.sent[1].content, /AI|机器人|暂时[^\n]{0,12}(?:无法|不能)[^\n]{0,12}回复|稍后再试/i);
+    assert.equal(f.modelRequests.length, 0, '已有人工选择不需要额外付费推理');
+    assert.deepEqual(Object.keys(f.state(session).offers), offerIds, '不重复创建人工offer');
+    assert.equal(f.state(session).mode, 'ai'); f.noFeedback();
+  });
+
+  await test('F33 worker中断造成超过5分钟普通积压时仍恰好回复，不以过期静默取消', async () => {
+    const f = makeFixture('old-received-recovery'), session = 'session_old-received';
+    const input = f.event(session, '这条问题在worker恢复后仍需要处理');
+    const received = await f.receive(input);
+    assert.equal(received.route, 'process'); assert.equal(f.sent.length, 0);
+    f.advance(300001); f.restart();
+    const scanned = await f.runtime().scan();
+    assert(scanned.some(item => item.key === f.key(session) && item.jobId === received.jobId));
+    const result = await f.runtime().process(f.key(session), received.jobId);
+    assert.equal(result.status, 'sent'); assert.equal(f.sent.length, 1);
+    assert.equal(typeof f.sent[0].content, 'string'); assert(f.sent[0].content.trim());
+    assert.doesNotMatch(f.sent[0].content, /AI|机器人|暂时[^\n]{0,12}(?:无法|不能)[^\n]{0,12}回复|稍后再试/i);
+    const generated = f.modelRequests.length;
+    assert(generated <= 1, '过期恢复可本地澄清或有界生成，不得放大请求');
+    assert.equal((await f.receive(input)).route, 'ignore');
+    assert.equal(f.sent.length, 1); assert.equal(f.modelRequests.length, generated, '重复Hook不得重复生成');
+    assert.equal(f.rawState(session).jobs.find(job => job.id === received.jobId).status, 'done'); f.noFeedback();
+  });
+
+  await test('F34 空的固定reply配置在运行时防御为自然澄清，不以none完成', async () => {
+    const f = makeFixture('empty-keyword-reply'), session = 'session_empty-reply';
+    const keywords = f.readConfig('keyword');
+    keywords.rules.unshift({ id: 'synthetic-empty-reply', name: '合成空回复', enabled: true, match_mode: 'exact',
+      keywords: ['空回复边界'], exclude_keywords: [], priority: 1000, action: 'reply', text: '', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keywords); f.restart();
+    const result = await f.deliver(f.event(session, '空回复边界'));
+    assert.equal(result.status, 'sent'); assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].type, 'text'); assert.equal(f.sent[0].content, clarification);
+    assert.equal(f.modelRequests.length, 0); assert.equal(f.state(session).mode, 'ai');
+    assert.equal(f.rawState(session).jobs.find(job => job.event === 'message:send').status, 'done'); f.noFeedback();
+  });
+
+  await test('F35 规划阶段连续异常不得终态吞消息，恢复后恰好回复一次', async () => {
+    const f = makeFixture('planning-recoverable'), session = 'session_planning-recoverable';
+    f.modes.historyFailure = true;
+    const input = f.event(session, '历史回读暂时异常的普通问题');
+    const received = await f.receive(input);
+    assert.equal(received.route, 'process');
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await f.runtime().process(f.key(session), received.jobId);
+      const job = f.rawState(session).jobs.find(item => item.id === received.jobId);
+      if (job.status !== 'received') break;
+      f.advance(5000);
+    }
+    const duringFailure = f.rawState(session).jobs.find(job => job.id === received.jobId);
+    const controlled = f.sent.filter(message => message.session_id === session);
+    assert(controlled.length === 1 || duringFailure.status === 'received', '连续规划异常只能受控回复或保持可恢复');
+    assert.notEqual(duringFailure.status, 'failed'); assert.notEqual(duringFailure.status, 'cancelled');
+    if (controlled.length) {
+      assert.equal(typeof controlled[0].content, 'string'); assert(controlled[0].content.trim());
+      assert.doesNotMatch(controlled[0].content, /AI|机器人|暂时[^\n]{0,12}(?:无法|不能)[^\n]{0,12}回复|稍后再试/i);
+    } else {
+      assert(duringFailure.data && duringFailure.data.content, '可恢复任务必须保留访客问题');
+      assert(duringFailure.retry_at >= f.now(), '可恢复任务必须有界延后重试');
+      f.modes.historyFailure = false; f.advance(5000); f.restart();
+      const scanned = await f.runtime().scan();
+      assert(scanned.some(item => item.jobId === received.jobId));
+      assert.equal((await f.runtime().process(f.key(session), received.jobId)).status, 'sent');
+    }
+    assert.equal(f.sent.filter(message => message.session_id === session).length, 1);
+    assert.equal((await f.receive(input)).route, 'ignore');
+    assert.equal(f.sent.filter(message => message.session_id === session).length, 1, '重放不得重复出站'); f.noFeedback();
+  });
+
+  await test('F36 出站登记后但POST前配置换代时移除未发登记，新代仍恰好出站一次', async () => {
+    const f = makeFixture('registered-before-config-change'), session = 'session_registered-race';
+    const poolFile = path.join(f.root, 'config/provider-pool-applied.json');
+    const pool = { schema_version: 1, revision: 1, primary_id: 'synthetic-primary', policy: { question_timeout_ms: 90000 },
+      entries: [{ id: 'synthetic-primary', enabled: true, model: 'synthetic-model' }] };
+    fs.writeFileSync(poolFile, JSON.stringify(pool));
+    const fingerprint = 77123;
+    const job = f.makeJob(session, 'registered-race', { type: 'text', purpose: 'ai_text', ai: true, ordinary: true,
+      content: '旧代缓存AI正文不得发送', fingerprint }, { inference: { pool_revision: 1, deadline_at: f.now() + 90000 } });
+    await f.seed(session, state => state.jobs.push(job));
+    const stateFile = path.join(f.root, 'data/runtime/session-' + f.key(session) + '.json');
+    const rename = fs.renameSync; let injected = false;
+    try {
+      fs.renameSync = (from, to) => {
+        const result = rename(from, to);
+        if (!injected && to === stateFile) {
+          const state = JSON.parse(fs.readFileSync(stateFile));
+          if (state.outgoing?.[String(fingerprint)]?.status === 'sending') {
+            fs.writeFileSync(poolFile, JSON.stringify({ ...pool, revision: 2 }));
+            injected = true;
+          }
+        }
+        return result;
+      };
+      assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred');
+    } finally { fs.renameSync = rename; }
+    assert.equal(injected, true, '必须精确触发sending已提交但Crisp POST尚未发生的窗口');
+    assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
+    let stored = f.rawState(session).jobs.find(item => item.id === job.id);
+    assert.equal(stored.status, 'received'); assert.equal(stored.deferred_configuration, true);
+    assert(stored.data, '配置换代后必须保留原始访客问题');
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)], undefined, '尚未POST的旧代登记不得成为永久取消栅栏');
+
+    f.advance(5000); f.restart();
+    assert((await f.runtime().scan()).some(item => item.jobId === job.id));
+    await f.seed(session, state => {
+      const current = state.jobs.find(item => item.id === job.id);
+      current.plan = { type: 'text', purpose: 'ai_text', ai: true, ordinary: true, content: f.modes.answer, fingerprint };
+      current.inference = { pool_revision: 2, deadline_at: f.now() + 90000 };
+    });
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].fingerprint, fingerprint); assert.equal(f.sent[0].content, f.modes.answer);
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'sent');
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle');
+    assert.equal(f.sent.length, 1, '同一访客问题只能有一个最终出站'); f.noFeedback();
+  });
+
+  await test('F37 Crisp已收字节但配置换代无回执时先对账旧指纹，不因规则变化重复回复', async () => {
+    const f = makeFixture('post-accepted-config-change'), session = 'session_post-uncertain';
+    const poolFile = path.join(f.root, 'config/provider-pool-applied.json');
+    const pool = { schema_version: 1, revision: 1, primary_id: 'synthetic-primary', policy: { question_timeout_ms: 90000 },
+      entries: [{ id: 'synthetic-primary', enabled: true, model: 'synthetic-model' }] };
+    fs.writeFileSync(poolFile, JSON.stringify(pool));
+    const fingerprint = 77124;
+    const job = f.makeJob(session, 'post-uncertain', { type: 'text', purpose: 'ai_text', ai: true, ordinary: true,
+      content: '旧代已经交给Crisp的唯一正文', fingerprint }, { inference: { pool_revision: 1, deadline_at: f.now() + 90000 } });
+    await f.seed(session, state => state.jobs.push(job));
+    f.modes.onCrispPost = async () => {
+      fs.writeFileSync(poolFile, JSON.stringify({ ...pool, revision: 2 }));
+      await new Promise(resolve => setTimeout(resolve, 150));
+    };
+    f.modes.crispPostThrow = true;
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred');
+    assert.equal(f.sent.length, 1, '合成远端已接收旧指纹一次');
+    let stored = f.rawState(session).jobs.find(item => item.id === job.id);
+    assert.equal(stored.status, 'received'); assert.equal(stored.deferred_configuration, true);
+    assert.equal(stored.plan.fingerprint, fingerprint, '结果未知时必须保留旧计划供同指纹对账');
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'unknown');
+
+    // 模拟新配置把同一访客文字改成固定回复。旧回执未完成对账前不得使用这个
+    // 新 purpose/fingerprint，否则远端会看到两条不同答案。
+    const keyword = f.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-new-rule', name: '换代后新规则', enabled: true, match_mode: 'exact',
+      keywords: ['旧队列的普通问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '新代固定回复不得重复发送', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keyword);
+    f.modes.onCrispPost = null; f.modes.crispPostThrow = false;
+    f.advance(5000); f.restart();
+    assert((await f.runtime().scan()).some(item => item.jobId === job.id));
+    const result = await f.runtime().process(f.key(session), job.id);
+    assert.equal(result.status, 'dispatched_after_cancel');
+    stored = f.rawState(session).jobs.find(item => item.id === job.id);
+    assert.equal(stored.status, 'done'); assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'sent');
+    assert.equal(f.sent.length, 1, '已在Crisp找到旧指纹后不得发送新规则的第二条正文');
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle');
+    assert.equal(f.sent.length, 1); f.noFeedback();
+  });
+
+  await test('F38 配置换代时旧POST确定未送达，双重负查后按新规则恢复一次且不永久卡住', async () => {
+    const f = makeFixture('post-absent-config-change'), session = 'session_post-absent';
+    const poolFile = path.join(f.root, 'config/provider-pool-applied.json');
+    const pool = { schema_version: 1, revision: 1, primary_id: 'synthetic-primary', policy: { question_timeout_ms: 90000 },
+      entries: [{ id: 'synthetic-primary', enabled: true, model: 'synthetic-model' }] };
+    fs.writeFileSync(poolFile, JSON.stringify(pool));
+    const fingerprint = 77125;
+    const job = f.makeJob(session, 'post-absent', { type: 'text', purpose: 'ai_text', ai: true, ordinary: true,
+      content: '旧代未被Crisp接收的正文', fingerprint }, { inference: { pool_revision: 1, deadline_at: f.now() + 90000 } });
+    await f.seed(session, state => state.jobs.push(job));
+    f.modes.crispDropBeforeAccept = true;
+    f.modes.onCrispPost = async () => {
+      fs.writeFileSync(poolFile, JSON.stringify({ ...pool, revision: 2 }));
+      await new Promise(resolve => setTimeout(resolve, 150));
+    };
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred');
+    assert.equal(f.postAttempts.length, 1); assert.equal(f.sent.length, 0);
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'unknown');
+
+    const keyword = f.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-new-rule-absent', name: '换代后恢复规则', enabled: true, match_mode: 'exact',
+      keywords: ['旧队列的普通问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '新代确认回复', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keyword);
+    f.modes.crispDropBeforeAccept = false; f.modes.onCrispPost = null;
+    f.advance(10000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry', '第一次精确负查只登记证据，不立即换正文');
+    assert.equal(f.sent.length, 0); assert.equal(f.postAttempts.length, 1);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred', '第二次间隔负查后才允许按新代重规划');
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)], undefined);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, '新代确认回复');
+    assert.equal(f.postAttempts.length, 2, '旧代一次不确定尝试后只允许一次新代出站');
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle');
+    assert.equal(f.sent.length, 1); f.noFeedback();
+  });
+
+  await test('F39 旧版unknown仍绑定job但plan已丢失时先对账已送指纹，不生成第二条', async () => {
+    const f = makeFixture('legacy-unknown-without-plan-found'), session = 'session_legacy-unknown-found';
+    const fingerprint = 77126;
+    const job = f.makeJob(session, 'legacy-unknown-found');
+    const body = { type: 'text', from: 'operator', origin: 'chat', content: '旧版远端已经收到的正文', fingerprint };
+    await f.seed(session, state => {
+      state.jobs.push(job);
+      state.outgoing[String(fingerprint)] = { status: 'unknown', body, created_at: f.now() - 15000, attempts: 1,
+        job_id: job.id, generation: 0, attempt_token: 'legacy-unknown-found' };
+    });
+    f.histories.set(session, [{ ...body, timestamp: f.now() - 1000 }]);
+    const keyword = f.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-legacy-new-rule', name: '旧状态后的新规则', enabled: true, match_mode: 'exact',
+      keywords: ['旧队列的普通问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '不得产生的第二条回复', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keyword); f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'dispatched_after_cancel');
+    assert.equal(f.sent.length, 0); assert.equal(f.postAttempts.length, 0); assert.equal(f.modelRequests.length, 0);
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'sent');
+    assert.equal(f.rawState(session).jobs.find(item => item.id === job.id).status, 'done');
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle'); f.noFeedback();
+  });
+
+  await test('F40 旧版unknown无plan且明确未送达时双重负查后按当前规则恢复一次', async () => {
+    const f = makeFixture('legacy-unknown-without-plan-absent'), session = 'session_legacy-unknown-absent';
+    const fingerprint = 77127;
+    const job = f.makeJob(session, 'legacy-unknown-absent');
+    await f.seed(session, state => {
+      state.jobs.push(job);
+      state.outgoing[String(fingerprint)] = { status: 'unknown', body: { type: 'text', from: 'operator', origin: 'chat', content: '旧版未送正文', fingerprint },
+        created_at: f.now() - 15000, attempts: 1, job_id: job.id, generation: 0, attempt_token: 'legacy-unknown-absent' };
+    });
+    const keyword = f.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-legacy-recovery-rule', name: '旧状态恢复规则', enabled: true, match_mode: 'exact',
+      keywords: ['旧队列的普通问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '旧状态恢复后的唯一回复', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keyword); f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.sent.length, 0); assert.equal(f.postAttempts.length, 0);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred');
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)], undefined);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, '旧状态恢复后的唯一回复');
+    assert.equal(f.postAttempts.length, 1); assert.equal(f.modelRequests.length, 0);
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle'); f.noFeedback();
+  });
+
+  await test('F41 Crisp消息列表滞后但精确指纹已存在时文字与picker只确认送达，不重复POST', async () => {
+    const variants = [['unknown', 'picker'], ['sending', 'picker'], ['unknown', 'text'], ['sending', 'text']];
+    for (const [index, [status, type]] of variants.entries()) {
+      const f = makeFixture('single-' + status + '-' + type + '-list-lag'), session = 'session_single-list-lag-' + status + '-' + type;
+      const fingerprint = 77128 + index * 100;
+      const content = type === 'picker' ? { id: 'synthetic-handoff-offer', text: '需要人工协助吗？请点击下方按钮确认。',
+        choices: [{ value: 'confirm_handoff', label: '召唤人工客服', selected: false }] } : '列表滞后时已被平台接收的文字';
+      const plan = { type, purpose: type === 'picker' ? 'handoff_offer' : 'keyword_reply', ordinary: true, content, fingerprint };
+      const job = f.makeJob(session, 'single-list-lag', plan);
+      const outgoing = f.makeOutgoing(job, content, status);
+      await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(fingerprint)] = outgoing; });
+      f.histories.set(session, [{ ...outgoing.body, timestamp: f.now() - 1000 }]);
+      f.modes.listHistoryOverride = [];
+      f.restart(); await f.runtime().scan();
+      assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+      assert.equal(f.exactRequests.length, 1, '列表缺席后必须查询精确 fingerprint');
+      assert.equal(f.postAttempts.length, 0, '精确端点已找到的消息绝不能再次 POST');
+      assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'sent');
+      assert.equal(f.rawState(session).jobs.find(item => item.id === job.id).status, 'done');
+    }
+  });
+
+  await test('F42 单一unknown经两次间隔精确负查后才允许同指纹重发一次', async () => {
+    const f = makeFixture('single-unknown-confirmed-absent'), session = 'session_single-confirmed-absent';
+    const fingerprint = 77129;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '已确认未送达后的唯一回复', fingerprint };
+    const job = f.makeJob(session, 'single-confirmed-absent', plan);
+    await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(fingerprint)] = f.makeOutgoing(job, plan.content); });
+    f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.exactRequests.length, 1); assert.equal(f.postAttempts.length, 0);
+    f.advance(4999); f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle', '调度重试时间前不能抢跑');
+    f.advance(1); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 1);
+    assert.equal(f.postAttempts[0].fingerprint, fingerprint);
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, plan.content);
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle');
+    assert.equal(f.postAttempts.length, 1, '完成后重放不得再次发送');
+  });
+
+  await test('F43 精确回查暂时失败时只保留原unknown，不抢先POST第二份', async () => {
+    const f = makeFixture('single-unknown-exact-failure'), session = 'session_single-exact-failure';
+    const fingerprint = 77130;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '不得在回查失败时重复发送', fingerprint };
+    const job = f.makeJob(session, 'single-exact-failure', plan);
+    await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(fingerprint)] = f.makeOutgoing(job, plan.content); });
+    f.modes.exactFailure = true; f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.exactRequests.length, 1); assert.equal(f.postAttempts.length, 0);
+    const stored = f.rawState(session);
+    assert.equal(stored.outgoing[String(fingerprint)].status, 'unknown');
+    assert.equal(stored.outgoing[String(fingerprint)].reconcile_misses, undefined, '失败查询不能充当阴性证据');
+    assert.equal(stored.jobs.find(item => item.id === job.id).status, 'received');
+  });
+
+  await test('F44 精确端点404只作一次阴性，间隔复核后同指纹补发一次', async () => {
+    const f = makeFixture('single-unknown-exact-404'), session = 'session_single-exact-404';
+    const fingerprint = 77131;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '精确404确认后的唯一回复', fingerprint };
+    const job = f.makeJob(session, 'single-exact-404', plan);
+    await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(fingerprint)] = f.makeOutgoing(job, plan.content); });
+    f.modes.exactStatus = 404; f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.exactRequests.length, 1); assert.equal(f.postAttempts.length, 0);
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)].reconcile_misses, 1);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 1);
+    assert.equal(f.postAttempts[0].fingerprint, fingerprint);
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, plan.content);
+  });
+
+  await test('F45 旧版丢plan的unknown遇精确404时双重负查后按当前规则仅恢复一次', async () => {
+    const f = makeFixture('orphan-unknown-exact-404'), session = 'session_orphan-exact-404';
+    const fingerprint = 77132;
+    const job = f.makeJob(session, 'orphan-exact-404');
+    await f.seed(session, state => {
+      state.jobs.push(job);
+      state.outgoing[String(fingerprint)] = { status: 'unknown', body: { type: 'text', from: 'operator', origin: 'chat',
+        automated: true, content: '旧版未送正文', fingerprint }, created_at: f.now() - 15000, attempts: 1,
+        job_id: job.id, generation: 0, attempt_token: 'orphan-exact-404' };
+    });
+    const keyword = f.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-orphan-404-rule', name: '404恢复规则', enabled: true, match_mode: 'exact',
+      keywords: ['旧队列的普通问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '404恢复后的唯一回复', cooldown_seconds: 0 });
+    f.writeConfig('keyword', keyword); f.modes.exactStatus = 404; f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.exactRequests.length, 1); assert.equal(f.postAttempts.length, 0);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'deferred');
+    assert.equal(f.rawState(session).outgoing[String(fingerprint)], undefined);
+    f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 1);
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, '404恢复后的唯一回复');
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'idle');
+    assert.equal(f.sent.length, 1);
+  });
+
+  await test('F46 人工确认通知回执未知且实际缺席时可在human模式同指纹补发一次', async () => {
+    const f = makeFixture('handoff-ack-unknown-404'), session = 'session_handoff-ack-404';
+    const fingerprint = 77133;
+    const plan = { type: 'text', purpose: 'handoff_ack', ordinary: false, content: '您的人工协助请求已收到，请稍候。', fingerprint };
+    const job = f.makeJob(session, 'handoff-ack-404', plan, { control: true, action: 'confirm_handoff', generation: 1 });
+    await f.seed(session, state => {
+      state.mode = 'human'; state.generation = 1; state.pause_reason = 'confirmed_handoff'; state.resume_at = f.now() + 3600000;
+      state.jobs.push(job); state.outgoing[String(fingerprint)] = f.makeOutgoing(job, plan.content);
+      state.outgoing[String(fingerprint)].generation = 1;
+    });
+    f.modes.exactStatus = 404; f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.postAttempts.length, 0); f.advance(5000); f.restart(); await f.runtime().scan();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 1);
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, plan.content);
+    assert.equal(f.state(session).mode, 'human');
+  });
+
+  await test('F47 人工确认未知回执复核期间总开关关闭或会话代次改变仍禁止补发', async () => {
+    for (const change of ['global-off', 'generation']) {
+      const f = makeFixture('handoff-ack-cancel-' + change), session = 'session_handoff-ack-cancel-' + change;
+      const fingerprint = change === 'global-off' ? 77134 : 77135;
+      const plan = { type: 'text', purpose: 'handoff_ack', ordinary: false, content: '不得补发的人工确认', fingerprint };
+      const job = f.makeJob(session, 'handoff-ack-cancel-' + change, plan, { control: true, action: 'confirm_handoff', generation: 1 });
+      await f.seed(session, state => {
+        state.mode = 'human'; state.generation = change === 'generation' ? 2 : 1;
+        state.jobs.push(job); state.outgoing[String(fingerprint)] = f.makeOutgoing(job, plan.content);
+        state.outgoing[String(fingerprint)].generation = 1;
+      });
+      if(change === 'global-off') f.writeConfig('runtime', { schema_version:2, enabled:false, revision:2, applied_revision:2 });
+      f.modes.exactStatus = 404; f.restart();
+      assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+      f.advance(5000); f.restart(); await f.runtime().scan();
+      assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'cancelled');
+      assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+      assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'cancelled');
     }
   });
 

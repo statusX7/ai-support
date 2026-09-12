@@ -33,6 +33,34 @@ assert.equal(result.status, 0, result.stderr);
 assert.equal(result.stdout.replace(/\n$/, ''), value);
 assert.equal(fs.statSync(envFile).mode & 0o777, 0o600);
 record('特殊字符环境值经生产序列化逐字往返、权限600');
+const validateConfiguration = (name, value, expected) => {
+  const file = path.join(evidence, 'configuration-' + name + '-' + passed + '.json');
+  fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+  const checked = spawnSync('bash', ['-c', 'source scripts/common.sh; source scripts/configuration.sh; configuration_validate "$1" "$2"',
+    'guard', name, file], { cwd: project, encoding: 'utf8' });
+  assert.equal(checked.status, expected, name + ': ' + checked.stderr);
+};
+const baseKeyword = JSON.parse(fs.readFileSync(path.join(project, 'config/keyword.yaml.example')));
+for (const [label, mutate] of [
+  ['空白固定回复', rule => { rule.action = 'reply'; rule.text = ' \t\n'; }],
+  ['空白提示指令', rule => { rule.action = 'prompt'; rule.prompt = '\n  \t'; }],
+  ['空白匹配词', rule => { rule.keywords = ['  \t']; }],
+  ['空白菜单目标', rule => { rule.action = 'menu'; rule.target = '  \t'; }],
+  ['空白确认按钮标题', rule => { rule.confirm_label = ' \t'; }],
+  ['空白取消按钮标题', rule => { rule.cancel_label = '\n '; }],
+  ['空白人工确认消息', rule => { rule.confirm_message = '  '; }],
+]) {
+  const value = structuredClone(baseKeyword); mutate(value.rules[0]);
+  validateConfiguration('keyword', value, 1); record(label + '在Shell配置层被拒绝');
+}
+const invalidHandoff = JSON.parse(fs.readFileSync(path.join(project, 'config/handoff.yaml.example')));
+invalidHandoff.handoff.message = ' \t\n';
+validateConfiguration('handoff', invalidHandoff, 1); record('启用人工通知时空白确认正文在Shell配置层被拒绝');
+for (const [label, field] of [['空白菜单固定回复', 'text'], ['空白菜单提示指令', 'prompt']]) {
+  const value = JSON.parse(fs.readFileSync(path.join(project, 'config/menu.yaml.example')));
+  value.menus.main.options['3'].action = { type: field === 'text' ? 'reply' : 'prompt', [field]: ' \t\n' };
+  validateConfiguration('menu', value, 1); record(label + '在Shell配置层被拒绝');
+}
 const lockDirectory = path.join(evidence, 'lock-instance');
 fs.mkdirSync(lockDirectory);
 const nested = spawnSync('bash', ['-c', 'source scripts/common.sh; ( acquire_maintenance_lock "$1"; ( acquire_maintenance_lock "$1"; printf reentrant ); )', 'guard', lockDirectory], { cwd: project, encoding: 'utf8', timeout: 5000 });

@@ -37,20 +37,26 @@ configuration_validate() {
     runtime)
       jq -M -e '.enabled | type == "boolean"' "$input" >/dev/null ;;
     handoff)
-      jq -M -e '.handoff | type == "object" and ((if has("resume_after_seconds") then .resume_after_seconds else 3600 end) | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and utf8bytelength <= 10000)' "$input" >/dev/null ;;
+      jq -M -e '.handoff | type == "object" and ((if has("resume_after_seconds") then .resume_after_seconds else 3600 end) | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and utf8bytelength <= 10000) and ((.notify_user.enabled // true) == false or (.message | type == "string" and utf8bytelength > 0 and test("\\S")))' "$input" >/dev/null ;;
     keyword)
       jq -M -e '
         .schema_version == 2 and (.rules | type == "array" and length <= 200) and
         ([.rules[].id] | length == (unique | length)) and
         all(.rules[]; (.id | type == "string" and test("^[A-Za-z0-9_-]{1,80}$")) and
           (.enabled | type == "boolean") and (.match_mode == "contains" or .match_mode == "exact") and
-          (.keywords | type == "array" and length > 0 and length <= 100 and all(type == "string" and utf8bytelength > 0 and utf8bytelength <= 256)) and
+          (.keywords | type == "array" and length > 0 and length <= 100 and all(type == "string" and utf8bytelength > 0 and utf8bytelength <= 256 and test("\\S"))) and
           ((.exclude_keywords // []) | type == "array" and all(type == "string" and utf8bytelength <= 256)) and
           (.action == "show_handoff_offer" or .action == "reply" or .action == "menu" or .action == "prompt") and
           ((.cooldown_seconds // 60) | type == "number" and floor == . and . >= 0 and . <= 86400) and
           ((.offer_ttl_seconds // 600) | type == "number" and floor == . and . >= 10 and . <= 86400) and
           ((.priority // 0) | type == "number" and floor == . and . >= -10000 and . <= 10000) and
-          ([.text,.confirm_label,.cancel_label,.confirm_message,.prompt,.target] | all(. == null or (type == "string" and utf8bytelength <= 10000))))
+          ([.text,.prompt,.target] | all(. == null or (type == "string" and utf8bytelength <= 10000))) and
+          ([.confirm_label,.cancel_label] | all(. == null or (type == "string" and utf8bytelength > 0 and utf8bytelength <= 100 and test("\\S")))) and
+          (.confirm_message == null or (.confirm_message | type == "string" and utf8bytelength > 0 and utf8bytelength <= 10000 and test("\\S"))) and
+          (if .action == "reply" then (.text | type == "string" and utf8bytelength > 0 and test("\\S"))
+           elif .action == "prompt" then (.prompt | type == "string" and utf8bytelength > 0 and test("\\S"))
+           elif .action == "menu" then (.target | type == "string" and utf8bytelength > 0 and test("\\S"))
+           else true end))
       ' "$input" >/dev/null ;;
     menu)
       jq -M -e '
@@ -70,9 +76,12 @@ configuration_validate() {
         ((.welcome.auto_open // false) | type == "boolean") and
         (.menus | type == "object" and length <= 100) and (.menus[.root] | type == "object") and
         all(.menus[]; (.title | type == "string" and utf8bytelength <= 2000) and (.options | type == "object" and length <= 12) and
-          all(.options[]; (.label | type == "string" and utf8bytelength > 0 and utf8bytelength <= 100) and
+          all(.options[]; (.label | type == "string" and utf8bytelength > 0 and utf8bytelength <= 100 and test("\\S")) and
             (.action.type | . == "menu" or . == "reply" or . == "prompt" or . == "show_handoff_offer") and
-            (if .action.type == "menu" then $root.menus[.action.target] != null else true end))) and nodeok(.root; []; 0)
+            (if .action.type == "menu" then $root.menus[.action.target] != null
+             elif .action.type == "reply" then (.action.text | type == "string" and utf8bytelength > 0 and utf8bytelength <= 10000 and test("\\S"))
+             elif .action.type == "prompt" then (.action.prompt | type == "string" and utf8bytelength > 0 and utf8bytelength <= 10000 and test("\\S"))
+             else true end))) and nodeok(.root; []; 0)
       ' "$input" >/dev/null ;;
     tags) jq -M -e '.tags | type == "object" and all(to_entries[]; if .key == "enabled" then (.value|type)=="boolean" else (.value|type)=="string" and (.value|utf8bytelength)<=100 end)' "$input" >/dev/null ;;
     feedback) jq -M -e '

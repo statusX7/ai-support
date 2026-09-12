@@ -300,15 +300,39 @@ async function test(name, action) {
       else {assert.equal(f.generated.length, 0); assert.equal(f.sent[0].content, clarification);}
     }
   });
-  await test('H12 检索或生成在途索引改变后旧任务不续推理/出站', async () => {
+  await test('H12 检索或生成在途索引改变后旧结果不出站，资料恢复后按当前代重做且只回复一次', async () => {
     for(const stage of ['vector', 'generation']) {
-      const f = fixture('inflight-' + stage), mutate = async () => f.write('data/runtime/knowledge-lexical.json', f.raw('data/runtime/knowledge-lexical.json') + '\n');
+      const f = fixture('inflight-' + stage);
+      const originalIndex = f.raw('data/runtime/knowledge-lexical.json');
+      const mutate = async () => {
+        if(stage === 'vector') f.beforeVectorResponse = null; else f.beforeModelResponse = null;
+        f.write('data/runtime/knowledge-lexical.json', originalIndex + '\n');
+      };
       if(stage === 'vector') f.beforeVectorResponse = mutate; else f.beforeModelResponse = mutate;
       const session = 'session_hybrid-inflight-' + stage;
       await f.deliver(f.event(session, stage === 'vector' ? overlapQuestion : question));
       assert.equal(f.vector.length, Number(stage === 'vector')); assert.equal(f.generated.length, Number(stage === 'generation'));
-      assert.equal(f.sent.length, 0); assert.equal(f.state(session).jobs[0].status, 'cancelled');
+      assert.equal(f.sent.length, 0); assert.equal(f.state(session).jobs[0].status, 'received');
+      assert.equal(f.state(session).jobs[0].deferred_configuration, true);
       assert.equal(f.events().filter(event => event.type === 'ai_reply').length, 0);
+
+      // 模拟受管资料事务完成：原问题应继续保留，但必须丢弃旧检索/生成结果，
+      // 使用当前生效投影重新规划。测试无需真实等待调度器的五秒退避。
+      f.write('data/runtime/knowledge-lexical.json', originalIndex);
+      const key = f.runtime.stateKey(f.env.CRISP_WEBSITE_ID, session);
+      const jobId = f.state(session).jobs[0].id;
+      await f.runtime.transaction(key, state => { state.jobs.find(job => job.id === jobId).retry_at = 0; });
+      const result = await f.runtime.process(key, jobId);
+      assert.equal(result.status, 'sent', JSON.stringify({stage, result, state:f.state(session), vector:f.vector.length, generated:f.generated.length, sent:f.sent.length}));
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.state(session).jobs[0].status, 'done');
+      if(stage === 'vector') {
+        assert.equal(f.vector.length, 2); assert.equal(f.generated.length, 1);
+        assert.equal(f.sent[0].content, answer);
+      } else {
+        assert.equal(f.vector.length, 0); assert.equal(f.generated.length, 2);
+        assert.equal(f.sent[0].content, answer);
+      }
     }
   });
   await test('H13 强词法生成中官方缺字段真人立即取消 A，B 独立正常', async () => {

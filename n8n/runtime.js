@@ -289,6 +289,10 @@ function createRuntime(env = {}, options = {}) {
     if (value) return value.configuration[name.replace(/\.yaml$/, '')] ?? fallback;
     return safeRead(root + '/config/' + name, fallback);
   };
+  const configuredSettings = () => {
+    const applied = appliedMaterials();
+    return applied ? applied.configuration.runtime : config('runtime.yaml', { schema_version: 2, enabled: true, revision: 0, applied_revision: 0 });
+  };
   const settings = () => {
     const applied = appliedMaterials();
     const value = applied ? applied.configuration.runtime : config('runtime.yaml', { schema_version: 2, enabled: true, revision: 0, applied_revision: 0 });
@@ -359,6 +363,59 @@ function createRuntime(env = {}, options = {}) {
     // 此0600标记属于配置事务；仅检查存在性，runtime不读取其正文或秘密。
     try { fs.lstatSync(root + '/config/provider-pool-transaction.json'); return false; }
     catch (error) { return error.code === 'ENOENT'; }
+  };
+  const replyConfigurationReady = () => settings().enabled === true && providerConfigurationReady();
+  const configurationShouldDefer = () => configuredSettings().enabled === true && !replyConfigurationReady();
+  const providerDependentPlan = (plan) => Boolean(plan && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
+  const uncertainDeliveriesFor = (state, job) => Object.entries(state.outgoing || {}).filter(([fingerprint, record]) =>
+    ['unknown', 'sending'].includes(record.status) && (record.job_id === job.id || job.plan?.fingerprint && String(job.plan.fingerprint) === fingerprint));
+  const uncertainDeliveryFor = (state, job) => uncertainDeliveriesFor(state, job).length > 0;
+  const deferForConfiguration = (job, preservePlan = false) => {
+    job.deferred_configuration = true;
+    job.retry_at = clock() + 5000;
+    job.lease_until = 0;
+    if (!preservePlan) {
+      delete job.inference;
+      delete job.plan;
+    }
+  };
+  const releaseConfigurationDeferrals = (state) => {
+    const configured = configuredSettings();
+    if (configured.enabled !== true || state.mode !== 'ai') {
+      for (const job of state.jobs.filter((entry) => entry.deferred_configuration === true && entry.status === 'received')) {
+        if (uncertainDeliveryFor(state, job)) {
+          job.retry_at = null; job.lease_until = 0; delete job.deferred_configuration;
+          continue;
+        }
+        job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
+        delete job.data; delete job.plan; delete job.inference; delete job.deferred_configuration;
+      }
+      return false;
+    }
+    if (!replyConfigurationReady()) {
+      for (const job of state.jobs.filter((entry) => entry.deferred_configuration === true && entry.status === 'received')) {
+        job.retry_at = clock() + 5000;
+      }
+      return false;
+    }
+    const current = settings();
+    for (const job of state.jobs.filter((entry) => entry.deferred_configuration === true && entry.status === 'received')) {
+      // 已经向 Crisp 交出过字节但未取得确定回执时，必须先沿用旧 plan/fingerprint
+      // 对账。若此处先改 revision 或重新规划，规则变化可能生成另一 fingerprint，
+      // 从而让同一访客问题出现两条回复。
+      if (uncertainDeliveryFor(state, job)) {
+        job.retry_at = null;
+        job.lease_until = 0;
+        delete job.deferred_configuration;
+        continue;
+      }
+      job.revision = current.revision;
+      job.generation = state.generation;
+      job.retry_at = null;
+      job.lease_until = 0;
+      delete job.plan; delete job.inference; delete job.deferred_configuration;
+    }
+    return true;
   };
   const providerGenerationCurrent = (job) => providerConfigurationReady() && (!job.inference || job.inference.pool_revision === (providerPool()?.revision ?? null));
   const providerToken = (key, job, stage) => {
@@ -468,8 +525,18 @@ function createRuntime(env = {}, options = {}) {
   // 网络发送不占用会话状态锁。逐会话登记尚未完成的普通出站，使真人接管
   // 在状态提交后可以立即中止仍挂起的 HTTP 请求；控制通知不受此机制影响。
   const outboundRequests = new Map();
-  const beginOutbound = (key, job) => {
-    const entry = { token: crypto.randomBytes(16).toString('hex'), controller: createAbortController() };
+  const outboundCancellationReason = (key, job, providerRequired = true, ordinary = true) => {
+    try {
+      const state = readState(key);
+      if (state.generation !== job.generation || (ordinary && state.mode !== 'ai') || state.uncertain_events.length) return 'conversation_state_changed';
+      const global = settings();
+      if (configuredSettings().enabled !== true) return 'global_disabled';
+      if (!global.enabled || global.revision !== job.revision || providerRequired && !providerGenerationCurrent(job)) return 'configuration_changed';
+      return '';
+    } catch (_) { return 'configuration_changed'; }
+  };
+  const beginOutbound = (key, job, providerRequired = true) => {
+    const entry = { token: crypto.randomBytes(16).toString('hex'), controller: createAbortController(), cancellation_reason: '' };
     const entries = outboundRequests.get(key) || new Set();
     entries.add(entry);
     outboundRequests.set(key, entries);
@@ -477,12 +544,8 @@ function createRuntime(env = {}, options = {}) {
     // 快速路径，持久 generation/mode 才是跨实例权威 fence。
     entry.timer = setInterval(() => {
       if (entry.controller.signal.aborted) return;
-      try {
-        const state = readState(key);
-        const global = settings();
-        if (!global.enabled || global.revision !== job.revision || state.generation !== job.generation
-          || state.mode !== 'ai' || state.uncertain_events.length || !providerGenerationCurrent(job)) entry.controller.abort();
-      } catch (_) { entry.controller.abort(); }
+      entry.cancellation_reason = outboundCancellationReason(key, job, providerRequired);
+      if (entry.cancellation_reason) entry.controller.abort();
     }, 100);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
     return entry;
@@ -497,7 +560,7 @@ function createRuntime(env = {}, options = {}) {
   };
   const cancelOutbound = (key) => {
     for (const entry of outboundRequests.get(key) || []) {
-      if (!entry.controller.signal.aborted) entry.controller.abort();
+      if (!entry.controller.signal.aborted) { entry.cancellation_reason = 'conversation_state_changed'; entry.controller.abort(); }
     }
   };
   const statePath = (key) => {
@@ -852,6 +915,7 @@ function createRuntime(env = {}, options = {}) {
       result = await transaction(key, (state) => {
         if (state.jobs.some((job) => job.id === id) || (event !== 'message:updated' && state.legacy_fingerprints?.includes(hash(data.fingerprint || '')))) return { duplicate: true };
         const global = settings();
+        const deferConfiguration = configuredSettings().enabled === true && !replyConfigurationReady();
         if (state.observations?.binding !== connectionBinding()) state.observations = { binding: connectionBinding() };
         if (!state.observations.hook_received_at) state.observations.hook_received_at = clock();
         const job = { id, event, data, event_time: eventTime, received_at: clock(), sequence: ++state.sequence, status: 'received', attempts: 0, revision: global.revision, generation: state.generation, control: false };
@@ -887,14 +951,14 @@ function createRuntime(env = {}, options = {}) {
             else if (!global.enabled || state.mode !== 'ai') job.status = 'done';
           }
         } else if (event === 'message:send') {
-          if (data.from !== 'user' || data.automated === true || !global.enabled || state.mode !== 'ai') job.status = 'done';
+          if (data.from !== 'user' || data.automated === true || state.mode !== 'ai' || !global.enabled && !deferConfiguration) job.status = 'done';
           // Crisp 偶尔先投递一个缺少 automated/user_id 的 operator 事件，再紧接着
           // 投递访客消息。归属回查完成前必须保留访客任务；直接取消会让该消息
           // 永久丢失。控制事件仍优先，确认真人时 pause() 会精确取消这些任务。
           if (job.status === 'received' && state.uncertain_events.length) job.deferred_control = true;
-        } else if (!global.enabled || state.mode !== 'ai') job.status = 'done';
-        if (!global.enabled && job.action !== 'resolve_operator' && job.action !== 'operator') job.status = 'done';
-        if (job.status === 'received' && (!job.control || job.action === 'menu_action') && !providerConfigurationReady()) job.status = 'cancelled';
+        } else if ((!global.enabled && !deferConfiguration) || state.mode !== 'ai') job.status = 'done';
+        if (!global.enabled && !deferConfiguration && job.action !== 'resolve_operator' && job.action !== 'operator') job.status = 'done';
+        if (job.status === 'received' && (!job.control || job.action === 'menu_action') && deferConfiguration) deferForConfiguration(job);
         const pending = state.jobs.filter((entry) => !['done', 'cancelled', 'failed'].includes(entry.status)).length;
         if (job.status === 'received' && pending >= 128) {
           if (job.action === 'operator') {
@@ -911,7 +975,8 @@ function createRuntime(env = {}, options = {}) {
         }
         if (['done', 'cancelled'].includes(job.status)) delete job.data;
         state.jobs.push(job);
-        return { jobId: id, pending: job.status === 'received' && (job.control || state.uncertain_events.length === 0) };
+        return { jobId: id, pending: job.status === 'received' && !job.deferred_configuration
+          && !(job.retry_at > clock()) && (job.control || state.uncertain_events.length === 0) };
       }, website, session);
     } catch (_) { return fail(503, '会话状态保存失败，请稍后重试'); }
     return { accepted: true, statusCode: 200, reason: result.duplicate ? '重复事件已忽略' : '已持久接收', route: result.pending ? 'process' : 'ignore', key, jobId: result.jobId || '', verification: mode === 'plugin' ? 'plugin-signature' : 'website-url-secret' };
@@ -934,7 +999,8 @@ function createRuntime(env = {}, options = {}) {
   const validateConfig = (name, value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置必须为对象');
     if (name === 'runtime' && (typeof value.enabled !== 'boolean' || !Number.isInteger(value.revision))) throw new Error('全局配置无效');
-    if (name === 'handoff' && (!Number.isInteger(value.handoff?.resume_after_seconds) || value.handoff.resume_after_seconds < 0 || value.handoff.resume_after_seconds > 604800)) throw new Error('恢复秒数应为 0 至 604800');
+    if (name === 'handoff' && (!Number.isInteger(value.handoff?.resume_after_seconds) || value.handoff.resume_after_seconds < 0 || value.handoff.resume_after_seconds > 604800
+      || (value.handoff?.notify_user?.enabled !== false && (typeof value.handoff?.message !== 'string' || !value.handoff.message.trim() || Buffer.byteLength(value.handoff.message) > 10000)))) throw new Error('人工接管配置无效');
     if (name === 'keyword') {
       if (!Array.isArray(value.rules)) throw new Error('关键词规则列表缺失');
       const ids = new Set();
@@ -943,6 +1009,13 @@ function createRuntime(env = {}, options = {}) {
         ids.add(rule.id);
         if (!['show_handoff_offer', 'reply', 'menu', 'prompt'].includes(rule.action) || !['exact', 'contains'].includes(rule.match_mode) || !Array.isArray(rule.keywords) || !rule.keywords.length || rule.keywords.some((word) => typeof word !== 'string' || !word.trim() || word.length > 200)) throw new Error('关键词规则内容无效');
         if (rule.exclude_keywords && (!Array.isArray(rule.exclude_keywords) || rule.exclude_keywords.some((word) => typeof word !== 'string'))) throw new Error('排除词格式无效');
+        for (const label of [rule.confirm_label, rule.cancel_label]) if (label !== undefined
+          && (typeof label !== 'string' || !label.trim() || Buffer.byteLength(label) > 100)) throw new Error('人工按钮标题无效');
+        if (rule.confirm_message !== undefined && (typeof rule.confirm_message !== 'string'
+          || !rule.confirm_message.trim() || Buffer.byteLength(rule.confirm_message) > 10000)) throw new Error('人工确认文案无效');
+        if (rule.action === 'reply' && (typeof rule.text !== 'string' || !rule.text.trim() || Buffer.byteLength(rule.text) > 10000)) throw new Error('固定回复正文无效');
+        if (rule.action === 'prompt' && (typeof rule.prompt !== 'string' || !rule.prompt.trim() || Buffer.byteLength(rule.prompt) > 10000)) throw new Error('规则提示内容无效');
+        if (rule.action === 'menu' && (typeof rule.target !== 'string' || !rule.target.trim())) throw new Error('菜单目标无效');
       }
     }
     if (name === 'menu') {
@@ -955,6 +1028,8 @@ function createRuntime(env = {}, options = {}) {
         for (const option of Object.values(node.options || {})) {
           const action = option.action || {};
           if (!['reply', 'menu', 'prompt', 'show_handoff_offer'].includes(action.type)) throw new Error('菜单动作无效');
+          if (action.type === 'reply' && (typeof action.text !== 'string' || !action.text.trim() || Buffer.byteLength(action.text) > 10000)) throw new Error('菜单固定回复正文无效');
+          if (action.type === 'prompt' && (typeof action.prompt !== 'string' || !action.prompt.trim() || Buffer.byteLength(action.prompt) > 10000)) throw new Error('菜单提示内容无效');
           if (action.type === 'menu') {
             if (!nodes[action.target]) throw new Error('菜单引用不存在');
             if (action.back !== true && !ancestors.includes(action.target)) visit(action.target, [...ancestors, id]);
@@ -1091,9 +1166,11 @@ function createRuntime(env = {}, options = {}) {
       if (await resolveOperator(state, message) === 'human') await transaction(key, (current) => pause(current, hash('operator|' + message.fingerprint), timestamp(message.timestamp) || clock(), 'operator_reply'));
     }
   };
-  const active = async (key, job, ordinary = true) => transaction(key, (state) => {
+  const active = async (key, job, ordinary = true, providerRequired = true) => transaction(key, (state) => {
     const global = settings();
-    return global.enabled && global.revision === job.revision && state.generation === job.generation && (!ordinary || state.mode === 'ai') && state.uncertain_events.length === 0 && providerGenerationCurrent(job);
+    return global.enabled && global.revision === job.revision && state.generation === job.generation
+      && (!ordinary || state.mode === 'ai') && state.uncertain_events.length === 0
+      && (!providerRequired || providerGenerationCurrent(job));
   });
   const beginInference = async (key, job) => {
     const pool = providerPool();
@@ -1320,13 +1397,16 @@ function createRuntime(env = {}, options = {}) {
     if (!action) return null;
     const type = typeof action.action === 'string' ? action.action : action.type;
     if (['handoff', 'show_handoff_offer'].includes(type)) return createOffer(key, job, { text: '需要人工协助吗？请点击下方按钮确认。', ...action }, 'handoff');
-    if (type === 'reply') return { type: 'text', content: String(action.text || '').slice(0, 8000), ordinary: true, purpose: 'keyword_reply' };
+    if (type === 'reply') {
+      const content = String(action.text || '').trim().slice(0, 8000);
+      return content ? { type: 'text', content, ordinary: true, purpose: 'keyword_reply' } : safeErrorPlan(job);
+    }
     if (type === 'menu') {
       await transaction(key, (state) => { state.menu_node = action.target; });
       return menuPlan(key, job, action.target || menus().root);
     }
     if (type === 'prompt') return knowledgePlan(key, job, String(action.prompt || '').slice(0, 1800));
-    return null;
+    return safeErrorPlan(job);
   };
   const makePlan = async (key, job) => {
     if (job.plan) return job.plan.purpose === 'safe_error' ? safeErrorPlan(job, job.plan) : job.plan;
@@ -1410,8 +1490,14 @@ function createRuntime(env = {}, options = {}) {
     const text = data.type === 'text' && typeof data.content === 'string' ? data.content.trim() : '';
     const rule = text ? matchRule(text) : null;
     if (rule) {
-      const last = readState(key).cooldowns[rule.id] || 0;
-      if (last && clock() - last < bounded(rule.cooldown_seconds, 60) * 1000 && rule.action === 'show_handoff_offer') return null;
+      const current = readState(key);
+      const last = current.cooldowns[rule.id] || 0;
+      if (last && clock() - last < bounded(rule.cooldown_seconds, 60) * 1000 && rule.action === 'show_handoff_offer') {
+        const validOffer = Object.values(current.offers || {}).some((offer) => offer?.kind === 'handoff'
+          && offer.rule_id === rule.id && !offer.consumed_at && offer.expires_at > clock()
+          && offer.revision === settings().revision && offer.generation === current.generation);
+        if (validOffer) return { type: 'text', content: '上方的人工协助选项仍然有效，您可以直接选择；也可以继续告诉我具体问题。', ordinary: true, purpose: 'handoff_offer_reminder' };
+      }
       return actionPlan(key, job, rule);
     }
     if (text === '菜单' || text.toLowerCase() === 'menu') return menuPlan(key, job, menus().root || 'main');
@@ -1448,7 +1534,8 @@ function createRuntime(env = {}, options = {}) {
     if (!record || attemptToken && record.attempt_token !== attemptToken) return { recorded: false, current: false };
     const global = settings();
     const current = global.enabled && global.revision === job.revision && state.generation === job.generation
-      && (plan.ordinary === false || state.mode === 'ai') && state.uncertain_events.length === 0 && providerGenerationCurrent(job);
+      && (plan.ordinary === false || state.mode === 'ai') && state.uncertain_events.length === 0
+      && (!providerDependentPlan(plan) || providerGenerationCurrent(job));
     if (record.status === 'sent') return { recorded: true, current };
     record.status = 'sent';
     record.sent_at = clock();
@@ -1464,6 +1551,65 @@ function createRuntime(env = {}, options = {}) {
     }
     return { recorded: true, current };
   });
+  const reconcileOrphanedDeliveries = async (key, job) => {
+    const snapshot = readState(key);
+    const records = uncertainDeliveriesFor(snapshot, job);
+    // send() 会在普通 plan 未显式带 fingerprint 时按同一公式稳定生成。把该值也视为
+    // 当前正常计划，避免重启后的单一未知回执被误判成“旧版丢失 plan”并错误记为
+    // state_changed_before_receipt。
+    const planned = !job.plan ? '' : String(job.plan.fingerprint
+      || Number.parseInt(hash(key + '|' + job.id + '|' + job.plan.purpose).slice(0, 12), 16));
+    // 正常单一未决记录由 send() 使用原 plan 处理；这里专门收敛旧版曾清除
+    // plan、或同一 job 留下多个未决 fingerprint 的崩溃/升级状态。
+    if (!records.length || records.length === 1 && planned && records[0][0] === planned) return 'none';
+    let history;
+    try { history = await messagesFor(snapshot); } catch (_) { return 'retry'; }
+    await observeOperators(key, history);
+    const delivered = new Set(records.filter(([fingerprint]) => history.some((message) => String(message.fingerprint) === fingerprint)).map(([fingerprint]) => fingerprint));
+    if (!delivered.size) {
+      if (records.some(([, record]) => clock() - (Number(record.created_at) || job.received_at || clock()) < 10000)) return 'retry';
+      for (const [fingerprint] of records) {
+        try {
+          const exact = await crisp(snapshot, '/message/' + encodeURIComponent(fingerprint));
+          if (String(exact.data?.fingerprint ?? '') === fingerprint) delivered.add(fingerprint);
+        } catch (error) {
+          // Crisp 的精确消息端点用 404 表示该 fingerprint 不存在。由于同一轮
+          // /messages 已成功，只有这个 404 可以作为阴性；认证、限流、网络与
+          // 其它服务错误仍保持 unknown，绝不能据此贸然补发。
+          if (error?.crispStatus !== 404) return 'retry';
+        }
+      }
+    }
+    if (delivered.size) {
+      await transaction(key, (state) => {
+        for (const [fingerprint] of uncertainDeliveriesFor(state, job)) {
+          const record = state.outgoing[fingerprint];
+          if (delivered.has(fingerprint)) {
+            record.status = 'sent'; record.sent_at = clock(); record.state_changed_before_receipt = true; delete record.body;
+          } else {
+            record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = 'other_attempt_delivered'; delete record.body;
+          }
+        }
+      });
+      appendEvent('delivery_after_state_change', { reason: 'orphaned_receipt_reconciled' });
+      return 'delivered';
+    }
+    const absent = await transaction(key, (state) => {
+      const current = uncertainDeliveriesFor(state, job);
+      if (!current.length) return true;
+      let confirmed = true;
+      for (const [, record] of current) {
+        if (!(record.reconcile_checked_at > 0) || clock() - record.reconcile_checked_at >= 5000) {
+          record.reconcile_misses = bounded(record.reconcile_misses, 0, 2) + 1;
+          record.reconcile_checked_at = clock();
+        }
+        if ((record.reconcile_misses || 0) < 2) confirmed = false;
+      }
+      if (confirmed) for (const [fingerprint] of current) delete state.outgoing[fingerprint];
+      return confirmed;
+    });
+    return absent ? 'absent' : 'retry';
+  };
   const send = async (key, job, plan) => {
     if (plan?.purpose === 'safe_error') plan = safeErrorPlan(job, plan);
     if (!plan?.content) return 'none';
@@ -1476,22 +1622,78 @@ function createRuntime(env = {}, options = {}) {
     if (outgoing && ['unknown', 'sending'].includes(outgoing.status)) {
       let history;
       try { history = await messagesFor(state); } catch (_) { return 'retry'; }
+      if (plan.ordinary !== false) await observeOperators(key, history);
       if (history.some((message) => String(message.fingerprint) === String(fingerprint))) {
         const receipt = await rememberSent(key, job, plan, fingerprint, outgoing.attempt_token || '');
         return retired ? 'cancelled' : receipt.current ? 'sent' : 'dispatched_after_cancel';
       }
       if (clock() - outgoing.created_at < 10000) return 'retry';
-      if (retired || clock() - job.received_at > 300000) {
-        await transaction(key, (current) => { const record = current.outgoing[String(fingerprint)]; record.status = 'cancelled'; delete record.body; });
+      // /messages 具有短暂列表滞后窗口。任何普通 unknown/sending 再次 POST 前，
+      // 必须用精确 fingerprint 端点确认；查询失败只继续对账，不能抢先补发。
+      let exact;
+      try { exact = await crisp(state, '/message/' + encodeURIComponent(fingerprint)); }
+      catch (error) {
+        // 列表请求已成功后，精确端点的 404 是“当前未找到”的正常协议结果；
+        // 它仍只算一次阴性，必须与下一次至少间隔五秒。其它失败不能算阴性。
+        if (error?.crispStatus !== 404) return 'retry';
+      }
+      if (String(exact?.data?.fingerprint ?? '') === String(fingerprint)) {
+        const receipt = await rememberSent(key, job, plan, fingerprint, outgoing.attempt_token || '');
+        return retired ? 'cancelled' : receipt.current ? 'sent' : 'dispatched_after_cancel';
+      }
+      if (retired) {
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (!record || !['unknown', 'sending'].includes(record.status)) return;
+          record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = 'feedback_retired'; delete record.body;
+        });
         return 'cancelled';
       }
-      if (outgoing.attempts >= 2) {
-        await transaction(key, (current) => { current.outgoing[String(fingerprint)].status = 'failed'; });
+      // 远端列表和精确端点都明确缺席两次，且两次至少间隔五秒，才把结果视为
+      // 未送达。这样同时覆盖正常文字、picker/offer 与配置换代，而不靠消息类型猜测。
+      const misses = await transaction(key, (current) => {
+        const record = current.outgoing[String(fingerprint)];
+        if (!record || !['unknown', 'sending'].includes(record.status)) return 0;
+        if (!(record.reconcile_checked_at > 0) || clock() - record.reconcile_checked_at >= 5000) {
+          record.reconcile_misses = bounded(record.reconcile_misses, 0, 2) + 1;
+          record.reconcile_checked_at = clock();
+        }
+        return record.reconcile_misses || 0;
+      });
+      if (misses < 2) return 'retry';
+      const cancellationReason = outboundCancellationReason(key, job, providerDependentPlan(plan), plan.ordinary !== false);
+      if (cancellationReason === 'configuration_changed') {
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (record && ['unknown', 'sending'].includes(record.status)) delete current.outgoing[String(fingerprint)];
+        });
+        return 'deferred';
+      }
+      if (cancellationReason) {
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (!record || !['unknown', 'sending'].includes(record.status)) return;
+          record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = cancellationReason; delete record.body;
+        });
+        return 'cancelled';
+      }
+      if (clock() - outgoing.created_at > 300000 || clock() - job.received_at > 300000) {
+        await transaction(key, (current) => {
+          const record = current.outgoing[String(fingerprint)];
+          if (!record || !['unknown', 'sending'].includes(record.status)) return;
+          record.status = 'failed'; record.failed_at = clock(); record.failure = 'delivery_unknown'; delete record.body;
+        });
         appendEvent('delivery_failed', { reason: 'delivery_unknown' });
         return 'failed';
       }
+      if (outgoing.attempts >= 2) {
+        // 两次结果未知后不再 POST，避免重复消息；在五分钟对账窗口内只查询同一
+        // fingerprint，Crisp/网络恢复后仍可确认已送达。窗口结束才收敛为失败。
+        return 'retry';
+      }
     }
-    if (retired || !await active(key, job, plan.ordinary !== false)) return 'cancelled';
+    const providerRequired = providerDependentPlan(plan);
+    if (retired || !await active(key, job, plan.ordinary !== false, providerRequired)) return 'cancelled';
     if (plan.ordinary !== false) {
       let history;
       try { history = await messagesFor(readState(key)); } catch (_) {
@@ -1500,38 +1702,47 @@ function createRuntime(env = {}, options = {}) {
       }
       await observeOperators(key, history);
       const unresolved = history.filter(publicOperator).some((message) => timestamp(message.timestamp) > job.event_time && automation(message, readState(key)) === null);
-      if (unresolved || !await active(key, job)) return 'cancelled';
+      if (unresolved || !await active(key, job, true, providerRequired)) return 'cancelled';
     }
     // 使用官方可选昵称，不请求自动消息徽标；自回流识别在POST前持久登记，
     // 不伪造真人账号，也不依赖昵称或可见标签判断是否为本项目出站。
     const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, user: { type: 'website', nickname: '在线客服' } };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
-    const outbound = plan.ordinary !== false ? beginOutbound(key, job) : null;
+    const outbound = plan.ordinary !== false ? beginOutbound(key, job, providerRequired) : null;
     const attemptToken = outbound?.token || crypto.randomBytes(16).toString('hex');
     try {
       const registered = await transaction(key, (current) => {
         const global = settings();
-        if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length || plan.ordinary !== false && current.mode !== 'ai' || !providerGenerationCurrent(job)) return false;
+        if (!global.enabled || global.revision !== job.revision || current.generation !== job.generation || current.uncertain_events.length
+          || plan.ordinary !== false && current.mode !== 'ai' || providerRequired && !providerGenerationCurrent(job)) return false;
         registerOwnedMessage(current, fingerprint);
         const previous = current.outgoing[String(fingerprint)];
         current.outgoing[String(fingerprint)] = { status: 'sending', body, created_at: previous?.created_at || clock(), attempts: (previous?.attempts || 0) + 1, job_id: job.id, generation: current.generation, attempt_token: attemptToken };
         return true;
       });
       if (!registered || outbound?.controller.signal.aborted) {
+        const reason = outbound?.cancellation_reason || outboundCancellationReason(key, job, providerRequired, plan.ordinary !== false);
         if (registered) await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
-          if (record?.status === 'sending' && record.attempt_token === attemptToken) { record.status = 'cancelled'; record.cancelled_at = clock(); delete record.body; }
+          if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
+          // 尚未调用 Crisp POST，配置换代可以安全删除本次登记并按新代重规划；
+          // 真人介入或总开关关闭则必须留下永久取消栅栏。
+          if (reason === 'configuration_changed') delete current.outgoing[String(fingerprint)];
+          else { record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = reason || 'conversation_state_changed'; delete record.body; }
         });
-        return 'cancelled';
+        return reason === 'configuration_changed' ? 'deferred' : 'cancelled';
       }
       // 登记出站后再次核对，再把字节交给 HTTP 层；之后的真人事件通过 signal
       // 中止仍挂起的请求。远端若已收到字节，最终回执仍会如实标记。
-      if (plan.ordinary !== false && !await active(key, job)) {
+      if (plan.ordinary !== false && !await active(key, job, true, providerRequired)) {
+        const reason = outboundCancellationReason(key, job, providerRequired, true);
         await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
-          if (record?.status === 'sending' && record.attempt_token === attemptToken) { record.status = 'cancelled'; record.cancelled_at = clock(); delete record.body; }
+          if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
+          if (reason === 'configuration_changed') delete current.outgoing[String(fingerprint)];
+          else { record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = reason || 'conversation_state_changed'; delete record.body; }
         });
-        return 'cancelled';
+        return reason === 'configuration_changed' ? 'deferred' : 'cancelled';
       }
       const result = await crisp(state, '/message', 'POST', body, { signal: outbound?.controller.signal });
       if (result.reason !== 'dispatched' || result.data?.fingerprint !== undefined && String(result.data.fingerprint) !== String(fingerprint)) throw new Error('发送未获得确定回执');
@@ -1542,17 +1753,18 @@ function createRuntime(env = {}, options = {}) {
       if (outbound?.controller.signal.aborted) {
         // abort 发生前 HTTP 层可能已经写出部分字节；保留未知回执供指纹对账，
         // 但人工状态已取消该任务，绝不再次推理或补发。
+        const configurationChanged = outbound.cancellation_reason === 'configuration_changed';
         await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status === 'sending' && record.attempt_token === attemptToken) {
-            record.status = 'cancelled';
+            record.status = configurationChanged ? 'unknown' : 'cancelled';
             record.cancelled_at = clock();
-            record.cancellation_reason = 'conversation_state_changed';
+            record.cancellation_reason = outbound.cancellation_reason || 'conversation_state_changed';
             record.delivery_uncertain = true;
-            delete record.body;
+            if (!configurationChanged) delete record.body;
           }
         });
-        return 'cancelled';
+        return configurationChanged ? 'deferred' : 'cancelled';
       }
       // 明确的请求/权限拒绝不是“发送结果未知”，不再对同一坏正文重试或反复调用模型。
       const rejected = [400, 401, 403, 404, 405, 410, 413, 415, 422].includes(error.crispStatus);
@@ -1572,8 +1784,23 @@ function createRuntime(env = {}, options = {}) {
   const process = async (key, requestedId = '') => {
     let job;
     let token;
+    let plan;
     try {
       job = await transaction(key, (state) => {
+        const configurationReady = replyConfigurationReady();
+        releaseConfigurationDeferrals(state);
+        if (!configurationReady) {
+          const configured = configuredSettings();
+          for (const pending of state.jobs.filter((entry) => entry.status === 'received' && !entry.control)) {
+            if (uncertainDeliveryFor(state, pending)) continue;
+            if (pending.plan && !providerDependentPlan(pending.plan)) continue;
+            if (configured.enabled === true && state.mode === 'ai') deferForConfiguration(pending);
+            else {
+              pending.status = 'cancelled'; pending.retry_at = null; pending.lease_until = 0;
+              delete pending.data; delete pending.plan; delete pending.inference; delete pending.deferred_configuration;
+            }
+          }
+        }
         const candidates = state.jobs.filter((entry) => ['received', 'processing'].includes(entry.status) && (!entry.retry_at || entry.retry_at <= clock()));
         const controls = candidates.filter((entry) => entry.control && entry.id === requestedId);
         const priority = candidates.find((entry) => priorityConfirmation(entry) && !(entry.lease_until > clock()));
@@ -1582,9 +1809,13 @@ function createRuntime(env = {}, options = {}) {
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
         if (!selected.control && state.worker && state.worker.until > clock()) return null;
-        const reconciling = selected.plan && Object.entries(state.outgoing || {}).some(([fingerprint, record]) =>
-          ['unknown', 'sending'].includes(record.status) && (record.job_id === selected.id || selected.plan.fingerprint && String(selected.plan.fingerprint) === fingerprint));
-        if (!selected.control && clock() - selected.received_at > 300000 && !reconciling) { selected.status = 'cancelled'; delete selected.data; return null; }
+        const reconciling = uncertainDeliveryFor(state, selected);
+        if (!selected.control && clock() - selected.received_at > 300000 && !reconciling && !selected.plan) {
+          // 调度停顿恢复后不能把已经持久接收的正常访客问题静默删除。过期问题不再
+          // 重新调用模型，而是发送一条本地、自然的澄清，人工/总开关仍在上方取消。
+          selected.plan = safeErrorPlan(selected);
+          selected.stale_recovered = true;
+        }
         token = crypto.randomBytes(12).toString('hex');
         // 生产推理两阶段共享90秒（可配置至180秒），租约另外覆盖检索与出站对账。
         if (!selected.control) state.worker = { job: selected.id, token, until: clock() + 300000 };
@@ -1594,28 +1825,62 @@ function createRuntime(env = {}, options = {}) {
         return JSON.parse(JSON.stringify(selected));
       });
       if (!job) return { status: 'idle' };
-      let plan = await makePlan(key, job);
-      if (plan) {
-        await transaction(key, (state) => {
-          const stored = state.jobs.find((entry) => entry.id === job.id);
-          if (!stored || stored.status === 'cancelled') return;
-          stored.plan = plan;
-          if (plan.outcome && !stored.knowledge_counted) {
-            stored.knowledge_counted = true;
-            appendEvent('question');
-            appendEvent(plan.outcome, { library_ids: sourceLibraries(plan.sources || []) });
-          }
-          if (job.human_changed && !stored.handoff_counted) { stored.handoff_counted = true; appendEvent('handoff', { reason: ['operator', 'resolve_operator'].includes(job.action) ? 'operator_reply' : 'confirmed_handoff' }); }
-        });
+      const reconciliation = !job.control ? await reconcileOrphanedDeliveries(key, job) : 'none';
+      let delivery;
+      if (reconciliation === 'delivered') delivery = 'dispatched_after_cancel';
+      else if (reconciliation === 'retry') delivery = 'retry';
+      else if (reconciliation === 'absent') delivery = 'deferred';
+      else {
+        plan = await makePlan(key, job);
+        if (plan) {
+          await transaction(key, (state) => {
+            const stored = state.jobs.find((entry) => entry.id === job.id);
+            if (!stored || stored.status === 'cancelled') return;
+            stored.plan = plan;
+            if (plan.outcome && !stored.knowledge_counted) {
+              stored.knowledge_counted = true;
+              appendEvent('question');
+              appendEvent(plan.outcome, { library_ids: sourceLibraries(plan.sources || []) });
+            }
+            if (job.human_changed && !stored.handoff_counted) { stored.handoff_counted = true; appendEvent('handoff', { reason: ['operator', 'resolve_operator'].includes(job.action) ? 'operator_reply' : 'confirmed_handoff' }); }
+          });
+        }
+        delivery = plan ? await send(key, job, plan) : 'cancelled';
       }
-      const delivery = plan ? await send(key, job, plan) : 'cancelled';
+      if (delivery === 'cancelled' && !job.control) {
+        try {
+          const current = readState(key);
+          const global = settings();
+          if (configuredSettings().enabled === true && current.mode === 'ai' && current.uncertain_events.length === 0
+            && (!global.enabled || global.revision !== job.revision || !providerGenerationCurrent(job))) delivery = 'deferred';
+        } catch (_) { delivery = 'deferred'; }
+      }
       if (plan && (delivery === 'sent' || !plan.content)) await tag(readState(key), plan.tags);
       await transaction(key, (state) => {
         const stored = state.jobs.find((entry) => entry.id === job.id);
         if (stored) {
           stored.lease_until = 0;
-          if (stored.status !== 'cancelled') stored.status = delivery === 'retry' && stored.attempts < 4 ? 'received' : delivery === 'retry' || delivery === 'failed' ? 'failed' : delivery === 'cancelled' ? 'cancelled' : 'done';
-          stored.retry_at = stored.status === 'received' ? clock() + 5000 : null;
+          if (delivery === 'deferred' && stored.status !== 'cancelled' && configuredSettings().enabled === true && state.mode === 'ai') {
+            stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
+          } else if (stored.status !== 'cancelled') {
+            if (delivery === 'retry') {
+              stored.delivery_retries = bounded(stored.delivery_retries, 0, 60) + 1;
+              const uncertain = uncertainDeliveriesFor(state, stored);
+              // 旧任务即使已超过五分钟，也必须完成至少两次间隔的远端阴性确认；
+              // 否则第一轮对账会被通用任务年龄上限提前置为 failed，既没有回执结论，
+              // 也不会记录 delivery_unknown。网络始终不可查时仍由60次上限有界收敛。
+              const reconciliationPending = uncertain.some(([, record]) => (record.reconcile_misses || 0) < 2);
+              stored.status = stored.delivery_retries <= 60
+                && (clock() - stored.received_at <= 300000 || reconciliationPending) ? 'received' : 'failed';
+              stored.retry_at = stored.status === 'received' ? clock() + 5000 : null;
+              if (stored.status === 'failed') appendEvent('delivery_failed', {
+                reason: uncertain.length ? 'receipt_reconciliation_unavailable' : 'delivery_retry_exhausted',
+              });
+            } else {
+              stored.status = delivery === 'failed' ? 'failed' : delivery === 'cancelled' ? 'cancelled' : 'done';
+              stored.retry_at = null;
+            }
+          }
           if (['done', 'cancelled', 'failed'].includes(stored.status)) { delete stored.data; delete stored.plan; }
         }
         if (state.worker?.token === token) state.worker = null;
@@ -1629,7 +1894,22 @@ function createRuntime(env = {}, options = {}) {
       if (job) {
         try { await transaction(key, (state) => {
           const stored = state.jobs.find((entry) => entry.id === job.id);
-          if (stored && stored.status !== 'cancelled') { stored.status = stored.attempts >= 3 ? 'failed' : 'received'; stored.retry_at = clock() + 5000; stored.lease_until = 0; }
+          if (stored && stored.status !== 'cancelled') {
+            stored.lease_until = 0;
+            if (!stored.control && stored.data && configurationShouldDefer() && configuredSettings().enabled === true && state.mode === 'ai') {
+              stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
+            } else if (!stored.control && stored.data && stored.attempts >= 3 && stored.plan?.purpose !== 'safe_error'
+              && settings().enabled === true && state.mode === 'ai' && state.uncertain_events.length === 0) {
+              // 本地规划异常不能把已持久接收的问题静默置为 failed。最后一次不再
+              // 调用模型，只发送受管自然澄清；若 Crisp 本身不可达仍按发送对账收敛。
+              stored.plan = safeErrorPlan(stored);
+              stored.runtime_fallback = true;
+              stored.status = 'received'; stored.retry_at = clock() + 1000;
+            } else {
+              stored.status = stored.attempts >= 3 ? 'failed' : 'received';
+              stored.retry_at = stored.status === 'received' ? clock() + 5000 : null;
+            }
+          }
           if (state.worker?.token === token) state.worker = null;
         }); } catch (_) {}
       }
@@ -1817,8 +2097,16 @@ function createRuntime(env = {}, options = {}) {
         const snapshot = safeRead(statePath(key), null);
         if (!snapshot?.website_id || snapshot.schema_version !== 2 || !scanNeedsTransaction(snapshot, clock())) continue;
         await transaction(key, (state) => {
+          const configurationReady = replyConfigurationReady();
+          const shouldDefer = configurationShouldDefer();
+          releaseConfigurationDeferrals(state);
           for (const job of state.jobs) {
             if (job.status === 'processing' && !(job.lease_until > clock())) { job.status = 'received'; job.lease_until = 0; }
+            if (job.status === 'received' && !job.control && !configurationReady && !uncertainDeliveryFor(state, job)
+              && (!job.plan || providerDependentPlan(job.plan))) {
+              if (shouldDefer && state.mode === 'ai') deferForConfiguration(job);
+              else { job.status = 'cancelled'; job.retry_at = null; delete job.data; delete job.plan; delete job.inference; delete job.deferred_configuration; }
+            }
             if (job.status === 'received' && !(job.retry_at > clock()) && (job.control || state.uncertain_events.length === 0)) jobs.push({ key, jobId: job.id, control: job.control });
           }
         });

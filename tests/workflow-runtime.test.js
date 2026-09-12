@@ -729,6 +729,14 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const humanIndex = card.content.choices.findIndex((choice) => choice.label.includes('人工'));
     await deliver(click('session_menu0001', card, humanIndex)); assert.equal(state('session_menu0001').mode, 'ai'); assert.equal(sent.at(-1).content.choices[0].label, '召唤人工客服');
     const invalid = readConfig('menu'); invalid.menus.main.options['8'] = { label: '循环', action: { type: 'menu', target: 'main' } }; assert.throws(() => runtime.validateConfig('menu', invalid), /循环|返回/);
+    for (const [field, value] of [['confirm_label', '  '], ['cancel_label', '\t'], ['confirm_message', '\n ']]) {
+      const keyword = readConfig('keyword'); keyword.rules[0][field] = value;
+      assert.throws(() => runtime.validateConfig('keyword', keyword), /按钮|确认/);
+    }
+    const keywordTarget = readConfig('keyword'); keywordTarget.rules[0].action = 'menu'; keywordTarget.rules[0].target = ' \t';
+    assert.throws(() => runtime.validateConfig('keyword', keywordTarget), /菜单目标/);
+    const invalidHandoff = readConfig('handoff'); invalidHandoff.handoff.message = ' \n';
+    assert.throws(() => runtime.validateConfig('handoff', invalidHandoff), /人工接管/);
   });
   await test('T37/T38 图片真实字节进入两协议、安全失败不转人工', async () => {
     const image = { url: 'https://storage.crisp.chat/synthetic.png', name: '虚构.png', type: 'image/png' };
@@ -1058,7 +1066,7 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       fs.unlinkSync(file);
     }
   });
-  await test('W03/B01 应用过渡取消旧答案，保留真人控制，期间问题不补答', async () => {
+  await test('W03/B01 应用过渡取消旧答案，保留真人控制，期间新问题按新代恢复一次', async () => {
     const file = path.join(root, 'config/materials-applied.json');
     const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
     const originalMap = fs.existsSync(mapFile) ? fs.readFileSync(mapFile) : null;
@@ -1079,14 +1087,23 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       projection.configuration.runtime.revision = 501; projection.configuration.runtime.applied_revision = 501; publish();
       assert.equal(runtime.settings().enabled, false);
       const before = sent.length;
-      await deliver(message('session_materials-during', '过渡期间问题'));
+      const during = await receive(message('session_materials-during', '过渡期间问题'));
+      assert.equal(during.accepted, true); assert.equal(during.route, 'ignore');
+      const queued = state('session_materials-during').jobs.find((job) => job.id === during.jobId);
+      assert.equal(queued.status, 'received'); assert.equal(queued.deferred_configuration, true);
+      assert(queued.data, '过渡期间已持久接收的问题不得丢失');
       now += 10; await operator('session_materials-human');
       assert.equal(state('session_materials-human').mode, 'human');
       finish(); await pending;
       assert.equal(sent.length, before);
-      projection.state = 'applied'; publish(); await runtime.scan();
-      assert.equal(sent.length, before);
+      projection.state = 'applied'; publish();
+      now += 5000;
+      const resumed = await runtime.scan();
+      assert(resumed.some((entry) => entry.jobId === during.jobId));
+      assert.equal((await runtime.process(during.key, during.jobId)).status, 'sent');
+      assert.equal(sent.length, before + 1); assert.equal(sent.at(-1).session_id, 'session_materials-during');
       await deliver(message('session_materials-during', '之后的新问题'));
+      assert.equal(sent.length, before + 2);
       assert.equal(sent.at(-1).session_id, 'session_materials-during');
       fs.writeFileSync(mapFile, JSON.stringify({ synthetic: 'unapplied-map' }));
       assert.equal(runtime.settings().enabled, false, '知识投影错代禁止普通出站');
