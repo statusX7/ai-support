@@ -283,6 +283,106 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       }
     }
   });
+  await test('P0 operator 归属事务后崩溃重放保持幂等，不取消恢复期间的新消息', async () => {
+    for (const [suffix, resolved, expectedResult] of [
+      ['not-human', { automated: true }, 'not-human'],
+      ['unknown', {}, 'unknown'],
+      ['human', { automated: false }, 'human'],
+    ]) {
+      const item = await deferredOperatorCase('resolution-replay-' + suffix, resolved);
+      const originalData = structuredClone(state(item.session).jobs.find((job) => job.id === item.control.jobId).data);
+      await runtime.process(item.control.key, item.control.jobId);
+      const resolvedJob = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+      assert.equal(resolvedJob.operator_resolution.result, expectedResult);
+      const firstGeneration = state(item.session).generation;
+      const firstResume = state(item.session).resume_at;
+      if (expectedResult !== 'human') {
+        assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+      }
+      const sentBeforeNewVisitor = sent.length;
+      now += 1;
+      const later = await receive(message(item.session, '归属事务提交后、控制任务完成前到达的新问题'));
+      await runtime.transaction(item.control.key, (current) => {
+        const stored = current.jobs.find((job) => job.id === item.control.jobId);
+        // 精确模拟：operator 归属及栅栏事务已经落盘，process 的完成事务尚未提交。
+        stored.status = 'processing';
+        stored.lease_until = now - 1;
+        stored.data = originalData;
+        delete stored.plan;
+      });
+      runtime = createRuntime(env, runtimeOptions);
+      await runtime.process(item.control.key, item.control.jobId);
+      assert.equal(state(item.session).generation, firstGeneration, '重放不得再次推进会话代次');
+      assert.equal(state(item.session).resume_at, firstResume, '重放不得重复延长或改写人工截止时间');
+      if (expectedResult === 'human') {
+        assert.equal(state(item.session).jobs.find((job) => job.id === later.jobId).status, 'done');
+        assert.equal(sent.length, sentBeforeNewVisitor);
+        assert(!(await runtime.scan()).some((entry) => entry.key === later.key && entry.jobId === item.visitor.jobId),
+          '真人确认前已取消的访客任务在重启扫描后不得重放');
+      } else {
+        assert.equal(state(item.session).jobs.find((job) => job.id === later.jobId).status, 'received');
+        assert.equal((await runtime.process(later.key, later.jobId)).status, 'sent');
+        assert.equal(sent.length, sentBeforeNewVisitor + 1);
+      }
+    }
+  });
+  await test('P0 兼容旧版已移除 uncertain ID 的崩溃状态，不重复 unknown 栅栏', async () => {
+    const item = await deferredOperatorCase('legacy-resolution-replay', {});
+    const originalData = structuredClone(state(item.session).jobs.find((job) => job.id === item.control.jobId).data);
+    await runtime.process(item.control.key, item.control.jobId);
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    const firstGeneration = state(item.session).generation;
+    await runtime.transaction(item.control.key, (current) => {
+      const stored = current.jobs.find((job) => job.id === item.control.jobId);
+      delete stored.operator_resolution;
+      stored.status = 'processing';
+      stored.lease_until = now - 1;
+      stored.data = originalData;
+      delete stored.plan;
+    });
+    const sentBefore = sent.length;
+    now += 1;
+    const later = await receive(message(item.session, '旧版崩溃状态恢复后的新问题'));
+    runtime = createRuntime(env, runtimeOptions);
+    await runtime.process(item.control.key, item.control.jobId);
+    const recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    assert.equal(recovered.operator_resolution.legacy_recovered, true);
+    assert.equal(state(item.session).generation, firstGeneration);
+    assert.equal((await runtime.process(later.key, later.jobId)).status, 'sent');
+    assert.equal(sent.length, sentBefore + 1);
+  });
+  await test('P0 未决控制队列满时返回可重试失败，释放容量后访客消息只处理一次', async () => {
+    const session = 'session_deferred-capacity';
+    const operatorFingerprint = ++sequence;
+    const ambiguous = { website_id: env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: now,
+      data: { session_id: session, from: 'operator', type: 'text', content: '受控队列 operator',
+        fingerprint: operatorFingerprint, timestamp: now, user: { type: 'website', nickname: '受控来源' } } };
+    const control = await receive(ambiguous);
+    await runtime.transaction(control.key, (current) => {
+      for (let index = 0; index < 127; index += 1) current.jobs.push({
+        id: crypto.createHash('sha256').update('capacity|' + index).digest('hex'), event: 'synthetic',
+        event_time: now, received_at: now, sequence: ++current.sequence, status: 'received', attempts: 0,
+        revision: 1, generation: current.generation, control: true,
+      });
+    });
+    const visitorBody = message(session, '控制队列满时的访客问题');
+    const rejected = await receive(visitorBody);
+    assert.equal(rejected.statusCode, 503);
+    assert(!state(session).jobs.some((job) => String(job.data?.fingerprint) === String(visitorBody.data.fingerprint)),
+      '队列拒绝事务不得留下半持久化访客任务');
+    await runtime.transaction(control.key, (current) => {
+      for (const job of current.jobs) if (job.event === 'synthetic') job.status = 'cancelled';
+    });
+    const accepted = await receive(visitorBody);
+    assert.equal(accepted.route, 'ignore');
+    histories.set(session, [{ ...ambiguous.data, automated: true }, ...(histories.get(session) || [])]);
+    await runtime.process(control.key, control.jobId);
+    const before = sent.length;
+    assert.equal((await runtime.process(accepted.key, accepted.jobId)).status, 'sent');
+    assert.equal(sent.length, before + 1);
+    runtime = createRuntime(env, runtimeOptions);
+    assert(!(await runtime.scan()).some((job) => job.key === accepted.key && job.jobId === accepted.jobId));
+  });
   await test('T18 人工关键词仅展示原生可继续聊天 picker', async () => {
     const before = modelRequests.length;
     await deliver(message('session_client-a', '我想转人工'));

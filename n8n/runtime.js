@@ -1271,9 +1271,33 @@ function createRuntime(env = {}, options = {}) {
     if (job.action === 'operator') return { purpose: 'operator', tags: job.human_changed ? ['human_required'] : [] };
     if (job.action === 'resolve_operator') {
       const state = readState(key);
-      const result = await resolveOperator(state, job.data);
+      const validResolution = (value) => value && value.schema_version === 1
+        && ['human', 'not-human', 'unknown'].includes(value.result)
+        && typeof value.human_changed === 'boolean';
+      // 归属解析和其状态栅栏先于 process 的最终 done 事务提交。进程若恰在两者
+      // 之间退出，租约恢复会再次进入本分支；持久结果必须使重放成为幂等操作，
+      // 否则 unknown 会重复增加 generation 并取消恢复期间的新访客消息。
+      let result = validResolution(job.operator_resolution)
+        ? job.operator_resolution.result : await resolveOperator(state, job.data);
       let changed = false;
       await transaction(key, (current) => {
+        const stored = current.jobs.find((entry) => entry.id === job.id);
+        if (!stored) return;
+        if (validResolution(stored.operator_resolution)) {
+          result = stored.operator_resolution.result;
+          changed = stored.operator_resolution.human_changed;
+          return;
+        }
+        const firstResolution = current.uncertain_events.includes(job.id);
+        if (!firstResolution) {
+          // 兼容升级前已经完成栅栏、但尚未来得及把控制 job 置为 done 的崩溃状态。
+          // uncertain ID 已原子移除即表示旧副作用已提交；不得猜测并重复执行。
+          const alreadyHuman = current.mode === 'human' && current.human_event_id === job.id;
+          if (alreadyHuman) result = 'human';
+          changed = alreadyHuman;
+          stored.operator_resolution = { schema_version: 1, result, human_changed: changed, legacy_recovered: true };
+          return;
+        }
         current.uncertain_events = current.uncertain_events.filter((id) => id !== job.id);
         if (result === 'human') changed = pause(current, job.id, job.event_time, 'operator_reply');
         else if (result === 'unknown') {
@@ -1300,8 +1324,10 @@ function createRuntime(env = {}, options = {}) {
           // REST 回查确认不是人工后，下一轮调度即可处理期间保留的访客消息。
           for (const pending of current.jobs) if (!pending.control && pending.status === 'received') delete pending.deferred_control;
         }
+        stored.operator_resolution = { schema_version: 1, result, human_changed: changed };
       });
       job.human_changed = changed;
+      job.operator_resolution = { schema_version: 1, result, human_changed: changed };
       return { purpose: 'operator', tags: changed ? ['human_required'] : [] };
     }
     if (job.action === 'confirm_handoff') return { type: 'text', content: handoff().notify_user?.enabled === false ? '' : job.confirm_message, ordinary: false, purpose: 'handoff_ack', tags: ['human_required'] };
