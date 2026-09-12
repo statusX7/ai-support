@@ -26,7 +26,9 @@ async function main() {
     else {response.writeHead(401);response.end(JSON.stringify({error:{message:'secret-do-not-echo'}}));}
   });
   await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve));
-  const environment={AI_API_BASE_URL:`http://127.0.0.1:${upstream.address().port}/proxy/v1`,AI_API_KEY:'synthetic-key-$#=\\"',AI_MODEL:'synthetic-model',AI_API_MODE:'responses',PROVIDER_CONFIG_PATH:configurationPath,AI_CUSTOM_HEADERS_JSON:'{"X-Synthetic":"fixture"}',PROVIDER_TIMEOUT_MS:'1000'};
+  // 固定到本夹具自己的实例根，避免发布验收机上真实 /opt/crisp-ai 接口池
+  // 将这个旧单接口协议测试误切换为池模式。
+  const environment={AI_API_BASE_URL:`http://127.0.0.1:${upstream.address().port}/proxy/v1`,AI_API_KEY:'synthetic-key-$#=\\"',AI_MODEL:'synthetic-model',AI_API_MODE:'responses',PROVIDER_ROOT:work,PROVIDER_CONFIG_PATH:configurationPath,AI_CUSTOM_HEADERS_JSON:'{"X-Synthetic":"fixture"}',PROVIDER_TIMEOUT_MS:'1000'};
   const adapter=createAdapter(environment);
   await new Promise(resolve=>adapter.listen(0,'127.0.0.1',resolve));
   const base=`http://127.0.0.1:${adapter.address().port}`;
