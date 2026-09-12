@@ -826,7 +826,10 @@ function createRuntime(env = {}, options = {}) {
           }
         } else if (event === 'message:send') {
           if (data.from !== 'user' || data.automated === true || !global.enabled || state.mode !== 'ai') job.status = 'done';
-          if (state.uncertain_events.length) job.status = 'cancelled';
+          // Crisp 偶尔先投递一个缺少 automated/user_id 的 operator 事件，再紧接着
+          // 投递访客消息。归属回查完成前必须保留访客任务；直接取消会让该消息
+          // 永久丢失。控制事件仍优先，确认真人时 pause() 会精确取消这些任务。
+          if (job.status === 'received' && state.uncertain_events.length) job.deferred_control = true;
         } else if (!global.enabled || state.mode !== 'ai') job.status = 'done';
         if (!global.enabled && job.action !== 'resolve_operator' && job.action !== 'operator') job.status = 'done';
         if (job.status === 'received' && (!job.control || job.action === 'menu_action') && !providerConfigurationReady()) job.status = 'cancelled';
@@ -846,7 +849,7 @@ function createRuntime(env = {}, options = {}) {
         }
         if (['done', 'cancelled'].includes(job.status)) delete job.data;
         state.jobs.push(job);
-        return { jobId: id, pending: job.status === 'received' };
+        return { jobId: id, pending: job.status === 'received' && (job.control || state.uncertain_events.length === 0) };
       }, website, session);
     } catch (_) { return fail(503, '会话状态保存失败，请稍后重试'); }
     return { accepted: true, statusCode: 200, reason: result.duplicate ? '重复事件已忽略' : '已持久接收', route: result.pending ? 'process' : 'ignore', key, jobId: result.jobId || '', verification: mode === 'plugin' ? 'plugin-signature' : 'website-url-secret' };
@@ -1275,7 +1278,27 @@ function createRuntime(env = {}, options = {}) {
         if (result === 'human') changed = pause(current, job.id, job.event_time, 'operator_reply');
         else if (result === 'unknown') {
           current.generation += 1;
+          // 无法证明是人工时仍建立代次栅栏，丢弃该 operator 事件之前已经
+          // 开始的生成；但该事件之后、因归属未决而尚未开始的访客任务属于
+          // 新咨询，重绑定到新代次并交给持久调度器，不能永久吞掉。
+          for (const pending of current.jobs) {
+            if (pending.control || pending.status !== 'received') continue;
+            const afterControl = pending.event_time > job.event_time
+              || pending.event_time === job.event_time && pending.sequence > job.sequence;
+            if (afterControl && pending.deferred_control === true) {
+              pending.generation = current.generation;
+              pending.lease_until = 0;
+              pending.retry_at = null;
+              delete pending.inference;
+              // 多个未决 operator 必须逐个建立栅栏；最后一个控制事件确认完毕
+              // 之前保留标记，避免下一次 unknown 又把同一访客任务当成旧代。
+              if (current.uncertain_events.length === 0) delete pending.deferred_control;
+            } else if (!afterControl) pending.status = 'cancelled';
+          }
           appendEvent('control_unknown');
+        } else if (current.uncertain_events.length === 0) {
+          // REST 回查确认不是人工后，下一轮调度即可处理期间保留的访客消息。
+          for (const pending of current.jobs) if (!pending.control && pending.status === 'received') delete pending.deferred_control;
         }
       });
       job.human_changed = changed;
@@ -1466,7 +1489,8 @@ function createRuntime(env = {}, options = {}) {
         const candidates = state.jobs.filter((entry) => ['received', 'processing'].includes(entry.status) && (!entry.retry_at || entry.retry_at <= clock()));
         const controls = candidates.filter((entry) => entry.control && entry.id === requestedId);
         const priority = candidates.find((entry) => priorityConfirmation(entry) && !(entry.lease_until > clock()));
-        const selected = priority || controls[0] || candidates.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence)[0] || candidates[0];
+        const ordinary = state.uncertain_events.length ? [] : candidates.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence);
+        const selected = priority || controls[0] || ordinary[0] || candidates.find((entry) => entry.control);
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
         if (!selected.control && state.worker && state.worker.until > clock()) return null;
@@ -1701,7 +1725,7 @@ function createRuntime(env = {}, options = {}) {
         await transaction(key, (state) => {
           for (const job of state.jobs) {
             if (job.status === 'processing' && !(job.lease_until > clock())) { job.status = 'received'; job.lease_until = 0; }
-            if (job.status === 'received' && !(job.retry_at > clock())) jobs.push({ key, jobId: job.id, control: job.control });
+            if (job.status === 'received' && !(job.retry_at > clock()) && (job.control || state.uncertain_events.length === 0)) jobs.push({ key, jobId: job.id, control: job.control });
           }
         });
       }

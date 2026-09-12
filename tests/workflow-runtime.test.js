@@ -173,6 +173,116 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     input.headers['X-Crisp-Request-Timestamp'] = String(now - 400000);
     assert.equal((await plugin.receive(input, { data: { data: Buffer.from(raw).toString('base64') } })).statusCode, 401);
   });
+  const deferredOperatorCase = async (suffix, resolved, advance = 5) => {
+    const session = 'session_deferred-' + suffix;
+    const operatorFingerprint = ++sequence;
+    const ambiguous = {
+      website_id: env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: now,
+      data: { session_id: session, from: 'operator', type: 'text', content: '受控 operator 事件',
+        fingerprint: operatorFingerprint, timestamp: now, user: { type: 'website', nickname: '受控来源' } },
+    };
+    const control = await receive(ambiguous);
+    assert.equal(control.route, 'process');
+    now += advance;
+    const visitor = await receive(message(session, 'operator 归属确认期间的新问题'));
+    assert.equal(visitor.route, 'ignore', '未决控制期间访客任务只持久化，不应立即抢跑');
+    const visitorJob = () => state(session).jobs.find((job) => job.id === visitor.jobId);
+    assert.equal(visitorJob().status, 'received');
+    assert.equal(visitorJob().deferred_control, true);
+    histories.set(session, [{ ...ambiguous.data, ...resolved }, ...(histories.get(session) || [])]);
+    return { session, control, visitor, visitorJob };
+  };
+  await test('P0 不确定 operator 回查为自动消息后，期间访客任务继续调度', async () => {
+    const before = sent.length;
+    const item = await deferredOperatorCase('automated', { automated: true });
+    await runtime.process(item.control.key, item.control.jobId);
+    assert.equal(state(item.session).uncertain_events.length, 0);
+    assert.equal(item.visitorJob().status, 'received');
+    assert.equal(item.visitorJob().deferred_control, undefined);
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    assert.equal(sent.length, before + 1);
+  });
+  await test('P0 不确定 operator 仍无法归属时建立代次栅栏，但不吞掉其后的新问题', async () => {
+    const before = sent.length;
+    const item = await deferredOperatorCase('unknown', {});
+    const previousGeneration = state(item.session).generation;
+    await runtime.process(item.control.key, item.control.jobId);
+    assert.equal(state(item.session).generation, previousGeneration + 1);
+    assert.equal(item.visitorJob().generation, state(item.session).generation);
+    assert.equal(item.visitorJob().status, 'received');
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    assert.equal(sent.length, before + 1);
+  });
+  await test('P0 同一时间戳按持久 sequence 判断先后，控制后的访客消息仍处理一次', async () => {
+    const before = sent.length;
+    const item = await deferredOperatorCase('same-timestamp', {}, 0);
+    assert.equal(item.visitorJob().event_time, state(item.session).jobs.find((job) => job.id === item.control.jobId).event_time);
+    assert(item.visitorJob().sequence > state(item.session).jobs.find((job) => job.id === item.control.jobId).sequence);
+    await runtime.process(item.control.key, item.control.jobId);
+    assert.equal(item.visitorJob().status, 'received');
+    assert.equal(item.visitorJob().generation, state(item.session).generation);
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    assert.equal(sent.length, before + 1);
+  });
+  await test('P0 不确定 operator 回查为真人后，只取消当前会话保留的问题', async () => {
+    const before = sent.length;
+    const item = await deferredOperatorCase('human', { automated: false });
+    await runtime.process(item.control.key, item.control.jobId);
+    assert.equal(state(item.session).mode, 'human');
+    assert.equal(item.visitorJob().status, 'cancelled');
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'idle');
+    assert.equal(sent.length, before);
+  });
+  await test('P0 调度并发只先处理未决控制，重启状态保持且后续访客不丢失', async () => {
+    const before = sent.length;
+    const item = await deferredOperatorCase('scheduler', { automated: true });
+    runtime = createRuntime(env, runtimeOptions);
+    const first = (await runtime.scan()).filter((job) => job.key === item.control.key);
+    assert.deepEqual(first.map((job) => [job.jobId, job.control]), [[item.control.jobId, true]]);
+    await Promise.all(first.map((job) => runtime.process(job.key, job.jobId)));
+    const second = (await runtime.scan()).filter((job) => job.key === item.control.key);
+    assert.deepEqual(second.map((job) => [job.jobId, job.control]), [[item.visitor.jobId, false]]);
+    await Promise.all(second.map((job) => runtime.process(job.key, job.jobId)));
+    assert.equal(sent.length, before + 1);
+  });
+  await test('P0 多个未决 operator 逐次建立栅栏，最后归属前不提前释放访客任务', async () => {
+    for (const [suffix, resolutions, shouldSend] of [
+      ['unknown-then-automated', [{}, { automated: true }], true],
+      ['unknown-then-unknown', [{}, {}], true],
+      ['unknown-then-human', [{}, { automated: false }], false],
+    ]) {
+      const before = sent.length;
+      const session = 'session_multi-control-' + suffix;
+      const controls = [];
+      const originals = [];
+      for (let index = 0; index < 2; index += 1) {
+        const data = { session_id: session, from: 'operator', type: 'text', content: '受控多控制事件',
+          fingerprint: ++sequence, timestamp: now, user: { type: 'website', nickname: '受控来源' } };
+        originals.push(data);
+        controls.push(await receive({ website_id: env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: now, data }));
+      }
+      now += 1;
+      const visitor = await receive(message(session, '两个 operator 归属确认期间的新问题'));
+      const visitorJob = () => state(session).jobs.find((job) => job.id === visitor.jobId);
+      assert.equal(visitorJob().deferred_control, true);
+      histories.set(session, [...originals.map((data, index) => ({ ...data, ...resolutions[index] })), ...(histories.get(session) || [])]);
+      await runtime.process(controls[0].key, controls[0].jobId);
+      assert.equal(state(session).uncertain_events.length, 1);
+      assert.equal(visitorJob().deferred_control, true, '尚有第二个未决控制时不能提前释放');
+      await runtime.process(controls[1].key, controls[1].jobId);
+      if (shouldSend) {
+        assert.equal(state(session).mode, 'ai');
+        assert.equal(visitorJob().status, 'received');
+        assert.equal(visitorJob().deferred_control, undefined);
+        assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'sent');
+        assert.equal(sent.length, before + 1);
+      } else {
+        assert.equal(state(session).mode, 'human');
+        assert.equal(visitorJob().status, 'cancelled');
+        assert.equal(sent.length, before);
+      }
+    }
+  });
   await test('T18 人工关键词仅展示原生可继续聊天 picker', async () => {
     const before = modelRequests.length;
     await deliver(message('session_client-a', '我想转人工'));
