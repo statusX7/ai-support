@@ -458,11 +458,82 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     let finish; delayed = new Promise((resolve) => { finish = resolve; });
     const entry = await receive(message('session_slowmodel1', '慢问题'));
     const pending = runtime.process(entry.key, entry.jobId); await wait(30);
+    assert.equal(state('session_slowmodel1').worker.job, entry.jobId);
     now += 5; await operator('session_slowmodel1'); await deliver(message('session_parallel-b', 'B 的快速问题'));
-    assert.equal(state('session_slowmodel1').mode, 'human'); const before = sent.filter((entry) => entry.session_id === 'session_slowmodel1').length;
+    assert.equal(state('session_slowmodel1').mode, 'human');
+    assert.equal(state('session_slowmodel1').worker, null, '真人事务取消 processing job 时必须同步释放其 worker');
+    const generationAfterPause = state('session_slowmodel1').generation;
+    await operator('session_slowmodel1', { fingerprint: sequence - 1, timestamp: now - 1 });
+    assert.equal(state('session_slowmodel1').worker, null, '重复/旧人工控制不得恢复已取消 worker');
+    assert.equal(state('session_slowmodel1').generation, generationAfterPause);
+    const before = sent.filter((entry) => entry.session_id === 'session_slowmodel1').length;
     finish(); await pending;
     assert.equal(sent.filter((entry) => entry.session_id === 'session_slowmodel1').length, before);
     assert.equal(sent.at(-1).session_id, 'session_parallel-b');
+  });
+  await test('P0 worker 崩溃恢复只清孤儿或过期租约，保留活跃任务并隔离会话', async () => {
+    const staleSession = 'session_worker-stale';
+    const stale = await receive(message(staleSession, '过期 worker 的问题'));
+    await runtime.transaction(stale.key, (current) => {
+      const job = current.jobs.find((entry) => entry.id === stale.jobId);
+      job.status = 'processing'; job.lease_until = now - 1;
+      current.worker = { job: job.id, token: 'stale-token', until: now - 1 };
+    });
+    const orphanSession = 'session_worker-orphan';
+    const orphanKey = key(orphanSession);
+    await runtime.transaction(orphanKey, (current) => {
+      current.worker = { job: 'f'.repeat(64), token: 'orphan-token', until: now + 60000 };
+    }, env.CRISP_WEBSITE_ID, orphanSession);
+    const cancelledSession = 'session_worker-cancelled';
+    const cancelled = await receive(message(cancelledSession, '已取消任务不得重放'));
+    await runtime.transaction(cancelled.key, (current) => {
+      const job = current.jobs.find((entry) => entry.id === cancelled.jobId);
+      job.status = 'cancelled'; delete job.data;
+      current.worker = { job: job.id, token: 'cancelled-token', until: now + 60000 };
+    });
+    const receivedSession = 'session_worker-received';
+    const received = await receive(message(receivedSession, '待处理任务应在孤儿 worker 清理后继续'));
+    await runtime.transaction(received.key, (current) => {
+      current.worker = { job: received.jobId, token: 'received-token', until: now + 60000 };
+    });
+    const activeSession = 'session_worker-active';
+    const active = await receive(message(activeSession, '活跃 worker 不得被扫描器清理'));
+    await runtime.transaction(active.key, (current) => {
+      const job = current.jobs.find((entry) => entry.id === active.jobId);
+      job.status = 'processing'; job.lease_until = now + 60000;
+      current.worker = { job: job.id, token: 'active-token', until: now + 60000 };
+    });
+    const permanentSession = 'session_worker-permanent';
+    await runtime.transaction(key(permanentSession), (current) => {
+      current.mode = 'human'; current.generation = 7; current.resume_at = null;
+      current.worker = { job: 'e'.repeat(64), token: 'permanent-orphan', until: now + 60000 };
+    }, env.CRISP_WEBSITE_ID, permanentSession);
+
+    runtime = createRuntime(env, runtimeOptions);
+    const scanJobs = await runtime.scan();
+    assert.equal(state(staleSession).worker, null);
+    assert(scanJobs.some((item) => item.key === stale.key && item.jobId === stale.jobId),
+      '过期 processing 租约应恢复为可调度任务');
+    assert.equal(state(orphanSession).worker, null);
+    assert.equal(state(cancelledSession).worker, null);
+    assert.equal(state(receivedSession).worker, null);
+    assert(!scanJobs.some((item) => item.key === cancelled.key && item.jobId === cancelled.jobId),
+      '已取消任务不得因孤儿 worker 被重新调度');
+    assert.deepEqual(state(activeSession).worker, { job: active.jobId, token: 'active-token', until: now + 60000 });
+    assert(!scanJobs.some((item) => item.key === active.key), '活跃 processing worker 不得被重复调度');
+    assert.equal(state(permanentSession).worker, null);
+    assert.equal(state(permanentSession).mode, 'human');
+    assert.equal(state(permanentSession).generation, 7);
+    assert.equal(state(permanentSession).resume_at, null);
+
+    const before = sent.length;
+    await runtime.process(stale.key, stale.jobId);
+    assert.equal(sent.length, before + 1);
+    await runtime.process(received.key, received.jobId);
+    assert.equal(sent.length, before + 2, 'received job 清理孤儿 worker 后只应正常处理一次');
+    const fresh = await receive(message(orphanSession, '孤儿 worker 清理后的新问题'));
+    assert.equal((await runtime.process(fresh.key, fresh.jobId)).status, 'sent');
+    assert.equal(state(activeSession).worker.token, 'active-token', '其他会话恢复不得触碰活跃 worker');
   });
   await test('P0 人工接管中止已登记但仍挂起的 Crisp 出站，A 不补发且 B 独立', async () => {
     let release;

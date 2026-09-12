@@ -551,9 +551,21 @@ function createRuntime(env = {}, options = {}) {
     }
     return state;
   };
+  const normalizeWorker = (state, at = clock()) => {
+    if (state.worker === null || state.worker === undefined) return state;
+    const worker = state.worker;
+    const job = worker && typeof worker === 'object' && Array.isArray(state.jobs)
+      ? state.jobs.find((entry) => entry && entry.id === worker.job) : null;
+    // 活跃 worker 必须同时拥有尚未到期的 worker 租约和同一 processing job
+    // 的处理租约。其余均是崩溃/旧版本遗留的孤儿引用，可以只清 worker；
+    // 不改变会话模式、generation、人工截止时间或 job 本身的恢复语义。
+    if (!job || job.status !== 'processing' || !(worker.until > at) || !(job.lease_until > at)) state.worker = null;
+    return state;
+  };
   const expire = (state) => {
     retireFeedback(state);
     normalizeSafeErrors(state);
+    normalizeWorker(state);
     if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= clock()) {
       state.mode = 'ai';
       state.generation += 1;
@@ -577,7 +589,7 @@ function createRuntime(env = {}, options = {}) {
   };
   const readState = (key, website, session) => {
     const current = safeRead(statePath(key), null);
-    if (current) return normalizeSafeErrors(retireFeedback(current));
+    if (current) return normalizeWorker(normalizeSafeErrors(retireFeedback(current)));
     const fresh = emptyState(website, session);
     if (website && session) {
       const legacy = safeRead(directory + '/session-' + hash(session) + '.json', null);
@@ -632,7 +644,14 @@ function createRuntime(env = {}, options = {}) {
     state.resume_at = seconds === 0 ? null : eventTime + seconds * 1000;
     state.pending_feedback = null;
     state.offers = {};
-    for (const job of state.jobs) if (!job.control && !['done', 'failed'].includes(job.status)) job.status = 'cancelled';
+    const cancelled = new Set();
+    for (const job of state.jobs) {
+      if (!job.control && !['done', 'failed'].includes(job.status)) {
+        job.status = 'cancelled';
+        cancelled.add(job.id);
+      }
+    }
+    if (state.worker && cancelled.has(state.worker.job)) state.worker = null;
     return true;
   };
   const appendEvent = (type, details = {}) => {
@@ -1602,6 +1621,12 @@ function createRuntime(env = {}, options = {}) {
     if (!state || state.schema_version !== 2 || !Array.isArray(state.jobs)
       || !state.offers || typeof state.offers !== 'object' || Array.isArray(state.offers)
       || !state.outgoing || typeof state.outgoing !== 'object' || Array.isArray(state.outgoing)) return true;
+    if (state.worker !== null && state.worker !== undefined) {
+      const worker = state.worker;
+      const workerJob = worker && typeof worker === 'object'
+        ? state.jobs.find((job) => job && job.id === worker.job) : null;
+      if (!workerJob || workerJob.status !== 'processing' || !(worker.until > at) || !(workerJob.lease_until > at)) return true;
+    }
     if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= at) return true;
     if (state.pending_feedback !== null && state.pending_feedback !== undefined) return true;
     if (Object.values(state.offers).some((offer) => feedbackOnly(offer)

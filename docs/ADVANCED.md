@@ -11,12 +11,12 @@ crispai_get_file=$(mktemp /tmp/crispai-maintenance.XXXXXXXX) && \
 curl -q --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 \
   https://raw.githubusercontent.com/statusX7/ai-support/main/get.sh -o "$crispai_get_file" && \
 bash -n "$crispai_get_file" && test "$(tail -n 1 "$crispai_get_file")" = '# crispai-get-end' && \
-bash "$crispai_get_file" --deploy-dir /opt/crisp-ai --update --release v1.2.0
+bash "$crispai_get_file" --deploy-dir /opt/crisp-ai --update --release v1.2.1
 ```
 
-这也适用于 v1.1.0/v1.1.1 升级：独立 get.sh 下载并校验指定 v1.2.0 后调用兼容更新链。必须在真实交互终端执行，原目录须有有效受管标记。操作完成后可删除刚创建的临时入口文件；部署内的入口不依赖它。
+这也适用于 v1.1.0/v1.1.1/v1.2.0 升级：独立 get.sh 下载并校验指定 v1.2.1 后调用兼容更新链。必须在真实交互终端执行，原目录须有有效受管标记。操作完成后可删除刚创建的临时入口文件；部署内的入口不依赖它。
 
-已有 get.sh 可使用 `--release v1.2.0` 固定版本、`--deploy-dir /opt/my-crisp-ai` 自定义目录、`--update` 明确升级。默认已有完整实例打开菜单；低于已装版本的目标被拒绝，回滚使用快照。
+已有 get.sh 可使用 `--release v1.2.1` 固定版本、`--deploy-dir /opt/my-crisp-ai` 自定义目录、`--update` 明确升级。默认已有完整实例打开菜单；低于已装版本的目标被拒绝，回滚使用快照。
 
 ## 命令损坏时的独立救援
 
@@ -26,7 +26,7 @@ bash "$crispai_get_file" --deploy-dir /opt/crisp-ai --update --release v1.2.0
 bash "$crispai_get_file" --deploy-dir /opt/crisp-ai --repair
 ```
 
-救援会读取本机版本并校验**同一个正式版本**的完整包，只恢复受管启动器和命令归属；不依赖损坏的 `crispai`，不询问十项、不改 Key、Prompt、知识或人工状态。`--repair` 与 `--update` 不可混用，也不跨版本。若实例本体程序缺失/归属不明，会明确拒绝；完整程序更新使用上面的 `--update --release v1.2.0` 或可信完整恢复，不无声重装。兼容 `crisp` 存在外来程序时保留对方命令。
+救援会读取本机版本并校验**同一个正式版本**的完整包，只恢复受管启动器和命令归属；不依赖损坏的 `crispai`，不询问十项、不改 Key、Prompt、知识或人工状态。`--repair` 与 `--update` 不可混用，也不跨版本。若实例本体程序缺失/归属不明，会明确拒绝；完整程序更新使用上面的 `--update --release v1.2.1` 或可信完整恢复，不无声重装。兼容 `crisp` 存在外来程序时保留对方命令。
 
 ## 可信离线完整包
 
@@ -34,8 +34,8 @@ bash "$crispai_get_file" --deploy-dir /opt/crisp-ai --repair
 
 ```bash
 sha256sum -c SHA256SUMS && \
-tar -xzf ai-support-v1.2.0.tar.gz && \
-sudo bash ai-support-v1.2.0/install.sh --deploy-dir /opt/crisp-ai
+tar -xzf ai-support-v1.2.1.tar.gz && \
+sudo bash ai-support-v1.2.1/install.sh --deploy-dir /opt/crisp-ai
 ```
 
 手工解压仅针对已信任且校验通过的正式资产。在线引导器另有路径/链接/成员数/展开大小检查；不把不可信上传包直接交给 tar。SHA256 是完整性检查，不是独立签名。

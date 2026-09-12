@@ -57,7 +57,15 @@ def main():
         assert match, path
         command = match.group(1).encode()
         assert len(command) == 1779 and hashlib.sha256(command).hexdigest() == COMMAND_DIGEST, path
-    passing("README、INSTALL、当前 Release 推荐命令逐字相同且保留已实测原样")
+    advanced = documents[ROOT / "docs/ADVANCED.md"]
+    advanced_blocks = re.findall(r"```bash[ \t]*\n(.*?)\n```", advanced, re.S)
+    versioned_blocks = [block for block in advanced_blocks if "--release " in block or "ai-support-v" in block]
+    assert versioned_blocks, "高级维护文档缺少固定版本示例"
+    for block in versioned_blocks:
+        releases = re.findall(r"--release\s+(v\d+\.\d+\.\d+)", block)
+        archives = re.findall(r"ai-support-(v\d+\.\d+\.\d+)(?:\.tar\.gz|/install\.sh)", block)
+        assert all(item == version for item in releases + archives), (version, block)
+    passing("README、INSTALL、当前 Release 推荐命令一致，高级维护示例同步当前 VERSION")
 
     count = 0
     for path, content in documents.items():
