@@ -986,6 +986,16 @@ pass '默认业务备份与菜单迁移统一，包含全部命名库原文和�
 
 # 旧离线恢复契约仍用真实已发布 v1.1.1 备份器生成的 v1 包验收；不能让
 # 新备份遗漏多库来维持旧夹具，也不能删除原有的离线恢复与安全断言。
+RESTORE_EXTENSION_TEMP=$(mktemp "${DEPLOY_DIR}/config/handoff.extension.XXXXXXXX")
+jq -M '.handoff.restore_test_extension={preserved:true}' "${DEPLOY_DIR}/config/handoff.yaml" \
+  > "$RESTORE_EXTENSION_TEMP"
+chmod 0640 "$RESTORE_EXTENSION_TEMP"
+mv -f -- "$RESTORE_EXTENSION_TEMP" "${DEPLOY_DIR}/config/handoff.yaml"
+RESTORE_EXTENSION_TEMP=$(mktemp "${DEPLOY_DIR}/config/provider.extension.XXXXXXXX")
+jq -M '.provider.restore_test_extension={preserved:true}' "${DEPLOY_DIR}/config/provider.yaml" \
+  > "$RESTORE_EXTENSION_TEMP"
+chmod 0640 "$RESTORE_EXTENSION_TEMP"
+mv -f -- "$RESTORE_EXTENSION_TEMP" "${DEPLOY_DIR}/config/provider.yaml"
 mkdir -p -- "${TEST_ROOT}/legacy-backup-tools"
 git -C "$PROJECT_ROOT" show 'v1.1.1:scripts/backup.sh' > "${TEST_ROOT}/legacy-backup-tools/backup.sh"
 cp -- "${DEPLOY_DIR}/scripts/common.sh" "${TEST_ROOT}/legacy-backup-tools/common.sh"
@@ -1004,6 +1014,53 @@ grep -Fq '正在运行，不能使用 --skip-restart' "${TEST_ROOT}/restore-runn
   || fail "服务运行中的离线恢复没有清晰拒绝原因"
 grep -Fq '临时 Prompt，恢复后应被替换。' "${DEPLOY_DIR}/config/prompt.md" \
   || fail "拒绝运行中恢复前已修改配置"
+
+# 语法合法但不符合当前 schema 或边界的现代配置必须在候选区失败；
+# 不能先覆盖活动配置，再依赖一个并未自动执行的安全备份恢复。
+assert_invalid_restore_candidate_rejected() {
+  local name=$1 expected=$2 stage="${TEST_ROOT}/restore-invalid-${1}-stage"
+  local archive="${DEPLOY_DIR}/backups/legacy-v1-invalid-modern-${1}.tar.gz"
+  local log="${TEST_ROOT}/restore-invalid-modern-${1}.log" before status=0
+  mkdir -p -- "$stage"
+  tar -xzf "$ARCHIVE" -C "$stage"
+  case "$name" in
+    handoff)
+      printf '%s\n' '{"handoff":{"keywords":["人工"],"match_mode":"contains","resume_after_seconds":3600,"disable_ai":true,"notify_user":{"enabled":true}}}' \
+        > "${stage}/config/handoff.yaml"
+      ;;
+    provider)
+      printf '%s\n' '{"schema_version":2,"provider":{"type":"openai-compatible","base_url":"https://provider.invalid/v1","api_key_env":"AI_API_KEY","model":"","api_mode":"chat_completions"}}' \
+        > "${stage}/config/provider.yaml"
+      ;;
+    prompt) : > "${stage}/config/prompt.md" ;;
+    *) fail '损坏恢复候选夹具名称无效' ;;
+  esac
+  (
+    cd -- "$stage"
+    find . -type f ! -name 'checksums.sha256' -print0 | sort -z | xargs -0 sha256sum > checksums.sha256
+  )
+  tar -czf "$archive" -C "$stage" .
+  before=$(find "${DEPLOY_DIR}/config" -maxdepth 1 -type f -print0 \
+    | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)
+  : > "$MOCK_DOCKER_LOG"
+  env MOCK_DOCKER_NO_RUNNING=1 "${DEPLOY_DIR}/scripts/restore.sh" \
+    --deploy-dir "$DEPLOY_DIR" --input "$archive" --skip-restart --no-safety-backup \
+    > "$log" 2>&1 || status=$?
+  (( status != 0 )) || fail "现代损坏 ${name} 被旧格式恢复错误接受"
+  grep -Fq "$expected" "$log" || fail "现代损坏 ${name} 恢复未定位到候选校验"
+  grep -Fq '尚未停止服务或覆盖现有资料' "$log" \
+    || fail "现代损坏 ${name} 恢复未说明活动状态保持不变"
+  [[ "$(find "${DEPLOY_DIR}/config" -maxdepth 1 -type f -print0 \
+    | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)" == "$before" ]] \
+    || fail "现代损坏 ${name} 恢复失败前已覆盖活动配置"
+  if grep -Eq '(^| )(stop|up)( |$)' "$MOCK_DOCKER_LOG"; then
+    fail "现代损坏 ${name} 候选预检失败后仍操作了服务"
+  fi
+}
+assert_invalid_restore_candidate_rejected handoff 'handoff 配置格式或边界无效'
+assert_invalid_restore_candidate_rejected provider '恢复包中的 provider 配置未通过候选校验'
+assert_invalid_restore_candidate_rejected prompt 'Prompt 必须为 1～262144 个 UTF-8 字节'
+pass '旧格式恢复先在候选区迁移并严格校验，现代损坏配置失败零活动修改'
 
 RESTORE_PRECHECK_PROMPT_HASH=$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | cut -d ' ' -f 1)
 RESTORE_PRECHECK_MANIFEST_HASH=$(sha256sum "${DEPLOY_DIR}/data/knowledge-manifest.json" | cut -d ' ' -f 1)
@@ -1057,6 +1114,10 @@ env MOCK_DOCKER_NO_RUNNING=1 "${DEPLOY_DIR}/scripts/restore.sh" \
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "Prompt 未恢复"
 [[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] || fail "知识文件未恢复"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "恢复覆盖了 .env"
+jq -e '.handoff.restore_test_extension.preserved == true' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null \
+  || fail 'handoff 现代扩展字段在候选规范化中丢失'
+jq -e '.provider.restore_test_extension.preserved == true' "${DEPLOY_DIR}/config/provider.yaml" >/dev/null \
+  || fail 'provider 现代扩展字段在候选规范化中丢失'
 pass "无密钥备份、运行中拒绝与完整离线恢复"
 
 "${SCRIPT_DIR}/test_archive_security.sh" "$DEPLOY_DIR" "$ARCHIVE"

@@ -323,6 +323,7 @@ setup_restore_fixture() {
   mkdir -p -- "${deploy}/scripts" "${deploy}/config" "${deploy}/tmp" \
     "${deploy}/backups" "${deploy}/data/runtime" "${deploy}/knowledge" "${deploy}/n8n"
   install -m 0700 -- "${PROJECT_ROOT}/scripts/restore.sh" "${deploy}/scripts/restore.sh"
+  install -m 0700 -- "${PROJECT_ROOT}/scripts/configuration.sh" "${deploy}/scripts/configuration.sh"
   write_caller_common "${deploy}/scripts/common.sh"
   write_installation_marker_fixture "$deploy"
   cat > "${deploy}/.env" <<'EOF'
@@ -332,6 +333,12 @@ EOF
   chmod 0600 "${deploy}/.env"
   printf 'services: {}\n' > "${deploy}/docker-compose.yml"
   printf '恢复前 Prompt。\n' > "${deploy}/config/prompt.md"
+  for name in keyword menu handoff tags feedback runtime; do
+    install -m 0640 -- "${PROJECT_ROOT}/config/${name}.yaml.example" \
+      "${deploy}/config/${name}.yaml"
+  done
+  printf '%s\n' '{"schema_version":2,"provider":{"type":"openai-compatible","base_url":"https://provider.invalid/v1","api_key_env":"AI_API_KEY","model":"fixture-model","api_mode":"chat_completions","custom_header_names":[],"capabilities":{"chat_completions":true,"responses":false,"vision":false},"context_window":8192,"max_output_tokens":1200}}' \
+    > "${deploy}/config/provider.yaml"
   printf '恢复前 Caddy。\n' > "${deploy}/config/Caddyfile"
   printf '%s\n' '{"version":1,"files":{},"pending_files":{},"garbage_locations":[]}' \
     > "${deploy}/data/knowledge-manifest.json"

@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=scripts/configuration.sh
+source "${SCRIPT_DIR}/configuration.sh"
 
 DEPLOY_REQUEST=""
 INPUT_REQUEST=""
@@ -226,6 +228,94 @@ if [[ -f "${STAGING}/config/provider.yaml" ]] \
   die "备份中的 provider.yaml 包含疑似密钥字段，拒绝恢复"
 fi
 
+# 先在隔离候选目录中合并“当前配置 + 备份覆盖项”，完成旧 schema 迁移和
+# 当前版本严格校验。此阶段不能停止服务、创建安全备份或覆盖活动配置；否则
+# 一个语法有效但 schema 损坏的历史文件会让恢复失败后仍遗留半套配置。
+CONFIG_CANDIDATE="${STAGING}/config-candidate"
+mkdir -m 0700 -- "${CONFIG_CANDIDATE}"
+mkdir -m 0700 -- "${CONFIG_CANDIDATE}/config" "${CONFIG_CANDIDATE}/tmp" \
+  "${CONFIG_CANDIDATE}/backups"
+mkdir -m 0700 -- "${CONFIG_CANDIDATE}/backups/config-history"
+ACTIVE_CONFIG_FILES=(provider.yaml prompt.md keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml runtime.yaml)
+for config_name in "${ACTIVE_CONFIG_FILES[@]}"; do
+  config_source="${DEPLOY_DIR}/config/${config_name}"
+  if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
+    config_source="${STAGING}/config/${config_name}"
+  fi
+  [[ -f "$config_source" && ! -L "$config_source" ]] \
+    || die "恢复候选缺少必要业务配置：${config_name}；尚未停止服务或覆盖现有资料"
+  install -m 0640 -- "$config_source" "${CONFIG_CANDIDATE}/config/${config_name}"
+done
+migrate_config_files "$CONFIG_CANDIDATE"
+if ! configuration_migrate "$CONFIG_CANDIDATE"; then
+  die '恢复包中的业务配置未通过候选迁移；尚未停止服务或覆盖现有资料'
+fi
+provider_normalized=$(mktemp "${CONFIG_CANDIDATE}/tmp/provider.normalized.XXXXXXXX")
+if ! configuration_decode_file "${CONFIG_CANDIDATE}/config/provider.yaml" "$provider_normalized" \
+  || ! jq -M -e '
+    . as $root |
+    .schema_version == 2 and (.provider | type == "object") and
+    .provider.type == "openai-compatible" and .provider.api_key_env == "AI_API_KEY" and
+    (.provider.base_url | type == "string" and length > 0) and
+    (.provider.model | type == "string" and length > 0) and
+    (.provider.api_mode == "chat_completions" or .provider.api_mode == "responses") and
+    ((.provider.custom_header_names // []) | type == "array" and length <= 32 and
+      all(type == "string" and test("^[A-Za-z][A-Za-z0-9-]{0,99}$"))) and
+    ((.provider.capabilities // {}) | type == "object" and
+      all(to_entries[]; (.key == "chat_completions" or .key == "responses" or .key == "vision") and
+        (.value | type == "boolean"))) and
+    ((.provider.context_window // 8192) | type == "number" and floor == . and . >= 256 and . <= 2097152) and
+    ((.provider.max_output_tokens // 1200) | type == "number" and floor == . and . >= 1 and
+      . < ($root.provider.context_window // 8192))
+  ' "$provider_normalized" >/dev/null \
+  || ! validate_model_identifier "$(jq -M -r '.provider.model // ""' "$provider_normalized")" \
+  || ! python3 -B - "$provider_normalized" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+
+try:
+    provider = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["provider"]
+    value = provider["base_url"]
+    if not isinstance(value, str) or not 0 < len(value) <= 4096:
+        raise ValueError
+    base = value.rstrip("/")
+    if not base or any(c in base for c in ("?", "#", "\\")) or any(ord(c) <= 32 or ord(c) == 127 for c in base):
+        raise ValueError
+    parsed = urllib.parse.urlsplit(base)
+    decoded = urllib.parse.unquote(parsed.path, errors="strict")
+    port = parsed.port
+    if (parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or
+            parsed.password or parsed.query or parsed.fragment or
+            (port is not None and not 1 <= port <= 65535) or
+            (parsed.scheme == "http" and parsed.hostname not in
+             ("127.0.0.1", "localhost", "host.docker.internal", "::1")) or
+            any(part in (".", "..") for part in decoded.split("/"))):
+        raise ValueError
+except (KeyError, OSError, TypeError, ValueError, UnicodeError):
+    raise SystemExit(1)
+PY
+  then
+  rm -f -- "$provider_normalized"
+  die '恢复包中的 provider 配置未通过候选校验；尚未停止服务或覆盖现有资料'
+fi
+chmod 0640 "$provider_normalized"
+mv -f -- "$provider_normalized" "${CONFIG_CANDIDATE}/config/provider.yaml"
+if ! configuration_prompt_candidate_validate "${CONFIG_CANDIDATE}/config/prompt.md"; then
+  die '恢复包中的 Prompt 未通过候选校验；尚未停止服务或覆盖现有资料'
+fi
+for config_name in runtime handoff keyword menu tags feedback; do
+  normalized=$(mktemp "${CONFIG_CANDIDATE}/tmp/${config_name}.normalized.XXXXXXXX")
+  if ! configuration_normalize_file "$config_name" \
+    "${CONFIG_CANDIDATE}/config/${config_name}.yaml" "$normalized"; then
+    rm -f -- "$normalized"
+    die "恢复包中的 ${config_name} 配置未通过严格校验；尚未停止服务或覆盖现有资料"
+  fi
+  chmod 0640 "$normalized"
+  mv -f -- "$normalized" "${CONFIG_CANDIDATE}/config/${config_name}.yaml"
+done
+
 preflight_current_knowledge_generation() {
   local profile="${DEPLOY_DIR}/data/runtime/knowledge-profile.json"
   local migration="${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
@@ -310,14 +400,14 @@ CURRENT_KNOWLEDGE_GENERATION=$(preflight_current_knowledge_generation)
 [[ "$CURRENT_KNOWLEDGE_GENERATION" == "$INITIAL_KNOWLEDGE_GENERATION" ]] \
   || die '知识索引代次在恢复预检期间发生变化；现有资料未覆盖'
 
-for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.example keyword.yaml keyword.yaml.example menu.yaml menu.yaml.example handoff.yaml handoff.yaml.example tags.yaml tags.yaml.example feedback.yaml feedback.yaml.example Caddyfile Caddyfile.example; do
+for config_name in "${ACTIVE_CONFIG_FILES[@]}"; do
+  install -m 0640 -- "${CONFIG_CANDIDATE}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
+done
+for config_name in provider.yaml.example prompt.md.example keyword.yaml.example menu.yaml.example handoff.yaml.example tags.yaml.example feedback.yaml.example Caddyfile Caddyfile.example; do
   if [[ -f "${STAGING}/config/${config_name}" && ! -L "${STAGING}/config/${config_name}" ]]; then
     install -m 0640 -- "${STAGING}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
   fi
 done
-migrate_config_files "$DEPLOY_DIR"
-bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate \
-  || die '恢复包中的业务配置未通过迁移与严格校验；现有实例将从安全备份恢复'
 if [[ -f "${STAGING}/n8n/workflow.json" ]]; then
   install -m 0640 -- "${STAGING}/n8n/workflow.json" "${DEPLOY_DIR}/n8n/workflow.json"
 fi
