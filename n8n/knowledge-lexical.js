@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const MAX_INDEX_BYTES = 16 * 1024 * 1024;
 const MAX_PASSAGE_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 2 * 1024 * 1024;
+const MAX_SYNONYM_BYTES = 4096;
 const ALGORITHM = 'crispai-lexical-v1';
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -111,6 +112,62 @@ function tokens(value) {
   return {found,chinese};
 }
 
+// 这是一组有界、与具体知识正文无关的紧义中文概念，只用于 FAQ 词法兜底。
+// 它不改变索引、映射或启停校验，也不把该分支提升为可跳过向量的 strong 命中。
+const CHINESE_CONCEPTS=[
+  ['capability',['是否支持','是否可以','可不可以','能不能','不支持','不允许','不能','支持','提供','可以','能够','能否','可否','允许','能']],
+  ['storage',['临时保管','寄存','存放','保管','暂存']],
+  ['change',['修改','更改','变更','改动']],
+  ['account',['账户','账号','帐号']],
+  ['sign_in',['登录','登入','登陆']],
+  ['passcode',['密码','口令']],
+  ['open',['开启','打开','启封']],
+  ['close',['关闭','关停']],
+  ['remove',['删除','移除','清除']],
+  ['lookup',['查询','查看','查找']],
+  ['purchase',['购买','订购','选购']],
+  ['booking',['预约','预订']],
+  ['refund',['退款','退费']],
+  ['cost',['费用','价钱','价格']],
+  ['expiry',['到期','过期','失效']],
+].map(([name,terms])=>({name,terms:[...terms].sort((left,right)=>right.length-left.length)}));
+const SYNONYM_ANCHOR_COMMON=/能不能|是不是|能否|怎样|哪里|哪儿|想问|想要|请教|关于|有关|相关|这个|那个|事情|情况|内容|资料|服务|业务|事项|功能/gu;
+function longestTerms(value,terms) {
+  const matched=[]; let remaining=value;
+  for(const term of terms) {
+    if(!remaining.includes(term)) continue;
+    matched.push(term); remaining=remaining.split(term).join(' ');
+  }
+  return matched;
+}
+function semanticProfile(value) {
+  const normalized=normalize(value),concepts=new Map(); let residual=normalized;
+  for(const concept of CHINESE_CONCEPTS) {
+    const matched=longestTerms(normalized,concept.terms);
+    if(matched.length) concepts.set(concept.name,new Set(matched));
+    for(const term of concept.terms) residual=residual.split(term).join(' ');
+  }
+  residual=residual.replace(SYNONYM_ANCHOR_COMMON,' ');
+  return {concepts,anchors:tokens(residual).found};
+}
+function safeApproximateQuestion(value) {
+  const normalized=value.normalize('NFKC');
+  if(/["“”‘’「」『』]/u.test(normalized)||(normalized.match(/[?？]/gu)||[]).length>1) return false;
+  // 只识别元指令式否定/改问；“是不是不能办理”这类普通能力疑问仍可检索。
+  if(/(?:请勿|不要|别|无需|不必)(?:再|去|继续|直接)?(?:回答|回复|提及|讨论|谈|说|查找|检索)/u.test(normalized)
+    ||/(?:不是|并非)(?:在|想|要)?(?:问|询问|咨询|讨论)/u.test(normalized)
+    ||/(?:不是|并非)(?:这个|我的|所问的)?问题/u.test(normalized)
+    ||/(?:问|询问|咨询|讨论)的?(?:不是|并非)/u.test(normalized)
+    ||/(?:不是|并非)[^。！？!?]{0,80}而是/u.test(normalized)
+    ||/(?:改问|改答|真正想问|只想(?:问|了解)|而(?:是|要)(?:问|了解|咨询)|另外|此外|同时|以及|并且|或者|还是|顺便|另一个问题|再问|还想问)/u.test(normalized)) return false;
+  return true;
+}
+function actualSynonym(left,right,name) {
+  const leftTerms=left.concepts.get(name),rightTerms=right.concepts.get(name);
+  return leftTerms&&rightTerms&&[...leftTerms].some(term=>!rightTerms.has(term))
+    &&[...rightTerms].some(term=>!leftTerms.has(term));
+}
+
 function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RESULT_BYTES}={}) {
   if(!text(query,40000)||!Number.isInteger(maxResults)||maxResults<1||maxResults>4
     ||!Number.isInteger(maxBytes)||maxBytes<1||maxBytes>MAX_RESULT_BYTES) unavailable('query_invalid');
@@ -119,8 +176,12 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
   const base={results:[],complete:checked.complete,coverage:checked.coverage};
   if(queryTokens.found.size<minimum||queryTokens.found.size>512) return base;
   const normalized=normalize(query), managed=managedQuestion(query), numbers=new Set(query.normalize('NFKC').match(/[0-9]+/g)||[]);
+  const approximateSafe=safeApproximateQuestion(query);
+  const synonymSafe=text(query,MAX_SYNONYM_BYTES)&&approximateSafe;
+  const querySemantic=synonymSafe?semanticProfile(query):{concepts:new Map(),anchors:new Set()};
   const candidates=checked.passages.map(passage=>({passage,surface:passage.question||passage.text,
-    features:tokens(passage.question||passage.text).found}));
+    features:tokens(passage.question||passage.text).found,
+    semantic:synonymSafe&&passage.question&&text(passage.question,MAX_SYNONYM_BYTES)?semanticProfile(passage.question):null}));
   const frequencies=new Map();
   for(const token of queryTokens.found) frequencies.set(token,candidates.reduce((total,item)=>total+Number(item.features.has(token)),0));
   const weight=token=>1+Math.log(1+(candidates.length+1)/(frequencies.get(token)+1));
@@ -133,7 +194,7 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
     const overlap=matched.reduce((total,token)=>total+weight(token),0)/totalWeight;
     const rare=matched.filter(token=>frequencies.get(token)<=Math.max(1,Math.floor(candidates.length*.15))).length;
     const surface=normalize(item.surface);
-    let kind, priority;
+    let kind, priority,semanticRank=0;
     if(passage.question && surface===normalized && matched.length===queryTokens.found.size) {kind='exact_question'; priority=3;}
     // 固定礼貌范围说明不应稀释完整具体 FAQ；仍保留词项和全问数字约束。
     else if(passage.question && surface.length>=6 && managed===surface
@@ -143,11 +204,22 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
     // 不再降级为同一条 FAQ 的词法命中。
     else if(passage.question && normalized.includes(surface)) continue;
     else if(normalized.length>=6 && surface.includes(normalized) && matched.length===queryTokens.found.size) {kind='exact_phrase'; priority=2;}
-    else if(matched.length>=minimum && overlap>=.72 && rare>=(queryTokens.chinese?2:1)) {kind='keyword_overlap'; priority=1;}
+    else if(approximateSafe&&matched.length>=minimum&&overlap>=.72&&rare>=(queryTokens.chinese?2:1)) {kind='keyword_overlap'; priority=1;}
+    else if(synonymSafe&&item.semantic&&surface.length>=4&&querySemantic.concepts.size>0) {
+      const shared=[...querySemantic.concepts.keys()].filter(name=>item.semantic.concepts.has(name));
+      const substantive=[...querySemantic.concepts.keys()].filter(name=>name!=='capability');
+      const required=substantive.length?substantive:[...querySemantic.concepts.keys()];
+      const anchors=[...querySemantic.anchors].filter(token=>item.semantic.anchors.has(token));
+      if(required.some(name=>!item.semantic.concepts.has(name))||anchors.length<1
+        ||(!substantive.length&&(anchors.length*3<querySemantic.anchors.size
+          ||anchors.length*3<item.semantic.anchors.size))
+        ||!shared.some(name=>actualSynonym(querySemantic,item.semantic,name))) continue;
+      kind='synonym_overlap'; priority=.5; semanticRank=shared.length+Math.min(anchors.length,8)/10;
+    }
     else continue;
-    ranked.push({passage,kind,priority,overlap});
+    ranked.push({passage,kind,priority,overlap,semanticRank});
   }
-  ranked.sort((left,right)=>right.priority-left.priority||right.overlap-left.overlap
+  ranked.sort((left,right)=>right.priority-left.priority||right.semanticRank-left.semanticRank||right.overlap-left.overlap
     ||left.passage.location.localeCompare(right.passage.location,'en')||left.passage.start_byte-right.passage.start_byte);
   let bytes=0;
   for(const item of ranked) {

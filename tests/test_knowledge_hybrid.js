@@ -417,6 +417,18 @@ async function test(name, action) {
       assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 0);
     }
   });
+  await test('H18 中文同义词法补召回保持非 strong，向量 miss 后才作为已绑定资料生成', async () => {
+    const synonymQa='问：苍蓝箱寄存？\n答：仅收取带虚构蓝羽标记的箱件。\n';
+    const query='苍蓝行李能否临时保管？';
+    const f=fixture('synonym-fallback',{contents:[synonymQa]});
+    const lexical=f.search(query);
+    assert.equal(lexical.results.length,1);
+    assert.equal(lexical.results[0].lexical.kind,'synonym_overlap');
+    const session='session_hybrid-synonym';
+    await f.deliver(f.event(session,query)); successful(f,session,1);
+    assert.deepEqual(f.vector,[{query}]);
+    assert.deepEqual(citations(f.generated[0]).map(item=>item.text),[synonymQa]);
+  });
   const result = {layer:'UNIT/PROTOCOL/GENERATED_CODE', passed, failed, evidence, cases};
   fs.writeFileSync(path.join(evidence, 'summary.json'), JSON.stringify(result, null, 2) + '\n', {mode:0o600});
   console.log(JSON.stringify({layer:result.layer, passed, failed, evidence})); process.exitCode = failed ? 1 : 0;

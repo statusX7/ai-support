@@ -273,5 +273,77 @@ test('L22 相同内容的重复构建会修复受管索引属主，不因提前�
   const verified=spawnSync('python3',[script,'verify','--deploy-dir',f.root],{encoding:'utf8',timeout:45000});
   assert.equal(verified.status,0,verified.stdout+verified.stderr);
 });
+test('L23 低字面重叠的中文同义改写由受控概念补回，且同主题多文档稳定限制为四条',()=>{
+  const query='苍蓝行李能否临时保管？';
+  const questions=['苍蓝箱寄存？','苍蓝柜寄存？','苍蓝袋寄存？','苍蓝盒寄存？','苍蓝篓寄存？'];
+  const contents=questions.map((item,index)=>'问：'+item+'\n答：虚构寄存规则第'+String.fromCharCode(65+index)+'款。\n');
+  contents.push('问：绯红箱寄存？\n答：这是另一座虚构资料库的规则。\n');
+  const bigrams=value=>{
+    const letters=Array.from(value.replace(/[？?]/gu,'')),result=new Set();
+    for(let index=0;index+1<letters.length;index++) result.add(letters[index]+letters[index+1]);
+    return result;
+  };
+  const sourceTokens=bigrams(questions[0]),queryTokens=bigrams(query);
+  assert.equal(sourceTokens.size,4); assert.equal(queryTokens.size,9);
+  assert.deepEqual([...sourceTokens].filter(token=>queryTokens.has(token)),['苍蓝']);
+  assert.deepEqual([...new Set(Array.from(questions[0].replace('？','')))]
+    .filter(letter=>new Set(Array.from(query.replace('？',''))).has(letter)).sort(),['苍','蓝']);
+
+  const f=fixture('synonym-low-overlap',contents);
+  const map=JSON.parse(f.mapRaw()); map.documents.at(-1).library_id='kb_2222222222222222';
+  save(f.mapPath,map); built(f);
+  const result=f.search(query);
+  assert.equal(result.results.length,4);
+  assert(result.results.every(item=>item.lexical.kind==='synonym_overlap'));
+  assert(result.results.every(item=>item.metadata.library_id==='kb_1111111111111111'));
+  assert.deepEqual(result.results.map(item=>item.text),contents.slice(0,4));
+});
+test('L24 同义补召回不接受引用、元否定改问、复合问句、短泛问、数字冲突或跨库弱关联',()=>{
+  const primary='问：苍蓝箱寄存？\n答：仅收取带虚构蓝羽标记的箱件。\n';
+  const unrelated='问：绯红箱寄存？\n答：这是另一座虚构资料库的规则。\n';
+  const f=fixture('synonym-negative',[primary,unrelated]);
+  const map=JSON.parse(f.mapRaw()); map.documents[1].library_id='kb_2222222222222222';
+  save(f.mapPath,map); built(f);
+  for(const query of ['资料写着“苍蓝行李能否临时保管？”，但这不是我的问题。',
+    '我不是想问苍蓝行李能否临时保管，只想了解绯红花园。',
+    '我问的不是苍蓝行李能否临时保管，而是绯红花园的开放时间。',
+    '苍蓝行李能否临时保管，另外绯红花园几点关门？',
+    '苍蓝行李能否临时保管，同时还想问绯红花园几点关门？',
+    '行李能否保管？',
+    '绯红花园的开放时间是什么？']) assert.deepEqual(f.search(query).results,[],query);
+  for(const query of ['苍蓝行李能否临时保管？','苍蓝行李是不是不能临时保管？']) {
+    const positive=f.search(query);
+    assert.equal(positive.results.length,1,query);
+    assert.equal(positive.results[0].text,primary);
+    assert.equal(positive.results[0].metadata.library_id,'kb_1111111111111111');
+  }
+  const numbered=fixture('synonym-numbered',['问：苍蓝7号箱寄存？\n答：仅适用于虚构7号寄存台。\n']); built(numbered);
+  assert.deepEqual(numbered.search('苍蓝8号行李能否临时保管？').results,[]);
+
+  const capabilityQa='问：星舟可以开具蓝羽凭证？\n答：虚构凭证只记录星舟编号。\n';
+  const capability=fixture('synonym-capability',[capabilityQa]); built(capability);
+  for(const query of ['蓝羽凭证由星舟支持提供？','蓝羽凭证是不是不能由星舟开具？']) {
+    const result=capability.search(query);
+    assert.equal(result.results.length,1,query);
+    assert.equal(result.results[0].lexical.kind,'synonym_overlap',query);
+    assert.equal(result.results[0].text,capabilityQa);
+  }
+  assert.deepEqual(capability.search('星舟是否支持修理赤铜车轮？').results,[]);
+
+  const sparseQa='问：星舟票据允许？\n答：仅表示虚构星舟凭证类别。\n';
+  const sparseSource=new Set(['星舟','舟票','票据']),sparseQuery=new Set(['星舟','舟凭','凭证']);
+  assert.equal(sparseSource.size,3); assert.equal(sparseQuery.size,3);
+  assert.deepEqual([...sparseSource].filter(token=>sparseQuery.has(token)),['星舟']);
+  const sparse=fixture('synonym-capability-sparse',[sparseQa]); built(sparse);
+  const sparseResult=sparse.search('星舟凭证支持？');
+  assert.equal(sparseResult.results.length,1);
+  assert.equal(sparseResult.results[0].lexical.kind,'synonym_overlap');
+
+  const nestedQa='问：星舟票据能使用？\n答：这是虚构星舟票据的使用说明。\n';
+  const nested=fixture('synonym-capability-longest',[nestedQa]); built(nested);
+  const nestedResult=nested.search('星舟凭证能否使用？');
+  assert.equal(nestedResult.results.length,1);
+  assert.equal(nestedResult.results[0].lexical.kind,'synonym_overlap');
+});
 process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:path.relative(project,evidence),synthetic_only:true})+'\n');
 process.exitCode=failed?1:0;
