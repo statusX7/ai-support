@@ -11,6 +11,53 @@ const {extractEnvelope,promptRetained} = require('./provider-envelope.js');
 const MAX_INPUT_BYTES = 12 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
+// 仅检查 Provider 生成的整段可见答复。用户 Prompt、知识、历史和受管固定回复
+// 不经过这里，避免因业务资料引用故障提示而被改写。
+function mechanicalFailureAnswer(value) {
+  if (typeof value !== 'string') return false;
+  const visible = value.trim().slice(0, 8000);
+  if (!visible) return false;
+  const compact = visible.normalize('NFKC').toLowerCase().replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/[\p{P}\p{S}\s]+/gu, '');
+  if (!compact) return false;
+  // 常见的非结构化安全拒绝是有效模型结果，不得通过换源绕过。
+  if (/^(?:(?:真的|非常|十分|实在|很)?(?:抱歉|对不起|不好意思))?我(?:无法|不能|不便)(?:回答|答复)(?:(?:这个|该|此)?问题|(?:关于|针对|对于)?(?:您|你)?(?:的)?[\p{L}\p{N}]{1,64}(?:的)?(?:问题|咨询|请求))(?:了|呢)?$/u.test(compact)) return false;
+  // 平台、业务服务或接口的单纯可用性陈述可能就是用户询问的事实；没有
+  // “稍后再试”等机械重试要求时，不把它当作模型自身故障。
+  if (/^(?:当前|目前|现在|此刻)?(?:平台|服务|接口)(?:当前|目前|现在|正在|正)?(?:暂时|临时)?(?:繁忙|忙碌|忙|不可用|异常|故障|维护|升级|更新|拥堵|超时|过载)(?:中|了|时)?$/u.test(compact)) return false;
+  if (/^(?:当前|目前|现在|此刻)?(?:请求|访问|咨询|用户|访客|客户|人数)(?:量|人数)?(?:当前|目前|现在|正在|正)?(?:较多|过多|太多|较大|过大|拥堵|繁忙|高峰)(?:中|了|时)?$/u.test(compact)) return false;
+  const failures = [
+    /(?:当前|目前|现在|此刻)?(?:ai(?:客服|助手|系统|模型)?|自动客服|智能客服|在线客服|机器人(?:客服|助手)?|客服系统|模型服务|客服|系统|服务|服务器|接口|平台|网络|后台|助手|模型)?(?:当前|目前|现在|正在)?(?:暂时|临时)?(?:无法|不能|不可|没法|没有办法|未能)(?:及时|正常)?(?:(?:为|给)(?:您|你))?(?:进行)?(?:回复|回答|答复|处理|响应|提供(?:回复|回答|答复|帮助|服务)|帮(?:助)?(?:您|你)?)(?:(?:关于|针对|对于)?(?:您|你)?(?:的)?[\p{L}\p{N}]{1,32}(?:的)?(?:问题|咨询|请求))?(?:中|了)?/gu,
+    /(?:当前|目前|现在|此刻)?(?:ai(?:客服|助手|系统|模型)?|自动客服|智能客服|在线客服|机器人(?:客服|助手)?|客服系统|模型服务|客服|系统|服务|服务器|接口|平台|网络|后台|助手|模型)?(?:当前|目前|现在|正在|正|有点|太)?(?:暂时|临时)?(?:繁忙|忙碌|忙|不可用|异常|故障|维护|升级|更新|拥堵|超时|过载|开(?:了)?小差|出(?:了)?(?:点)?小差)(?:中|了|时)?/gu,
+    /(?:当前|目前|现在|此刻)?(?:系统|平台|服务|服务器|接口|网络|后台)?(?:当前|目前|现在|正在|正)?(?:请求|访问|咨询|用户|访客|客户|人数)(?:量|人数)?(?:当前|目前|现在|正在|正)?(?:较多|过多|太多|较大|过大|拥堵|繁忙|高峰)(?:中|了|时)?/gu,
+    /(?:当前|目前|现在|此刻)?(?:暂时|临时)?(?:回复|回答|答复|处理|响应)(?:不了|不上|失败)(?:了)?/gu,
+  ];
+  let residual = compact;
+  let unavailable = false;
+  for (const pattern of failures) residual = residual.replace(pattern, () => { unavailable = true; return ''; });
+  const fillers = [
+    /(?:您好|你好|嗨)/gu,
+    /(?:真的|非常|十分|实在|很)?(?:抱歉|对不起|不好意思)/gu,
+    /(?:给|为)(?:您|你)(?:带来|造成)(?:的|了)?(?:一些)?不便/gu,
+    /(?:谢谢|感谢)(?:您|你)?(?:的)?(?:理解|谅解|耐心等待|耐心|配合|等待)/gu,
+    /(?:请|还请|敬请)?(?:您|你)?(?:多多)?(?:谅解|理解|见谅)/gu,
+    /(?:我们|后台)?(?:当前|目前|现在|正在)?(?:为(?:您|你))?(?:检查|处理中|处理|恢复中|恢复)/gu,
+    /(?:我们|本客服|本系统)/gu,
+    /(?:由于|因为|所以|因此|可能|似乎|看来)/gu,
+    /(?:您|你|我|这边)/gu,
+    /(?:如果|若|要是|遇到|出现)(?:这种|此类|上述|该)?(?:情况|问题)?/gu,
+    /(?:(?:您|你|我们|这个|该|当前|上述)(?:的)?)?(?:问题|请求|咨询|消息)(?:当前|目前)?/gu,
+  ];
+  for (const pattern of fillers) residual = residual.replace(pattern, '');
+  let retry = false;
+  const retryFillers = [
+    /(?:请|还请|建议|麻烦)?(?:您|你)?(?:耐心)?(?:稍后|稍晚|稍候(?:一下|片刻)?|稍等(?:一下|片刻)?|过一会儿?|过会儿?|等一会儿?|晚点|之后)(?:再|重新)?(?:尝试|试试|试|重试|联系|咨询|操作|访问|提交|刷新|回来|发起|来|问|发送)?(?:一下|看看)?/gu,
+    /(?:请|还请|麻烦)?(?:您|你)?耐心等待(?:一下|片刻)?/gu,
+  ];
+  for (const pattern of retryFillers) residual = residual.replace(pattern, () => { retry = true; return ''; });
+  return (unavailable || retry) && /^(?:了|的|呢|吧|啊|呀|哦|啦|哈)*$/u.test(residual);
+}
+
 function appliedPrompt(root, revision) {
   const read = (file, maximum) => {
     const stat = fs.lstatSync(file);
@@ -93,6 +140,7 @@ function responseToChat(body, model) {
   const refusal = parts.filter(part => part.type === 'refusal' && typeof part.refusal === 'string').map(part => part.refusal).join('');
   const filtered = body.incomplete_details?.reason === 'content_filter';
   if (!content.trim() && !refusal.trim() && !filtered) throw upstreamFailure(200,{});
+  if (!refusal.trim() && !filtered && mechanicalFailureAnswer(content)) throw upstreamFailure(200,{});
   const input = Number(body.usage?.input_tokens) || 0, output = Number(body.usage?.output_tokens) || 0;
   const usage = {prompt_tokens:input,completion_tokens:output,total_tokens:Number(body.usage?.total_tokens) || input+output};
   if (body.usage?.input_tokens_details) usage.prompt_tokens_details = body.usage.input_tokens_details;
@@ -106,6 +154,8 @@ function validChat(body,model) {
   const choice = body.choices?.[0], message = choice?.message;
   if (!message || !(typeof message.content === 'string' && message.content.trim()) && !(typeof message.refusal === 'string' && message.refusal.trim()) && choice.finish_reason !== 'content_filter') throw upstreamFailure(200,{});
   if (message.tool_calls || message.function_call) throw terminal('invalid_input','客服协议不执行模型工具');
+  if (!(typeof message.refusal === 'string' && message.refusal.trim()) && choice.finish_reason !== 'content_filter'
+    && mechanicalFailureAnswer(message.content)) throw upstreamFailure(200,{});
   return {id:body.id || `chatcmpl-${crypto.randomUUID()}`,object:'chat.completion',created:body.created || Math.floor(Date.now()/1000),model:model || body.model,
     choices:[{index:0,message:{role:'assistant',content:message.content ?? null,...(message.refusal ? {refusal:message.refusal}:{})},finish_reason:choice.finish_reason || 'stop'}],...(body.usage ? {usage:body.usage}: {})};
 }
@@ -267,7 +317,7 @@ function createAdapter(environment = process.env, fetchFunction) {
   return server;
 }
 
-module.exports = {createAdapter,chatToResponses,responseToChat,parseHeaders,providerSettings,validChat,writeChatStream,requestUpstream};
+module.exports = {createAdapter,chatToResponses,responseToChat,parseHeaders,providerSettings,validChat,writeChatStream,requestUpstream,mechanicalFailureAnswer};
 if (require.main === module) {
   const server = createAdapter(); server.listen(Number(process.env.PROVIDER_ADAPTER_PORT) || 8787,'0.0.0.0');
   process.on('SIGTERM',() => server.close(() => process.exit(0)));

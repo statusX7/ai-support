@@ -223,6 +223,62 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。');assert.equal(f.state(event.data.session_id).mode,'ai');
     f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
   });
+  await test('主接口200机械故障切到备用，备用200机械故障继续切下一备用且仅出站业务答案',async f=>{
+    const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
+    f.behavior=async(call,response)=>{
+      if(call.index===0){send(response,{choices:[{message:{role:'assistant',content:'AI暂时无法回复，请稍后再试。'}}]});return true;}
+      return false;
+    };
+    await f.deliver(f.event('session_pool_mechanical-primary','合成主接口故障问题'));
+    assert.deepEqual(f.calls.map(call=>call.index),[0,1]);assert.equal(f.sent.length,1);
+    assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
+    assert(!f.sent.some(item=>/暂时无法回复|稍后再试/.test(item.content)));
+  });
+  await test('HTTP故障后的备用机械答复继续到Responses备用，整条链仅出站最终正常答案',async f=>{
+    const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
+    f.behavior=async(call,response)=>{
+      if(call.index===0){response.writeHead(503,{'content-type':'application/json'});response.end('{}');return true;}
+      if(call.index===1){send(response,{choices:[{message:{role:'assistant',content:'模型繁忙，请稍后再试，谢谢理解。'}}]});return true;}
+      return false;
+    };
+    await f.deliver(f.event('session_pool_mechanical-backup','合成备用接口故障问题'));
+    assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);assert.equal(f.sent.length,1);
+    assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
+    assert(!f.sent.some(item=>/系统繁忙|稍后再试/.test(item.content)));
+  });
+  await test('视觉摘要及图片最终阶段的机械答复均在接口池内切换，不污染记忆或访客出站',async f=>{
+    const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
+    f.behavior=async(call,response)=>{
+      if(call.index===0&&call.visual){send(response,{choices:[{message:{role:'assistant',content:'系统维护中，请过会儿再试。'}}]});return true;}
+      return false;
+    };
+    const first=f.event('session_pool_mechanical-vision',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
+    await f.deliver(first);assert.deepEqual(f.calls.map(call=>[call.index,call.visual]),[[0,true],[1,true],[1,false]]);
+    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
+    const context=f.state(first.data.session_id).image_context;assert.equal(context.length,1);
+    assert.equal(context[0].summary,'合成图片中是蓝色保存按钮。');assert(!JSON.stringify(context).includes('维护中'));
+  });
+  await test('图片最终阶段主接口机械答复切备用，视觉事实只保存一次且不发送机械正文',async f=>{
+    const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
+    f.behavior=async(call,response)=>{
+      if(call.index===0&&!call.visual){send(response,{choices:[{message:{role:'assistant',content:'请稍后再试。'}}]});return true;}
+      return false;
+    };
+    const event=f.event('session_pool_mechanical-image-final',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
+    await f.deliver(event);assert.deepEqual(f.calls.map(call=>[call.index,call.visual]),[[0,true],[0,false],[1,false]]);
+    assert.equal(f.state(event.data.session_id).image_context.length,1);
+    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
+    assert(!f.sent.some(item=>/稍后再试/.test(item.content)));
+  });
+  await test('全池200机械故障只发送一次本地自然澄清，不误计AI成功或自动转人工',async f=>{
+    const variants=['系统维护中，请稍后再试。','模型繁忙，请过会儿再试。','A\u0000I暂时无法回\u0007复，请稍后再试。'];
+    f.behavior=async(call,response)=>{response.setHeader('content-type','application/json');
+      response.end(JSON.stringify(call.index===2?{status:'completed',output_text:variants[2]}:{choices:[{message:{role:'assistant',content:variants[call.index]}}]}));return true;};
+    const session='session_pool_mechanical-exhausted';await f.deliver(f.event(session,'合成全池机械故障问题'));
+    assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);assert.equal(f.sent.length,1);
+    assert.equal(f.sent[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');
+    assert.equal(f.state(session).mode,'ai');assert.equal(f.state(session).jobs.filter(job=>job.status==='done').length,1);
+  });
   await test('A21 全池失败后多个新会话得到单次安全提示，保护期及重启不重复轰击上游',async f=>{
     f.failed=new Set([0,1,2]);
     const initial=f.event('session_pool_exhausted0','合成全失败问题');

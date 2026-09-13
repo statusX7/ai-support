@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
-const { createRuntime } = require('../n8n/runtime');
+const { createRuntime, mechanicalFailureAnswer } = require('../n8n/runtime');
 
 const project = path.resolve(__dirname, '..');
 const work = path.join(project, '.work', 'v1.2.1');
@@ -1305,6 +1305,329 @@ const test = async (name, action) => {
       assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
       assert.equal(f.rawState(session).outgoing[String(fingerprint)].status, 'cancelled');
     }
+  });
+
+  await test('F48 人工接管撞上已登记出站的 worker 崩溃时明确取消，重启不补发且按期清理', async () => {
+    const f = makeFixture('operator-post-worker-crash'), session = 'session_operator-post-crash';
+    const fingerprint = 77136;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '不得在人工接管后补发', fingerprint };
+    const job = f.makeJob(session, 'operator-post-crash', plan, {
+      status: 'processing', attempts: 1, lease_until: f.now() + 300000,
+    });
+    const outgoing = f.makeOutgoing(job, plan.content, 'sending');
+    outgoing.attempt_token = 'a'.repeat(32);
+    await f.seed(session, state => {
+      state.jobs.push(job);
+      state.worker = { job: job.id, token: 'worker-before-crash', until: f.now() + 300000 };
+      state.outgoing[String(fingerprint)] = outgoing;
+    });
+    const bucket = path.join(f.root, 'data/runtime', 'owned-' + f.key(session) + '-'
+      + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
+    fs.writeFileSync(bucket, JSON.stringify({ schema_version: 1, fingerprints: [String(fingerprint)] }), { mode: 0o600 });
+
+    f.advance(1);
+    const human = f.event(session, '合成人工公开回复', { from: 'operator', automated: false });
+    human.event = 'message:received';
+    const accepted = await f.receive(human);
+    assert.equal(accepted.accepted, true);
+    if (accepted.route === 'process') await f.runtime().process(accepted.key, accepted.jobId);
+
+    let stored = f.rawState(session);
+    const cancelled = stored.jobs.find(item => item.id === job.id);
+    const record = stored.outgoing[String(fingerprint)];
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(record.status, 'cancelled');
+    assert.equal(record.delivery_uncertain, true);
+    assert.equal(record.cancellation_reason, 'conversation_state_changed');
+    assert.equal(record.attempt_token, outgoing.attempt_token, '迟到的确定回执仍须保留同一次 attempt fence');
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(bucket, 'utf8')).fingerprints, [String(fingerprint)], '永久自有指纹不得随详细状态取消');
+
+    f.restart();
+    assert(!(await f.runtime().scan()).some(item => item.jobId === job.id));
+    assert.equal(f.postAttempts.length, 0);
+    f.advance(8 * 86400000); await f.runtime().scan();
+    stored = f.rawState(session);
+    assert.equal(stored.jobs.some(item => item.id === job.id), false);
+    assert.equal(stored.outgoing[String(fingerprint)], undefined, '已终态的详细出站按七天策略清理，不能永久积累 sending');
+    assert.deepEqual(JSON.parse(fs.readFileSync(bucket, 'utf8')).fingerprints, [String(fingerprint)]);
+    assert.equal(f.sent.length, 0); assert.equal(f.modelRequests.length, 0);
+  });
+
+  await test('F49 未知回执持续不可查到重试上限时 job 与 outgoing 同时失败且不再补发', async () => {
+    const f = makeFixture('receipt-reconciliation-exhausted'), session = 'session_receipt-exhausted';
+    const fingerprint = 77137;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '未知回执不得越过上限补发', fingerprint };
+    const job = f.makeJob(session, 'receipt-exhausted', plan, {
+      delivery_retries: 60, received_at: f.now() - 300000,
+    });
+    const outgoing = f.makeOutgoing(job, plan.content, 'unknown');
+    outgoing.attempt_token = 'b'.repeat(32);
+    await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(fingerprint)] = outgoing; });
+    f.modes.historyFailure = true; f.restart();
+
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    let stored = f.rawState(session);
+    const failed = stored.jobs.find(item => item.id === job.id);
+    const record = stored.outgoing[String(fingerprint)];
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.delivery_retries, 61);
+    assert.equal(failed.failure, 'receipt_reconciliation_unavailable');
+    assert.equal(record.status, 'failed');
+    assert.equal(record.failure, 'receipt_reconciliation_unavailable');
+    assert.equal(record.delivery_uncertain, true);
+    assert.equal(record.attempt_token, outgoing.attempt_token);
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(f.postAttempts.length, 0); assert.equal(f.exactRequests.length, 0);
+
+    f.restart();
+    assert(!(await f.runtime().scan()).some(item => item.jobId === job.id));
+    f.advance(8 * 86400000); await f.runtime().scan();
+    stored = f.rawState(session);
+    assert.equal(stored.jobs.some(item => item.id === job.id), false);
+    assert.equal(stored.outgoing[String(fingerprint)], undefined);
+    assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+  });
+
+  await test('F50 Chat与Responses残余机械故障答复一律转本地自然澄清，正常实质说明不误杀', async () => {
+    const mechanical = ['暂时无法回复，请稍后再试。', '  抱歉，暂时无法回复，请稍后再试。谢谢理解！  ',
+      '系\u200b统　正忙，请稍后再试，谢谢理解。', '当前暂时不能答复，建议过一会儿再试。',
+      '服务开了小差，请过会儿再试。', '很抱歉，我们目前没有办法为您提供帮助，请您耐心等待。',
+      '抱歉呀，客服系统有点忙，您过会儿再咨询吧。', '由于系统繁忙，现在暂时无法回答您的问题，请稍候。',
+      '服务器繁忙，请稍后再试。', '暂时无法进行回复，稍后重试。', '系统出了点小差，请稍后再试。',
+      '系统维护中，请稍后再试。', '模型繁忙，请过会再试。', 'AI暂时无法回复，请稍后再试。',
+      '机器人开小差了，稍后重试。', '请稍后再试。', 'ＡＩ暂时无法答复，过会再试。',
+      'A\u0000I暂时无法回\u0007复，请稍后再试。', '系统正在升级，请稍后再试。',
+      '系统拥堵，请稍后再试。', '请求人数较多，请稍后再试。', '网络开小差了，请稍后再试。',
+      '后台维护中，请稍后再试。', '系统超时，请稍后重试。',
+      'AI暂时无法回答您的订单问题，请稍后再试。', '客服暂时无法回答关于发票的问题，请稍后再试。'];
+    const allowed = ['网站显示“系统繁忙，请稍后再试”时，请检查网络设置并刷新页面。',
+      '设置保存后可能需要几十秒生效；如页面仍显示旧值，刷新后再试。',
+      '订单暂时无法处理，请稍后再试。', '退款接口当前不可用，请改用银行卡原路退款。',
+      '抱歉，我无法回答这个问题。', '抱歉，我无法回答关于制造武器的问题。', '我不能回答您的账户问题。',
+      '当前平台不可用。', '当前服务不可用，预计十分钟恢复。',
+      '当前平台升级中。', '当前服务超时。', '请求人数较多。', clarification];
+    assert(mechanical.every(mechanicalFailureAnswer));assert(allowed.every(value=>!mechanicalFailureAnswer(value)));
+    for (const apiMode of ['chat_completions', 'responses']) for (const [index, content] of mechanical.entries()) {
+      const f = makeFixture('mechanical-runtime-' + apiMode + '-' + index), session = 'session_mechanical-' + apiMode.replaceAll('_','-') + '-' + index;
+      f.writeConfig('provider', { provider: { ...f.readConfig('provider').provider, api_mode: apiMode } });
+      f.modes.answer = content; await f.deliver(f.event(session, '合成模型故障话术问题'));
+      assert.equal(f.modelRequests.length, 1);assert.equal(f.sent.length, 1);assert.equal(f.sent[0].content, clarification);
+      assert.equal(f.state(session).mode, 'ai');
+      assert.equal(f.events().filter(event=>event.type==='ai_reply'||event.type==='knowledge_hit').length,0);
+    }
+    for (const [index, content] of allowed.slice(0, -1).entries()) {
+      const f = makeFixture('mechanical-allowed-' + index), session = 'session_mechanical-allowed-' + index;
+      f.modes.answer = content; await f.deliver(f.event(session, '合成实质排障问题'));
+      assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,content);assert.equal(f.modelRequests.length,1);
+    }
+  });
+
+  await test('F51 视觉摘要和图片最终阶段残余机械话术不进入图片记忆或访客出站', async () => {
+    const summaryFailure = makeFixture('mechanical-vision-summary'), summarySession = 'session_mechanical-vision-summary';
+    summaryFailure.modes.visionAnswer = '服务开小差了，请过会儿再试。';
+    await summaryFailure.deliver(summaryFailure.event(summarySession,
+      { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
+    assert.equal(summaryFailure.visionRequests.length,1);assert.equal(summaryFailure.modelRequests.length,0);
+    assert.equal(Object.hasOwn(summaryFailure.rawState(summarySession),'image_context'),false);
+    assert.equal(summaryFailure.sent.length,1);assert.equal(summaryFailure.sent[0].content,imageClarification);
+
+    const finalFailure = makeFixture('mechanical-image-final'), finalSession = 'session_mechanical-image-final';
+    finalFailure.modes.visionAnswer = '图片可见虚构的蓝色保存按钮。';
+    finalFailure.modes.answer = '当前暂时不能答复，建议过一会儿再试。';
+    await finalFailure.deliver(finalFailure.event(finalSession,
+      { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }));
+    assert.equal(finalFailure.visionRequests.length,1);assert.equal(finalFailure.modelRequests.length,1);
+    assert.equal(finalFailure.rawState(finalSession).image_context.length,1);
+    assert.equal(finalFailure.rawState(finalSession).image_context[0].summary,'图片可见虚构的蓝色保存按钮。');
+    assert(!JSON.stringify(finalFailure.rawState(finalSession).image_context).includes('不能答复'));
+    assert.equal(finalFailure.sent.length,1);assert.equal(finalFailure.sent[0].content,imageClarification);
+    assert.equal(finalFailure.state(finalSession).mode,'ai');
+  });
+
+  await test('F52 升级后未发送的模型机械缓存改为自然澄清，业务固定回复和实质说明保持原文', async () => {
+    const cached = [
+      { label: 'text', purpose: 'ai_text', content: '系统维护中，请稍后再试。', expected: clarification },
+      { label: 'vision', purpose: 'vision', content: '模型繁忙，请过会再试。', expected: imageClarification, image: true },
+      { label: 'queued', purpose: 'ai_text', content: 'AI暂时无法回复，请稍后再试。', expected: clarification, queued: true },
+    ];
+    for (const [index, item] of cached.entries()) {
+      const f = makeFixture('mechanical-cached-' + item.label), session = 'session_mechanical-cached-' + item.label;
+      const plan = { type: 'text', purpose: item.purpose, ordinary: true, ai: true, content: item.content, fingerprint: 77201 + index };
+      const job = f.makeJob(session, 'cached-' + item.label, plan);
+      if (item.image) job.data = f.event(session, { url: 'https://storage.crisp.chat/synthetic.png', type: 'image/png' }, { type: 'file' }).data;
+      await f.seed(session, state => {
+        state.jobs.push(job);
+        if (item.queued) state.outgoing[String(plan.fingerprint)] = f.makeOutgoing(job, item.content, 'queued');
+      });
+      f.restart(); const result = await f.runtime().process(f.key(session));
+      assert.equal(result.status, 'sent'); assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, item.expected);
+      assert.equal(f.modelRequests.length, 0); assert.equal(f.visionRequests.length, 0);
+      assert(!f.sent.some(entry => mechanicalFailureAnswer(entry.content)));
+    }
+    const allowed = [
+      { label: 'provider', purpose: 'ai_text', ai: true, content: '网站显示“系统繁忙，请稍后再试”时，请检查网络设置。' },
+      { label: 'fixed', purpose: 'keyword_reply', ai: true, content: '暂时无法回复，请稍后再试。' },
+    ];
+    for (const [index, item] of allowed.entries()) {
+      const f = makeFixture('mechanical-cached-allowed-' + item.label), session = 'session_mechanical-allowed-' + item.label;
+      const plan = { type: 'text', purpose: item.purpose, ordinary: true, ai: item.ai, content: item.content, fingerprint: 77211 + index };
+      const job = f.makeJob(session, 'allowed-' + item.label, plan);
+      await f.seed(session, state => state.jobs.push(job)); f.restart();
+      assert.equal((await f.runtime().process(f.key(session))).status, 'sent');
+      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, item.content); assert.equal(f.modelRequests.length, 0);
+    }
+  });
+
+  await test('F53 旧模型机械答复未知回执先核对原指纹，确认缺席后才发送一次自然澄清', async () => {
+    const delivered = makeFixture('mechanical-cached-unknown-found'), deliveredSession = 'session_mechanical-unknown-found';
+    const deliveredPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: '系统维护中，请稍后再试。', fingerprint: 77221 };
+    const deliveredJob = delivered.makeJob(deliveredSession, 'unknown-found', deliveredPlan);
+    const deliveredOutgoing = delivered.makeOutgoing(deliveredJob, deliveredPlan.content, 'unknown');
+    await delivered.seed(deliveredSession, state => { state.jobs.push(deliveredJob); state.outgoing['77221'] = deliveredOutgoing; });
+    const historical = { ...deliveredOutgoing.body, timestamp: delivered.now() - 1000 };
+    delivered.histories.set(deliveredSession, [historical]); delivered.restart();
+    assert.equal((await delivered.runtime().process(delivered.key(deliveredSession))).status, 'sent');
+    assert.equal(delivered.postAttempts.length, 0); assert.equal(delivered.sent.length, 0);
+    assert.deepEqual(delivered.histories.get(deliveredSession), [historical]);
+    assert.equal(delivered.rawState(deliveredSession).outgoing['77221'].status, 'sent');
+
+    const absent = makeFixture('mechanical-cached-unknown-absent'), absentSession = 'session_mechanical-unknown-absent';
+    const absentPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: 'A\u0000I暂时无法回\u0007复，请稍后再试。', fingerprint: 77222 };
+    const absentJob = absent.makeJob(absentSession, 'unknown-absent', absentPlan);
+    await absent.seed(absentSession, state => { state.jobs.push(absentJob); state.outgoing['77222'] = absent.makeOutgoing(absentJob, absentPlan.content, 'unknown'); });
+    absent.restart(); assert.equal((await absent.runtime().process(absent.key(absentSession))).status, 'retry');
+    let stored = absent.rawState(absentSession);
+    assert.equal(absent.exactRequests.length, 1); assert.equal(absent.postAttempts.length, 0);
+    assert.equal(stored.jobs.find(job => job.id === absentJob.id).plan.content, absentPlan.content);
+    assert.equal(stored.outgoing['77222'].body.content, absentPlan.content);
+    absent.advance(5000); absent.restart();
+    assert.equal((await absent.runtime().process(absent.key(absentSession))).status, 'retry');
+    stored = absent.rawState(absentSession);
+    assert.equal(absent.exactRequests.length, 2); assert.equal(absent.postAttempts.length, 0);
+    assert.equal(stored.jobs.find(job => job.id === absentJob.id).plan.purpose, 'safe_error');
+    assert.equal(stored.jobs.find(job => job.id === absentJob.id).plan.content, clarification);
+    assert.equal(stored.outgoing['77222'].status, 'cancelled'); assert.equal(Object.hasOwn(stored.outgoing['77222'], 'body'), false);
+    absent.advance(5000); absent.restart();
+    assert.equal((await absent.runtime().process(absent.key(absentSession))).status, 'sent');
+    assert.equal(absent.postAttempts.length, 1); assert.equal(absent.sent.length, 1); assert.equal(absent.sent[0].content, clarification);
+    assert.equal(absent.exactRequests.length, 2); assert(!absent.sent.some(entry => mechanicalFailureAnswer(entry.content)));
+  });
+
+  await test('F54 升级时job已被旧版清掉的超龄sending/unknown安全清理，年轻和有关联记录保留', async () => {
+    const f = makeFixture('aged-orphaned-outgoing-upgrade'), session = 'session_aged-orphaned-outgoing';
+    const retention = 7 * 86400000;
+    const fingerprints = { sending: 77301, unknown: 77302, young: 77303, linked: 77304, boundary: 77305 };
+    const plans = Object.fromEntries(Object.entries(fingerprints).map(([name, fingerprint]) => [name,
+      { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '合成出站-' + name, fingerprint }]));
+    const ghosts = {
+      sending: f.makeJob(session, 'removed-sending', plans.sending),
+      unknown: f.makeJob(session, 'removed-unknown', plans.unknown),
+      young: f.makeJob(session, 'young-orphan', plans.young),
+      boundary: f.makeJob(session, 'boundary-orphan', plans.boundary),
+    };
+    const linked = f.makeJob(session, 'still-linked', plans.linked, {
+      received_at: f.now() - retention - 1000, retry_at: f.now() + 120000,
+    });
+    await f.seed(session, state => {
+      // 模拟升级顺序：旧 runtime 已在七天清理中删除取消/失败 job，却把其
+      // sending/unknown 详情留下；年轻 orphan 与仍有关联 job 不能据年龄猜测删除。
+      state.jobs.push(linked, { ...linked, id: undefined, plan: undefined, status: 'done', received_at: f.now() });
+      state.outgoing[String(fingerprints.sending)] = f.makeOutgoing(ghosts.sending, plans.sending.content, 'sending');
+      state.outgoing[String(fingerprints.unknown)] = f.makeOutgoing(ghosts.unknown, plans.unknown.content, 'unknown');
+      state.outgoing[String(fingerprints.young)] = f.makeOutgoing(ghosts.young, plans.young.content, 'sending');
+      state.outgoing[String(fingerprints.linked)] = f.makeOutgoing(linked, plans.linked.content, 'unknown');
+      state.outgoing[String(fingerprints.boundary)] = f.makeOutgoing(ghosts.boundary, plans.boundary.content, 'unknown');
+      // undefined 不构成可证明的 ID 关联；旧版缺失 ID 仍必须按真正 orphan 处理。
+      delete state.outgoing[String(fingerprints.unknown)].job_id;
+      state.outgoing[String(fingerprints.sending)].created_at = f.now() - retention - 1000;
+      state.outgoing[String(fingerprints.unknown)].created_at = f.now() - retention - 1000;
+      state.outgoing[String(fingerprints.young)].created_at = f.now() - retention + 1000;
+      state.outgoing[String(fingerprints.linked)].created_at = f.now() - retention - 1000;
+      state.outgoing[String(fingerprints.boundary)].created_at = f.now() - retention;
+    });
+    for (const fingerprint of Object.values(fingerprints)) {
+      const bucket = path.join(f.root, 'data/runtime', 'owned-' + f.key(session) + '-'
+        + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
+      fs.writeFileSync(bucket, JSON.stringify({ schema_version: 1, fingerprints: [String(fingerprint)] }), { mode: 0o600 });
+    }
+
+    f.restart();
+    assert.deepEqual(await f.runtime().scan(), []);
+    let stored = f.rawState(session);
+    assert.equal(stored.outgoing[String(fingerprints.sending)], undefined);
+    assert.equal(stored.outgoing[String(fingerprints.unknown)], undefined);
+    assert.equal(stored.outgoing[String(fingerprints.young)].status, 'sending');
+    assert.equal(stored.outgoing[String(fingerprints.linked)].status, 'unknown');
+    assert.equal(stored.outgoing[String(fingerprints.boundary)].status, 'unknown');
+    assert.equal(stored.jobs.some(job => job.id === linked.id), true);
+    assert.equal(f.modelRequests.length, 0); assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+    for (const fingerprint of Object.values(fingerprints)) {
+      const bucket = path.join(f.root, 'data/runtime', 'owned-' + f.key(session) + '-'
+        + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
+      assert.deepEqual(JSON.parse(fs.readFileSync(bucket, 'utf8')).fingerprints, [String(fingerprint)]);
+    }
+
+    f.restart(); assert.deepEqual(await f.runtime().scan(), []);
+    const accepted = await f.receive(f.event(session, '升级清理后的新问题'));
+    assert.equal(accepted.accepted, true); assert.equal(accepted.route, 'process');
+    f.restart();
+    const scheduled = await f.runtime().scan();
+    assert(scheduled.some(item => item.key === accepted.key && item.jobId === accepted.jobId));
+    assert.equal((await f.runtime().process(accepted.key, accepted.jobId)).status, 'sent');
+    stored = f.rawState(session);
+    assert.equal(f.sent.length, 1); assert.equal(f.postAttempts.length, 1); assert.equal(f.modelRequests.length, 1);
+    assert.equal(stored.outgoing[String(fingerprints.sending)], undefined);
+    assert.equal(stored.outgoing[String(fingerprints.unknown)], undefined);
+    assert.equal(stored.outgoing[String(fingerprints.young)].status, 'sending');
+    assert.equal(stored.outgoing[String(fingerprints.linked)].status, 'unknown');
+    assert.equal(stored.outgoing[String(fingerprints.boundary)].status, 'unknown');
+  });
+
+  await test('F55 旧机械答复已有两次未知尝试时双重负查后仍改为自然澄清且不重发原文', async () => {
+    const f = makeFixture('mechanical-cached-two-attempts'), session = 'session_mechanical-two-attempts';
+    const plan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: '系统正在升级，请稍后再试。', fingerprint: 77311 };
+    const job = f.makeJob(session, 'unknown-two-attempts', plan);
+    const outgoing = f.makeOutgoing(job, plan.content, 'unknown');
+    outgoing.attempts = 2;
+    await f.seed(session, state => { state.jobs.push(job); state.outgoing[String(plan.fingerprint)] = outgoing; });
+    f.modes.exactStatus = 404; f.restart();
+
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    assert.equal(f.exactRequests.length, 1); assert.equal(f.postAttempts.length, 0);
+    f.advance(5000); f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'retry');
+    let stored = f.rawState(session);
+    assert.equal(f.exactRequests.length, 2); assert.equal(f.postAttempts.length, 0);
+    assert.equal(stored.outgoing[String(plan.fingerprint)].status, 'cancelled');
+    assert.equal(stored.outgoing[String(plan.fingerprint)].cancellation_reason, 'provider_mechanical_response');
+    assert.equal(stored.jobs.find(item => item.id === job.id).plan.purpose, 'safe_error');
+    assert.equal(stored.jobs.find(item => item.id === job.id).plan.content, clarification);
+
+    f.advance(5000); f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    assert.equal(f.postAttempts.length, 1); assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].content, clarification);
+    assert.notEqual(String(f.sent[0].fingerprint), String(plan.fingerprint));
+    assert(!f.sent.some(item => mechanicalFailureAnswer(item.content)));
+
+    const stale = makeFixture('mechanical-cached-two-attempts-stale'), staleSession = 'session_mechanical-two-attempts-stale';
+    const stalePlan = { ...plan, fingerprint: 77312 };
+    const staleJob = stale.makeJob(staleSession, 'unknown-two-attempts-stale', stalePlan,
+      { received_at: stale.now() - 600000 });
+    const staleOutgoing = stale.makeOutgoing(staleJob, stalePlan.content, 'unknown');
+    staleOutgoing.attempts = 2; staleOutgoing.created_at = stale.now() - 590000;
+    await stale.seed(staleSession, state => { state.jobs.push(staleJob); state.outgoing[String(stalePlan.fingerprint)] = staleOutgoing; });
+    stale.modes.exactStatus = 404; stale.restart();
+    assert.equal((await stale.runtime().process(stale.key(staleSession), staleJob.id)).status, 'retry');
+    stale.advance(5000); stale.restart();
+    assert.equal((await stale.runtime().process(stale.key(staleSession), staleJob.id)).status, 'failed');
+    stored = stale.rawState(staleSession);
+    assert.equal(stored.outgoing[String(stalePlan.fingerprint)].status, 'failed');
+    assert.equal(stale.postAttempts.length, 0); assert.equal(stale.sent.length, 0);
   });
 
   fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed, synthetic_only: true }, null, 2));

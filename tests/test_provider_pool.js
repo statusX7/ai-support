@@ -702,6 +702,40 @@ async function main() {
       await g.post(sample,envelope);assert.equal(g.calls.length,1);
     }finally{await g.close();}
   });
+  await test('纯机械故障200按invalid_response有界切换主备，全池同类故障不冒充成功',async()=>{
+    const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
+    const primary=await fixture(2);try {
+      primary.publish(pool=>{pool.entries[1].api_mode='responses';pool.entries[1].capabilities={...pool.entries[1].capabilities,chat_completions:false,responses:true};});
+      primary.behavior=async(call,response)=>{
+        if(call.index===0){send(response,chat('AI暂时无法回答您的订单问题，请稍后再试。'));return true;}
+        send(response,{status:'completed',output_text:'备用接口给出完整业务回答'});return true;
+      };
+      const result=await primary.post();assert.equal(result.status,200,result.text);
+      assert.equal(result.value.choices[0].message.content,'备用接口给出完整业务回答');
+      assert.deepEqual(primary.calls.map(call=>[call.index,call.path.endsWith('/responses')?'responses':'chat']),[[0,'chat'],[1,'responses']]);
+      const recent=(await primary.get('recent')).records;assert.equal(recent.filter(item=>item.error_class==='invalid_response').length,1);
+      assert.equal(recent.filter(item=>item.outcome==='success').length,1);
+    }finally{await primary.close();}
+    const backup=await fixture(3);try {
+      backup.behavior=async(call,response)=>{
+        response.setHeader('content-type','application/json');
+        if(call.index===0){response.writeHead(503);response.end('{}');return true;}
+        if(call.index===1){response.end(JSON.stringify(chat('系统正在升级，请稍后再试。')));return true;}
+        response.end(JSON.stringify(chat('第二备用接口给出唯一业务回答')));return true;
+      };
+      const result=await backup.post();assert.equal(result.status,200,result.text);
+      assert.equal(result.value.choices[0].message.content,'第二备用接口给出唯一业务回答');
+      assert.deepEqual(backup.calls.map(call=>call.index),[0,1,2]);
+      assert.deepEqual((await backup.get('recent')).records.filter(item=>item.outcome==='failed').map(item=>item.error_class).sort(),['invalid_response','upstream_unavailable']);
+    }finally{await backup.close();}
+    const exhausted=await fixture(3);try {
+      const variants=['请求人数较多，请稍后再试。','网络开小差了，请稍后再试。','后台维护中，请稍后再试。'];
+      exhausted.behavior=async(call,response)=>{send(response,chat(variants[call.index]));return true;};
+      const result=await exhausted.post();assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,'invalid_response');
+      assert.deepEqual(exhausted.calls.map(call=>call.index),[0,1,2]);
+      const recent=(await exhausted.get('recent')).records;assert.equal(recent.length,3);assert(recent.every(item=>item.outcome==='failed'&&item.error_class==='invalid_response'));
+    }finally{await exhausted.close();}
+  });
   await test('A13 多候选连续挂起共享总期限，剩余时间不够时不继续遍历',async()=>{
     const f=await fixture(3,{call_timeout_ms:1200,connect_timeout_ms:200,question_timeout_ms:2000});try {
       let closed=0;f.behavior=async(_call,response)=>{response.once('close',()=>{closed++;});return true;};

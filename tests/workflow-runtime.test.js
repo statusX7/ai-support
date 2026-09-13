@@ -226,8 +226,9 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
       const wasCancelled = () => Object.values(state(interruptedSession).outgoing || {})
         .some((record) => record.cancellation_reason === 'conversation_state_changed');
-      for (let tries = 0; tries < 100 && !wasCancelled(); tries += 1) await wait(10);
+      for (let tries = 0; tries < 100 && (!wasCancelled() || !interruptedEvents.includes('survivor')); tries += 1) await wait(10);
       assert.equal(wasCancelled(), true, '持久人工状态必须触发 fallback signal 的 abort 监听器');
+      assert(interruptedEvents.includes('survivor'), '原 worker 仍存活时必须继续收到持久状态触发的网络取消');
       await operator(interruptedSession, { content: '重复真人事件不得重复触发 abort' });
       const result = await pending;
       release();
@@ -613,7 +614,9 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const attempts = sendAttempts;
     const beforeA = sent.filter((entry) => entry.session_id === session).length;
     const entry = await receive(message(session, '等待发送的普通问题'));
-    const pending = runtime.process(entry.key, entry.jobId);
+    let pendingSettled = false;
+    const pending = runtime.process(entry.key, entry.jobId).then((result) => { pendingSettled = true; return result; },
+      (error) => { pendingSettled = true; throw error; });
     for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
     assert.equal(sendAttempts, attempts + 1, '普通回答必须已经进入受控 Crisp POST');
     now += 5;
@@ -623,8 +626,9 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const accepted = await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     assert.equal(accepted.accepted, true);
     if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
-    for (let tries = 0; tries < 100 && !Object.values(state(session).outgoing)
-      .some(record => record.cancellation_reason === 'conversation_state_changed'); tries += 1) await wait(10);
+    for (let tries = 0; tries < 100 && (!pendingSettled || !Object.values(state(session).outgoing)
+      .some(record => record.cancellation_reason === 'conversation_state_changed')); tries += 1) await wait(10);
+    assert.equal(pendingSettled, true, '原 worker 仍存活时必须由持久状态轮询中止网络请求');
     const result = await pending;
     release();
     assert.equal(result.status, 'cancelled');
