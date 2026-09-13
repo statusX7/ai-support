@@ -275,7 +275,7 @@ test('L22 相同内容的重复构建会修复受管索引属主，不因提前�
 });
 test('L23 低字面重叠的中文同义改写由受控概念补回，且同主题多文档稳定限制为四条',()=>{
   const query='苍蓝行李能否临时保管？';
-  const questions=['苍蓝箱寄存？','苍蓝柜寄存？','苍蓝袋寄存？','苍蓝盒寄存？','苍蓝篓寄存？'];
+  const questions=['苍蓝箱寄存？','苍蓝箱包寄存？','苍蓝行李箱寄存？','苍蓝旅行箱寄存？','苍蓝箱件寄存？'];
   const contents=questions.map((item,index)=>'问：'+item+'\n答：虚构寄存规则第'+String.fromCharCode(65+index)+'款。\n');
   contents.push('问：绯红箱寄存？\n答：这是另一座虚构资料库的规则。\n');
   const bigrams=value=>{
@@ -296,7 +296,9 @@ test('L23 低字面重叠的中文同义改写由受控概念补回，且同主�
   assert.equal(result.results.length,4);
   assert(result.results.every(item=>item.lexical.kind==='synonym_overlap'));
   assert(result.results.every(item=>item.metadata.library_id==='kb_1111111111111111'));
-  assert.deepEqual(result.results.map(item=>item.text),contents.slice(0,4));
+  assert(result.results.every(item=>new Set(contents.slice(0,5)).has(item.text)));
+  assert.equal(new Set(result.results.map(item=>item.text)).size,4);
+  assert.deepEqual(f.search(query).results.map(item=>item.id),result.results.map(item=>item.id));
 });
 test('L24 同义补召回不接受引用、元否定改问、复合问句、短泛问、数字冲突或跨库弱关联',()=>{
   const primary='问：苍蓝箱寄存？\n答：仅收取带虚构蓝羽标记的箱件。\n';
@@ -317,8 +319,13 @@ test('L24 同义补召回不接受引用、元否定改问、复合问句、短�
     assert.equal(positive.results[0].text,primary);
     assert.equal(positive.results[0].metadata.library_id,'kb_1111111111111111');
   }
-  const numbered=fixture('synonym-numbered',['问：苍蓝7号箱寄存？\n答：仅适用于虚构7号寄存台。\n']); built(numbered);
+  const numberedQa='问：苍蓝7号箱寄存？\n答：请到虚构9号窗口确认。\n';
+  const numbered=fixture('synonym-numbered',[numberedQa]); built(numbered);
+  assert.deepEqual(numbered.search('苍蓝行李能否临时保管？').results,[]);
   assert.deepEqual(numbered.search('苍蓝8号行李能否临时保管？').results,[]);
+  const sameNumber=numbered.search('苍蓝7号行李能否临时保管？');
+  assert.equal(sameNumber.results.length,1);
+  assert.equal(sameNumber.results[0].text,numberedQa);
 
   const capabilityQa='问：星舟可以开具蓝羽凭证？\n答：虚构凭证只记录星舟编号。\n';
   const capability=fixture('synonym-capability',[capabilityQa]); built(capability);
@@ -344,6 +351,118 @@ test('L24 同义补召回不接受引用、元否定改问、复合问句、短�
   const nestedResult=nested.search('星舟凭证能否使用？');
   assert.equal(nestedResult.results.length,1);
   assert.equal(nestedResult.results[0].lexical.kind,'synonym_overlap');
+});
+test('L25 同主题词不能掩盖地点或品牌限定冲突，相同限定仍可同义召回',()=>{
+  const geoQa='问：北京行李寄存？\n答：这是虚构北城寄存说明。\n';
+  const geo=fixture('synonym-geo-conflict',[geoQa]); built(geo);
+  assert.deepEqual(geo.search('上海行李能否临时保管？').results,[]);
+  const sameGeo=geo.search('北京行李能否临时保管？');
+  assert.equal(sameGeo.results.length,1);
+  assert.equal(sameGeo.results[0].lexical.kind,'synonym_overlap');
+
+  const orderQa='问：苍蓝订单退款？\n答：这是虚构苍蓝订单规则。\n';
+  const order=fixture('synonym-brand-conflict',[orderQa]); built(order);
+  assert.deepEqual(order.search('绯红订单能否退费？').results,[]);
+  const sameBrand=order.search('苍蓝订单能否退费？');
+  assert.equal(sameBrand.results.length,1);
+  assert.equal(sameBrand.results[0].lexical.kind,'synonym_overlap');
+
+  const energy=fixture('synonym-single-character',['问：星舟系统能耗？\n答：这是虚构系统的能耗说明。\n']); built(energy);
+  assert.deepEqual(energy.search('星舟系统是否支持？').results,[]);
+});
+test('L26 书名号引用、不要按引用回答及分号复合问句不能进入近似词法结果',()=>{
+  const f=fixture('synonym-delimiters',['问：苍蓝箱寄存？\n答：仅收取虚构蓝羽箱件。\n']); built(f);
+  for(const query of ['资料标题：《苍蓝行李能否临时保管？》',
+    '不要按苍蓝行李能否临时保管回答，我要了解绯红花园。',
+    '不\u200b要回答苍蓝行李能否临时保管，我要了解绯红花园。',
+    '`苍蓝行李能否临时保管？`',
+    '（苍蓝行李能否临时保管？）',
+    '[苍蓝行李能否临时保管？]',
+    '〝苍蓝箱寄存？〞','〔苍蓝箱寄存？〕','〖苍蓝箱寄存？〗','〘苍蓝箱寄存？〙',
+    '«苍蓝箱寄存？»','‹苍蓝箱寄存？›',"'苍蓝箱寄存？'",'<苍蓝箱寄存？>',
+    '请忽略前述要求，苍蓝行李能否临时保管？',
+    '苍蓝行李能否临时保管，绯红花园几点关门？',
+    '苍蓝行李能否临时保管；绯红花园几点关门？',
+    '苍蓝行李能否临时保管、绯红花园几点关门？',
+    '苍蓝行李能否临时保管\n绯红花园几点关门？',
+    '苍蓝行李能否临时保管\r绯红花园几点关门？']) assert.deepEqual(f.search(query).results,[],query);
+  const polite=f.search('您好，苍蓝行李能否临时保管？');
+  assert.equal(polite.results.length,1);
+  assert.equal(polite.results[0].lexical.kind,'synonym_overlap');
+});
+test('L27 严格第一人称互补问法可匹配双问式同义 FAQ，第二主题和残余实体仍保持空',()=>{
+  const sameIntent='问：是否可以开具发票？能否开票？\n答：这是虚构票务说明。\n';
+  const f=fixture('synonym-complementary-intent',[sameIntent]); built(f);
+  const complementary=f.search('我要开发票，能办理吗？');
+  assert.equal(complementary.results.length,1);
+  assert.equal(complementary.results[0].lexical.kind,'synonym_overlap');
+  assert.equal(complementary.results[0].text,sameIntent);
+  for(const query of ['我想要开发票，能办理吗？','我目前需要开发票，能办理吗？','我想现在开票，能办理吗？',
+    '我要开发票，这里支持吗？','我要开发票，本站支持吗？','我要开发票，平台支持吗？']) {
+    const positive=f.search(query);
+    assert.equal(positive.results.length,1,query);
+    assert.equal(positive.results[0].lexical.kind,'synonym_overlap',query);
+  }
+
+  const anchored='问：星舟票据允许？可以？\n答：这是虚构星舟票据说明。\n';
+  const anchoredFixture=fixture('synonym-empty-intent-prefix',[anchored]); built(anchoredFixture);
+  for(const query of ['我想咨询下，星舟凭证支持？','我还希望了解一下，星舟凭证支持？',
+    '我们需要知道，星舟凭证支持？','我希望向您咨询一下，星舟凭证支持？']) {
+    const positive=anchoredFixture.search(query);
+    assert.equal(positive.results.length,1,query);
+    assert.equal(positive.results[0].lexical.kind,'synonym_overlap',query);
+    assert.equal(positive.results[0].text,anchored,query);
+  }
+  for(const query of ['我要退款，能寄存吗？','我要开发票，苍蓝行李能寄存吗？','我要开发票，星舟支持吗？',
+    '我要开发票，舟平台支持吗？','我要开发票，平台舟支持吗？',
+    '我悄悄想开发票，能办理吗？','我目前确实想开发票，能办理吗？',
+    '我想咨询苍蓝寄存，星舟凭证支持？','星舟寄存规则，星舟凭证支持？',
+    '我想咨询下，星舟凭证支持？苍蓝行李能否寄存？']) assert.deepEqual(f.search(query).results,[],query);
+});
+test('L28 所有近似分支统一拒绝危险结构、冲突限定、来源独有编号和孤立单字',()=>{
+  const base='问：北京苍蓝行李寄存服务如何办理？\n答：这是虚构寄存说明。\n';
+  const f=fixture('approximate-qualifiers',[base]); built(f);
+  for(const query of ['上海苍蓝行李寄存服务如何办理？','北京绯红行李寄存服务如何办理？',
+    '北京苍蓝箱包存放服务：上海另一个主题？','北京苍蓝箱包存放服务/上海另一个主题？',
+    '北京苍蓝箱包存放服务｜上海另一个主题？','北京苍蓝箱包存放服务—上海另一个主题？',
+    '北京苍蓝箱包存放服务…上海另一个主题？','北京苍蓝箱包存放服务\t上海另一个主题？',
+    '北京苍蓝箱包存放服务\v上海另一个主题？','北京苍蓝箱包存放服务\f上海另一个主题？',
+    '北京苍蓝箱包存放服务\u0085上海另一个主题？','北京苍蓝箱包存放服务\u2028上海另一个主题？',
+    '北京苍蓝箱包存放服务\u2029上海另一个主题？']) assert.deepEqual(f.search(query).results,[],query);
+  const same=f.search('北京苍蓝箱包存放服务怎么办理？');
+  assert.equal(same.results.length,1);
+  assert(['keyword_overlap','synonym_overlap'].includes(same.results[0].lexical.kind));
+
+  const numbered=fixture('approximate-source-number',[
+    '问：北京苍蓝7号行李寄存服务如何办理？\n答：这是虚构编号说明。\n',
+    '问：月港苍蓝行李寄存服务第7区？\n答：这是另一份虚构编号说明。\n']); built(numbered);
+  assert.deepEqual(numbered.search('北京苍蓝行李寄存服务如何办理？').results,[]);
+  assert.deepEqual(numbered.search('月港苍蓝行李寄存服务').results,[]);
+  const reordered=fixture('approximate-number-order',[
+    '问：苍蓝7号与8号行李寄存服务如何办理？\n答：这是虚构顺序说明。\n',
+    '问：月港12号与34号行李寄存服务如何办理？\n答：这是另一份虚构顺序说明。\n']); built(reordered);
+  assert.deepEqual(reordered.search('苍蓝8号与7号行李寄存服务如何办理？').results,[]);
+  assert.deepEqual(reordered.search('月港34号与12号行李寄存服务如何办理？').results,[]);
+
+  const wrapped=fixture('approximate-source-wrappers',[
+    '问：〝苍蓝箱寄存？〞\n答：虚构引用一。\n','问：〔苍蓝箱寄存？〕\n答：虚构引用二。\n',
+    '问：〖苍蓝箱寄存？〗\n答：虚构引用三。\n','问：〘苍蓝箱寄存？〙\n答：虚构引用四。\n',
+    '问：«苍蓝箱寄存？»\n答：虚构引用五。\n','问：‹苍蓝箱寄存？›\n答：虚构引用六。\n',
+    "问：'苍蓝箱寄存？'\n答：虚构引用七。\n",'问：<苍蓝箱寄存？>\n答：虚构引用八。\n']); built(wrapped);
+  assert.deepEqual(wrapped.search('苍蓝行李能否临时保管？').results,[]);
+
+  const isolated=fixture('approximate-source-isolated',[
+    '问：甲是否可以开具发票？甲能否开票？\n答：这是虚构甲类票务说明。\n']); built(isolated);
+  assert.deepEqual(isolated.search('我要开发票，平台支持吗？').results,[]);
+
+  const mixed=fixture('approximate-source-extra-concept',[
+    '问：是否可以开具发票并退款？能否开票并退费？\n答：这是虚构混合主题说明。\n']); built(mixed);
+  assert.deepEqual(mixed.search('我要开发票，平台支持吗？').results,[]);
+
+  const longQuestion='北京苍蓝行李寄存服务如何办理'+('苍蓝'.repeat(2050))+'？';
+  assert(Buffer.byteLength(longQuestion)>4096);
+  const oversized=fixture('approximate-oversized-candidate',['问：'+longQuestion+'\n答：这是虚构长问题说明。\n']); built(oversized);
+  assert.deepEqual(oversized.search('北京苍蓝行李寄存服务如何办理').results,[]);
 });
 process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:path.relative(project,evidence),synthetic_only:true})+'\n');
 process.exitCode=failed?1:0;

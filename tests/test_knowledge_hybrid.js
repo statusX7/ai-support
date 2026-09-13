@@ -271,10 +271,11 @@ async function test(name, action) {
     await f.deliver(f.event('session_hybrid-stale')); assert.equal(f.vector.length, 0); safeFailure(f);
   });
   await test('H09 特定短问句仍可精确命中，泛问/不相关改写不能冒充词法语义召回', async () => {
-    const short = '补给箱的启封口令'; const exact = fixture('short-specific');
+    // 短问可以省略疑问尾词，但不能省略区分同类 FAQ 的实体限定。
+    const short = '曜石灯塔补给箱的启封口令'; const exact = fixture('short-specific');
     assert.equal(exact.search(short).results[0].lexical.kind, 'exact_phrase');
     await exact.deliver(exact.event('session_hybrid-short', short)); successful(exact, 'session_hybrid-short');
-    for(const [index, query] of ['口令', '请问怎么办', '另一座银杉花园的停车时间是什么？', '那座海边建筑的物资容器怎么打开？'].entries()) {
+    for(const [index, query] of ['口令', '补给箱的启封口令', '请问怎么办', '另一座银杉花园的停车时间是什么？', '那座海边建筑的物资容器怎么打开？'].entries()) {
       const f = fixture('generic-' + index); assert.deepEqual(f.search(query).results, []);
       await f.deliver(f.event('session_hybrid-generic-' + index, query));
       assert.equal(f.vector.length, 1); assert.equal(f.vector[0].query, query); assert.equal(f.generated.length, 0);
