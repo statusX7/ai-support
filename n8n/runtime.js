@@ -713,6 +713,9 @@ function createRuntime(env = {}, options = {}) {
     }
   };
   const outgoingRetentionMilliseconds = 604800000;
+  // Crisp 发送在结果未知时只能沿用同一 fingerprint 有界重试。首次发送及最多
+  // 两次恢复发送之间都必须先完成列表 + 精确端点的双重间隔负查。
+  const outboundPostMaximum = 3;
   const deliveryHasRelatedJob = (state, fingerprint, record) => (state.jobs || []).some((job) => job
     && (typeof record.job_id === 'string' && record.job_id.length > 0
       && typeof job.id === 'string' && job.id.length > 0 && record.job_id === job.id
@@ -1888,8 +1891,8 @@ function createRuntime(env = {}, options = {}) {
         });
         if (normalized) return 'retry';
       }
-      if (outgoing.attempts >= 2) {
-        // 两次结果未知后不再 POST，避免重复消息；在五分钟对账窗口内只查询同一
+      if (outgoing.attempts >= outboundPostMaximum) {
+        // 三次结果未知后不再 POST，避免重复消息；在五分钟对账窗口内只查询同一
         // fingerprint，Crisp/网络恢复后仍可确认已送达。窗口结束才收敛为失败。
         return 'retry';
       }

@@ -1630,6 +1630,64 @@ const test = async (name, action) => {
     assert.equal(stale.postAttempts.length, 0); assert.equal(stale.sent.length, 0);
   });
 
+  await test('F56 两次发送暂时失败后经逐轮双重负查仍可第三次恢复，且三次后有界停止', async () => {
+    const recovered = makeFixture('crisp-post-third-attempt-recovery'), recoveredSession = 'session_crisp-third-recovery';
+    const keyword = recovered.readConfig('keyword');
+    keyword.rules.unshift({ id: 'synthetic-third-post', name: '第三次发送恢复', enabled: true, match_mode: 'exact',
+      keywords: ['发送恢复问题'], exclude_keywords: [], priority: 1000, action: 'reply', text: '发送恢复后的唯一回复', cooldown_seconds: 0 });
+    recovered.writeConfig('keyword', keyword);
+    recovered.modes.exactStatus = 404;
+    recovered.modes.crispDropBeforeAccept = true;
+    recovered.modes.onCrispPost = async () => {
+      if (recovered.postAttempts.length >= 2) recovered.modes.crispDropBeforeAccept = false;
+    };
+    recovered.restart();
+    const event = recovered.event(recoveredSession, '发送恢复问题');
+    const accepted = await recovered.receive(event);
+    assert.equal(accepted.accepted, true); assert.equal(accepted.route, 'process');
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'retry');
+    assert.equal(recovered.postAttempts.length, 1); assert.equal(recovered.sent.length, 0);
+
+    recovered.advance(5000); recovered.restart();
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'retry');
+    assert.equal(recovered.exactRequests.length, 0); assert.equal(recovered.postAttempts.length, 1);
+    recovered.advance(5000); recovered.restart();
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'retry');
+    assert.equal(recovered.exactRequests.length, 1); assert.equal(recovered.postAttempts.length, 1);
+    recovered.advance(5000); recovered.restart();
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'retry');
+    assert.equal(recovered.exactRequests.length, 2); assert.equal(recovered.postAttempts.length, 2);
+    recovered.advance(5000); recovered.restart();
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'retry');
+    assert.equal(recovered.exactRequests.length, 3); assert.equal(recovered.postAttempts.length, 2);
+    recovered.advance(5000); recovered.restart();
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'sent');
+    assert.equal(recovered.exactRequests.length, 4); assert.equal(recovered.postAttempts.length, 3);
+    assert.equal(new Set(recovered.postAttempts.map(item => String(item.fingerprint))).size, 1);
+    assert.equal(recovered.sent.length, 1); assert.equal(recovered.sent[0].content, '发送恢复后的唯一回复');
+    assert.equal((await recovered.receive(event)).reason, '重复事件已忽略');
+    assert.equal((await recovered.runtime().process(accepted.key, accepted.jobId)).status, 'idle');
+    assert.equal(recovered.postAttempts.length, 3); assert.equal(recovered.sent.length, 1);
+
+    const bounded = makeFixture('crisp-post-maximum-bounded'), boundedSession = 'session_crisp-post-bounded';
+    const boundedPlan = { type: 'text', purpose: 'keyword_reply', ordinary: true, content: '不得无限重发', fingerprint: 77321 };
+    const boundedJob = bounded.makeJob(boundedSession, 'maximum-post-attempts', boundedPlan);
+    const boundedOutgoing = bounded.makeOutgoing(boundedJob, boundedPlan.content, 'unknown');
+    boundedOutgoing.attempts = 3;
+    await bounded.seed(boundedSession, state => { state.jobs.push(boundedJob); state.outgoing[String(boundedPlan.fingerprint)] = boundedOutgoing; });
+    bounded.modes.exactStatus = 404; bounded.restart();
+    assert.equal((await bounded.runtime().process(bounded.key(boundedSession), boundedJob.id)).status, 'retry');
+    bounded.advance(5000); bounded.restart();
+    assert.equal((await bounded.runtime().process(bounded.key(boundedSession), boundedJob.id)).status, 'retry');
+    assert.equal(bounded.exactRequests.length, 2); assert.equal(bounded.postAttempts.length, 0);
+    bounded.advance(300001); bounded.restart();
+    assert.equal((await bounded.runtime().process(bounded.key(boundedSession), boundedJob.id)).status, 'failed');
+    const stored = bounded.rawState(boundedSession);
+    assert.equal(stored.jobs.find(item => item.id === boundedJob.id).status, 'failed');
+    assert.equal(stored.outgoing[String(boundedPlan.fingerprint)].status, 'failed');
+    assert.equal(bounded.postAttempts.length, 0); assert.equal(bounded.sent.length, 0);
+  });
+
   fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed, synthetic_only: true }, null, 2));
   process.stdout.write(JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed, synthetic_only: true, evidence: path.relative(project, evidence) }) + '\n');
   if (failed) process.exitCode = 1;
