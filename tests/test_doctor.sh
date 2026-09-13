@@ -1031,6 +1031,163 @@ jq -M -n --argjson now "$(date -u '+%s%3N')" \
 unset DOCTOR_TEST_PRESERVE_HEARTBEAT
 pass '独立 scheduler 心跳区分无流量健康、延迟警告和扫描停滞'
 
+# 旧 runtime 没有 isolated_sessions 字段时继续兼容；新字段为零时不得增加结果或改变退出码。
+export DOCTOR_TEST_PRESERVE_HEARTBEAT=1
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  control_cursor:7,ordinary_cursor:9,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:null
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 0 )) || fail '隔离计数全零的扫描心跳不应改变健康退出码'
+assert_result runtime.scheduler PASS
+jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null \
+  || fail '隔离计数全零时不应增加诊断结果'
+jq -e 'all(.results[]; .id != "runtime.scheduler_health_recovery")' "$OUT" >/dev/null \
+  || fail '空恢复记录不应增加诊断结果'
+pass 'scheduler 隔离字段全零、空恢复记录及公平游标兼容，且不改变既有健康结果'
+
+# 隔离统计必须是严格的非负整数，并且原因之和必须等于总数。
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:2,reasons:{too_large:1,invalid_json:0,invalid_state:0}}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '隔离原因之和不等于总数时应判定扫描心跳无效'
+assert_result runtime.scheduler FAIL
+jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null \
+  || fail '畸形隔离统计不应生成可信的隔离计数结果'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:1,reasons:{too_large:0,invalid_json:-1,invalid_state:2}}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '隔离原因包含负数时应判定扫描心跳无效'
+assert_result runtime.scheduler FAIL
+pass 'scheduler 隔离统计拒绝负数及总数不守恒的畸形状态'
+
+# 心跳自恢复记录只接受匿名、固定原因的正整数毫秒时间；近期恢复警告，历史恢复不永久降级。
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:{at:$now,reason:"unknown_reason"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '未知心跳恢复原因应判定扫描心跳无效'
+assert_result runtime.scheduler FAIL
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:{at:($now - 1000),reason:"invalid_json"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+recovered_health_hash=$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')
+recovered_business_hash=$(business_hash)
+recovered_session_hash=$(sha256sum "$SESSION_FILE" | awk '{print $1}')
+invoke --local
+(( LAST_RC == 2 )) || fail '最近 24 小时内的扫描心跳自恢复应返回警告 2'
+assert_result runtime.scheduler PASS
+assert_result runtime.scheduler_health_recovery WARN
+jq -e 'any(.results[]; .id == "runtime.scheduler_health_recovery" and
+  (.summary | contains("JSON 内容无效") and contains("会话状态未被删除")))' "$OUT" >/dev/null \
+  || fail '近期心跳恢复记录缺少匿名中文原因和状态保护说明'
+
+recovered_text_rc=0
+fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --local \
+  > "${TEST_ROOT}/scheduler-recovered.txt" 2> "${TEST_ROOT}/scheduler-recovered.err" || recovered_text_rc=$?
+(( recovered_text_rc == 2 )) || fail '普通中文 doctor 未保留近期心跳恢复警告退出码'
+grep -Fq '扫描心跳恢复记录' "${TEST_ROOT}/scheduler-recovered.txt" \
+  || fail '普通中文 doctor 未展示心跳恢复记录'
+grep -F '扫描心跳恢复记录' "${TEST_ROOT}/scheduler-recovered.txt" > "${TEST_ROOT}/scheduler-recovered-line.txt"
+! grep -Eq 'session-[a-f0-9]{64}|data/runtime|health_recovered' "${TEST_ROOT}/scheduler-recovered-line.txt" \
+  || fail '普通中文心跳恢复提示泄漏内部路径、会话身份或字段名'
+
+invoke --local --fix
+(( LAST_RC == 2 )) || fail 'doctor --fix 不应清除近期心跳恢复警告'
+assert_result runtime.scheduler_health_recovery WARN
+[[ "$recovered_health_hash" == "$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 修改了心跳自恢复记录'
+[[ "$recovered_business_hash" == "$(business_hash)" ]] \
+  || fail 'doctor --fix 因心跳自恢复记录修改了业务状态'
+[[ "$recovered_session_hash" == "$(sha256sum "$SESSION_FILE" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 因心跳自恢复记录修改或删除了会话状态'
+jq -e 'all(.fix.actions[]?; .id != "fix.runtime.scheduler_health_recovery")' "$OUT" >/dev/null \
+  || fail 'doctor --fix 不应提供自动清理心跳恢复记录的动作'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:{at:($now - 86401000),reason:"too_large"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 0 )) || fail '超过 24 小时的心跳恢复历史不应永久降级健康状态'
+assert_result runtime.scheduler PASS
+assert_result runtime.scheduler_health_recovery PASS
+jq -e 'any(.results[]; .id == "runtime.scheduler_health_recovery" and (.summary | startswith("历史记录：")))' "$OUT" >/dev/null \
+  || fail '超过 24 小时的心跳恢复未明确标记为历史记录'
+pass '心跳自恢复 schema 严格，近期匿名警告且 --fix 只读，历史记录不永久降级'
+
+# 非零隔离是关键故障：报告仅给匿名分类计数；doctor --fix 和兼容门禁均不得清理状态。
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:3,reasons:{too_large:1,invalid_json:1,invalid_state:1}},
+  health_recovered:null
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+isolated_health_hash=$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')
+isolated_business_hash=$(business_hash)
+isolated_session_hash=$(sha256sum "$SESSION_FILE" | awk '{print $1}')
+invoke --local
+(( LAST_RC == 1 )) || fail '存在被隔离会话状态时 local doctor 应退出 1'
+assert_result runtime.scheduler PASS
+assert_result runtime.scheduler_isolation FAIL
+jq -e 'any(.results[]; .id == "runtime.scheduler_isolation" and .severity == "critical" and
+  (.summary | contains("隔离 3 个异常会话状态") and contains("其他合法会话继续扫描")))' "$OUT" >/dev/null \
+  || fail '非零隔离没有生成关键、匿名且说明继续扫描的诊断结果'
+! grep -Eq 'session[-_][[:alnum:]_-]+|data/runtime/session-' "$OUT" \
+  || fail '会话隔离诊断泄漏了会话身份或状态路径'
+
+health_isolation_rc=0
+fixture_env "${DEPLOY}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY" --application --json \
+  > "${TEST_ROOT}/health-isolation.json" 2> "${TEST_ROOT}/health-isolation.err" || health_isolation_rc=$?
+(( health_isolation_rc == 1 )) || fail '兼容 application 门禁未阻断非零会话隔离故障'
+jq -e 'any(.results[]; .id == "runtime.scheduler_isolation" and .status == "FAIL")' \
+  "${TEST_ROOT}/health-isolation.json" >/dev/null \
+  || fail '兼容 application 门禁缺少会话隔离结构化故障'
+
+invoke --local --fix
+(( LAST_RC == 1 )) || fail 'doctor --fix 不应掩盖或自动清理会话隔离故障'
+assert_result runtime.scheduler_isolation FAIL
+[[ "$isolated_health_hash" == "$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 修改了 scheduler 隔离证据'
+[[ "$isolated_business_hash" == "$(business_hash)" ]] \
+  || fail 'doctor --fix 因会话隔离修改了业务状态'
+[[ "$isolated_session_hash" == "$(sha256sum "$SESSION_FILE" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 因会话隔离修改或删除了会话状态'
+jq -e 'all(.fix.actions[]?; .id != "fix.runtime.scheduler_isolation")' "$OUT" >/dev/null \
+  || fail 'doctor --fix 不应提供自动清理隔离状态的动作'
+pass '非零会话隔离使 doctor/healthcheck 关键失败，且自检与 --fix 保持业务状态不变'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" \
+  '{schema_version:1,started_at:($now - 10),completed_at:$now}' \
+  > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 0 )) || fail '缺少隔离字段的旧 scheduler 心跳应继续兼容'
+assert_result runtime.scheduler PASS
+jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null \
+  || fail '旧 scheduler 心跳不应凭空产生隔离结果'
+unset DOCTOR_TEST_PRESERVE_HEARTBEAT
+pass '缺少 isolated_sessions 的旧 scheduler 心跳保持向后兼容'
+
 SCHEDULER_LOCK="${DEPLOY}/data/runtime/scheduler-scan.lock"
 mkdir -m 0700 -- "$SCHEDULER_LOCK"
 invoke --local

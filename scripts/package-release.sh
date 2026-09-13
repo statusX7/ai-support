@@ -91,7 +91,7 @@ RELEASE_FILES=(
   docs/SECURITY.md docs/TESTING.md docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   tests/run.sh tests/test_archive_security.sh tests/test_bootstrap.sh
   tests/test_configuration_guards.js tests/test_configuration_protocol.js
-  tests/test_feedback_runtime.js tests/test_provider_pool.js tests/test_runtime_provider_pool.js tests/test_provider_lifecycle.js
+  tests/test_feedback_runtime.js tests/test_provider_pool.js tests/test_runtime_provider_pool.js tests/test_runtime_missing_reply_p0.js tests/test_provider_lifecycle.js
   tests/test_outgoing_identity.js tests/owned_outgoing.py tests/test_provider_log_redaction.py
   tests/test_rag_context.py tests/test_snapshot_live.py
   tests/test_knowledge_context.js tests/test_knowledge_runtime.js tests/test_knowledge_lexical.js tests/test_knowledge_hybrid.js

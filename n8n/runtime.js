@@ -120,6 +120,10 @@ function createRuntime(env = {}, options = {}) {
   const { URL } = require('url');
   const root = options.root || '/opt/crisp-ai';
   const directory = root + '/data/runtime';
+  const stateMaximumBytes = 2097152;
+  // Webhook 已持久接收之后仍需写入租约、plan 与 outgoing。为一个最大
+  // Webhook 控制事件和处理元数据预留空间，队列同时受条目数和字节数约束。
+  const stateIngressMaximumBytes = stateMaximumBytes - 327680;
   const clock = options.clock || (() => Date.now());
   const sleep = options.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   const hash = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -135,11 +139,20 @@ function createRuntime(env = {}, options = {}) {
     if (result > 0 && result < 100000000000) result *= 1000;
     return Number.isFinite(result) && result > 0 ? result : 0;
   };
-  const safeRead = (file, fallback, maximum = 2097152) => {
+  const safeRead = (file, fallback, maximum = stateMaximumBytes) => {
     try {
       const stat = fs.lstatSync(file);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maximum) throw new Error('受管文件格式不安全');
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maximum) {
+        const error = new Error('受管文件格式不安全');
+        error.code = stat.size > maximum ? 'MANAGED_FILE_TOO_LARGE' : 'MANAGED_FILE_UNSAFE';
+        error.managedFile = file;
+        throw error;
+      }
+      try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+      catch (error) {
+        if (error?.name === 'SyntaxError') { error.code = 'MANAGED_FILE_INVALID_JSON'; error.managedFile = file; }
+        throw error;
+      }
     } catch (error) {
       if (error.code === 'ENOENT' && fallback !== undefined) return fallback;
       throw error;
@@ -461,12 +474,28 @@ function createRuntime(env = {}, options = {}) {
     const stat = fs.lstatSync(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('会话目录不安全');
   };
-  const atomic = (file, value) => {
+  const serialized = (value) => JSON.stringify(value);
+  const assertSerializedWithin = (value, maximum) => {
+    const content = serialized(value);
+    if (Buffer.byteLength(content, 'utf8') > maximum) {
+      const error = new Error('受管文件超过安全字节上限');
+      error.code = 'MANAGED_FILE_TOO_LARGE';
+      throw error;
+    }
+    return content;
+  };
+  const atomic = (file, value, maximum) => {
+    if (!Number.isSafeInteger(maximum) || maximum < 1) throw new Error('受管文件字节上限无效');
+    // 必须在创建临时文件前完成字节计数；超限事务不留下
+    // 候选文件，也不会替换上一个可读的活动状态。
+    let content;
+    try { content = assertSerializedWithin(value, maximum); }
+    catch (error) { error.managedFile = file; throw error; }
     const temporary = file + '.tmp-' + crypto.randomBytes(8).toString('hex');
     let descriptor;
     try {
       descriptor = fs.openSync(temporary, 'wx', 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify(value));
+      fs.writeFileSync(descriptor, content);
       fs.fsyncSync(descriptor);
       fs.closeSync(descriptor);
       descriptor = undefined;
@@ -592,7 +621,7 @@ function createRuntime(env = {}, options = {}) {
     if (value.fingerprints.includes(String(fingerprint))) return;
     if (value.fingerprints.length >= 50000) throw new Error('本项目出站身份索引需要维护，未发送消息');
     value.fingerprints.push(String(fingerprint));
-    atomic(file, value);
+    atomic(file, value, 1048576);
   };
   const emptyState = (website, session) => ({
     schema_version: 2, website_id: website, session_id: session,
@@ -603,6 +632,63 @@ function createRuntime(env = {}, options = {}) {
   });
   const priorityConfirmation = (job) => job.control === true && job.action === 'confirm_handoff'
     && job.priority_confirmation === true && !['done', 'cancelled', 'failed'].includes(job.status);
+  const terminalJob = (job) => ['done', 'cancelled', 'failed'].includes(job?.status);
+  const validOperatorResolution = (value) => value && value.schema_version === 1
+    && ['human', 'not-human', 'unknown'].includes(value.result)
+    && typeof value.human_changed === 'boolean';
+  const establishUnknownOperatorFence = (state, control, reason = 'identity_unresolved') => {
+    if (!Array.isArray(state.uncertain_events) || !state.uncertain_events.includes(control.id)) return false;
+    state.uncertain_events = state.uncertain_events.filter((id) => id !== control.id);
+    state.generation += 1;
+    const ordered = Number.isFinite(control.event_time) && control.event_time > 0
+      && Number.isSafeInteger(control.sequence) && control.sequence >= 0;
+    // 无法证明是人工时仍建立代次栅栏，丢弃该 operator 事件之前已经
+    // 开始的生成；其后因归属未决保留的访客任务重绑到新代次。
+    for (const pending of state.jobs || []) {
+      if (!pending || pending.control || pending.status !== 'received') continue;
+      const afterControl = ordered ? pending.event_time > control.event_time
+        || pending.event_time === control.event_time && pending.sequence > control.sequence
+        : pending.deferred_control === true;
+      if (afterControl && pending.deferred_control === true) {
+        pending.generation = state.generation;
+        pending.lease_until = 0;
+        pending.retry_at = null;
+        delete pending.inference;
+        if (state.uncertain_events.length === 0) delete pending.deferred_control;
+      } else if (!afterControl) pending.status = 'cancelled';
+    }
+    appendEvent('control_unknown', { reason });
+    return true;
+  };
+  const repairOperatorBarriers = (state) => {
+    if (!Array.isArray(state.uncertain_events) || !Array.isArray(state.jobs)) return state;
+    for (const id of [...new Set(state.uncertain_events)]) {
+      const job = state.jobs.find((entry) => entry?.id === id);
+      if (job?.action === 'resolve_operator' && !terminalJob(job)) continue;
+      const resolution = validOperatorResolution(job?.operator_resolution) ? job.operator_resolution : null;
+      if (resolution?.result === 'human') {
+        state.uncertain_events = state.uncertain_events.filter((entry) => entry !== id);
+        const changed = pause(state, id, Number.isFinite(job.event_time) ? job.event_time : clock(), 'operator_reply');
+        job.operator_resolution = { ...resolution, human_changed: resolution.human_changed || changed, recovered: true };
+      } else if (resolution?.result === 'not-human') {
+        state.uncertain_events = state.uncertain_events.filter((entry) => entry !== id);
+        if (state.uncertain_events.length === 0) {
+          for (const pending of state.jobs) if (!pending.control && pending.status === 'received') delete pending.deferred_control;
+        }
+        job.operator_resolution = { ...resolution, recovered: true };
+      } else {
+        const control = job || { id, event_time: null, sequence: null };
+        if (!establishUnknownOperatorFence(state, control, 'orphaned_barrier')) continue;
+        if (job) job.operator_resolution = { schema_version: 1, result: 'unknown', human_changed: false, recovered: true };
+      }
+      if (job) {
+        job.status = 'done';
+        job.lease_until = 0;
+        job.retry_at = null;
+      }
+    }
+    return state;
+  };
   const feedbackPurpose = (value) => ['feedback', 'feedback_invite', 'feedback_prompt', 'feedback_offer', 'feedback_ack',
     'feedback_response', 'feedback_thanks', 'feedback_clarification', 'feedback_positive', 'feedback_negative'].includes(value);
   const feedbackOnly = (value) => Boolean(value && (['purpose', 'kind', 'action', 'type'].some((field) => feedbackPurpose(value[field]))
@@ -671,6 +757,7 @@ function createRuntime(env = {}, options = {}) {
   const expire = (state) => {
     retireFeedback(state);
     normalizeSafeErrors(state);
+    repairOperatorBarriers(state);
     normalizeWorker(state);
     if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= clock()) {
       state.mode = 'ai';
@@ -734,7 +821,7 @@ function createRuntime(env = {}, options = {}) {
       const result = mutate(state);
       if (result && typeof result.then === 'function') throw new Error('状态事务不能等待网络');
       state.updated_at = clock();
-      atomic(file, state);
+      atomic(file, state, stateMaximumBytes);
       if (state.mode === 'human' && (previousMode !== 'human' || state.generation !== previousGeneration)) cancelOutbound(key);
       return result;
     } finally { fs.rmdirSync(lock); }
@@ -754,6 +841,14 @@ function createRuntime(env = {}, options = {}) {
     for (const job of state.jobs) {
       if (!job.control && !['done', 'failed'].includes(job.status)) {
         job.status = 'cancelled';
+        // 真人接管是容量压力下也必须落盘的控制状态。被取消的普通任务不会
+        // 再恢复或补答，立即释放其正文和推理计划，避免旧版接近 2 MiB 的
+        // 合法状态因本次控制事件新增少量元数据而拒绝提交。
+        delete job.data;
+        delete job.plan;
+        delete job.inference;
+        delete job.deferred_configuration;
+        delete job.deferred_control;
         cancelled.add(job.id);
       }
     }
@@ -975,6 +1070,7 @@ function createRuntime(env = {}, options = {}) {
         }
         if (['done', 'cancelled'].includes(job.status)) delete job.data;
         state.jobs.push(job);
+        if (job.status === 'received' && !job.control) assertSerializedWithin(state, stateIngressMaximumBytes);
         return { jobId: id, pending: job.status === 'received' && !job.deferred_configuration
           && !(job.retry_at > clock()) && (job.control || state.uncertain_events.length === 0) };
       }, website, session);
@@ -1413,19 +1509,16 @@ function createRuntime(env = {}, options = {}) {
     if (job.action === 'operator') return { purpose: 'operator', tags: job.human_changed ? ['human_required'] : [] };
     if (job.action === 'resolve_operator') {
       const state = readState(key);
-      const validResolution = (value) => value && value.schema_version === 1
-        && ['human', 'not-human', 'unknown'].includes(value.result)
-        && typeof value.human_changed === 'boolean';
       // 归属解析和其状态栅栏先于 process 的最终 done 事务提交。进程若恰在两者
       // 之间退出，租约恢复会再次进入本分支；持久结果必须使重放成为幂等操作，
       // 否则 unknown 会重复增加 generation 并取消恢复期间的新访客消息。
-      let result = validResolution(job.operator_resolution)
+      let result = validOperatorResolution(job.operator_resolution)
         ? job.operator_resolution.result : await resolveOperator(state, job.data);
       let changed = false;
       await transaction(key, (current) => {
         const stored = current.jobs.find((entry) => entry.id === job.id);
         if (!stored) return;
-        if (validResolution(stored.operator_resolution)) {
+        if (validOperatorResolution(stored.operator_resolution)) {
           result = stored.operator_resolution.result;
           changed = stored.operator_resolution.human_changed;
           return;
@@ -1440,29 +1533,12 @@ function createRuntime(env = {}, options = {}) {
           stored.operator_resolution = { schema_version: 1, result, human_changed: changed, legacy_recovered: true };
           return;
         }
-        current.uncertain_events = current.uncertain_events.filter((id) => id !== job.id);
-        if (result === 'human') changed = pause(current, job.id, job.event_time, 'operator_reply');
-        else if (result === 'unknown') {
-          current.generation += 1;
-          // 无法证明是人工时仍建立代次栅栏，丢弃该 operator 事件之前已经
-          // 开始的生成；但该事件之后、因归属未决而尚未开始的访客任务属于
-          // 新咨询，重绑定到新代次并交给持久调度器，不能永久吞掉。
-          for (const pending of current.jobs) {
-            if (pending.control || pending.status !== 'received') continue;
-            const afterControl = pending.event_time > job.event_time
-              || pending.event_time === job.event_time && pending.sequence > job.sequence;
-            if (afterControl && pending.deferred_control === true) {
-              pending.generation = current.generation;
-              pending.lease_until = 0;
-              pending.retry_at = null;
-              delete pending.inference;
-              // 多个未决 operator 必须逐个建立栅栏；最后一个控制事件确认完毕
-              // 之前保留标记，避免下一次 unknown 又把同一访客任务当成旧代。
-              if (current.uncertain_events.length === 0) delete pending.deferred_control;
-            } else if (!afterControl) pending.status = 'cancelled';
-          }
-          appendEvent('control_unknown');
-        } else if (current.uncertain_events.length === 0) {
+        if (result === 'unknown') establishUnknownOperatorFence(current, stored);
+        else {
+          current.uncertain_events = current.uncertain_events.filter((id) => id !== job.id);
+          if (result === 'human') changed = pause(current, job.id, job.event_time, 'operator_reply');
+        }
+        if (result === 'not-human' && current.uncertain_events.length === 0) {
           // REST 回查确认不是人工后，下一轮调度即可处理期间保留的访客消息。
           for (const pending of current.jobs) if (!pending.control && pending.status === 'received') delete pending.deferred_control;
         }
@@ -1896,7 +1972,17 @@ function createRuntime(env = {}, options = {}) {
           const stored = state.jobs.find((entry) => entry.id === job.id);
           if (stored && stored.status !== 'cancelled') {
             stored.lease_until = 0;
-            if (!stored.control && stored.data && configurationShouldDefer() && configuredSettings().enabled === true && state.mode === 'ai') {
+            if (stored.control && stored.action === 'resolve_operator' && stored.attempts >= 3
+              && state.uncertain_events.includes(stored.id)) {
+              // 控制任务终端状态不得与未决栅栏并存。重试耗尽时与
+              // 正常 unknown 分支一次性建立同样的代次栅栏并释放后续访客任务。
+              establishUnknownOperatorFence(state, stored, 'retry_exhausted');
+              stored.operator_resolution = { schema_version: 1, result: 'unknown', human_changed: false, recovered: true };
+              stored.status = 'done';
+              stored.retry_at = null;
+              delete stored.data;
+              delete stored.plan;
+            } else if (!stored.control && stored.data && configurationShouldDefer() && configuredSettings().enabled === true && state.mode === 'ai') {
               stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
             } else if (!stored.control && stored.data && stored.attempts >= 3 && stored.plan?.purpose !== 'safe_error'
               && settings().enabled === true && state.mode === 'ai' && state.uncertain_events.length === 0) {
@@ -1951,6 +2037,10 @@ function createRuntime(env = {}, options = {}) {
       if (!workerJob || workerJob.status !== 'processing' || !(worker.until > at) || !(workerJob.lease_until > at)) return true;
     }
     if (state.mode === 'human' && state.resume_at !== null && state.resume_at <= at) return true;
+    if (!Array.isArray(state.uncertain_events) || state.uncertain_events.some((id) => {
+      const control = state.jobs.find((job) => job?.id === id);
+      return !control || control.action !== 'resolve_operator' || terminalJob(control);
+    })) return true;
     if (state.pending_feedback !== null && state.pending_feedback !== undefined) return true;
     if (Object.values(state.offers).some((offer) => feedbackOnly(offer)
       || Number.isFinite(offer?.expires_at) && offer.expires_at < at - 86400000)) return true;
@@ -1970,6 +2060,33 @@ function createRuntime(env = {}, options = {}) {
     if (Array.isArray(state.image_context) && state.image_context.some((entry) => !entry
       || !(entry.created_at > at - 86400000 && entry.created_at <= at + 60000))) return true;
     return false;
+  };
+  const scanStateEnvelopeValid = (state) => state && typeof state === 'object' && !Array.isArray(state)
+    && state.schema_version === 2 && typeof state.website_id === 'string' && typeof state.session_id === 'string'
+    && Array.isArray(state.jobs) && state.jobs.every((job) => job && typeof job === 'object' && !Array.isArray(job))
+    && state.offers && typeof state.offers === 'object' && !Array.isArray(state.offers)
+    && Object.values(state.offers).every((offer) => offer && typeof offer === 'object' && !Array.isArray(offer))
+    && state.outgoing && typeof state.outgoing === 'object' && !Array.isArray(state.outgoing)
+    && Object.values(state.outgoing).every((record) => record && typeof record === 'object' && !Array.isArray(record)
+      && (!Object.prototype.hasOwnProperty.call(record, 'body') || record.body === null
+        || record.body && typeof record.body === 'object' && !Array.isArray(record.body)))
+    && Array.isArray(state.uncertain_events)
+    && (state.worker === null || state.worker === undefined || state.worker && typeof state.worker === 'object' && !Array.isArray(state.worker));
+  const emptyScanIsolation = () => ({ count: 0, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0 } });
+  const scanIsolation = (value) => {
+    const reasons = value?.reasons;
+    if (!value || !Number.isSafeInteger(value.count) || value.count < 0 || !reasons
+      || !['too_large', 'invalid_json', 'invalid_state'].every((name) => Number.isSafeInteger(reasons[name]) && reasons[name] >= 0)
+      || value.count !== reasons.too_large + reasons.invalid_json + reasons.invalid_state) return emptyScanIsolation();
+    return { count: value.count, reasons: { too_large: reasons.too_large,
+      invalid_json: reasons.invalid_json, invalid_state: reasons.invalid_state } };
+  };
+  const recordScanIsolation = (aggregate, error) => {
+    const reason = error?.code === 'MANAGED_FILE_TOO_LARGE' ? 'too_large'
+      : error?.code === 'MANAGED_FILE_INVALID_JSON' || error?.name === 'SyntaxError' ? 'invalid_json'
+        : 'invalid_state';
+    aggregate.count += 1;
+    aggregate.reasons[reason] += 1;
   };
   const processIdentity = (pid = 'self') => {
     try {
@@ -1998,12 +2115,28 @@ function createRuntime(env = {}, options = {}) {
       && /^[0-9]+$/.test(value.process_start || '') && Number.isFinite(value.started_at)
       && Number.isFinite(value.heartbeat_at) ? value : null;
   };
+  const syncManagedDirectory = (path) => {
+    const descriptor = fs.openSync(path, 'r');
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+  };
+  const writeExclusiveJson = (file, value, maximum) => {
+    const content = assertSerializedWithin(value, maximum);
+    let descriptor;
+    try {
+      descriptor = fs.openSync(file, 'wx', 0o600);
+      fs.writeFileSync(descriptor, content);
+      fs.fsyncSync(descriptor);
+    } finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
+  };
   const writeScanOwner = (lock, owner) => {
     const file = lock + '/owner.json';
-    const temporary = lock + '/.owner-' + owner.token;
+    // heartbeat 候选文件位于锁目录之外；进程在 rename 前退出只会
+    // 留下无影响的 sibling，不会把活动锁变成永久不可获取。
+    const temporary = lock + '.heartbeat-' + owner.token + '-' + crypto.randomBytes(6).toString('hex');
     try {
-      fs.writeFileSync(temporary, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+      writeExclusiveJson(temporary, owner, 4096);
       fs.renameSync(temporary, file);
+      syncManagedDirectory(lock);
     } finally { try { fs.unlinkSync(temporary); } catch (_) {} }
   };
   const scanLockContainsOnlyOwner = (lock) => {
@@ -2024,42 +2157,176 @@ function createRuntime(env = {}, options = {}) {
     try { fs.unlinkSync(lock + '/owner.json'); } catch (_) { return false; }
     try { fs.rmdirSync(lock); return true; } catch (_) { return false; }
   };
+  const secureScanFile = (file) => {
+    try {
+      const stat = fs.lstatSync(file);
+      return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && (stat.mode & 0o077) === 0 ? stat : null;
+    } catch (_) { return null; }
+  };
+  const crashScanRemnant = (lock, bootId) => {
+    let directoryStat;
+    try { directoryStat = fs.lstatSync(lock); } catch (_) { return null; }
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0) return null;
+    let names;
+    try { names = fs.readdirSync(lock).sort(); } catch (_) { return null; }
+    const members = {};
+    const remember = (name) => {
+      const stat = secureScanFile(lock + '/' + name);
+      if (!stat) return false;
+      members[name] = { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs };
+      return true;
+    };
+    let newest = directoryStat.mtimeMs;
+    if (names.length === 0) {
+      if (Date.now() - newest <= 60000) return null;
+    } else if (names.length === 1 && /^\.owner-[a-f0-9]{32}$/.test(names[0])) {
+      if (!remember(names[0])) return null;
+      newest = Math.max(newest, members[names[0]].mtimeMs);
+      if (Date.now() - newest <= 60000) return null;
+    } else if (names.length === 2 && names.includes('owner.json')) {
+      const owner = readScanOwner(lock);
+      const temporary = names.find((name) => name !== 'owner.json');
+      if (!owner || temporary !== '.owner-' + owner.token || !remember('owner.json') || !remember(temporary)) return null;
+      newest = Math.max(newest, members['owner.json'].mtimeMs, members[temporary].mtimeMs, owner.heartbeat_at);
+      if (Date.now() - newest <= 60000) return null;
+      const sameBoot = owner.boot_id === bootId;
+      const running = sameBoot ? processIdentity(owner.pid) : null;
+      if (sameBoot && (!running || !running.dead && running.process_start === owner.process_start)) return null;
+    } else return null;
+    return { directory: { dev: directoryStat.dev, ino: directoryStat.ino }, names, members };
+  };
+  const removeCrashScanRemnant = (lock, remnant, token) => {
+    const quarantine = lock + '.stale-' + token;
+    try { fs.renameSync(lock, quarantine); } catch (error) {
+      if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) return false;
+      throw error;
+    }
+    let valid = false;
+    try {
+      const stat = fs.lstatSync(quarantine);
+      const names = fs.readdirSync(quarantine).sort();
+      valid = stat.isDirectory() && !stat.isSymbolicLink()
+        && stat.dev === remnant.directory.dev && stat.ino === remnant.directory.ino
+        && JSON.stringify(names) === JSON.stringify(remnant.names)
+        && names.every((name) => {
+          const member = secureScanFile(quarantine + '/' + name);
+          return member && member.dev === remnant.members[name].dev && member.ino === remnant.members[name].ino;
+        });
+      if (valid) {
+        for (const name of names) fs.unlinkSync(quarantine + '/' + name);
+        fs.rmdirSync(quarantine);
+        return true;
+      }
+    } catch (_) {}
+    try { fs.renameSync(quarantine, lock); } catch (_) {}
+    return false;
+  };
+  const prepareScanClaim = (claim, owner) => {
+    fs.mkdirSync(claim, { mode: 0o700 });
+    try {
+      writeExclusiveJson(claim + '/owner.json', owner, 4096);
+      syncManagedDirectory(claim);
+    } catch (error) {
+      try { fs.unlinkSync(claim + '/owner.json'); } catch (_) {}
+      try { fs.rmdirSync(claim); } catch (_) {}
+      throw error;
+    }
+  };
+  const pruneScanArtifacts = (lock, maximum = 64) => {
+    const prefix = lock.slice(directory.length + 1);
+    const names = fs.readdirSync(directory).filter((name) => name.startsWith(prefix + '.claim-')
+      || name.startsWith(prefix + '.heartbeat-')).sort().slice(0, maximum);
+    const current = readScanOwner(lock);
+    const bootId = bootIdentity();
+    for (const name of names) {
+      const target = directory + '/' + name;
+      try {
+        const stat = fs.lstatSync(target);
+        if (Date.now() - stat.mtimeMs <= 60000) continue;
+        const heartbeat = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          + '\\.heartbeat-([a-f0-9]{32})-[a-f0-9]{12}$').exec(name);
+        if (heartbeat) {
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) continue;
+          if (current?.token === heartbeat[1]) continue;
+          fs.unlinkSync(target);
+          continue;
+        }
+        const claim = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          + '\\.claim-([a-f0-9]{32})$').exec(name);
+        if (!claim || !stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) continue;
+        const members = fs.readdirSync(target);
+        if (members.length === 0) { fs.rmdirSync(target); continue; }
+        if (members.length !== 1 || members[0] !== 'owner.json' || !secureScanFile(target + '/owner.json')) continue;
+        const candidate = readScanOwner(target);
+        if (candidate) {
+          const sameBoot = candidate.boot_id === bootId;
+          const running = sameBoot ? processIdentity(candidate.pid) : null;
+          if (sameBoot && (!running || !running.dead && running.process_start === candidate.process_start)) continue;
+        }
+        fs.unlinkSync(target + '/owner.json');
+        fs.rmdirSync(target);
+      } catch (_) {}
+    }
+  };
   const acquireScanLock = (lock) => {
     const identity = processIdentity();
     const bootId = bootIdentity();
     if (!identity || !bootId) throw new Error('无法建立调度锁进程身份');
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       const token = crypto.randomBytes(16).toString('hex');
       const at = Date.now();
       const owner = { schema_version: 1, token, pid: identity.pid, boot_id: bootId,
         process_start: identity.process_start, started_at: at, heartbeat_at: at };
-      try {
-        fs.mkdirSync(lock, { mode: 0o700 });
-        try { writeScanOwner(lock, owner); }
-        catch (error) { try { fs.rmdirSync(lock); } catch (_) {} throw error; }
-        return owner;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-      }
       let stat;
-      try { stat = fs.lstatSync(lock); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('扫描锁不安全');
-      const existing = readScanOwner(lock);
-      // 缺少或损坏的旧锁不能仅凭 mtime 自动删除；由自检明确提示后人工修复。
-      // 即使 owner 有效，目录中存在额外成员、链接或宽松权限也必须原位退让，
-      // 不能先改名后留下隔离残骸并在原路径并发启动第二个扫描器。
-      if (!existing || !scanLockContainsOnlyOwner(lock) || Date.now() - existing.heartbeat_at <= 60000) return null;
-      const sameBoot = existing.boot_id === bootId;
-      const running = sameBoot ? processIdentity(existing.pid) : null;
-      if (sameBoot && (!running || !running.dead && running.process_start === existing.process_start)) return null;
-      const quarantine = lock + '.stale-' + token;
-      try { fs.renameSync(lock, quarantine); } catch (error) {
-        if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) continue;
-        throw error;
+      try { stat = fs.lstatSync(lock); } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
       }
-      if (!removeOwnedScanLock(quarantine, existing.token)) {
-        try { fs.renameSync(quarantine, lock); } catch (_) {}
-        return null;
+      if (stat) {
+        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('扫描锁不安全');
+        const existing = readScanOwner(lock);
+        if (!existing || !scanLockContainsOnlyOwner(lock)) {
+          // v1.2.1 在 mkdir/首次 owner 发布之间，或在目录内替换
+          // heartbeat 时退出，会留下这些严格可识别的残件。
+          const remnant = crashScanRemnant(lock, bootId);
+          if (!remnant || !removeCrashScanRemnant(lock, remnant, token)) return null;
+          continue;
+        }
+        if (Date.now() - existing.heartbeat_at <= 60000) return null;
+        const sameBoot = existing.boot_id === bootId;
+        const running = sameBoot ? processIdentity(existing.pid) : null;
+        if (sameBoot && (!running || !running.dead && running.process_start === existing.process_start)) return null;
+        const quarantine = lock + '.stale-' + token;
+        try { fs.renameSync(lock, quarantine); } catch (error) {
+          if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) continue;
+          throw error;
+        }
+        if (!removeOwnedScanLock(quarantine, existing.token)) {
+          try { fs.renameSync(quarantine, lock); } catch (_) {}
+          return null;
+        }
+        continue;
+      }
+
+      // 先在唯一 sibling 目录中完整写入并 fsync owner，再用一次
+      // rename 发布。其它扫描器只会看到“不存在”或“完整锁”。
+      const claim = lock + '.claim-' + token;
+      prepareScanClaim(claim, owner);
+      let published = false;
+      try {
+        try {
+          fs.lstatSync(lock);
+          continue;
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        try { fs.renameSync(claim, lock); }
+        catch (error) {
+          if (['EEXIST', 'ENOTEMPTY', 'ENOENT'].includes(error.code)) continue;
+          throw error;
+        }
+        published = true;
+        syncManagedDirectory(directory);
+        return owner;
+      } finally {
+        if (!published) removeOwnedScanLock(claim, owner.token);
       }
     }
     return null;
@@ -2072,48 +2339,123 @@ function createRuntime(env = {}, options = {}) {
     writeScanOwner(lock, owner);
     return true;
   };
+  const scanCursor = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const rotatedScanSelection = (entries, cursor, maximum) => {
+    if (!entries.length || maximum <= 0) return [];
+    const start = cursor % entries.length;
+    const rotated = entries.slice(start).concat(entries.slice(0, start));
+    return rotated.slice(0, maximum);
+  };
+  const advanceScanCursor = (cursor, count) => cursor >= Number.MAX_SAFE_INTEGER - count
+    ? count - (Number.MAX_SAFE_INTEGER - cursor) : cursor + count;
+  const scanHealthRecovery = (value) => value && Number.isSafeInteger(value.at) && value.at > 0
+    && ['too_large', 'invalid_json', 'invalid_state'].includes(value.reason)
+    ? { at: value.at, reason: value.reason } : null;
   const scan = async () => {
     ensureDirectory();
     const healthPath = directory + '/scheduler-health.json';
     const scanLock = directory + '/scheduler-scan.lock';
-    const previousHealth = safeRead(healthPath, {});
+    let previousHealth = {};
+    let recoveredHealth = null;
+    let healthExists = false;
+    try { fs.lstatSync(healthPath); healthExists = true; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { previousHealth = safeRead(healthPath, {}, 65536); }
+    catch (error) {
+      if (!['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code)) throw error;
+      const stat = fs.lstatSync(healthPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw error;
+      recoveredHealth = { at: clock(), reason: error.code === 'MANAGED_FILE_TOO_LARGE' ? 'too_large' : 'invalid_json' };
+      previousHealth = {};
+    }
+    if (healthExists && !recoveredHealth && (!previousHealth || typeof previousHealth !== 'object' || Array.isArray(previousHealth)
+      || previousHealth.schema_version !== 1 || !Number.isFinite(previousHealth.started_at)
+      || !Number.isFinite(previousHealth.completed_at))) {
+      recoveredHealth = { at: clock(), reason: 'invalid_state' };
+      previousHealth = {};
+    }
+    const healthRecovered = recoveredHealth || scanHealthRecovery(previousHealth.health_recovered);
+    const previousIsolation = scanIsolation(previousHealth.isolated_sessions);
+    const controlCursor = scanCursor(previousHealth.control_cursor);
+    const ordinaryCursor = scanCursor(previousHealth.ordinary_cursor);
     // 重叠执行只允许一个扫描器进入；历史会话的纯读取不会再触发逐文件 fsync，
     // 因此排队的调度执行也能快速排空而不会饿死 Webhook Code runner。
     const owner = acquireScanLock(scanLock);
     if (!owner) return [];
+    pruneScanArtifacts(scanLock);
     const startedAt = clock();
     const heartbeat = setInterval(() => { try { refreshScanLock(scanLock, owner); } catch (_) {} }, 10000);
     if (typeof heartbeat.unref === 'function') heartbeat.unref();
     try {
-      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0 });
+      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0,
+        control_cursor: controlCursor, ordinary_cursor: ordinaryCursor, isolated_sessions: previousIsolation,
+        health_recovered: healthRecovered }, 65536);
+      if (recoveredHealth) appendEvent('scheduler_health_recovered', { reason: recoveredHealth.reason });
       pruneAnalytics();
       if (!refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
       const jobs = [];
-      const filenames = fs.readdirSync(directory).filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name));
+      const isolated = emptyScanIsolation();
+      const filenames = fs.readdirSync(directory).filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name)).sort();
       for (let index = 0; index < filenames.length; index += 1) {
         if (index % 32 === 0 && !refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
         const filename = filenames[index];
         const key = filename.slice(8, -5);
-        const snapshot = safeRead(statePath(key), null);
-        if (!snapshot?.website_id || snapshot.schema_version !== 2 || !scanNeedsTransaction(snapshot, clock())) continue;
-        await transaction(key, (state) => {
-          const configurationReady = replyConfigurationReady();
-          const shouldDefer = configurationShouldDefer();
-          releaseConfigurationDeferrals(state);
-          for (const job of state.jobs) {
-            if (job.status === 'processing' && !(job.lease_until > clock())) { job.status = 'received'; job.lease_until = 0; }
-            if (job.status === 'received' && !job.control && !configurationReady && !uncertainDeliveryFor(state, job)
-              && (!job.plan || providerDependentPlan(job.plan))) {
-              if (shouldDefer && state.mode === 'ai') deferForConfiguration(job);
-              else { job.status = 'cancelled'; job.retry_at = null; delete job.data; delete job.plan; delete job.inference; delete job.deferred_configuration; }
+        let snapshot;
+        try { snapshot = safeRead(statePath(key), null, stateMaximumBytes); }
+        catch (error) {
+          if (!['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code)) throw error;
+          recordScanIsolation(isolated, error);
+          continue;
+        }
+        if (!scanStateEnvelopeValid(snapshot)) {
+          recordScanIsolation(isolated, { code: 'SESSION_STATE_INVALID' });
+          continue;
+        }
+        if (!scanNeedsTransaction(snapshot, clock())) continue;
+        try {
+          const selected = await transaction(key, (state) => {
+            const configurationReady = replyConfigurationReady();
+            const shouldDefer = configurationShouldDefer();
+            releaseConfigurationDeferrals(state);
+            for (const job of state.jobs) {
+              if (job.status === 'processing' && !(job.lease_until > clock())) { job.status = 'received'; job.lease_until = 0; }
+              if (job.status === 'received' && !job.control && !configurationReady && !uncertainDeliveryFor(state, job)
+                && (!job.plan || providerDependentPlan(job.plan))) {
+                if (shouldDefer && state.mode === 'ai') deferForConfiguration(job);
+                else { job.status = 'cancelled'; job.retry_at = null; delete job.data; delete job.plan; delete job.inference; delete job.deferred_configuration; }
+              }
             }
-            if (job.status === 'received' && !(job.retry_at > clock()) && (job.control || state.uncertain_events.length === 0)) jobs.push({ key, jobId: job.id, control: job.control });
-          }
-        });
+            const due = state.jobs.filter((job) => job.status === 'received' && !(job.retry_at > clock()));
+            const priority = due.filter((job) => priorityConfirmation(job) && !(job.lease_until > clock()))
+              .sort((left, right) => left.sequence - right.sequence)[0];
+            const control = due.filter((job) => job.control && !(job.lease_until > clock()))
+              .sort((left, right) => left.sequence - right.sequence)[0];
+            const workerBusy = state.worker && state.worker.until > clock();
+            const ordinary = !state.uncertain_events.length && !workerBusy
+              ? due.filter((job) => !job.control).sort((left, right) => left.sequence - right.sequence)[0] : null;
+            const candidate = priority || control || ordinary;
+            return candidate ? { key, jobId: candidate.id, control: candidate.control === true } : null;
+          });
+          if (selected) jobs.push(selected);
+        } catch (error) {
+          if (error?.managedFile !== statePath(key)
+            || !['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code)) throw error;
+          recordScanIsolation(isolated, error);
+        }
       }
       if (!refreshScanLock(scanLock, owner)) throw new Error('调度锁所有权已变化');
-      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: clock() });
-      return jobs.sort((left, right) => Number(right.control) - Number(left.control)).slice(0, 16);
+      const controls = jobs.filter((job) => job.control).sort((left, right) => left.key.localeCompare(right.key));
+      const ordinary = jobs.filter((job) => !job.control).sort((left, right) => left.key.localeCompare(right.key));
+      const selectedControls = rotatedScanSelection(controls, controlCursor, ordinary.length ? 15 : 16);
+      const selectedOrdinary = rotatedScanSelection(ordinary, ordinaryCursor, 16 - selectedControls.length);
+      const selected = [...selectedControls, ...selectedOrdinary];
+      const nextControlCursor = advanceScanCursor(controlCursor, selectedControls.length);
+      const nextOrdinaryCursor = advanceScanCursor(ordinaryCursor, selectedOrdinary.length);
+      if (isolated.count) appendEvent('scheduler_sessions_isolated', { count: isolated.count, reasons: isolated.reasons });
+      atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: clock(),
+        control_cursor: nextControlCursor, ordinary_cursor: nextOrdinaryCursor, isolated_sessions: isolated,
+        health_recovered: healthRecovered }, 65536);
+      return selected;
     } finally {
       clearInterval(heartbeat);
       removeOwnedScanLock(scanLock, owner.token);
@@ -2144,7 +2486,7 @@ function createRuntime(env = {}, options = {}) {
         fs.writeFileSync(temporary, lines.length ? lines.join('\n') + '\n' : '', { mode: 0o660, flag: 'wx' });
         fs.renameSync(temporary, file);
       }
-      atomic(directory + '/analytics-retention.json', { days: retention, at: clock() });
+      atomic(directory + '/analytics-retention.json', { days: retention, at: clock() }, 65536);
     } catch (_) { /* 统计维护不能阻断客服与人工状态处理。 */ }
     finally { if (locked) { try { fs.rmdirSync(analytics + '/.events.lock'); } catch (_) {} } }
   };

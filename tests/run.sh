@@ -291,6 +291,8 @@ if command -v node >/dev/null 2>&1; then
   node "${SCRIPT_DIR}/test_runtime_provider_pool.js"
   "${SCRIPT_DIR}/test_provider_menu.sh"
   pass "主备池生产协议与管理专项（内部子项单列，不重复计入总数）"
+  node "${SCRIPT_DIR}/test_runtime_missing_reply_p0.js"
+  pass "漏回复状态背压、会话隔离、公平调度与扫描恢复专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_feedback_runtime.js"
   pass "取消评价与历史出站恢复专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_outgoing_identity.js"

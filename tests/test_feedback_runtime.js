@@ -209,7 +209,8 @@ const test = async (name, action) => {
     assert(retired.every((job) => f.rawState(session).jobs.find((item) => item.id === job.id).status === 'cancelled'));
     assert.equal(f.rawState(session).outgoing['51001'].body.content, f.modes.answer);
     assert(f.rawState(session).offers.manual, '人工 offer 必须保留');
-    assert(scanned.some((job) => job.jobId === normal.id)); assert(scanned.some((job) => job.jobId === ordinary.id));
+    assert(scanned.some((job) => job.jobId === normal.id));
+    assert(!scanned.some((job) => job.jobId === ordinary.id), '单会话每轮只调度最早的一个可执行任务');
     await f.runtime().process(f.key(session)); await f.runtime().process(f.key(session));
     assert.equal(f.sent.length, 2); assert.equal(f.modelRequests.length, 1, '缓存答案不应重新推理');
     assert(f.sent.every((item) => item.content === f.modes.answer)); f.noFeedback();

@@ -1991,6 +1991,8 @@ doctor_runtime_state_check() {
 
 doctor_runtime_scheduler_check() {
   local start file now started completed age lock_state lock_file
+  local isolated_count isolated_too_large isolated_invalid_json isolated_invalid_state
+  local recovered_at recovered_age recovered_reason recovered_reason_cn recovered_status recovered_summary
   start=$(doctor_now_ms)
   lock_file="${DOCTOR_DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
   lock_state=$(scheduler_scan_lock_state "$DOCTOR_DEPLOY_DIR")
@@ -2025,7 +2027,42 @@ doctor_runtime_scheduler_check() {
     return
   fi
   if [[ ! -f "$file" || -L "$file" ]] \
-    || ! jq -e '.schema_version == 1 and (.started_at | type == "number") and (.completed_at | type == "number")' "$file" >/dev/null 2>&1; then
+    || ! jq -e '
+      def nonnegative_integer:
+        type == "number" and . >= 0 and floor == .;
+      .schema_version == 1 and
+      (.started_at | type == "number") and
+      (.completed_at | type == "number") and
+      (
+        if has("isolated_sessions") then
+          (.isolated_sessions | type == "object") and
+          (.isolated_sessions as $isolated |
+            ($isolated.count | nonnegative_integer) and
+            ($isolated.reasons | type == "object") and
+            ($isolated.reasons.too_large | nonnegative_integer) and
+            ($isolated.reasons.invalid_json | nonnegative_integer) and
+            ($isolated.reasons.invalid_state | nonnegative_integer) and
+            ($isolated.count == (
+              $isolated.reasons.too_large +
+              $isolated.reasons.invalid_json +
+              $isolated.reasons.invalid_state
+            ))
+          )
+        else
+          true
+        end
+      ) and
+      (
+        if has("health_recovered") then
+          .health_recovered == null or
+          ((.health_recovered | type == "object") and
+            (.health_recovered.at | nonnegative_integer and . > 0 and . <= 9007199254740991) and
+            (.health_recovered.reason | type == "string" and
+              (. == "too_large" or . == "invalid_json" or . == "invalid_state")))
+        else
+          true
+        end
+      )' "$file" >/dev/null 2>&1; then
     doctor_add runtime.scheduler '会话恢复扫描心跳' FAIL critical '扫描心跳文件无效或不安全' filesystem '检查 n8n runtime 挂载和原子写入；不要执行扫描来伪造健康' "$start"
     return
   fi
@@ -2049,6 +2086,39 @@ doctor_runtime_scheduler_check() {
     else
       doctor_add runtime.scheduler '会话恢复扫描心跳' FAIL critical "最近扫描已停滞 ${age} 毫秒" filesystem '检查 n8n workflow 调度与 Code runner；自检不会调用 scan 或修改会话' "$start"
     fi
+  fi
+  if jq -e 'has("isolated_sessions") and .isolated_sessions.count > 0' "$file" >/dev/null 2>&1; then
+    isolated_count=$(jq -r '.isolated_sessions.count' "$file")
+    isolated_too_large=$(jq -r '.isolated_sessions.reasons.too_large' "$file")
+    isolated_invalid_json=$(jq -r '.isolated_sessions.reasons.invalid_json' "$file")
+    isolated_invalid_state=$(jq -r '.isolated_sessions.reasons.invalid_state' "$file")
+    doctor_add runtime.scheduler_isolation '会话状态隔离' FAIL critical \
+      "最近完成的扫描隔离 ${isolated_count} 个异常会话状态（文件过大 ${isolated_too_large}、JSON 无效 ${isolated_invalid_json}、状态无效 ${isolated_invalid_state}）；异常会话未参与处理，其他合法会话继续扫描" \
+      filesystem '从受限备份逐一核对并恢复异常状态；自检及 --fix 不会删除状态、解除人工或补发历史消息' "$start"
+  fi
+  if jq -e 'has("health_recovered") and .health_recovered != null' "$file" >/dev/null 2>&1; then
+    recovered_at=$(jq -r '.health_recovered.at' "$file")
+    recovered_reason=$(jq -r '.health_recovered.reason' "$file")
+    case "$recovered_reason" in
+      too_large) recovered_reason_cn='文件超过安全读取上限' ;;
+      invalid_json) recovered_reason_cn='JSON 内容无效' ;;
+      invalid_state) recovered_reason_cn='心跳结构无效' ;;
+    esac
+    if (( recovered_at > now + 60000 )); then
+      recovered_status=WARN
+      recovered_summary="扫描心跳曾因${recovered_reason_cn}被安全重建；恢复记录时间晚于本机时钟，会话状态未被删除"
+    else
+      if (( recovered_at > now )); then recovered_age=0; else recovered_age=$((now-recovered_at)); fi
+      if (( recovered_age <= 86400000 )); then
+        recovered_status=WARN
+        recovered_summary="最近 24 小时内扫描心跳曾因${recovered_reason_cn}被安全重建；会话状态未被删除，当前扫描活性见上一项"
+      else
+        recovered_status=PASS
+        recovered_summary="历史记录：扫描心跳曾因${recovered_reason_cn}被安全重建，已超过 24 小时；会话状态未被删除，当前扫描活性见上一项"
+      fi
+    fi
+    doctor_add runtime.scheduler_health_recovery '扫描心跳恢复记录' "$recovered_status" warning \
+      "$recovered_summary" filesystem '若近期反复出现，请检查运行目录容量、权限及原子写入；自检及 --fix 不会删除会话状态' "$start"
   fi
 }
 

@@ -890,7 +890,11 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal(next.started_at, now);
     assert.equal(next.completed_at, now);
     assert(next.completed_at > first.completed_at);
-    assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'schema_version', 'started_at']);
+    assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'control_cursor', 'health_recovered', 'isolated_sessions', 'ordinary_cursor', 'schema_version', 'started_at']);
+    assert.deepEqual(Object.keys(next.isolated_sessions.reasons).sort(), ['invalid_json', 'invalid_state', 'too_large']);
+    assert.equal(next.isolated_sessions.count, Object.values(next.isolated_sessions.reasons)
+      .reduce((total, count) => total + count, 0));
+    assert.equal(next.health_recovered, null);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(state('session_permanent1').mode, 'human');
   });
@@ -943,10 +947,9 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const old = new Date(Date.now() - 120000);
     fs.mkdirSync(lock, { mode: 0o700 });
     fs.utimesSync(lock, old, old);
-    assert.deepEqual(await runtime.scan(), []);
-    assert(fs.existsSync(lock), '没有所有权资料的旧活动锁不能只凭 mtime 被删除');
-    assert.equal(fs.readFileSync(health, 'utf8'), healthBefore);
-    fs.rmdirSync(lock);
+    await runtime.scan();
+    assert(!fs.existsSync(lock), '超时的旧版空锁必须恢复，且新扫描完成后释放锁');
+    assert.notEqual(fs.readFileSync(health, 'utf8'), healthBefore);
 
     const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim().toLowerCase();
     const statText = fs.readFileSync('/proc/self/stat', 'utf8');

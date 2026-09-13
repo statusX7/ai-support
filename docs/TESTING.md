@@ -75,6 +75,8 @@ ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服
 
 人工控制容量专项保留旧代码在 128 条积压时返回 503 的负例；修后验证 127/128 普通队列、混合/纯控制及未知身份对账积压、总开关和窗口事务保护。确定真人不等待网络或普通队列，迟到答案不能出站；有效按钮只允许一个第 129 个优先确认，重复/过期/跨会话/伪造选择不能占用，未终态时手动恢复也不能不断新建人工 offer。原有未知发送和控制任务保持，普通及未知身份请求仍有容量限制。
 
+`node tests/test_runtime_missing_reply_p0.js` 直接驱动生产 runtime：验证写前字节背压不覆盖旧状态、旧高水位仍优先落盘真人暂停、坏 JSON/超限/坏 envelope 及内层 `outgoing.body` 只隔离所属会话、operator 重试耗尽和旧孤儿屏障恢复、单会话不挤占整批、超过 16 个会话跨重启公平轮转、控制优先仍保留普通名额、scheduler 心跳重建和 scan lock 崩溃残件/并发所有权。全局配置损坏的对照仍必须让扫描失败，不能被错误降格为单会话隔离。
+
 `test_feedback_runtime.js` 的图片阶段回归先保留旧请求失败：前问仍作为活动用户消息时，受控契约夹具返回前问答案。修后分别检查 Chat/Responses 的独立事实提取指令、原 Prompt、真实图像字段、只读历史和同会话摘要/重启后指代；另测视觉期间真人或总开关取消后不保存摘要、不续 RAG、不出站。这是请求/状态契约证据，不是视觉模型能力测试。实机必须另外核对原图可见内容、模型摘要及最终回复，不能仅凭非空或 HTTP 200 通过。
 
 `node tests/test_knowledge_context.js` 与 `node tests/test_knowledge_runtime.js` 验证固定 `/vector-search` 的实际结构、纯当前问题、完整片段与 Prompt、启用来源归属、上下文隔离、检索中人工取消及管理员同链。`test_knowledge_lexical.js` 实际从虚构 parsed 正文构建/验证补召回索引；`test_knowledge_hybrid.js` 再通过生产 runtime 和生成的 Code node 覆盖强命中跳过向量、向量 miss/故障降级、长文尾 FAQ、合并去重、部分覆盖、三层篡改、旧投影及生成中真人取消。测试只用虚构资料；正文断言解析实际 JSON 后逐字比较，不能用转义形式相似代替保真。HTTP 200 错误、未知来源不能算未命中。runtime 热路验证 materials/map/lexical/profile/settings 与迁移门禁；manifest/cache 摘要由 profile 和 Shell 集成套件另行验证，不把两层证据混成“每问实时扫描向量缓存”。
