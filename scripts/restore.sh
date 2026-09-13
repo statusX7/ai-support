@@ -316,6 +316,8 @@ for config_name in provider.yaml provider.yaml.example prompt.md prompt.md.examp
   fi
 done
 migrate_config_files "$DEPLOY_DIR"
+bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" migrate \
+  || die '恢复包中的业务配置未通过迁移与严格校验；现有实例将从安全备份恢复'
 if [[ -f "${STAGING}/n8n/workflow.json" ]]; then
   install -m 0640 -- "${STAGING}/n8n/workflow.json" "${DEPLOY_DIR}/n8n/workflow.json"
 fi

@@ -324,6 +324,10 @@ case "$COMMAND" in
       service=${!#}
       [[ "$service" != caddy ]] || exit 0
       [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]] || exit 0
+      if [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
+        [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
+        grep -Fxq -- "$service" "$MOCK_DOCKER_SERVICE_STATE" || exit 0
+      fi
       printf 'mock-%s\n' "$service"
       exit 0
     fi

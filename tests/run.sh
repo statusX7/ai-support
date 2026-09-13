@@ -1348,9 +1348,13 @@ printf '%s\n' \
   'exit 97' > "${DEPLOY_DIR}/scripts/backup.sh"
 chmod 0750 "${DEPLOY_DIR}/scripts/backup.sh"
 mkdir -m 0700 -- "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
+UPDATE_SERVICE_STATE="${TEST_ROOT}/update-running-services"
+printf 'postgres\nanythingllm\nn8n\nprovider-adapter\n' > "$UPDATE_SERVICE_STATE"
+export MOCK_DOCKER_SERVICE_STATE="$UPDATE_SERVICE_STATE"
 "${DEPLOY_DIR}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update.log" 2>&1
+unset MOCK_DOCKER_SERVICE_STATE
 if grep -Fq 'legacy-backup-should-not-run' "${TEST_ROOT}/update.log"; then
   fail "升级错误调用了旧部署中的备份脚本"
 fi

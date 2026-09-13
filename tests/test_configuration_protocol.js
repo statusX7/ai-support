@@ -93,6 +93,10 @@ async function main() {
     const child=spawn('bash',[path.join(root,'scripts',script),'--deploy-dir',deploy,...args],{cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`,CONFIGURATION_FIXTURE_DEPLOY:deploy,PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,...overrides}});
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',code=>resolve({code,stdout,stderr}));
   });
+  const invokeCommonMigration=()=>new Promise(resolve=>{
+    const child=spawn('bash',['-c','set -euo pipefail; source "$1/scripts/common.sh"; migrate_config_files "$2"','configuration-common-migrate',root,deploy],{cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}});
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',code=>resolve({code,stdout,stderr}));
+  });
   const ok=async(script,args)=>{const output=await invoke(script,args);assert.equal(output.code,0,`${script} ${args.join(' ')}\n${output.stderr}\n${output.stdout}`);return output;};
   const readCatalog=()=>JSON.parse(fs.readFileSync(path.join(deploy,'knowledge/catalog.json')));
   try {
@@ -170,6 +174,49 @@ async function main() {
     assert.doesNotMatch(JSON.stringify(convertedRule),/继续 AI 客服|已暂停本次对话的 AI 回复/);
     fs.writeFileSync(keywordFile,currentKeywordBytes);
     pass('旧关键词schema在同一次迁移返回前完成中性文案归一化，不发布旧生成缺省');
+    const currentHandoffBytes=fs.readFileSync(handoffFile);
+    const legacyHandoffWithoutMessage={handoff:{
+      keywords:['人工','客服','真人'],resume_keywords:['恢复AI'],topic_keywords:{payment:['付款']},
+      resume_after_seconds:1800,on_operator_message:true,on_low_confidence:true,on_no_answer:true,
+      confirmation:'已为您转接人工客服，AI 将暂停回复。',
+      no_answer_message:'知识库暂时没有足够信息，已为您转接人工客服。',
+      low_confidence_message:'当前答案可信度不足，已为您转接人工客服。',
+      failure_message:'当前自动客服暂时不可用，已为您转接人工客服。',
+      low_confidence:{require_sources:true,minimum_score:0.25}
+    }};
+    fs.writeFileSync(handoffFile,JSON.stringify(legacyHandoffWithoutMessage));
+    await ok('configuration.sh',['migrate']);
+    const migratedLegacyHandoff=JSON.parse(fs.readFileSync(handoffFile));
+    assert.equal(migratedLegacyHandoff.handoff.message,'正在为您转接人工客服，请稍候。');
+    assert.equal(migratedLegacyHandoff.handoff.disable_ai,true);
+    assert.equal(migratedLegacyHandoff.handoff.notify_user.enabled,true);
+    assert.equal(migratedLegacyHandoff.handoff.resume_after_seconds,1800);
+    assert.deepEqual(migratedLegacyHandoff.handoff.low_confidence,legacyHandoffWithoutMessage.handoff.low_confidence);
+    assert.deepEqual(migratedLegacyHandoff.handoff.low_confidence,legacyHandoffWithoutMessage.handoff.low_confidence);
+    for(const removed of ['confirmation','topic_keywords','on_operator_message','on_low_confidence','on_no_answer','resume_keywords','resume_match_mode']) {
+      assert.equal(Object.hasOwn(migratedLegacyHandoff.handoff,removed),false,`旧字段仍存在：${removed}`);
+    }
+    const migratedLegacyHandoffBytes=fs.readFileSync(handoffFile);
+    await ok('configuration.sh',['migrate']);
+    assert.deepEqual(fs.readFileSync(handoffFile),migratedLegacyHandoffBytes);
+    const invalidModernHandoff=path.join(work,'invalid-modern-handoff.json');
+    fs.writeFileSync(invalidModernHandoff,JSON.stringify({handoff:{
+      keywords:['人工'],match_mode:'contains',resume_after_seconds:3600,disable_ai:true,
+      notify_user:{enabled:true}
+    }}));
+    const invalidModernResult=await invoke('configuration.sh',['apply','handoff','--input',invalidModernHandoff]);
+    assert.notEqual(invalidModernResult.code,0);
+    assert.deepEqual(fs.readFileSync(handoffFile),migratedLegacyHandoffBytes);
+    const invalidModernBytes=fs.readFileSync(invalidModernHandoff);
+    fs.writeFileSync(handoffFile,invalidModernBytes);
+    const commonMigrationResult=await invokeCommonMigration();
+    assert.equal(commonMigrationResult.code,0,commonMigrationResult.stderr);
+    assert.deepEqual(fs.readFileSync(handoffFile),invalidModernBytes,'公共旧版迁移不得补齐现代损坏配置');
+    const strictMigrationResult=await invoke('configuration.sh',['migrate']);
+    assert.notEqual(strictMigrationResult.code,0);
+    assert.deepEqual(fs.readFileSync(handoffFile),invalidModernBytes,'严格迁移失败不得改写现代损坏配置');
+    fs.writeFileSync(handoffFile,currentHandoffBytes);
+    pass('旧人工配置先迁移再严格校验且幂等，现代缺失通知文案仍拒绝并保留旧值');
     await ok('knowledge.sh',['sync']);
     assert.equal(readCatalog().libraries[0].id,'kb_default');assert.equal(readCatalog().libraries[0].documents.length,1);const originalSequence=sequence;
     await ok('knowledge.sh',['sync']);assert.equal(sequence,originalSequence);pass('单库幂等迁移保留既有 filename 与索引');

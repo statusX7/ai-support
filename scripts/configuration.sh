@@ -151,9 +151,63 @@ except OSError:
 PY
 }
 
+configuration_upgrade_legacy_handoff_file() {
+  local target=$1 temporary
+  # v0.x/v1.0 的人工配置没有 message。必须先完成可识别的旧结构迁移，
+  # 再执行 v1.2.1 严格校验；没有旧字段标记的现代损坏配置仍会被拒绝。
+  if ! jq -M -e '
+    .handoff | type == "object" and
+      (has("confirmation") or has("topic_keywords") or has("on_operator_message") or
+       has("on_low_confidence") or has("on_no_answer") or has("resume_keywords") or
+       has("resume_match_mode"))
+  ' "$target" >/dev/null 2>&1; then
+    return 0
+  fi
+  temporary=$(mktemp "${target}.legacy-handoff.XXXXXXXX") || return 1
+  if ! jq -M '
+    if .handoff.keywords == ["人工", "客服", "真人"] or
+       .handoff.keywords == ["人工", "人工客服", "转人工", "真人客服"] then
+      .handoff.keywords = ["人工", "人工客服", "转人工", "真人", "真人客服"]
+    else . end |
+    if (.handoff.match_mode == "exact" or .handoff.match_mode == "contains") then .
+    else .handoff.match_mode = "exact" end |
+    .handoff.disable_ai = true |
+    if (.handoff.notify_user | type) == "object" then . else .handoff.notify_user = {} end |
+    if (.handoff.notify_user | has("enabled")) then . else .handoff.notify_user.enabled = true end |
+    if (.handoff.message // "") == "您已请求人工客服，正在为您转接，请稍候。" then
+      .handoff.message = "正在为您转接人工客服，请稍候。"
+    elif ((.handoff.message // "") | length) > 0 then .
+    elif (.handoff.confirmation // "") == "已为您转接人工客服，AI 将暂停回复。" then
+      .handoff.message = "正在为您转接人工客服，请稍候。"
+    elif ((.handoff.confirmation // "") | length) > 0 then
+      .handoff.message = .handoff.confirmation
+    else .handoff.message = "正在为您转接人工客服，请稍候。" end |
+    if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
+      .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
+    else . end |
+    if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
+      .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
+    else . end |
+    if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
+      .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
+    else . end |
+    del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence,
+        .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords,
+        .handoff.resume_match_mode)
+  ' "$target" > "$temporary"; then
+    rm -f -- "$temporary"
+    configuration_error '旧版人工接管配置迁移失败'
+    return 1
+  fi
+  mv -f -- "$temporary" "$target"
+}
+
 configuration_normalize_file() {
   local name=$1 input=$2 output=$3 policy_output
   configuration_decode_file "$input" "$output" || return 1
+  if [[ "$name" == handoff ]]; then
+    configuration_upgrade_legacy_handoff_file "$output" || return 1
+  fi
   configuration_validate "$name" "$output" \
     || { configuration_error "${name} 配置格式或边界无效"; return 1; }
   if [[ "$name" == feedback ]]; then

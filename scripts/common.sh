@@ -1372,42 +1372,51 @@ migrate_config_files() {
 
   [[ -f "$handoff_file" && ! -L "$handoff_file" ]] || die "人工接管配置缺失或不安全"
   require_command jq
-  if ! jq -e '.handoff.disable_ai == true' "$handoff_file" >/dev/null 2>&1; then
-    warn "已将人工转接配置迁移为 disable_ai=true；明确转人工后必须停止 AI 回复"
+  # 只有带明确旧字段的配置才允许补齐旧版缺省。现代配置缺少必需字段时，
+  # 后续 configuration.sh 严格校验必须 fail-closed，不能被公共迁移静默“修好”。
+  if jq -e '
+    .handoff | type == "object" and
+      (has("confirmation") or has("topic_keywords") or has("on_operator_message") or
+       has("on_low_confidence") or has("on_no_answer") or has("resume_keywords") or
+       has("resume_match_mode"))
+  ' "$handoff_file" >/dev/null 2>&1; then
+    if ! jq -e '.handoff.disable_ai == true' "$handoff_file" >/dev/null 2>&1; then
+      warn "已将人工转接配置迁移为 disable_ai=true；明确转人工后必须停止 AI 回复"
+    fi
+    handoff_temp=$(mktemp "${handoff_file}.tmp.XXXXXX")
+    jq '
+      if .handoff.keywords == ["人工", "客服", "真人"] or
+         .handoff.keywords == ["人工", "人工客服", "转人工", "真人客服"] then
+        .handoff.keywords = ["人工", "人工客服", "转人工", "真人", "真人客服"]
+      else . end |
+      if (.handoff.match_mode == "exact" or .handoff.match_mode == "contains") then . else .handoff.match_mode = "exact" end |
+      .handoff.disable_ai = true |
+      if (.handoff.notify_user | type) == "object" then . else .handoff.notify_user = {} end |
+      if (.handoff.notify_user | has("enabled")) then . else .handoff.notify_user.enabled = true end |
+      if (.handoff.message // "") == "您已请求人工客服，正在为您转接，请稍候。" then
+        .handoff.message = "正在为您转接人工客服，请稍候。"
+      elif ((.handoff.message // "") | length) > 0 then .
+      elif (.handoff.confirmation // "") == "已为您转接人工客服，AI 将暂停回复。" then
+        .handoff.message = "正在为您转接人工客服，请稍候。"
+      elif ((.handoff.confirmation // "") | length) > 0 then .handoff.message = .handoff.confirmation
+      else .handoff.message = "正在为您转接人工客服，请稍候。" end |
+      if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
+        .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
+      else . end |
+      if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
+        .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
+      else . end |
+      if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
+        .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
+      else . end |
+      del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence, .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords, .handoff.resume_match_mode)
+    ' "$handoff_file" > "$handoff_temp" || {
+      rm -f -- "$handoff_temp"
+      die "人工接管配置迁移失败"
+    }
+    chmod 640 "$handoff_temp"
+    mv -f -- "$handoff_temp" "$handoff_file"
   fi
-  handoff_temp=$(mktemp "${handoff_file}.tmp.XXXXXX")
-  jq '
-    if .handoff.keywords == ["人工", "客服", "真人"] or
-       .handoff.keywords == ["人工", "人工客服", "转人工", "真人客服"] then
-      .handoff.keywords = ["人工", "人工客服", "转人工", "真人", "真人客服"]
-    else . end |
-    if (.handoff.match_mode == "exact" or .handoff.match_mode == "contains") then . else .handoff.match_mode = "exact" end |
-    .handoff.disable_ai = true |
-    if (.handoff.notify_user | type) == "object" then . else .handoff.notify_user = {} end |
-    if (.handoff.notify_user | has("enabled")) then . else .handoff.notify_user.enabled = true end |
-    if (.handoff.message // "") == "您已请求人工客服，正在为您转接，请稍候。" then
-      .handoff.message = "正在为您转接人工客服，请稍候。"
-    elif ((.handoff.message // "") | length) > 0 then .
-    elif (.handoff.confirmation // "") == "已为您转接人工客服，AI 将暂停回复。" then
-      .handoff.message = "正在为您转接人工客服，请稍候。"
-    elif ((.handoff.confirmation // "") | length) > 0 then .handoff.message = .handoff.confirmation
-    else .handoff.message = "正在为您转接人工客服，请稍候。" end |
-    if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
-      .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
-    else . end |
-    if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
-      .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
-    else . end |
-    if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
-      .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
-    else . end |
-    del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence, .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords, .handoff.resume_match_mode)
-  ' "$handoff_file" > "$handoff_temp" || {
-    rm -f -- "$handoff_temp"
-    die "人工接管配置迁移失败"
-  }
-  chmod 640 "$handoff_temp"
-  mv -f -- "$handoff_temp" "$handoff_file"
 
   tags_file="${deploy_dir}/config/tags.yaml"
   [[ -f "$tags_file" && ! -L "$tags_file" ]] || die "Conversation 标签配置缺失或不安全"
