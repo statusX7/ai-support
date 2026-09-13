@@ -67,6 +67,12 @@ def main():
             receipt.write_text(json.dumps(accepted if record is None else record), encoding="utf-8")
             receipt.chmod(0o600)
 
+        def save_raw(contents):
+            if receipt.exists() or receipt.is_symlink():
+                receipt.unlink()
+            receipt.write_text(contents, encoding="utf-8")
+            receipt.chmod(0o600)
+
         def check(label, allowed=False):
             nonlocal passed
             called.unlink(missing_ok=True)
@@ -80,6 +86,15 @@ def main():
         check("无 TARGET-A 回执时阻止后续发布动作")
         save()
         check("同提交同资产且全部真实验收项通过的回执允许后续动作", True)
+        save({**accepted, "schema_version": True})
+        check("布尔 true 不能冒充整数 schema_version 1")
+        serialized = json.dumps(accepted)
+        save_raw(serialized[:-1] + ', "version": "v1.2.1"}')
+        check("顶层重复字段即使值相同也被拒绝")
+        duplicate_check = '"candidate_installed": true'
+        assert duplicate_check in serialized
+        save_raw(serialized.replace(duplicate_check, duplicate_check + ', "candidate_installed": true', 1))
+        check("嵌套 checks 重复字段即使值相同也被拒绝")
         for field, value in (("commit", "0" * 40), ("archive_sha256", "0" * 64), ("version", "v1.2.0")):
             save({**accepted, field: value})
             check(f"回执 {field} 不匹配时阻止发布")

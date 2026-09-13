@@ -22,6 +22,15 @@ CHECKS = {
 }
 
 
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate")
+        value[key] = item
+    return value
+
+
 def safe_file(file, maximum, private=False):
     if any(parent.is_symlink() for parent in (file, *file.parents)):
         raise ValueError("path")
@@ -52,11 +61,13 @@ def verify(root, artifacts, receipt):
         raise ValueError("checksum")
     if safe_file(artifacts / "get.sh", 1024 * 1024) != (root / "get.sh").read_bytes():
         raise ValueError("entry")
-    record = json.loads(safe_file(receipt, 65536, private=True))
+    record = json.loads(safe_file(receipt, 65536, private=True), object_pairs_hook=unique_object)
     fields = {"schema_version", "version", "commit", "archive_sha256", "target_alias", "checked_at", "checks"}
     if not isinstance(record, dict) or set(record) != fields:
         raise ValueError("receipt")
-    if record["schema_version"] != 1 or record["version"] != version or record["commit"] != commit or record["archive_sha256"] != digest or record["target_alias"] != "TARGET-A":
+    if type(record["schema_version"]) is not int or record["schema_version"] != 1 \
+            or record["version"] != version or record["commit"] != commit \
+            or record["archive_sha256"] != digest or record["target_alias"] != "TARGET-A":
         raise ValueError("identity")
     if not isinstance(record["checked_at"], str):
         raise ValueError("time")
