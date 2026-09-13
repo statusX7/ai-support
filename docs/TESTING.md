@@ -79,7 +79,7 @@ ShellCheck、PTY 驱动和 Node.js 是维护者测试依赖，不是宿主客服
 
 `test_feedback_runtime.js` 的图片阶段回归先保留旧请求失败：前问仍作为活动用户消息时，受控契约夹具返回前问答案。修后分别检查 Chat/Responses 的独立事实提取指令、原 Prompt、真实图像字段、只读历史和同会话摘要/重启后指代；另测视觉期间真人或总开关取消后不保存摘要、不续 RAG、不出站。这是请求/状态契约证据，不是视觉模型能力测试。实机必须另外核对原图可见内容、模型摘要及最终回复，不能仅凭非空或 HTTP 200 通过。
 
-`node tests/test_knowledge_context.js` 与 `node tests/test_knowledge_runtime.js` 验证固定 `/vector-search` 的实际结构、纯当前问题、完整片段与 Prompt、启用来源归属、上下文隔离、检索中人工取消及管理员同链。`test_knowledge_lexical.js` 实际从虚构 parsed 正文构建/验证补召回索引；`test_knowledge_hybrid.js` 再通过生产 runtime 和生成的 Code node 覆盖强命中跳过向量、向量 miss/故障降级、长文尾 FAQ、合并去重、部分覆盖、三层篡改、旧投影及生成中真人取消。测试只用虚构资料；正文断言解析实际 JSON 后逐字比较，不能用转义形式相似代替保真。HTTP 200 错误、未知来源不能算未命中。runtime 热路验证 materials/map/lexical/profile/settings 与迁移门禁；manifest/cache 摘要由 profile 和 Shell 集成套件另行验证，不把两层证据混成“每问实时扫描向量缓存”。
+`node tests/test_knowledge_context.js` 与 `node tests/test_knowledge_runtime.js` 验证固定 `/vector-search` 的实际结构、纯当前问题、完整片段与 Prompt、启用来源归属、上下文隔离、检索中人工取消及管理员同链。`test_knowledge_lexical.js` 实际从虚构 parsed 正文构建/验证补召回索引；当前 28 组还覆盖紧义中文同义改写、双问句/礼貌前缀，以及引用、元指令、混合主题、城市/品牌/编号/孤立字符冲突、危险分隔符和 4096 字节边界。`test_knowledge_hybrid.js` 的 18 组再通过生产 runtime 和生成的 Code node 覆盖 strong 命中跳过向量、非 strong 同义候选仍先走向量且只在 miss 后补充、向量故障降级、长文尾 FAQ、合并去重、部分覆盖、三层篡改、旧投影及生成中真人取消。缺少唯一实体的泛问必须继续走纯向量。测试只用虚构资料；正文断言解析实际 JSON 后逐字比较，不能用转义形式相似代替保真。HTTP 200 错误、未知来源不能算未命中。runtime 热路验证 materials/map/lexical/profile/settings 与迁移门禁；manifest/cache 摘要由 profile 和 Shell 集成套件另行验证，不把两层证据混成“每问实时扫描向量缓存”。
 
 `test_knowledge_profile.py` 与 `test_knowledge_profile_integration.sh` 验证模型/切块代次、完整组件保全、失败恢复、权限和会话状态保护。另在固定真实 AnythingLLM Embedding 环境比较中文原问与改写的排名、token 保留和完整答案片段；多语言模型、400 字符块的实测只证明检索层，最终还必须由真实模型根据送入的事实正确回答。UNIT 协议夹具、真实本地 Embedding 和 TARGET-A 最终回答是三个不同证据层级，不能合并计数。
 
