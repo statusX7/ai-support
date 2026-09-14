@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("release_gate", ROOT / "scripts/release-gate.py")
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
+identity_spec = importlib.util.spec_from_file_location(
+    "release_identity_fixture", ROOT / "tests/test_release_identity.py",
+)
+identity = importlib.util.module_from_spec(identity_spec)
+identity_spec.loader.exec_module(identity)
 
 
 def run(arguments, cwd, **kwargs):
@@ -25,34 +30,45 @@ def run(arguments, cwd, **kwargs):
 def main():
     with tempfile.TemporaryDirectory(prefix=".test-runtime.release-gate.", dir=ROOT) as name:
         temporary = Path(name)
-        source = temporary / "source"
-        source.mkdir()
-        (source / "scripts").mkdir()
-        shutil.copy2(ROOT / "scripts/release-gate.py", source / "scripts/release-gate.py")
-        (source / "VERSION").write_text("v1.2.1\n", encoding="utf-8")
-        (source / "get.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        for command in (
-            ["git", "init", "--quiet"], ["git", "add", "."],
-            ["git", "-c", "user.name=Contract Test", "-c", "user.email=contract@example.invalid", "commit", "--quiet", "-m", "v1.2.1 gate fixture"],
-        ):
-            assert run(command, source).returncode == 0
+        source = identity.create_repository(temporary / "source")
         commit = run(["git", "rev-parse", "HEAD"], source).stdout.strip()
         artifacts = temporary / "artifacts"
-        artifacts.mkdir()
-        archive = artifacts / "ai-support-v1.2.1.tar.gz"
-        original = b"synthetic gate contract asset, never installed or published\n"
+        package_result = identity.package(source, artifacts)
+        assert package_result.returncode == 0, (
+            package_result.returncode, package_result.stdout, package_result.stderr,
+        )
+        archive = artifacts / "ai-support-v1.3.0.tar.gz"
+        original = archive.read_bytes()
         archive.write_bytes(original)
         digest = hashlib.sha256(original).hexdigest()
         checksum = artifacts / "SHA256SUMS"
-        checksum.write_text(digest + "  " + archive.name + "\n", encoding="ascii")
-        shutil.copy2(source / "get.sh", artifacts / "get.sh")
+        assert checksum.read_text(encoding="ascii") == digest + "  " + archive.name + "\n"
         receipt = temporary / "receipt.json"
         accepted = {
-            "schema_version": 1, "version": "v1.2.1", "commit": commit,
+            "schema_version": 2, "version": "v1.3.0", "commit": commit,
             "archive_sha256": digest, "target_alias": "TARGET-A",
             "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "checks": dict.fromkeys(gate.CHECKS, True),
+            "metrics": {
+                "eligible_messages_total": 1,
+                "eligible_messages_accounted": 1,
+                "unexplained_missing": 0,
+                "knowledge_cases_total": 12,
+                "knowledge_cases_passed": 12,
+                "generic_clarifications": 0,
+                "observation_seconds": 900,
+                "duplicate_visible_answers": 0,
+            },
         }
+        assert {
+            "crisp_rest_catchup_verified",
+            "doctor_soft_deleted_backlog_verified",
+            "eligible_messages_accounted",
+            "knowledge_case_set_passed",
+            "generic_clarification_zero",
+            "catchup_quarantine_budget_verified",
+            "observation_15_minutes",
+        }.issubset(gate.CHECKS)
         called = temporary / "publish-called"
         invoke = [
             "bash", "-c",
@@ -87,9 +103,9 @@ def main():
         save()
         check("同提交同资产且全部真实验收项通过的回执允许后续动作", True)
         save({**accepted, "schema_version": True})
-        check("布尔 true 不能冒充整数 schema_version 1")
+        check("布尔 true 不能冒充整数 schema_version 2")
         serialized = json.dumps(accepted)
-        save_raw(serialized[:-1] + ', "version": "v1.2.1"}')
+        save_raw(serialized[:-1] + ', "version": "v1.3.0"}')
         check("顶层重复字段即使值相同也被拒绝")
         duplicate_check = '"candidate_installed": true'
         assert duplicate_check in serialized
@@ -101,9 +117,27 @@ def main():
         for field in sorted(gate.CHECKS):
             save({**accepted, "checks": {**accepted["checks"], field: False}})
             check(f"实机验收项 {field} 未通过时阻止发布")
-        for time_value in (None, "invalid", "2020-01-01T00:00:00Z", "2999-01-01T00:00:00Z"):
+        invalid_metrics = {
+            "eligible_messages_total": 0,
+            "eligible_messages_accounted": 0,
+            "unexplained_missing": 1,
+            "knowledge_cases_total": 11,
+            "knowledge_cases_passed": 11,
+            "generic_clarifications": 1,
+            "observation_seconds": 899,
+            "duplicate_visible_answers": 1,
+        }
+        for field, value in invalid_metrics.items():
+            save({**accepted, "metrics": {**accepted["metrics"], field: value}})
+            check(f"实机 P0 指标 {field} 未达到门槛时阻止发布")
+        save({**accepted, "metrics": {**accepted["metrics"], "observation_seconds": True}})
+        check("布尔 true 不能冒充数值验收指标")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for time_value in (None, "invalid", "2020-01-01T00:00:00Z", "2999-01-01T00:00:00Z",
+                           (now - datetime.timedelta(days=8)).isoformat(),
+                           (now - datetime.timedelta(hours=1)).isoformat()):
             save({**accepted, "checked_at": time_value})
-            check("无效、过期或未来回执不能证明当前验收")
+            check("无效、过期、早于提交或未来回执不能证明当前验收")
         save()
         receipt.chmod(0o644)
         check("公开可读回执被拒绝")
@@ -129,8 +163,11 @@ def main():
         (source / "untracked-file").write_text("uncommitted", encoding="utf-8")
         check("未提交文件存在时阻止发布")
         (source / "untracked-file").unlink()
-        (source / "VERSION").write_text("v1.2.1\n\n", encoding="utf-8")
+        (source / "VERSION").write_text("v1.3.0\n\n", encoding="utf-8")
         check("已跟踪源码发生验收后修改时阻止发布")
+        run_script = (ROOT / "tests/run.sh").read_text(encoding="utf-8")
+        assert "v1.3.0 发布验收不允许 External Validation Pending" in run_script
+        print("通过：[UNIT/CONTRACT] v1.3.0 发布测试入口禁止外部验收豁免", flush=True)
         print(f"发布门禁专项：{passed} 通过，0 失败；仅机制测试，不是 TARGET-A 验收回执。")
 
 

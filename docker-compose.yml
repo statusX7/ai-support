@@ -23,6 +23,7 @@ services:
     volumes:
       - ${DEPLOY_DIR:-/opt/crisp-ai}/config:/opt/crisp-ai/config:ro
       - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-adapter.js:/opt/crisp-ai/scripts/provider-adapter.js:ro
+      - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/visitor-output.js:/opt/crisp-ai/scripts/visitor-output.js:ro
       - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-router.js:/opt/crisp-ai/scripts/provider-router.js:ro
       - ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/provider-envelope.js:/opt/crisp-ai/scripts/provider-envelope.js:ro
       - ${DEPLOY_DIR:-/opt/crisp-ai}/secrets/provider:/opt/crisp-ai/secrets/provider:ro
@@ -145,6 +146,8 @@ services:
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?请在 .env 中设置 N8N_ENCRYPTION_KEY}
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       N8N_RUNNERS_ENABLED: "true"
+      # 固定版本 task runner 共 10 个；后台处理总占 8 个，其中普通长任务最多 7 个。
+      N8N_RUNNERS_MAX_CONCURRENCY: "10"
       N8N_RUNNERS_GRANT_TOKEN_TTL: "300"
       N8N_RUNNERS_TASK_TIMEOUT: "300"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"

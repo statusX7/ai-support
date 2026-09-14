@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const {mechanicalFailureAnswer,legacyGenericNonAnswer} = require('./visitor-output.js');
 
 const DEFAULT_POLICY = Object.freeze({question_timeout_ms:90000, call_timeout_ms:20000, connect_timeout_ms:5000,
   max_attempts:21, cooldown_initial_ms:60000, cooldown_max_ms:300000, pool_cooldown_ms:3000});
@@ -10,6 +11,17 @@ const POLICY_BOUNDS = {question_timeout_ms:[1000,180000],call_timeout_ms:[1000,6
   max_attempts:[1,21],cooldown_initial_ms:[1000,300000],cooldown_max_ms:[1000,3600000],pool_cooldown_ms:[100,60000]};
 const forbiddenHeaders = new Set(['authorization','host','connection','content-length','content-type','transfer-encoding','cookie','proxy-authorization','x-crispai-question']);
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+
+function cachedResultDisposition(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return 'invalid';
+  const choice = result.choices?.[0], message = choice?.message;
+  const refusal = typeof message?.refusal === 'string' && Boolean(message.refusal.trim());
+  if (refusal || choice?.finish_reason === 'content_filter') return 'safety_refusal';
+  if (!message || message.tool_calls || message.function_call
+    || typeof message.content !== 'string' || !message.content.trim()) return 'invalid';
+  return mechanicalFailureAnswer(message.content) || legacyGenericNonAnswer(message.content)
+    ? 'non_answer' : 'answer';
+}
 
 function estimateTextTokens(text) {
   let estimate = 0, ascii = 0;
@@ -238,7 +250,10 @@ function createRouter(environment, invoke) {
     if (envelope.scope === 'admin') return;
     const session = readJson(path.join(root,'data/runtime/session-' + envelope.session_key + '.json'));
     if (session.schema_version !== 2 || session.mode !== 'ai' || session.generation !== envelope.generation || session.uncertain_events?.length
-      || !Array.isArray(session.jobs) || !session.jobs.some(job => job.id === envelope.question_id && job.generation === envelope.generation && job.revision === envelope.runtime_revision && !['cancelled','failed','done'].includes(job.status))) throw terminal('question_cancelled','会话状态已变更，本次问题已取消');
+      || !Array.isArray(session.jobs) || !session.jobs.some(job => job.id === envelope.question_id
+        && job.generation === envelope.generation && job.revision === envelope.runtime_revision
+        && job.inference?.attempt_generation === envelope.attempt_generation
+        && !['cancelled','failed','done'].includes(job.status))) throw terminal('question_cancelled','会话状态已变更，本次问题已取消');
   };
   const questionFile = id => path.join(directory,'questions',id + '.json');
   const readQuestion = id => { try { return readJson(questionFile(id),20000000); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
@@ -261,7 +276,7 @@ function createRouter(environment, invoke) {
     const used = storage(); let previous = 0; try { previous = fs.statSync(target).size; } catch (_) {}
     if (!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) {
       for (const phase of Object.values(question.stages)) delete phase.result;
-      question.terminal = {code:'question_cache_full',message:'问题处理缓存已满，请稍后再发起新问题'};
+      question.terminal = {code:'question_cache_full',message:'问题处理缓存已达容量上限'};
       if (previous) atomic(target,question);
       throw terminal(question.terminal.code,question.terminal.message);
     }
@@ -273,14 +288,86 @@ function createRouter(environment, invoke) {
     if (envelope && Date.now() >= envelope.deadline_at) throw terminal('question_timeout','本次问题的总处理时间已用尽');
     const id = envelope?.question_id || hash(crypto.randomUUID());
     const stage = envelope?.stage || 'answer';
-    const binding = hash(JSON.stringify(envelope ? [envelope.scope || 'conversation',envelope.session_key,envelope.generation,envelope.runtime_revision,envelope.pool_revision,envelope.deadline_at] : [pool.revision]));
+    const attemptGeneration = envelope?.attempt_generation || 1;
+    const identityParts = envelope ? [envelope.scope || 'conversation',envelope.session_key,
+      envelope.generation,envelope.runtime_revision,envelope.pool_revision] : [pool.revision];
+    const identityBinding = hash(JSON.stringify(identityParts));
+    const bindingForGeneration = generation => hash(JSON.stringify([...identityParts,generation]));
+    const binding = bindingForGeneration(attemptGeneration);
     let question = readQuestion(id);
-    if (question && question.binding !== binding) throw terminal('question_conflict','问题标识与原处理上下文不一致');
-    if (!question) question = {id,binding,revision:pool.revision,deadline:Math.min(envelope?.deadline_at || Infinity,Date.now()+pool.policy.question_timeout_ms),attempts:0,stages:{},created_at:Date.now()};
+    if (question && question.binding !== binding) {
+      const priorGeneration = Number.isSafeInteger(question.attempt_generation) ? question.attempt_generation : 1;
+      const nonRetryable = new Set(['invalid_input','safety_refusal']);
+      const sameIdentity = question.identity_binding
+        ? question.identity_binding === identityBinding
+        : question.binding === bindingForGeneration(priorGeneration);
+      const cached = question.stages?.[stage];
+      const cachedDisposition = cachedResultDisposition(cached?.result);
+      const otherCachedDispositions = Object.entries(question.stages || {})
+        .filter(([name,phase]) => name !== stage && phase?.result !== undefined)
+        .map(([,phase]) => cachedResultDisposition(phase.result));
+      const otherCachedResultsSafe = otherCachedDispositions.every(value => value === 'answer');
+      const recoverCachedNonAnswer = sameIdentity && attemptGeneration === priorGeneration + 1
+        && cachedDisposition === 'non_answer' && otherCachedResultsSafe && !question.output_policy_recovery
+        && (!question.terminal || !nonRetryable.has(question.terminal.code));
+      if (recoverCachedNonAnswer) {
+        const invalidatedSha256 = hash(JSON.stringify(cached.result));
+        delete cached.result;
+        delete cached.owner;
+        cached.invalidated_result = {sha256:invalidatedSha256,
+          reason:'current_output_policy_non_answer',attempt_generation:priorGeneration,invalidated_at:Date.now()};
+        question.output_policy_recovery = {stage,from_attempt_generation:priorGeneration,
+          to_attempt_generation:attemptGeneration,result_sha256:invalidatedSha256,invalidated_at:Date.now()};
+        question.binding = binding;
+        question.identity_binding = identityBinding;
+        question.attempt_generation = attemptGeneration;
+        question.deadline = Math.min(envelope?.deadline_at || Infinity,
+          Date.now()+pool.policy.question_timeout_ms);
+        if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+        persistQuestion(question);
+        record({at:Date.now(),question_id:id,stage,pool_revision:pool.revision,
+          outcome:'cached_non_answer_invalidated',attempt:question.attempts});
+      } else if (sameIdentity && attemptGeneration === priorGeneration + 1
+        && cachedDisposition === 'invalid' && cached?.result === undefined
+        && otherCachedResultsSafe
+        && (!question.terminal || !nonRetryable.has(question.terminal.code))) {
+        question.binding = binding;
+        question.identity_binding = identityBinding;
+        question.attempt_generation = attemptGeneration;
+        question.deadline = Math.min(envelope?.deadline_at || Infinity,
+          Date.now()+pool.policy.question_timeout_ms);
+        for (const phase of Object.values(question.stages || {})) {
+          if (phase?.result !== undefined) continue;
+          phase.tried = [];
+          delete phase.owner;
+        }
+        if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+        persistQuestion(question);
+      }
+      else throw terminal('question_conflict','问题标识与原处理上下文不一致');
+    }
+    if (!question) question = {id,binding,attempt_generation:attemptGeneration,revision:pool.revision,
+      identity_binding:identityBinding,
+      deadline:Math.min(envelope?.deadline_at || Infinity,Date.now()+pool.policy.question_timeout_ms),attempts:0,stages:{},created_at:Date.now()};
     const check = () => { if (signal?.aborted) throw terminal('question_cancelled','本次问题已取消'); assertCurrent(envelope,pool.revision,question.deadline); };
     try { check(); } catch (error) { question.terminal = {code:error.code || 'question_cancelled',message:'本次问题已取消或到期'}; persistQuestion(question); throw error; }
     const existing = question.stages[stage];
-    if (existing?.result) return existing.result;
+    // 旧版或崩溃恢复状态可能只留下另一阶段的结果。即使当前阶段尚未创建
+    // result，也必须先封住安全拒绝和畸形缓存，不能因此取得一次新的上游调用权。
+    const otherDispositions = Object.entries(question.stages || {})
+      .filter(([name,phase]) => name !== stage && phase?.result !== undefined)
+      .map(([,phase]) => cachedResultDisposition(phase.result));
+    if (otherDispositions.includes('safety_refusal')) {
+      throw terminal('safety_refusal','模型已拒绝该内容，本次问题已终止');
+    }
+    if (otherDispositions.some(value => value !== 'answer')) {
+      throw terminal('invalid_response','跨阶段缓存结果未通过当前输出策略');
+    }
+    if (existing?.result) {
+      const disposition = cachedResultDisposition(existing.result);
+      if (disposition === 'answer' || disposition === 'safety_refusal') return existing.result;
+      throw terminal('invalid_response','缓存结果未通过当前输出策略');
+    }
     if (question.terminal) throw terminal(question.terminal.code,question.terminal.message);
     if (existing?.owner && existing.owner !== boot) {
       question.terminal = {code:'question_interrupted',message:'先前请求未获得确定结果，本次问题已终止'}; persistQuestion(question);
@@ -295,7 +382,7 @@ function createRouter(environment, invoke) {
     let candidates = 0;
     const attemptFailures = [];
     try {
-      if (state.pool_until > Date.now()) throw terminal('pool_cooling','接口池正在短暂保护期，请稍后再发起新问题');
+      if (state.pool_until > Date.now()) throw terminal('pool_cooling','接口池处于冷却保护状态');
       for (const entry of pool.entries) {
         check();
         if (question.attempts >= pool.policy.max_attempts) throw terminal('question_budget_exhausted','本次问题的调用次数已用尽');

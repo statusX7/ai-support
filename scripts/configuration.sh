@@ -22,7 +22,7 @@ configuration_runtime_init() {
   [[ ! -L "${deploy_dir}/config" && ! -L "$target" ]] || return 1
   if [[ ! -f "$target" ]]; then
     temporary=$(mktemp "${target}.tmp.XXXXXX")
-    jq -M -n '{schema_version:2,enabled:true,revision:1,applied_revision:0}' > "$temporary"
+    jq -M -n '{schema_version:2,enabled:true,disable_epoch:0,revision:1,applied_revision:0}' > "$temporary"
     chmod 640 "$temporary"
     chown root:1000 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$target"
@@ -35,7 +35,8 @@ configuration_validate() {
   jq -M -e 'type == "object"' "$input" >/dev/null 2>&1 || return 1
   case "$name" in
     runtime)
-      jq -M -e '.enabled | type == "boolean"' "$input" >/dev/null ;;
+      jq -M -e '(.enabled | type == "boolean") and
+        ((.disable_epoch // 0) | type == "number" and floor == . and . >= 0 and . <= 2147483647)' "$input" >/dev/null ;;
     handoff)
       jq -M -e '.handoff | type == "object" and ((if has("resume_after_seconds") then .resume_after_seconds else 3600 end) | type == "number" and floor == . and . >= 0 and . <= 604800) and ((.message // "") | type == "string" and utf8bytelength <= 10000) and ((.notify_user.enabled // true) == false or (.message | type == "string" and utf8bytelength > 0 and test("\\S")))' "$input" >/dev/null ;;
     keyword)
@@ -183,13 +184,13 @@ configuration_upgrade_legacy_handoff_file() {
       .handoff.message = .handoff.confirmation
     else .handoff.message = "正在为您转接人工客服，请稍候。" end |
     if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
-      .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
+      .handoff.no_answer_message = ""
     else . end |
     if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
-      .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
+      .handoff.low_confidence_message = ""
     else . end |
     if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
-      .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
+      .handoff.failure_message = ""
     else . end |
     del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence,
         .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords,
@@ -210,6 +211,14 @@ configuration_normalize_file() {
   fi
   configuration_validate "$name" "$output" \
     || { configuration_error "${name} 配置格式或边界无效"; return 1; }
+  if [[ "$name" == runtime ]]; then
+    policy_output=$(mktemp "${output}.runtime-policy.XXXXXXXX") || return 1
+    # disable_epoch 是受管控制代次，不接受用户或迁移包直接指定的负值/非整数；
+    # 真正的 true→false 递增由统一资料应用事务根据上一有效投影完成。
+    jq -M '.schema_version=2 | .disable_epoch=(.disable_epoch // 0)' "$output" > "$policy_output" \
+      || { rm -f -- "$policy_output"; return 1; }
+    mv -f -- "$policy_output" "$output"
+  fi
   if [[ "$name" == feedback ]]; then
     # 本版停用自动邀请是控制策略，不允许旧导入或直编配置重新开启。
     policy_output=$(mktemp "${output}.policy.XXXXXXXX") || return 1
@@ -220,7 +229,7 @@ configuration_normalize_file() {
   if [[ "$name" == keyword || "$name" == handoff ]]; then
     policy_output=$(mktemp "${output}.display.XXXXXXXX") || return 1
     # 只迁移项目曾提供的精确缺省文案，不扫描/改写用户 Prompt、知识或自定义句子。
-    jq -M --arg name "$name" --arg clarification '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。' '
+    jq -M --arg name "$name" '
       def confirmation:
         if . == "已暂停本次对话的 AI 回复，您的人工协助请求已收到。"
         then "您的人工协助请求已收到，请稍候。" else . end;
@@ -232,15 +241,18 @@ configuration_normalize_file() {
         (if .handoff | has("resume_after_seconds") then . else .handoff.resume_after_seconds=3600 end) |
         (if .handoff | has("message") then .handoff.message |= confirmation else . end) |
         (.handoff.no_answer_message |=
-          if . == null or . == "" or . == "知识库暂时没有足够信息，请换一种方式描述问题。"
-             or . == "目前知识还不足以确认，请补充您遇到的具体情况。" then $clarification else . end) |
+          if . == null or . == "知识库暂时没有足够信息，请换一种方式描述问题。"
+             or . == "目前知识还不足以确认，请补充您遇到的具体情况。"
+             or . == "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。" then "" else . end) |
         (.handoff.low_confidence_message |=
-          if . == null or . == "" or . == "当前答案可信度不足，请补充更多问题细节。"
-             or . == "现有资料还不足以确定答案，请补充更多细节。" then $clarification else . end) |
+          if . == null or . == "当前答案可信度不足，请补充更多问题细节。"
+             or . == "现有资料还不足以确定答案，请补充更多细节。"
+             or . == "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。" then "" else . end) |
         (if .handoff.failure_message == "当前自动客服暂时不可用，请稍后再试。"
          or .handoff.failure_message == "自动客服暂时无法回答，请稍后再试。"
          or .handoff.failure_message == "暂时无法回复，请稍后再试。"
-         then .handoff.failure_message=$clarification else . end)
+         or .handoff.failure_message == "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
+         then .handoff.failure_message="" else . end)
       end' "$output" > "$policy_output" || { rm -f -- "$policy_output"; return 1; }
     mv -f -- "$policy_output" "$output"
   fi
@@ -291,9 +303,8 @@ configuration_materials_ensure() {
   local deploy_dir=$1
   [[ -x "${CONFIGURATION_DIR}/materials.sh" ]] \
     || { configuration_error '资料应用模块缺失'; return 1; }
-  if [[ ! -e "${deploy_dir}/config/materials-applied.json" && ! -L "${deploy_dir}/config/materials-applied.json" ]]; then
-    bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" initialize >/dev/null
-  fi
+  # initialize 对当前 schema 幂等，并负责将安全的旧投影迁移到当前身份契约。
+  bash "${CONFIGURATION_DIR}/materials.sh" --deploy-dir "$deploy_dir" initialize >/dev/null
 }
 
 configuration_apply() (
@@ -445,7 +456,8 @@ configuration_query_failure() {
     pool_cooling) message='全部可用接口处于短暂保护期；请查看近期切换记录和各接口状态' ;;
     pool_exhausted) message='本题预算内已启用接口均未成功；请查看近期切换记录定位每次失败类别' ;;
     no_capable_provider) message='没有同时满足当前协议、上下文或图片能力的已启用接口' ;;
-    question_budget_exhausted) message='本次测试已达到总时间或调用次数上限；不会继续放大请求' ;;
+    question_budget_exhausted|question_timeout) message='本次测试已达到总时间或调用次数上限；不会继续放大请求' ;;
+    question_interrupted) message='先前推理在接口适配器重启或执行权丢失后已安全终止；旧结果不会继续出站' ;;
     safety_refusal) message='模型对合成检查作出安全拒绝；这不是连接成功证据，也不会改用接口规避安全限制' ;;
     *) code=admin_query_failed; message='知识问答测试未完成；请分别检查检索、接口池、协议和组件状态' ;;
   esac
@@ -662,7 +674,7 @@ configuration_main() {
       configuration_runtime_init "$deploy_dir"
       if [[ -e "${deploy_dir}/config/materials-applied.json" || -L "${deploy_dir}/config/materials-applied.json" ]]; then
         if [[ ! -f "${deploy_dir}/config/materials-applied.json" || -L "${deploy_dir}/config/materials-applied.json" ]] \
-          || ! jq -M -e '.schema_version == 1 and (.state == "applied" or .state == "applying") and (.configuration.runtime | type == "object")' "${deploy_dir}/config/materials-applied.json" >/dev/null 2>&1; then
+          || ! jq -M -e '(.schema_version == 1 or .schema_version == 2) and (.state == "applied" or .state == "applying") and (.configuration.runtime | type == "object")' "${deploy_dir}/config/materials-applied.json" >/dev/null 2>&1; then
           configuration_error '资料投影损坏，拒绝将可编辑原文显示为当前运行配置'
           return 1
         fi

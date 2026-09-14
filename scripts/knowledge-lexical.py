@@ -16,7 +16,7 @@ MAX_INDEX_BYTES = 16 * 1024 * 1024
 MAX_MAP_BYTES = 16 * 1024 * 1024
 MAX_PARSED_BYTES = 256 * 1024 * 1024
 MAX_PASSAGE_BYTES = 512 * 1024
-ALGORITHM = "crispai-lexical-v1"
+ALGORITHM = "crispai-lexical-v2"
 QUESTION = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:问(?:题)?|q(?:uestion)?)[ \t]*[:：][ \t]*([^\r\n]+)")
 # 用户原文常见两种中文标签都是受支持格式：`答/答案` 与 `回答`。
 # 缺少 `回答` 会让整段退化成普通窗口，索引中没有可供精确命中的 question 字段；
@@ -143,7 +143,7 @@ def windows(text, start, end):
             boundary = text.rfind("\n", start + 1024, stop)
             if boundary >= 0:
                 stop = boundary + 1
-        yield start, stop, ""
+        yield start, stop, "", None, None
         start = stop
 
 
@@ -154,13 +154,36 @@ def passage_spans(text):
         end = questions[position + 1].start() if position + 1 < len(questions) else len(text)
         if cursor < question.start():
             yield from windows(text, cursor, question.start())
-        if ANSWER.search(text, question.end(), end):
-            yield question.start(), end, question.group(1).strip()
+        answers = list(ANSWER.finditer(text, question.end(), end))
+        if len(answers) == 1:
+            answer = answers[0]
+            answer_start, answer_end = answer.end(), end
+            while answer_start < answer_end and text[answer_start].isspace():
+                answer_start += 1
+            while answer_end > answer_start and text[answer_end - 1].isspace():
+                answer_end -= 1
+            yield question.start(), end, question.group(1).strip(), answer_start, answer_end
         else:
             yield from windows(text, question.start(), end)
         cursor = end
     if cursor < len(text):
         yield from windows(text, cursor, len(text))
+
+
+def byte_passage_spans(text):
+    """将解析器字符边界一次转换为连续 UTF-8 字节边界。"""
+    byte_offset = 0
+    for start, end, question, answer_start, answer_end in passage_spans(text):
+        body = text[start:end]
+        size = len(body.encode("utf-8"))
+        answer_begin_byte = None
+        answer_finish_byte = None
+        if answer_start is not None and answer_end is not None and answer_end > answer_start:
+            answer_begin_byte = byte_offset + len(text[start:answer_start].encode("utf-8"))
+            answer_finish_byte = answer_begin_byte + len(text[answer_start:answer_end].encode("utf-8"))
+        yield (start, end, question, byte_offset, byte_offset + size,
+               answer_begin_byte, answer_finish_byte)
+        byte_offset += size
 
 
 def spread(indices):
@@ -253,18 +276,17 @@ def build_index(deploy_dir, output=None):
                     raise ValueError
             except (ValueError, UnicodeError, RecursionError):
                 raise LexicalError("source_invalid") from None
-            source_bytes += len(text.encode("utf-8"))
-            parsed_hash, content_hash = digest(raw), digest(text.encode("utf-8"))
-            spans, byte_offset = [], 0
-            for start, end, question in passage_spans(text):
-                size = len(text[start:end].encode("utf-8"))
-                spans.append((start, end, question, byte_offset, byte_offset + size))
-                byte_offset += size
+            encoded_content = text.encode("utf-8")
+            source_bytes += len(encoded_content)
+            if not encoded_content:
+                reasons.add("empty_source")
+            parsed_hash, content_hash = digest(raw), digest(encoded_content)
+            spans = list(byte_passage_spans(text))
             priority = spread([i for i, span in enumerate(spans) if span[2]]) + spread([i for i, span in enumerate(spans) if not span[2]])
             allowance = (MAX_INDEX_BYTES - used) // max(1, len(documents) - document_number)
             local_used, selected = 0, []
             for position in priority:
-                start, end, question, begin_byte, end_byte = spans[position]
+                start, end, question, begin_byte, end_byte, answer_begin_byte, answer_finish_byte = spans[position]
                 if end_byte - begin_byte > MAX_PASSAGE_BYTES:
                     reasons.add("passage_too_large")
                     continue
@@ -272,6 +294,11 @@ def build_index(deploy_dir, output=None):
                 entry = {**document, "parsed_sha256": parsed_hash, "content_sha256": content_hash,
                          "start_byte": begin_byte, "end_byte": end_byte, "text": body,
                          "question": question, "text_sha256": digest(body.encode("utf-8"))}
+                if answer_begin_byte is not None and answer_finish_byte is not None:
+                    answer_body = encoded_content[answer_begin_byte:answer_finish_byte]
+                    entry.update({"answer_start_byte": answer_begin_byte,
+                                  "answer_end_byte": answer_finish_byte,
+                                  "answer_sha256": digest(answer_body)})
                 entry["id"] = passage_id(entry)
                 size = len(canonical(entry)) + 1
                 if local_used + size > allowance:
@@ -298,8 +325,9 @@ def build_index(deploy_dir, output=None):
                     os.close(descriptor)
             except OSError:
                 raise LexicalError("source_changed") from None
-        result = {"schema_version": 1, "algorithm": ALGORITHM, "map_sha256": digest(map_raw),
-                  "complete": source_bytes == indexed_bytes,
+        complete = source_bytes == indexed_bytes and indexed_documents == len(documents)
+        result = {"schema_version": 2, "algorithm": ALGORITHM, "map_sha256": digest(map_raw),
+                  "complete": complete,
                   "coverage": {"source_documents": len(documents), "indexed_documents": indexed_documents,
                                "omitted_documents": len(documents) - indexed_documents, "source_bytes": source_bytes,
                                "indexed_bytes": indexed_bytes, "omitted_bytes": source_bytes - indexed_bytes,
@@ -340,7 +368,7 @@ def verify_index(deploy_dir):
         indexed_bytes = 0
         try:
             index = strict_json(index_raw)
-            if not isinstance(index, dict) or index.get("schema_version") != 1 or index.get("algorithm") != ALGORITHM \
+            if not isinstance(index, dict) or index.get("schema_version") != 2 or index.get("algorithm") != ALGORITHM \
                     or not isinstance(index.get("passages"), list) or not isinstance(index.get("complete"), bool):
                 raise ValueError
             expected = index.get("payload_sha256")
@@ -355,14 +383,16 @@ def verify_index(deploy_dir):
                     or coverage["source_documents"] != len(documents) \
                     or coverage["indexed_documents"] + coverage["omitted_documents"] != len(documents) \
                     or coverage["indexed_bytes"] + coverage["omitted_bytes"] != coverage["source_bytes"] \
-                    or index["complete"] != (coverage["omitted_bytes"] == 0) \
+                    or index["complete"] != (coverage["omitted_bytes"] == 0 and coverage["omitted_documents"] == 0) \
                     or not isinstance(coverage.get("reasons"), list) \
-                    or any(reason not in ("index_capacity", "passage_too_large") for reason in coverage["reasons"]):
+                    or any(reason not in ("empty_source", "index_capacity", "passage_too_large") for reason in coverage["reasons"]):
                 raise ValueError
             for entry in index["passages"]:
                 if not isinstance(entry, dict):
                     raise ValueError
                 source = sources.get(entry.get("location"))
+                answer_fields = ("answer_start_byte", "answer_end_byte", "answer_sha256")
+                answer_present = [key in entry for key in answer_fields]
                 if not source or any(entry.get(key) != source[key] for key in ("library_id", "document_id", "projection", "location")) \
                         or not safe_text(entry.get("text"), MAX_PASSAGE_BYTES, empty=True) \
                         or not safe_text(entry.get("question"), MAX_PASSAGE_BYTES, empty=True) \
@@ -373,6 +403,14 @@ def verify_index(deploy_dir):
                         or entry["end_byte"] <= entry["start_byte"] \
                         or entry["end_byte"] - entry["start_byte"] != len(entry["text"].encode("utf-8")) \
                         or entry["start_byte"] < positions.get(entry["location"], 0) \
+                        or any(answer_present) and not all(answer_present) \
+                        or all(answer_present) and (type(entry["answer_start_byte"]) is not int
+                            or type(entry["answer_end_byte"]) is not int
+                            or entry["answer_start_byte"] < entry["start_byte"]
+                            or entry["answer_end_byte"] <= entry["answer_start_byte"]
+                            or entry["answer_end_byte"] > entry["end_byte"]
+                            or not isinstance(entry["answer_sha256"], str)
+                            or not re.fullmatch(r"[a-f0-9]{64}", entry["answer_sha256"])) \
                         or entry.get("id") != passage_id(entry) or entry["id"] in seen \
                         or entry["question"] not in entry["text"]:
                     raise ValueError
@@ -389,17 +427,35 @@ def verify_index(deploy_dir):
             raw, _ = read_relative(base, "data/anythingllm/documents/" + document["location"], MAX_PARSED_BYTES, "source_invalid")
             try:
                 parsed = strict_json(raw)
-                content = parsed.get("pageContent") if isinstance(parsed, dict) else None
-                if not safe_text(content, MAX_PARSED_BYTES, empty=True):
+                content_text = parsed.get("pageContent") if isinstance(parsed, dict) else None
+                if not safe_text(content_text, MAX_PARSED_BYTES, empty=True):
                     raise ValueError
-                content = content.encode("utf-8")
+                content = content_text.encode("utf-8")
             except (ValueError, UnicodeError, RecursionError):
                 raise LexicalError("source_invalid") from None
             actual_bytes += len(content)
             parsed_hash, content_hash = digest(raw), digest(content)
+            expected_spans = {(item[3], item[4]): item for item in byte_passage_spans(content_text)}
             for entry in groups.get(document["location"], []):
+                expected_span = expected_spans.get((entry["start_byte"], entry["end_byte"]))
+                expected_question = expected_span[2] if expected_span else None
+                expected_answer_start = expected_span[5] if expected_span else None
+                expected_answer_end = expected_span[6] if expected_span else None
+                answer_present = "answer_sha256" in entry
+                answer_raw = content[entry.get("answer_start_byte", 0):entry.get("answer_end_byte", 0)] \
+                    if answer_present else b""
+                try:
+                    answer_text = answer_raw.decode("utf-8", "strict") if answer_present else ""
+                except UnicodeDecodeError:
+                    raise LexicalError("source_changed") from None
                 if entry["parsed_sha256"] != parsed_hash or entry["content_sha256"] != content_hash \
-                        or content[entry["start_byte"]:entry["end_byte"]] != entry["text"].encode("utf-8"):
+                        or content[entry["start_byte"]:entry["end_byte"]] != entry["text"].encode("utf-8") \
+                        or expected_span is None or entry["question"] != expected_question \
+                        or answer_present != (expected_answer_start is not None and expected_answer_end is not None) \
+                        or answer_present and (entry["answer_start_byte"] != expected_answer_start
+                            or entry["answer_end_byte"] != expected_answer_end
+                            or not answer_text.strip()
+                            or digest(answer_raw) != entry["answer_sha256"]):
                     raise LexicalError("source_changed")
         if actual_bytes != coverage["source_bytes"]:
             raise LexicalError("source_changed")
@@ -423,7 +479,7 @@ def main():
     try:
         result = verify_index(args.deploy_dir) if args.command == "verify" else build_index(args.deploy_dir, args.output)
         print(json.dumps({"ok": True, "complete": result["complete"], "coverage": result["coverage"],
-                          "schema_version": 1, "map_sha256": result["map_sha256"],
+                          "schema_version": 2, "map_sha256": result["map_sha256"],
                           "payload_sha256": result["payload_sha256"], "read_only": args.command == "verify"}, ensure_ascii=False))
         return 0
     except (LexicalError, OSError, ValueError, MemoryError, RecursionError) as error:

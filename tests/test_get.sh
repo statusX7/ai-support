@@ -147,7 +147,7 @@ write_mock_package() {
     scripts/provider-adapter.js n8n/workflow.json n8n/runtime.js
     config/app.yaml config/provider.yaml.example
   )
-  if [[ "$layout" == current || "$layout" == v120 || "$layout" == v121 ]]; then
+  if [[ "$layout" == current || "$layout" == v120 || "$layout" == v121 || "$layout" == v122 ]]; then
     required+=(
       .env.example get.sh
       config/Caddyfile.example config/feedback.yaml.example config/handoff.yaml.example
@@ -158,11 +158,14 @@ write_mock_package() {
       scripts/restore.sh scripts/rollback.sh scripts/snapshot.sh scripts/menu-ui.sh
       scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
     )
-    if [[ "$layout" == v120 || "$layout" == v121 ]]; then
+    if [[ "$layout" == v120 || "$layout" == v121 || "$layout" == v122 ]]; then
       required+=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
     fi
-    if [[ "$layout" == v121 ]]; then
+    if [[ "$layout" == v121 || "$layout" == v122 ]]; then
       required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/admin-query.js n8n/knowledge-lexical.js scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py)
+    fi
+    if [[ "$layout" == v122 ]]; then
+      required+=(scripts/visitor-output.js)
     fi
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
@@ -263,18 +266,26 @@ write_mock_package v1.1.1
 write_mock_package v1.1.2
 write_mock_package v1.2.0 v120
 write_mock_package v1.2.1 v121
+write_mock_package v1.2.2 v122
 V120_REQUIRED=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
 for entry_index in "${!V120_REQUIRED[@]}"; do
-  missing_release="v1.2.$((entry_index + 2))"
-  write_mock_package "$missing_release" v121
+  missing_release="v1.2.$((entry_index + 40))"
+  write_mock_package "$missing_release" v122
   rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V120_REQUIRED[entry_index]}"
   repack_mock_package "$missing_release"
 done
 V121_REQUIRED=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/admin-query.js n8n/knowledge-lexical.js scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py)
 for entry_index in "${!V121_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 10))"
-  write_mock_package "$missing_release" v121
+  write_mock_package "$missing_release" v122
   rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V121_REQUIRED[entry_index]}"
+  repack_mock_package "$missing_release"
+done
+V122_REQUIRED=(scripts/visitor-output.js)
+for entry_index in "${!V122_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 30))"
+  write_mock_package "$missing_release" v122
+  rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V122_REQUIRED[entry_index]}"
   repack_mock_package "$missing_release"
 done
 
@@ -701,6 +712,31 @@ run_tty "$CALLER_DIR" "${TEST_ROOT}/v121.typescript" "$V121_CAPTURE" \
 assert_contains "$V121_CAPTURE" 'action=install' 'v1.2.1 完整包没有进入正式安装器'
 pass 'v1.2.1 完整包包含全部接口池、签名信封和中文菜单模块'
 
+V122_CAPTURE="${TEST_ROOT}/v122.capture"
+: > "$V122_CAPTURE"
+run_tty "$CALLER_DIR" "${TEST_ROOT}/v122.typescript" "$V122_CAPTURE" \
+  --release v1.2.2 --deploy-dir "${TEST_ROOT}/v122-deploy"
+assert_contains "$V122_CAPTURE" 'action=install' 'v1.2.2 完整包没有进入正式安装器'
+pass 'v1.2.2 完整包包含公共访客输出策略模块'
+
+for entry_index in "${!V122_REQUIRED[@]}"; do
+  missing_release="v1.2.$((entry_index + 30))"
+  MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
+  MISSING_DEPLOY="${TEST_ROOT}/missing-${missing_release}.deploy"
+  MISSING_LOG="${TEST_ROOT}/missing-${missing_release}.typescript"
+  : > "$MISSING_CAPTURE"
+  set +e
+  run_tty "$CALLER_DIR" "$MISSING_LOG" "$MISSING_CAPTURE" \
+    --release "$missing_release" --deploy-dir "$MISSING_DEPLOY"
+  MISSING_STATUS=$?
+  set -e
+  [[ "$MISSING_STATUS" != 0 && ! -s "$MISSING_CAPTURE" && ! -e "$MISSING_DEPLOY" ]] \
+    || fail 'v1.2.2 包缺少访客输出策略却执行了安装器'
+  assert_contains "$MISSING_LOG" "归档缺少生产文件：${V122_REQUIRED[entry_index]}" \
+    'v1.2.2 缺失访客输出策略未在执行前准确拒绝'
+done
+pass 'v1.2.2 访客输出策略缺失即使 SHA 正确也在执行包内程序前拒绝'
+
 for entry_index in "${!V121_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 10))"
   MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
@@ -719,7 +755,7 @@ done
 pass 'v1.2.1 五个新增生产模块逐项缺失均在执行包内程序前拒绝'
 
 for entry_index in "${!V120_REQUIRED[@]}"; do
-  missing_release="v1.2.$((entry_index + 2))"
+  missing_release="v1.2.$((entry_index + 40))"
   MISSING_CAPTURE="${TEST_ROOT}/missing-${missing_release}.capture"
   MISSING_DEPLOY="${TEST_ROOT}/missing-${missing_release}.deploy"
   MISSING_LOG="${TEST_ROOT}/missing-${missing_release}.typescript"

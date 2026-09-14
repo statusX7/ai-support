@@ -10,8 +10,8 @@ const {createAdapter} = require('../scripts/provider-adapter.js');
 const root = path.resolve(__dirname, '..');
 
 async function main() {
-  fs.mkdirSync(path.join(root,'.work/v1.2.1'),{recursive:true});
-  const work = fs.mkdtempSync(path.join(root,'.work/v1.2.1/configuration-contract-'));
+  fs.mkdirSync(path.join(root,'.work/v1.3.0'),{recursive:true});
+  const work = fs.mkdtempSync(path.join(root,'.work/v1.3.0/configuration-contract-'));
   const deploy = path.join(work,'deploy');
   for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','n8n','scripts','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=staged\n');
@@ -25,7 +25,7 @@ async function main() {
   fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
   fs.copyFileSync(path.join(root,'n8n/workflow.json'),path.join(deploy,'n8n/workflow.json'));
   fs.copyFileSync(path.join(root,'docker-compose.yml'),path.join(deploy,'docker-compose.yml'));
-  for (const name of ['provider-adapter.js','provider-router.js','provider-envelope.js','provider-pool.py']) fs.copyFileSync(path.join(root,'scripts',name),path.join(deploy,'scripts',name));
+  for (const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py']) fs.copyFileSync(path.join(root,'scripts',name),path.join(deploy,'scripts',name));
   fs.copyFileSync(path.join(root,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker'));
   fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
   const documents = new Map(); let locations=[], prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'), sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
@@ -151,14 +151,16 @@ async function main() {
     assert.equal(neutralKeyword.rules[0].confirm_message,'您的人工协助请求已收到，请稍候。');
     assert.deepEqual(neutralKeyword.rules[1],legacyKeyword.rules[1]);
     assert.equal(neutralHandoff.handoff.message,'您的人工协助请求已收到，请稍候。');
-    assert.equal(neutralHandoff.handoff.failure_message,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');
+    assert.equal(neutralHandoff.handoff.no_answer_message,'');
+    assert.equal(neutralHandoff.handoff.low_confidence_message,'');
+    assert.equal(neutralHandoff.handoff.failure_message,'');
     assert.equal(neutralHandoff.handoff.resume_after_seconds,37);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'backups/config-history/keyword.display.pre-v1.2.1.yaml'))),legacyKeyword);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'backups/config-history/handoff.display.pre-v1.2.1.yaml'))),legacyHandoff);
     const neutralBytes=[fs.readFileSync(keywordFile),fs.readFileSync(handoffFile)];
     await ok('configuration.sh',['migrate']);
     assert.deepEqual([fs.readFileSync(keywordFile),fs.readFileSync(handoffFile)],neutralBytes);
-    pass('中性显示只迁移系统精确旧默认，保留自定义和人工秒数，受限备份且重复不变');
+    pass('系统精确旧默认迁移为空且不再生成 generic，保留自定义人工动作和秒数，受限备份且重复不变');
     const currentKeywordBytes=fs.readFileSync(keywordFile);
     fs.writeFileSync(keywordFile,JSON.stringify({keywords:[{
       id:'legacy-confirmation',name:'旧结构人工确认',enabled:true,match_mode:'contains',
@@ -192,7 +194,9 @@ async function main() {
     assert.equal(migratedLegacyHandoff.handoff.notify_user.enabled,true);
     assert.equal(migratedLegacyHandoff.handoff.resume_after_seconds,1800);
     assert.deepEqual(migratedLegacyHandoff.handoff.low_confidence,legacyHandoffWithoutMessage.handoff.low_confidence);
-    assert.deepEqual(migratedLegacyHandoff.handoff.low_confidence,legacyHandoffWithoutMessage.handoff.low_confidence);
+    assert.equal(migratedLegacyHandoff.handoff.no_answer_message,'');
+    assert.equal(migratedLegacyHandoff.handoff.low_confidence_message,'');
+    assert.equal(migratedLegacyHandoff.handoff.failure_message,'');
     for(const removed of ['confirmation','topic_keywords','on_operator_message','on_low_confidence','on_no_answer','resume_keywords','resume_match_mode']) {
       assert.equal(Object.hasOwn(migratedLegacyHandoff.handoff,removed),false,`旧字段仍存在：${removed}`);
     }
@@ -284,9 +288,9 @@ async function main() {
     assert.equal(JSON.parse(fs.readFileSync(path.join(deploy,'config/feedback.yaml'))).feedback.prompt,legacyFeedback.feedback.prompt);
     pass('旧启用反馈候选重新应用仍停用邀请，不篡改历史正文');
     const candidate=path.join(work,'runtime.json');fs.writeFileSync(candidate,JSON.stringify({enabled:false}));await ok('configuration.sh',['apply','runtime','--input',candidate]);
-    let runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.applied_revision,runtime.revision);pass('全局配置原子提交与运行时文件读回');
+    let runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.disable_epoch,1);assert.equal(runtime.applied_revision,runtime.revision);pass('全局配置原子提交与运行时文件读回');
     const revision=runtime.revision;fs.writeFileSync(candidate,JSON.stringify({enabled:true}));const failure=await invoke('configuration.sh',['apply','runtime','--input',candidate],{CONFIGURATION_FIXTURE_READBACK_FAIL:'1'});assert.notEqual(failure.code,0);
-    runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.ok(runtime.revision>revision);pass('应用失败恢复旧值且revision单调防旧请求复活');
+    runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.disable_epoch,1);assert.ok(runtime.revision>revision);pass('应用失败恢复旧值且revision/停用代次防旧请求复活');
     const models=JSON.parse((await ok('provider.sh',['models'])).stdout);assert.deepEqual(models.models,['synthetic-a','synthetic-b']);pass('模型列表去重与排序');
     modelStatus=401;assert.equal((await invoke('provider.sh',['models'])).code,3);modelStatus=404;assert.equal((await invoke('provider.sh',['models'])).code,2);modelStatus=200;pass('模型鉴权失败和手填后备状态可区分');
     modelEmpty=true;const emptyModels=await invoke('provider.sh',['models']);

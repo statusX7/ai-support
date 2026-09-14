@@ -178,6 +178,10 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 2 1; then
   fi
   snapshot_pool_required=true
 fi
+if snapshot_version_at_least "$VERSION_VALUE" 1 2 2; then
+  # adapter 会直接 require 这一公共访客输出策略；必须与调用者成套快照。
+  SCRIPT_FILES+=(visitor-output.js)
+fi
 
 snapshot_validate_file() {
   local relative=$1 label=$2 path="${DEPLOY_DIR}/${1}"

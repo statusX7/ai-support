@@ -413,6 +413,227 @@ webhook_proxy_snippet_target_is_replaceable() {
   grep -Fxq '# ai-support-managed-proxy' "$target"
 }
 
+install_configuration_transaction_path_is_safe() {
+  local deploy_dir=$1 transaction=$2 mode owner
+  [[ "$transaction" == "${deploy_dir}/tmp/install-configuration."* ]] || return 1
+  [[ -d "$transaction" && ! -L "$transaction" ]] || return 1
+  mode=$(stat -c '%a' -- "$transaction" 2>/dev/null || true)
+  owner=$(stat -c '%u' -- "$transaction" 2>/dev/null || true)
+  [[ "$mode" == 700 && "$owner" == "$EUID" ]]
+}
+
+install_configuration_transaction_state_value() {
+  local state=$1 wanted=$2
+  awk -F= -v wanted="$wanted" '
+    $1 == wanted {
+      count += 1
+      value = substr($0, length($1) + 2)
+    }
+    END {
+      if (count != 1) exit 1
+      print value
+    }
+  ' "$state"
+}
+
+install_configuration_transaction_validate() {
+  local deploy_dir=$1 transaction=$2 state member name value present
+  local -a file_flags=(
+    'original.env:env_present'
+    'original.Caddyfile:caddy_present'
+    'original.crispai-nginx.conf:nginx_present'
+    'original.crispai-caddy.conf:proxy_caddy_present'
+  )
+
+  install_configuration_transaction_path_is_safe "$deploy_dir" "$transaction" || return 1
+  state="${transaction}/state"
+  [[ -f "$state" && ! -L "$state" \
+    && "$(stat -c '%h' -- "$state" 2>/dev/null || true)" == 1 \
+    && "$(stat -c '%a' -- "$state" 2>/dev/null || true)" == 600 ]] || return 1
+  [[ "$(wc -l < "$state")" == 7 ]] || return 1
+  while IFS= read -r member; do
+    case "$member" in
+      schema_version=1|env_present=0|env_present=1|caddy_present=0|caddy_present=1|\
+      nginx_present=0|nginx_present=1|proxy_caddy_present=0|proxy_caddy_present=1|\
+      previous_caddy_running=0|previous_caddy_running=1|previous_mode=|\
+      previous_mode=external_proxy|previous_mode=managed_https) ;;
+      *) return 1 ;;
+    esac
+  done < "$state"
+  [[ "$(install_configuration_transaction_state_value "$state" schema_version)" == 1 ]]
+  value=$(install_configuration_transaction_state_value "$state" previous_caddy_running) || return 1
+  [[ "$value" == 0 || "$value" == 1 ]] || return 1
+  value=$(install_configuration_transaction_state_value "$state" previous_mode) || return 1
+  [[ -z "$value" || "$value" == external_proxy || "$value" == managed_https ]] || return 1
+
+  while IFS= read -r -d '' member; do
+    name=${member##*/}
+    case "$name" in
+      state|original.env|original.Caddyfile|original.crispai-nginx.conf|original.crispai-caddy.conf) ;;
+      *) return 1 ;;
+    esac
+    [[ -f "$member" && ! -L "$member" \
+      && "$(stat -c '%h' -- "$member" 2>/dev/null || true)" == 1 ]] || return 1
+  done < <(find "$transaction" -mindepth 1 -maxdepth 1 -print0)
+
+  for value in "${file_flags[@]}"; do
+    name=${value%%:*}
+    present=$(install_configuration_transaction_state_value "$state" "${value#*:}") || return 1
+    [[ "$present" == 0 || "$present" == 1 ]] || return 1
+    if [[ "$present" == 1 ]]; then
+      [[ -f "${transaction}/${name}" && ! -L "${transaction}/${name}" ]] || return 1
+    else
+      [[ ! -e "${transaction}/${name}" && ! -L "${transaction}/${name}" ]] || return 1
+    fi
+  done
+  [[ "$(install_configuration_transaction_state_value "$state" env_present)" == 1 ]]
+}
+
+# install.sh 的 Provider/Crisp 重配置会先切换 Webhook 与受管 Caddy，
+# 再用真实适配器验证主接口。这个受限快照将两个阶段合并为
+# 同一安装事务；快照只位于部署根的 0700 临时目录，不会输出内容。
+install_configuration_transaction_begin() (
+  set -euo pipefail
+  umask 077
+
+  local deploy_dir=$1 transaction previous_mode running member state completed=0
+  local env_present=0 caddy_present=0 nginx_present=0 proxy_caddy_present=0
+  local previous_caddy_running=0
+
+  [[ -d "$deploy_dir" && ! -L "$deploy_dir" \
+    && -d "${deploy_dir}/tmp" && ! -L "${deploy_dir}/tmp" ]] || return 1
+  transaction=$(mktemp -d "${deploy_dir}/tmp/install-configuration.XXXXXX") || return 1
+  chmod 0700 "$transaction"
+
+  # shellcheck disable=SC2317 # 由 EXIT trap 调用。
+  install_configuration_transaction_begin_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( ! completed )) && install_configuration_transaction_path_is_safe "$deploy_dir" "$transaction"; then
+      for member in state original.env original.Caddyfile \
+        original.crispai-nginx.conf original.crispai-caddy.conf; do
+        rm -f -- "${transaction}/${member}"
+      done
+      rmdir -- "$transaction" 2>/dev/null || true
+    fi
+    exit "$status"
+  }
+  trap install_configuration_transaction_begin_cleanup EXIT
+
+  [[ -f "${deploy_dir}/.env" && ! -L "${deploy_dir}/.env" \
+    && "$(stat -c '%h' -- "${deploy_dir}/.env" 2>/dev/null || true)" == 1 ]] || return 1
+  install -m 0600 -- "${deploy_dir}/.env" "${transaction}/original.env"
+  env_present=1
+  previous_mode=$(env_get "${deploy_dir}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
+  [[ -z "$previous_mode" || "$previous_mode" == external_proxy \
+    || "$previous_mode" == managed_https ]] || return 1
+
+  if [[ -e "${deploy_dir}/config/Caddyfile" || -L "${deploy_dir}/config/Caddyfile" ]]; then
+    caddy_configuration_file_is_safe "${deploy_dir}/config/Caddyfile" \
+      || { warn '当前受管 Caddy 配置不安全'; return 1; }
+    install -m 0600 -- "${deploy_dir}/config/Caddyfile" "${transaction}/original.Caddyfile"
+    caddy_present=1
+  fi
+  for member in crispai-nginx.conf crispai-caddy.conf; do
+    if [[ -e "${deploy_dir}/config/${member}" || -L "${deploy_dir}/config/${member}" ]]; then
+      webhook_proxy_snippet_target_is_replaceable "${deploy_dir}/config/${member}" || return 1
+      install -m 0600 -- "${deploy_dir}/config/${member}" "${transaction}/original.${member}"
+      if [[ "$member" == crispai-nginx.conf ]]; then
+        nginx_present=1
+      else
+        proxy_caddy_present=1
+      fi
+    fi
+  done
+
+  if [[ "$previous_mode" == managed_https ]]; then
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || return 1
+    running=$(docker_compose "$deploy_dir" --profile managed-https \
+      ps --services --filter status=running 2>/dev/null) || return 1
+    grep -Fxq caddy <<< "$running" && previous_caddy_running=1
+  fi
+
+  state="${transaction}/state"
+  printf '%s\n' \
+    'schema_version=1' \
+    "env_present=${env_present}" \
+    "caddy_present=${caddy_present}" \
+    "nginx_present=${nginx_present}" \
+    "proxy_caddy_present=${proxy_caddy_present}" \
+    "previous_caddy_running=${previous_caddy_running}" \
+    "previous_mode=${previous_mode}" > "$state"
+  chmod 0600 "$state"
+  install_configuration_transaction_validate "$deploy_dir" "$transaction" || return 1
+  completed=1
+  printf '%s\n' "$transaction"
+)
+
+install_configuration_transaction_discard() {
+  local deploy_dir=$1 transaction=$2 member
+  install_configuration_transaction_validate "$deploy_dir" "$transaction" || return 1
+  for member in state original.env original.Caddyfile \
+    original.crispai-nginx.conf original.crispai-caddy.conf; do
+    rm -f -- "${transaction}/${member}" || return 1
+  done
+  rmdir -- "$transaction"
+}
+
+install_configuration_transaction_rollback() (
+  set -euo pipefail
+
+  local deploy_dir=$1 transaction=$2 state present previous_caddy_running running
+  local target
+  install_configuration_transaction_validate "$deploy_dir" "$transaction" || return 1
+  state="${transaction}/state"
+  previous_caddy_running=$(install_configuration_transaction_state_value \
+    "$state" previous_caddy_running) || return 1
+
+  # 先验证当前目标，再改任何文件；不覆盖非本项目片段、符号链接
+  # 或多硬链接目标。回滚副本已在 validate 中逐个核对。
+  [[ -f "${deploy_dir}/.env" && ! -L "${deploy_dir}/.env" \
+    && "$(stat -c '%h' -- "${deploy_dir}/.env" 2>/dev/null || true)" == 1 ]] || return 1
+  if [[ -e "${deploy_dir}/config/Caddyfile" || -L "${deploy_dir}/config/Caddyfile" ]]; then
+    caddy_configuration_file_is_safe "${deploy_dir}/config/Caddyfile" || return 1
+  fi
+  for target in "${deploy_dir}/config/crispai-nginx.conf" \
+    "${deploy_dir}/config/crispai-caddy.conf"; do
+    webhook_proxy_snippet_target_is_replaceable "$target" || return 1
+  done
+
+  present=$(install_configuration_transaction_state_value "$state" caddy_present)
+  if [[ "$present" == 1 ]]; then
+    webhook_access_install_file "${transaction}/original.Caddyfile" \
+      "${deploy_dir}/config/Caddyfile" 0640 || return 1
+  else
+    rm -f -- "${deploy_dir}/config/Caddyfile" || return 1
+  fi
+  present=$(install_configuration_transaction_state_value "$state" nginx_present)
+  if [[ "$present" == 1 ]]; then
+    webhook_access_install_file "${transaction}/original.crispai-nginx.conf" \
+      "${deploy_dir}/config/crispai-nginx.conf" 0640 || return 1
+  else
+    rm -f -- "${deploy_dir}/config/crispai-nginx.conf" || return 1
+  fi
+  present=$(install_configuration_transaction_state_value "$state" proxy_caddy_present)
+  if [[ "$present" == 1 ]]; then
+    webhook_access_install_file "${transaction}/original.crispai-caddy.conf" \
+      "${deploy_dir}/config/crispai-caddy.conf" 0640 || return 1
+  else
+    rm -f -- "${deploy_dir}/config/crispai-caddy.conf" || return 1
+  fi
+  webhook_access_install_file "${transaction}/original.env" "${deploy_dir}/.env" 0600 \
+    || return 1
+
+  running=$(docker_compose "$deploy_dir" --profile managed-https \
+    ps --services --filter status=running 2>/dev/null) || return 1
+  if [[ "$previous_caddy_running" == 1 ]]; then
+    reconcile_caddy_runtime "$deploy_dir" || return 1
+  elif grep -Fxq caddy <<< "$running"; then
+    retire_managed_caddy "$deploy_dir" || return 1
+  fi
+  install_configuration_transaction_discard "$deploy_dir" "$transaction"
+)
+
 configure_webhook_access() (
   local deploy_dir=$1
   local mode=$2
@@ -1064,7 +1285,7 @@ secure_permissions() {
     find "${deploy_dir}/${readable_tree}" -type d -exec chmod 750 {} +
     find "${deploy_dir}/${readable_tree}" -type f -exec chmod 640 {} +
   done
-  for readable_tree in provider-adapter.js provider-router.js provider-envelope.js; do
+  for readable_tree in provider-adapter.js visitor-output.js provider-router.js provider-envelope.js; do
     if [[ -f "${deploy_dir}/scripts/${readable_tree}" && ! -L "${deploy_dir}/scripts/${readable_tree}" ]]; then
       chown root:1000 "${deploy_dir}/scripts/${readable_tree}"
       chmod 640 "${deploy_dir}/scripts/${readable_tree}"
@@ -1245,6 +1466,7 @@ repair_runtime_modules_from_source() {
   local source_dir relative source target mode
   local -a required=(
     get.sh scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh
+    scripts/visitor-output.js
     config/Caddyfile.example
   )
 
@@ -1292,7 +1514,7 @@ copy_project_files() {
     config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
     config/logging.yaml.example
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/build-workflow.js n8n/web-chat.js
-    scripts/provider-adapter.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
+    scripts/provider-adapter.js scripts/visitor-output.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
     scripts/knowledge-component.js
     scripts/menu-display.py scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
@@ -1401,13 +1623,13 @@ migrate_config_files() {
       elif ((.handoff.confirmation // "") | length) > 0 then .handoff.message = .handoff.confirmation
       else .handoff.message = "正在为您转接人工客服，请稍候。" end |
       if .handoff.no_answer_message == "知识库暂时没有足够信息，已为您转接人工客服。" then
-        .handoff.no_answer_message = "知识库暂时没有足够信息，请换一种方式描述问题。"
+        .handoff.no_answer_message = ""
       else . end |
       if .handoff.low_confidence_message == "当前答案可信度不足，已为您转接人工客服。" then
-        .handoff.low_confidence_message = "当前答案可信度不足，请补充更多问题细节。"
+        .handoff.low_confidence_message = ""
       else . end |
       if .handoff.failure_message == "当前自动客服暂时不可用，已为您转接人工客服。" then
-        .handoff.failure_message = "你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。"
+        .handoff.failure_message = ""
       else . end |
       del(.handoff.topic_keywords, .handoff.on_operator_message, .handoff.on_low_confidence, .handoff.on_no_answer, .handoff.confirmation, .handoff.resume_keywords, .handoff.resume_match_mode)
     ' "$handoff_file" > "$handoff_temp" || {

@@ -105,7 +105,11 @@ knowledge_profile_restore() {
     state=$(jq -er '.state' "$old")
     materials_publish_old_generation "$deploy" "$old" "$revision" "$state" || return 1
     materials_finalize_runtime_source "$deploy" "$revision" || return 1
-    materials_projection_readback "$deploy" || return 1
+    if [[ $(jq -er '.schema_version' "$old") == 1 ]]; then
+      materials_initialize "$deploy" >/dev/null || return 1
+    else
+      materials_projection_readback "$deploy" || return 1
+    fi
   fi
   rm -f -- "${deploy}/data/runtime/knowledge-migration.json"
 }
@@ -185,7 +189,7 @@ knowledge_profile_ensure() (
       && materials_prepare_candidate "$deploy" "$stage" "$revision" applied \
       && materials_snapshot_create "$deploy" "${stage}/materials.applied.tar.gz" \
       && materials_finalize_runtime_source "$deploy" "$revision" \
-      && materials_projection_write "$deploy" "${stage}/materials-applied.json" \
+      && materials_projection_write_current "$deploy" "${stage}/materials-applied.json" \
       && materials_projection_readback "$deploy" \
       && install -m 600 -- "${stage}/materials.applied.tar.gz" "${deploy}/backups/config-history/materials.applied.tar.gz" || result=1
   fi

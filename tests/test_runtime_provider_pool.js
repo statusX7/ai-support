@@ -11,11 +11,24 @@ const {createRuntime} = require('../n8n/runtime');
 const {createAdapter} = require('../scripts/provider-adapter');
 const {verifyEnvelope} = require('../scripts/provider-envelope');
 const project = path.resolve(__dirname,'..');
-const area = path.join(project,'.work/v1.2.1');
+const area = path.join(project,'.work/v1.3.0');
 fs.mkdirSync(area,{recursive:true});
 const base = fs.mkdtempSync(path.join(area,'runtime-pool-'));
 const write = (file,value) => {fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(value),{mode:0o600});};
 const read = file => JSON.parse(fs.readFileSync(file));
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const sealMaterials = value => {
+  const runtime = structuredClone(value.configuration.runtime);
+  delete runtime.revision; delete runtime.applied_revision;
+  value.source_components = {runtime:digest(canonical(runtime)),handoff:digest(canonical(value.configuration.handoff)),
+    keyword:digest(canonical(value.configuration.keyword)),menu:digest(canonical(value.configuration.menu)),
+    tags:digest(canonical(value.configuration.tags)),feedback:digest(canonical(value.configuration.feedback)),
+    prompt:value.prompt.sha256,knowledge:digest(canonical(value.knowledge))};
+  value.source_sha256 = digest(canonical(value.source_components)); return value;
+};
 const wait = ms => new Promise(resolve=>setTimeout(resolve,ms));
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const execute = args => new Promise(resolve=>{
@@ -32,10 +45,35 @@ async function fixture(label) {
   const prompt='用户原文规则：结合知识与公开历史回答。';fs.writeFileSync(path.join(root,'config/prompt.md'),prompt);
   write(path.join(root,'config/runtime.yaml'),{schema_version:2,enabled:true,revision:1,applied_revision:1});
   const projection='kb_1111111111111111_doc_2222222222222222.md';
-  write(path.join(root,'data/runtime/knowledge-map.json'),{schema_version:2,revision:1,documents:[{
+  const mapPath=path.join(root,'data/runtime/knowledge-map.json');
+  write(mapPath,{schema_version:2,revision:1,documents:[{
     library_id:'kb_1111111111111111',library_name:'合成处理资料',document_id:'doc_2222222222222222',projection,
     location:'custom-documents/'+projection+'-33333333-3333-4333-8333-333333333333.json',
   }]});
+  const settingsPath=path.join(root,'data/runtime/knowledge-settings.json');
+  write(settingsPath,{schema_version:1,workspace_slug:'synthetic',temperature:0.35,observed_at:Date.now()});
+  const profileValue={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
+    passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
+  const profilePath=path.join(root,'data/runtime/knowledge-profile.json');
+  write(profilePath,{schema_version:1,state:'applied',profile:profileValue,
+    fingerprint:digest(canonical(profileValue)),applied_at:Date.now()});
+  const mapRaw=fs.readFileSync(mapPath);
+  const lexicalPayload={schema_version:2,algorithm:'crispai-lexical-v2',map_sha256:digest(mapRaw),complete:false,
+    coverage:{source_documents:1,indexed_documents:0,omitted_documents:1,source_bytes:1,indexed_bytes:0,
+      omitted_bytes:1,reasons:['index_capacity']},passages:[]};
+  const lexicalPath=path.join(root,'data/runtime/knowledge-lexical.json');
+  write(lexicalPath,{...lexicalPayload,payload_sha256:digest(canonical(lexicalPayload))});
+  const configuration=Object.fromEntries(['runtime','handoff','keyword','menu','tags','feedback']
+    .map(name=>[name,read(path.join(root,'config',name+'.yaml'))]));
+  const materialsPath=path.join(root,'config/materials-applied.json');
+  write(materialsPath,sealMaterials({schema_version:2,state:'applied',revision:1,applied_at:Date.now(),
+    source_sha256:'',source_components:{},configuration,
+    prompt:{text:prompt,bytes:Buffer.byteLength(prompt),sha256:digest(prompt)},
+    knowledge:{catalog_revision:1,catalog_sha256:digest(canonical({fixture:'catalog',documents:1})),
+      manifest_sha256:digest(canonical({fixture:'manifest',projection})),map_sha256:digest(mapRaw),
+      settings_sha256:digest(fs.readFileSync(settingsPath)),profile_sha256:digest(fs.readFileSync(profilePath)),
+      lexical_sha256:digest(fs.readFileSync(lexicalPath)),enabled_library_ids:['kb_1111111111111111'],
+      library_count:1,document_count:1,enabled_document_count:1}}));
   let sequence=10000, runtime;
   const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,adapterRestarts:0,answerRequests:[],answerResponses:[],sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
   const upstream=http.createServer(async(req,res)=>{
@@ -63,6 +101,8 @@ async function fixture(label) {
     pool.entries.push({...pool.entries[0],id,name:'合成备用'+n,role:'backup',order:n,base_url:upstreamBase+`/p${n}/v1`,model:'synthetic-backup-'+n,api_mode:n===2?'responses':'chat_completions',capabilities:{chat_completions:n!==2,responses:n===2,vision:true}});
     secrets.entries[id]={api_key:'synthetic-backup-key-'+n,custom_headers:{}};
   }
+  Object.assign(pool.policy,{question_timeout_ms:7000,call_timeout_ms:1500,connect_timeout_ms:100,
+    max_attempts:3,cooldown_initial_ms:1000,cooldown_max_ms:2000,pool_cooldown_ms:100});
   write(secretPath,secrets);write(poolPath,pool);
   const internal=/^PROVIDER_ADAPTER_KEY=(.*)$/m.exec(fs.readFileSync(path.join(root,'.env'),'utf8'))[1];
   let adapter,adapterBase;
@@ -135,6 +175,17 @@ async function fixture(label) {
   f.question=id=>read(path.join(root,'data/provider-router/questions',id+'.json'));
   f.process=(key,id)=>runtime.process(key,id);
   f.scan=()=>runtime.scan();
+  f.makeDue=async(session,id)=>{
+    const normalized=session.replace(/^session_pool_/,'session_pool-');
+    const key=runtime.stateKey(env.CRISP_WEBSITE_ID,normalized);
+    await runtime.transaction(key,state=>{const job=state.jobs.find(item=>item.id===id);assert(job);job.retry_at=0;});
+  };
+  f.publishRuntime=enabled=>{
+    const materials=read(materialsPath);materials.revision++;
+    materials.configuration.runtime={...materials.configuration.runtime,enabled,
+      revision:materials.revision,applied_revision:materials.revision};
+    write(materialsPath,sealMaterials(materials));
+  };
   f.event=(session,content,extra={})=>({website_id:env.CRISP_WEBSITE_ID,event:'message:send',timestamp:Date.now(),data:{session_id:session.replace(/^session_pool_/,'session_pool-'),from:'user',type:'text',content,fingerprint:++sequence,timestamp:Date.now(),...extra}});
   f.receive=async body=>{if(body.event==='message:send'||body.data.from==='operator'){const items=histories.get(body.data.session_id)||[];items.push(body.data);histories.set(body.data.session_id,items);}return runtime.receive({body,query:{key:env.CRISP_WEBSITE_HOOK_SECRET}});};
   f.deliver=async body=>{const accepted=await f.receive(body);assert.equal(accepted.accepted,true);return accepted.route==='process'?runtime.process(accepted.key,accepted.jobId):accepted;};
@@ -146,6 +197,21 @@ async function fixture(label) {
 
 let passed=0;
 async function test(name,action){const f=await fixture('case-'+passed);try{await action(f);passed++;console.log('通过 UNIT/PROTOCOL：'+name);}finally{await f.close();}}
+function assertUnresolved(f,event,result,code=''){
+  assert.equal(result.status,'unresolved');assert.equal(f.sent.filter(item=>item.session_id===event.data.session_id).length,0);
+  const job=f.state(event.data.session_id).jobs.find(item=>item.id===result.jobId);assert(job);
+  assert.equal(job.status,'received');assert.equal(job.responsibility_status,'unresolved_failure');
+  if(code)assert.equal(job.failure_code,code);assert(Number.isFinite(job.retry_at));return job;
+}
+async function recoverOnce(f,event,result){
+  f.failed.clear();f.failAnswer=false;f.slow=false;f.behavior=null;f.beforeAnswer=null;f.answerSystem=undefined;
+  await f.makeDue(event.data.session_id,result.jobId);await wait(1100);
+  const before=f.sent.length,recovered=await f.process(result.key,result.jobId);assert.equal(recovered.status,'sent');
+  assert.equal(f.sent.length,before+1);assert.equal(f.sent.at(-1).session_id,event.data.session_id);
+  assert.equal(f.sent.at(-1).content,'受控业务答案：保存后重试。');
+  const job=f.state(event.data.session_id).jobs.find(item=>item.id===result.jobId);
+  assert.equal(job.status,'done');assert.equal(job.responsibility_status,'answered_confirmed');
+}
 (async()=>{
   await test('文本经官方检索结构/生产签名/主备到Responses，唯一答案且无评价',async f=>{
     f.failed=new Set([0,1]);assert.equal((await f.deliver(f.event('session_pool_text1','请说明保存操作。'))).status,'sent');
@@ -158,24 +224,31 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.answerRequests[0].envelope.stage,'answer');assert.equal(f.answerRequests[0].body.messages[0].content,'用户原文规则：结合知识与公开历史回答。');
     assert(JSON.stringify(f.calls[2].body).includes('合成处理码是蓝色'));
   });
-  await test('adapter前丢失业务Prompt时不推理或遍历备用，仅自然澄清且重启不重识图',async f=>{
+  await test('adapter前丢失业务Prompt时零可见出站并保留责任，恢复后原问题仅一份有效答案',async f=>{
     f.answerSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
     const event=f.event('session_pool_prompt1','合成普通问题');
-    assert.equal((await f.deliver(event)).status,'sent');assert.equal(f.calls.length,0);assert.equal(f.sent.length,1);
+    const unresolved=await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);
     assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'context_preparation_incomplete');
-    assert.equal(f.sent[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');assert.equal(f.state(event.data.session_id).mode,'ai');
-    f.restart();await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
+    assertUnresolved(f,event,unresolved,'context_preparation_incomplete');assert.equal(f.state(event.data.session_id).mode,'ai');
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);assert.equal(f.tasks.length,1);
+    await recoverOnce(f,event,unresolved);assert.equal(f.sent.length,1);
+    f.answerSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
     const imageEvent=f.event('session_pool_promptimage',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
-    assert.equal((await f.deliver(imageEvent)).status,'sent');assert.equal(f.calls.length,1);assert.equal(f.calls[0].visual,true);
-    assert.equal(f.answerResponses[1].body.error.code,'context_preparation_incomplete');assert.equal(f.sent.length,2);assert.equal(f.state(imageEvent.data.session_id).image_context.length,1);
+    const imageUnresolved=await f.deliver(imageEvent);assert.equal(f.calls.filter(call=>call.visual).length,1);
+    assert.equal(f.answerResponses.at(-1).body.error.code,'context_preparation_incomplete');assert.equal(f.sent.length,1);assert.equal(f.state(imageEvent.data.session_id).image_context.length,1);
+    assertUnresolved(f,imageEvent,imageUnresolved,'context_preparation_incomplete');
     assert.equal(f.state(imageEvent.data.session_id).mode,'ai');f.restart();await f.deliver(imageEvent);
-    assert.equal(f.calls.length,1);assert.equal(f.sent.length,2);assert.equal(f.tasks.length,2);
+    assert.equal(f.calls.filter(call=>call.visual).length,1);assert.equal(f.sent.length,1);
+    await recoverOnce(f,imageEvent,imageUnresolved);assert.equal(f.sent.length,2);
+    assert.equal(f.calls.filter(call=>call.visual).length,1,'恢复不得重新识图');
   });
-  await test('视觉与RAG回答共享三次上限、重启不重复识图或重放答案',async f=>{
+  await test('视觉与RAG回答共享三次上限，耗尽后保留责任并在恢复后仅答一次',async f=>{
     f.publish(pool=>{pool.policy.max_attempts=3;});f.failed=new Set([0]);f.failAnswer=true;
     const event=f.event('session_pool_image1',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
-    await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.calls.filter(x=>x.visual).length,2);assert.equal(f.sent.length,1);assert.equal(f.state(event.data.session_id).mode,'ai');
-    assert(f.tasks[0].query.includes('蓝色保存按钮'));f.restart();await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.sent.length,1);
+    const result=await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.calls.filter(x=>x.visual).length,2);assert.equal(f.sent.length,0);assert.equal(f.state(event.data.session_id).mode,'ai');
+    assert(f.tasks[0].query.includes('蓝色保存按钮'));assertUnresolved(f,event,result);
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);
+    await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
   await test('主备等待时真人优先暂停A，B独立回复，不续尝试不发送迟到A答案',async f=>{
     f.slow=true;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
@@ -187,8 +260,8 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
   });
   await test('总关与池配置变更取消整条推理；不误发一次错误提示',async f=>{
     f.slow=true;const pending=f.deliver(f.event('session_pool_global','慢问题'));while(!f.calls.length)await wait(5);
-    write(path.join(f.root,'config/runtime.yaml'),{schema_version:2,enabled:false,revision:2,applied_revision:2});await pending;assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
-    write(path.join(f.root,'config/runtime.yaml'),{schema_version:2,enabled:true,revision:3,applied_revision:3});
+    f.publishRuntime(false);await pending;assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
+    f.publishRuntime(true);
     const changed=f.deliver(f.event('session_pool_changed','另一个慢问题'));while(f.calls.length<2)await wait(5);f.publish(pool=>{pool.entries[1].enabled=false;});await changed;assert.equal(f.sent.length,0);assert.equal(f.calls.length,2);
   });
   await test('A19 视觉后重启adapter仍共享真实总期限和累计次数，重放缓存不再次识图',async f=>{
@@ -207,7 +280,7 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
       await f.restartAdapter();replay=await f.replayVision();afterRestart=f.question(answerEnvelope.question_id);
     };
     const event=f.event('session_pool_deadline',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
-    await f.deliver(event);const ended=Date.now(),stored=f.question(answerEnvelope.question_id);
+    const result=await f.deliver(event),ended=Date.now(),stored=f.question(answerEnvelope.question_id);
     assert.equal(f.adapterRestarts,1);assert.equal(beforeRestart.attempts,2);assert.equal(afterRestart.attempts,2);assert.equal(visionCallsBefore,2);assert.equal(replay.status,200);assert.equal(replay.body.choices[0].message.content,'合成图片中是蓝色保存按钮。');
     assert.equal(f.visionRequest.envelope.stage,'vision');assert.equal(answerEnvelope.stage,'answer');assert.equal(f.visionRequest.envelope.question_id,answerEnvelope.question_id);assert.equal(f.visionRequest.envelope.deadline_at,answerEnvelope.deadline_at);
     assert.equal(beforeRestart.deadline,answerEnvelope.deadline_at);assert.equal(afterRestart.deadline,beforeRestart.deadline);assert.equal(stored.deadline,beforeRestart.deadline);assert.equal(stored.attempts,4);
@@ -220,8 +293,9 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
       upstream_closed:answerClosed,upstream_closed_at:answerClosedAt??null,close_event_wait_max_ms:100,
       attempts:stored.attempts,vision_attempts:f.calls.filter(call=>call.visual).length});
     assert.equal(answerClosed,true);assert.ok(answerClosedAt<=ended+100);
-    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'请把图片中的关键信息或报错文字贴出来，并说明你正在进行的操作和希望解决的问题。');assert.equal(f.state(event.data.session_id).mode,'ai');
-    f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,1);assert.equal(f.tasks.length,1);
+    assert.equal(f.sent.length,0);assert.equal(f.state(event.data.session_id).mode,'ai');assertUnresolved(f,event,result,'question_timeout');
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,0);assert.equal(f.tasks.length,1);
+    await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
   await test('主接口200机械故障切到备用，备用200机械故障继续切下一备用且仅出站业务答案',async f=>{
     const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
@@ -270,29 +344,72 @@ async function test(name,action){const f=await fixture('case-'+passed);try{await
     assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
     assert(!f.sent.some(item=>/稍后再试/.test(item.content)));
   });
-  await test('全池200机械故障只发送一次本地自然澄清，不误计AI成功或自动转人工',async f=>{
+  await test('全池200机械故障零可见出站且保留责任，恢复后原问题仅一份有效答案',async f=>{
     const variants=['系统维护中，请稍后再试。','模型繁忙，请过会儿再试。','A\u0000I暂时无法回\u0007复，请稍后再试。'];
     f.behavior=async(call,response)=>{response.setHeader('content-type','application/json');
       response.end(JSON.stringify(call.index===2?{status:'completed',output_text:variants[2]}:{choices:[{message:{role:'assistant',content:variants[call.index]}}]}));return true;};
-    const session='session_pool_mechanical-exhausted';await f.deliver(f.event(session,'合成全池机械故障问题'));
-    assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);assert.equal(f.sent.length,1);
-    assert.equal(f.sent[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');
-    assert.equal(f.state(session).mode,'ai');assert.equal(f.state(session).jobs.filter(job=>job.status==='done').length,1);
+    const session='session_pool_mechanical-exhausted',event=f.event(session,'合成全池机械故障问题');
+    const result=await f.deliver(event);assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);
+    assertUnresolved(f,event,result,'invalid_response');assert.equal(f.state(session).mode,'ai');
+    await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
-  await test('A21 全池失败后多个新会话得到单次安全提示，保护期及重启不重复轰击上游',async f=>{
+  await test('旧 Provider generic 缓存不会让同一责任永久 conflict，下一代仅发一份有效答案',async f=>{
+    const generic='你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
+    let seeded=false;
+    f.beforeAnswer=async request=>{
+      if(seeded)return;seeded=true;f.beforeAnswer=undefined;
+      const envelope=request.envelope,pool=read(path.join(f.root,'config/provider-pool-applied.json'));
+      const binding=digest(JSON.stringify([envelope.scope||'conversation',envelope.session_key,
+        envelope.generation,envelope.runtime_revision,envelope.pool_revision,envelope.attempt_generation]));
+      write(path.join(f.root,'data/provider-router/questions',envelope.question_id+'.json'),{
+        id:envelope.question_id,binding,attempt_generation:envelope.attempt_generation,
+        revision:envelope.pool_revision,deadline:envelope.deadline_at,attempts:1,
+        stages:{answer:{tried:[pool.primary_id],result:{id:'legacy-generic-cache',model:'legacy-model',
+          choices:[{message:{role:'assistant',content:generic},finish_reason:'stop'}]}}},created_at:Date.now(),
+      });
+    };
+    const event=f.event('session_pool_legacy-generic-cache','合成知识问题'),first=await f.deliver(event);
+    assertUnresolved(f,event,first,'invalid_response');
+    assert.equal(f.calls.length,0,'首次只读取旧缓存，不得伪造新的上游调用');
+    assert.equal(f.sent.length,0,'旧 generic 缓存不得出站');
+    let question=f.question(first.jobId);assert.equal(question.attempt_generation,1);
+    assert.equal(question.stages.answer.result.choices[0].message.content,generic);
+
+    await f.makeDue(event.data.session_id,first.jobId);await wait(1100);
+    const recovered=await f.process(first.key,first.jobId);
+    assert.equal(recovered.status,'sent');assert.deepEqual(f.calls.map(call=>call.index),[1]);
+    assert.equal(f.sent.length,1);assert.equal(f.sent[0].content,'受控业务答案：保存后重试。');
+    assert(!f.sent[0].content.includes('最希望先解决'));
+    question=f.question(first.jobId);
+    assert.equal(question.attempt_generation,2);
+    assert.equal(question.attempts,2,'缓存失效恢复不得重置原有供应商尝试预算');
+    assert.equal(question.output_policy_recovery.from_attempt_generation,1);
+    assert.match(question.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
+    const stored=f.state(event.data.session_id).jobs.find(job=>job.id===first.jobId);
+    assert.equal(stored.status,'done');assert.equal(stored.responsibility_status,'answered_confirmed');
+    assert.equal((await f.receive(event)).reason,'重复事件已忽略');
+    assert.equal(f.calls.length,1);assert.equal(f.sent.length,1);
+  });
+  await test('A21 全池失败后多会话零可见出站且责任不丢，恢复后每问题仅一份答案',async f=>{
     f.failed=new Set([0,1,2]);
     const initial=f.event('session_pool_exhausted0','合成全失败问题');
-    assert.equal((await f.deliver(initial)).status,'sent');assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);
+    const firstResult=await f.deliver(initial);assertUnresolved(f,initial,firstResult,'upstream_unavailable');assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);
     await f.restartAdapter();f.restart();
     const events=Array.from({length:5},(_,n)=>f.event('session_pool_exhausted'+(n+1),'另一个合成问题'));
-    const results=await Promise.all(events.map(event=>f.deliver(event)));assert(results.every(result=>result.status==='sent'));
-    assert.equal(f.calls.length,3);assert.equal(f.tasks.length,6);assert.equal(f.sent.length,6);
-    for(const event of [initial,...events]) {
-      const messages=f.sent.filter(item=>item.session_id===event.data.session_id);assert.equal(messages.length,1);
-      assert.equal(messages[0].content,'你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');assert.equal(f.state(event.data.session_id).mode,'ai');
+    const results=await Promise.all(events.map(event=>f.deliver(event)));
+    assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);
+    for(const [index,event] of [initial,...events].entries()) {
+      const result=index===0?firstResult:results[index-1];assertUnresolved(f,event,result);
+      assert.equal(f.state(event.data.session_id).mode,'ai');
       assert.equal((await f.receive(event)).reason,'重复事件已忽略');
     }
-    assert.equal(f.calls.length,3);assert.equal(f.sent.length,6);
+    assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);f.failed.clear();await wait(1100);
+    for(const [index,event] of [initial,...events].entries()) {
+      const result=index===0?firstResult:results[index-1];await f.makeDue(event.data.session_id,result.jobId);
+      const recovered=await f.process(result.key,result.jobId);assert.equal(recovered.status,'sent');
+    }
+    assert.equal(f.sent.length,6);
+    for(const event of [initial,...events])assert.equal(f.sent.filter(item=>item.session_id===event.data.session_id).length,1);
   });
   await test('A28 新池完成推理后Crisp回执未知与标签失败，重启只对账且模型/答案不重复',async f=>{
     f.failed=new Set([0,1]);f.unknownSend=true;f.tagFailure=true;

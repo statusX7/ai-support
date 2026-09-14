@@ -21,9 +21,12 @@ function verifyEnvelope(token, key) {
   if (!crypto.timingSafeEqual(Buffer.from(parts[1]), Buffer.from(expected))) throw new Error('问题信封认证失败');
   const value = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
   const scope = value.scope || 'conversation';
+  const attemptGeneration = value.attempt_generation === undefined ? 1 : value.attempt_generation;
   if (value.version !== 1 || !['conversation', 'admin'].includes(scope) || !/^[a-f0-9]{64}$/.test(value.question_id || '')
     || scope === 'conversation' && (!/^[a-f0-9]{64}$/.test(value.session_key || '') || !Number.isSafeInteger(value.generation) || value.generation < 0)
+    || !Number.isSafeInteger(attemptGeneration) || attemptGeneration < 1
     || !['vision', 'answer'].includes(value.stage) || !['runtime_revision', 'pool_revision', 'deadline_at'].every(name => Number.isSafeInteger(value[name]) && value[name] >= 0)) throw new Error('问题信封字段无效');
+  value.attempt_generation = attemptGeneration;
   return value;
 }
 

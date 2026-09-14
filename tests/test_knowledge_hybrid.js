@@ -10,12 +10,25 @@ const {isBuiltin} = require('node:module');
 const {createRuntime} = require('../n8n/runtime');
 const {searchKnowledgeLexical} = require('../n8n/knowledge-lexical');
 const project = path.resolve(__dirname, '..');
-const area = path.join(project, '.work/v1.2.1');
+const area = path.join(project, '.work/v1.3.0');
 fs.mkdirSync(area, {recursive:true});
 const evidence = fs.mkdtempSync(path.join(area, 'knowledge-hybrid-'));
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+const sealMaterials = value => {
+  const runtime = structuredClone(value.configuration.runtime);
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  value.source_components = {
+    runtime:hash(canonical(runtime)), handoff:hash(canonical(value.configuration.handoff)),
+    keyword:hash(canonical(value.configuration.keyword)), menu:hash(canonical(value.configuration.menu)),
+    tags:hash(canonical(value.configuration.tags)), feedback:hash(canonical(value.configuration.feedback)),
+    prompt:value.prompt.sha256, knowledge:hash(canonical(value.knowledge)),
+  };
+  value.source_sha256 = hash(canonical(value.source_components));
+  return value;
+};
 const question = '曜石灯塔补给箱的启封口令是什么？';
 const overlapQuestion = '曜石灯塔补给箱 启封口令';
 const answer = '启封口令是翠羽环-4831，核对箱体编号后使用。';
@@ -23,7 +36,6 @@ const qa = '问：' + question + '\n答：' + answer + '\n';
 const pairedQuestion = '能寄存苍蓝行李箱吗？可以存放苍蓝行李箱吗？';
 const pairedAnswer = '仅可寄存带有虚构蓝羽标记的行李箱。';
 const pairedQa = '问题：' + pairedQuestion + '\n回答：' + pairedAnswer + '\n';
-const clarification = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
 const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
 
 function fixture(label, options={}) {
@@ -62,12 +74,28 @@ function fixture(label, options={}) {
     CRISP_AUTH_B64:'synthetic-hybrid-crisp-auth', AI_API_KEY:'synthetic-hybrid-provider-key',
     ANYTHINGLLM_API_KEY:'synthetic-hybrid-knowledge-key', ANYTHINGLLM_WORKSPACE:'synthetic-hybrid'};
   write('data/runtime/knowledge-settings.json', {schema_version:1, workspace_slug:env.ANYTHINGLLM_WORKSPACE, temperature:0.23});
+  const profileValue = {engine:'native', model:'synthetic-embedding', chunk_size:1000, chunk_overlap:20,
+    passage_prefix:'', query_prefix:'', component_version:'synthetic', splitter:'synthetic'};
+  write('data/runtime/knowledge-profile.json', {schema_version:1, state:'applied', profile:profileValue,
+    fingerprint:hash(canonical(profileValue)), applied_at:Date.now()});
   const configuration = {};
   for(const name of ['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']) configuration[name] = read('config/' + name + '.yaml');
-  const applied = {schema_version:1, state:'applied', revision:1, applied_at:Date.now(), source_sha256:'a'.repeat(64),
-    source_components:{}, configuration, prompt:{text:prompt, bytes:Buffer.byteLength(prompt), sha256:hash(prompt)},
-    knowledge:{map_sha256:hash(raw('data/runtime/knowledge-map.json')), settings_sha256:hash(raw('data/runtime/knowledge-settings.json'))}};
-  if(options.legacy !== true) applied.knowledge.lexical_sha256 = hash(raw('data/runtime/knowledge-lexical.json'));
+  const enabledLibraryIds = [...new Set(documents.map(item => item.library_id))].sort();
+  const applied = options.legacy === true
+    ? {schema_version:1, state:'applied', revision:1, applied_at:Date.now(), source_sha256:'a'.repeat(64),
+      source_components:{}, configuration, prompt:{text:prompt, bytes:Buffer.byteLength(prompt), sha256:hash(prompt)},
+      knowledge:{map_sha256:hash(raw('data/runtime/knowledge-map.json')),
+        settings_sha256:hash(raw('data/runtime/knowledge-settings.json'))}}
+    : sealMaterials({schema_version:2, state:'applied', revision:1, applied_at:Date.now(), source_sha256:'',
+      source_components:{}, configuration, prompt:{text:prompt, bytes:Buffer.byteLength(prompt), sha256:hash(prompt)},
+      knowledge:{catalog_revision:1, catalog_sha256:hash(canonical({fixture:'catalog', documents})),
+        manifest_sha256:hash(canonical({fixture:'manifest', locations:documents.map(item => item.location)})),
+        map_sha256:hash(raw('data/runtime/knowledge-map.json')),
+        settings_sha256:hash(raw('data/runtime/knowledge-settings.json')),
+        profile_sha256:hash(raw('data/runtime/knowledge-profile.json')),
+        lexical_sha256:hash(raw('data/runtime/knowledge-lexical.json')),
+        enabled_library_ids:enabledLibraryIds, library_count:enabledLibraryIds.length,
+        document_count:documents.length, enabled_document_count:documents.length}});
   write('config/materials-applied.json', applied);
   const f = {root, env, prompt, documents, write, raw, read, index, search, vector:[], generated:[], sent:[],
     history:new Map(), metadata:new Map(), workspaceReads:0, violations:[], vectorResponse:{status:200, body:{results:[]}}};
@@ -143,6 +171,7 @@ function fixture(label, options={}) {
     return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
   };
   f.rebind = patch => {const current = read('config/materials-applied.json'); patch(current); write('config/materials-applied.json', current);};
+  f.reseal = patch => {const current = read('config/materials-applied.json'); patch(current); sealMaterials(current); write('config/materials-applied.json', current);};
   f.vectorResult = (text, index=0, id='synthetic-vector-result') => ({id, text,
     metadata:{title:documents[index].projection, docpath:documents[index].location}, distance:0.1});
   return f;
@@ -163,15 +192,24 @@ function successful(f, session, vectorCount=0) {
   assert.equal(f.events().filter(event => event.type === 'ai_reply').length, 1);
   assert.deepEqual(f.violations, []);
 }
+function directSuccessful(f, session, expected=answer) {
+  assert.equal(f.vector.length, 0); assert.equal(f.workspaceReads, 0); assert.equal(f.generated.length, 0);
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, expected); assert.equal(f.sent[0].session_id, session);
+  const state = f.state(session); assert.equal(state.mode, 'ai'); assert(state.jobs.every(job => job.status === 'done'));
+  assert.equal(state.jobs[0].plan.knowledge_answer_sha256, hash(expected));
+  assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 1);
+  assert.deepEqual(f.violations, []);
+}
 function blocked(f) {
   assert.equal(f.vector.length, 0); assert.equal(f.generated.length, 0); assert.equal(f.sent.length, 0);
   assert.equal(f.events().filter(event => event.type === 'ai_reply').length, 0);
   assert.deepEqual(f.violations, []);
 }
-function safeFailure(f) {
-  assert.equal(f.generated.length, 0); assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+function unresolved(f, session) {
+  assert.equal(f.generated.length, 0); assert.equal(f.sent.length, 0);
   assert.equal(f.events().filter(event => event.type === 'ai_reply').length, 0);
-  assert.equal(f.events().filter(event => event.type === 'retrieval_failed').length, 1);
+  const job = f.state(session).jobs[0]; assert.equal(job.status, 'received');
+  assert.equal(job.responsibility_status, 'unresolved_failure'); assert(Number.isFinite(job.retry_at));
   assert.deepEqual(f.violations, []);
 }
 function builtinResolver() {
@@ -192,13 +230,11 @@ async function test(name, action) {
   catch(error) {failed++; cases.push({name, passed:false}); console.error('失败 UNIT/PROTOCOL：' + name + '\n' + error.stack);}
 }
 (async () => {
-  await test('H01 强词法命中保留长文末尾完整 FAQ，不调用向量且只生成一次', async () => {
+  await test('H01 唯一严格 FAQ 保留长文末尾完整答案，不调用向量或模型', async () => {
     const f = fixture('strong-tail', {contents:['虚构灯塔建设年表。'.repeat(4000) + '\n' + qa]});
     assert.equal(f.search(question).results[0].lexical.kind, 'exact_question');
     f.vectorError = new Error('不应调用的向量服务');
-    const session = 'session_hybrid-strong'; await f.deliver(f.event(session)); successful(f, session);
-    const knowledge = citations(f.generated[0]); assert.equal(knowledge.length, 1); assert.equal(knowledge[0].text, qa);
-    assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 1);
+    const session = 'session_hybrid-strong'; await f.deliver(f.event(session)); directSuccessful(f, session);
   });
   await test('H02 关键词改写＋向量 miss 由绑定的中文 FAQ 补回，只生成一次', async () => {
     const f = fixture('vector-miss'); assert.equal(f.search(overlapQuestion).results[0].lexical.kind, 'keyword_overlap');
@@ -236,7 +272,7 @@ async function test(name, action) {
     assert.equal(f.index().complete, false); assert(f.index().coverage.omitted_bytes > 0);
     assert(f.index().coverage.reasons.includes('passage_too_large'));
     assert.equal(f.search(question).complete, false);
-    const session = 'session_hybrid-partial'; await f.deliver(f.event(session)); successful(f, session);
+    const session = 'session_hybrid-partial'; await f.deliver(f.event(session)); successful(f, session, 1);
     assert.deepEqual(citations(f.generated[0]).map(item => item.text), [qa]);
   });
   await test('H06 lexical/map 原字节和 materials 绑定 hash 篡改均在推理前阻断', async () => {
@@ -246,8 +282,11 @@ async function test(name, action) {
       if(variant === 'map') f.write('data/runtime/knowledge-map.json', f.raw('data/runtime/knowledge-map.json') + '\n');
       if(variant === 'material-lexical') f.rebind(current => {current.knowledge.lexical_sha256 = 'f'.repeat(64);});
       if(variant === 'material-map') f.rebind(current => {current.knowledge.map_sha256 = 'f'.repeat(64);});
-      const session = 'session_hybrid-tamper-' + variant; const result = await f.deliver(f.event(session));
-      assert.equal(result.accepted.route, 'ignore'); blocked(f); assert.equal(f.state(session).mode, 'ai');
+      const session = 'session_hybrid-tamper-' + variant, event = f.event(session); f.remember(event);
+      const result = await f.runtime.receive({body:event, query:{key:f.env.CRISP_WEBSITE_HOOK_SECRET}});
+      if(variant.startsWith('material-')) { assert.equal(result.accepted, false); assert.equal(result.statusCode, 503); }
+      else { assert.equal(result.accepted, true); assert.equal(result.route, 'ignore'); assert.equal(f.state(session).mode, 'ai'); }
+      blocked(f);
     }
   });
   await test('H07 仅重绑外层 SHA 不能绕过 payload/片段/来源校验，不调用向量或模型', async () => {
@@ -258,17 +297,18 @@ async function test(name, action) {
       if(variant === 'source') index.passages[0].library_id = 'kb_ffffffffffffffff';
       if(variant !== 'payload') {delete index.payload_sha256; index.payload_sha256 = hash(canonical(index));}
       f.write('data/runtime/knowledge-lexical.json', index);
-      f.rebind(current => {current.knowledge.lexical_sha256 = hash(f.raw('data/runtime/knowledge-lexical.json'));});
-      await f.deliver(f.event('session_hybrid-inner-' + variant));
-      assert.equal(f.vector.length, 0); safeFailure(f);
+      f.reseal(current => {current.knowledge.lexical_sha256 = hash(f.raw('data/runtime/knowledge-lexical.json'));});
+      const session = 'session_hybrid-inner-' + variant; const result = await f.deliver(f.event(session));
+      assert.equal(result.result.status, 'unresolved'); assert.equal(f.vector.length, 0); unresolved(f, session);
     }
   });
   await test('H08 map 新代即使外层已重绑，旧词法整份不可用且不回退旧资料', async () => {
     const f = fixture('stale-map'); const mapping = f.read('data/runtime/knowledge-map.json');
     mapping.revision++; mapping.documents[0].enabled = false;
     f.write('data/runtime/knowledge-map.json', mapping);
-    f.rebind(current => {current.knowledge.map_sha256 = hash(f.raw('data/runtime/knowledge-map.json'));});
-    await f.deliver(f.event('session_hybrid-stale')); assert.equal(f.vector.length, 0); safeFailure(f);
+    f.reseal(current => {current.knowledge.map_sha256 = hash(f.raw('data/runtime/knowledge-map.json'));});
+    const session = 'session_hybrid-stale'; const result = await f.deliver(f.event(session));
+    assert.equal(result.result.status, 'unresolved'); assert.equal(f.vector.length, 0); unresolved(f, session);
   });
   await test('H09 特定短问句仍可精确命中，泛问/不相关改写不能冒充词法语义召回', async () => {
     // 短问可以省略疑问尾词，但不能省略区分同类 FAQ 的实体限定。
@@ -277,9 +317,9 @@ async function test(name, action) {
     await exact.deliver(exact.event('session_hybrid-short', short)); successful(exact, 'session_hybrid-short');
     for(const [index, query] of ['口令', '补给箱的启封口令', '请问怎么办', '另一座银杉花园的停车时间是什么？', '那座海边建筑的物资容器怎么打开？'].entries()) {
       const f = fixture('generic-' + index); assert.deepEqual(f.search(query).results, []);
-      await f.deliver(f.event('session_hybrid-generic-' + index, query));
+      const session = 'session_hybrid-generic-' + index; const result = await f.deliver(f.event(session, query));
       assert.equal(f.vector.length, 1); assert.equal(f.vector[0].query, query); assert.equal(f.generated.length, 0);
-      assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+      assert.equal(result.result.status, 'unresolved'); unresolved(f, session);
       assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 0);
     }
   });
@@ -291,14 +331,13 @@ async function test(name, action) {
     assert.equal(citations(f.generated[0])[0].source.id, 'synthetic-vector-result');
     assert.equal(f.vector[0].query, query);
   });
-  await test('H11 无 lexical 字段的旧投影仍只消费向量，不偷偷启用磁盘辅助索引', async () => {
+  await test('H11 schema v1 旧投影必须先迁移，不可作为运行时资料身份继续推理', async () => {
     for(const hit of [true, false]) {
       const f = fixture('legacy-' + hit, {legacy:true}); assert.equal(f.search(question).results.length, 1);
       if(hit) f.vectorResponse = {status:200, body:{results:[f.vectorResult(qa)]}};
-      const session = 'session_hybrid-legacy-' + hit; await f.deliver(f.event(session));
-      assert.equal(f.vector.length, 1);
-      if(hit) {successful(f, session, 1); assert.equal(citations(f.generated[0])[0].source.id, 'synthetic-vector-result');}
-      else {assert.equal(f.generated.length, 0); assert.equal(f.sent[0].content, clarification);}
+      const session = 'session_hybrid-legacy-' + hit; const result = await f.deliver(f.event(session));
+      assert.equal(result.accepted.route, 'ignore'); blocked(f);
+      const job = f.state(session).jobs[0]; assert.equal(job.status, 'received'); assert.equal(job.deferred_configuration, true);
     }
   });
   await test('H12 检索或生成在途索引改变后旧结果不出站，资料恢复后按当前代重做且只回复一次', async () => {
@@ -311,7 +350,8 @@ async function test(name, action) {
       };
       if(stage === 'vector') f.beforeVectorResponse = mutate; else f.beforeModelResponse = mutate;
       const session = 'session_hybrid-inflight-' + stage;
-      await f.deliver(f.event(session, stage === 'vector' ? overlapQuestion : question));
+      const currentQuestion = stage === 'vector' ? overlapQuestion : '曜石灯塔补给箱的启封口令';
+      await f.deliver(f.event(session, currentQuestion));
       assert.equal(f.vector.length, Number(stage === 'vector')); assert.equal(f.generated.length, Number(stage === 'generation'));
       assert.equal(f.sent.length, 0); assert.equal(f.state(session).jobs[0].status, 'received');
       assert.equal(f.state(session).jobs[0].deferred_configuration, true);
@@ -349,19 +389,19 @@ async function test(name, action) {
       assert.equal(f.state(first).resume_at - f.state(first).last_human_at, 3600000);
       await f.runtime.process(accepted.key, accepted.jobId);
     };
-    await f.deliver(f.event(first)); assert.equal(f.generated.length, 1); assert.equal(f.sent.length, 0);
+    const generatedQuestion = '曜石灯塔补给箱的启封口令';
+    await f.deliver(f.event(first, generatedQuestion)); assert.equal(f.generated.length, 1); assert.equal(f.sent.length, 0);
     assert(f.state(first).jobs.some(job => job.status === 'cancelled'));
-    await f.deliver(f.event(second)); assert.equal(f.generated.length, 2); assert.equal(f.sent.length, 1);
+    await f.deliver(f.event(second, generatedQuestion)); assert.equal(f.generated.length, 2); assert.equal(f.sent.length, 1);
     assert.equal(f.sent[0].session_id, second); assert.equal(f.sent[0].content, answer); assert.equal(f.vector.length, 0);
     assert.equal(f.state(first).mode, 'human'); assert.equal(f.state(second).mode, 'ai');
   });
   await test('H14 同一映射文档多个 parsed 位置不会误报歧义或丢掉不同片段', async () => {
-    const extra = qa + '第二页附注：先确认箱体完好。\n';
+    const extra = '第二页附注：先确认箱体完好。\n' + qa;
     const f = fixture('multi-location', {contents:[qa, extra], sameDocument:true});
     assert.equal(f.search(question).results.length, 2);
-    const session = 'session_hybrid-multilocation'; await f.deliver(f.event(session)); successful(f, session);
-    assert.deepEqual(citations(f.generated[0]).map(item => item.text).sort(), [qa, extra].sort());
-    assert.equal(new Set(citations(f.generated[0]).map(item => item.source.document_id)).size, 1);
+    const session = 'session_hybrid-multilocation'; await f.deliver(f.event(session)); directSuccessful(f, session);
+    assert.equal(f.state(session).jobs[0].plan.sources.length, 2);
   });
   await test('H15 生成 Code 使用生产字面内置白名单完成强词法问答，源码哈希同步', async () => {
     const check = spawnSync(process.execPath, [path.join(project, 'n8n/build-workflow.js'), '--check'], {encoding:'utf8', timeout:10000});
@@ -382,8 +422,7 @@ async function test(name, action) {
     const received = await execute('校验并持久接收', {json:{body:event, query:{key:f.env.CRISP_WEBSITE_HOOK_SECRET}}});
     assert.equal(received[0].json.accepted, true); assert.equal(received[0].json.route, 'process');
     const processed = await execute('处理持久任务', {json:received[0].json}); assert.equal(processed[0].json.status, 'sent');
-    successful(f, session); assert.equal(citations(f.generated[0])[0].text, qa);
-    assert.equal(f.generated[0].messages.at(-1).content, event.data.content);
+    directSuccessful(f, session);
   });
   await test('H16 完整且锚定的礼貌范围说明剥离后跳过向量，完整问答及用户原句进入唯一生成', async () => {
     const cases = [
@@ -396,10 +435,8 @@ async function test(name, action) {
       const {query, contents, expected} = item;
       const f = fixture('prefix-strong-' + index, {contents}); f.vectorError = new Error('此分支不应调用向量');
       const session = 'session_hybrid-prefixed-' + index;
-      await f.deliver(f.event(session, query)); successful(f, session);
+      await f.deliver(f.event(session, query)); directSuccessful(f, session, expected === qa ? answer : pairedAnswer);
       assert.equal(f.search(query).results[0].lexical.kind, 'exact_question');
-      assert.deepEqual(citations(f.generated[0]).map(item => item.text), [expected]);
-      assert.equal(f.generated[0].messages.at(-1).content, query);
     }
   });
   await test('H17 无关/否定引用/复述改问/复合问句/数字冲突不会跳过向量或制造词法知识答案', async () => {
@@ -412,9 +449,9 @@ async function test(name, action) {
     for(const [index, query] of queries.entries()) {
       const f = fixture('prefix-negative-' + index, {contents:[qa, '问：可以吗？\n答：请先说明具体事项。\n']});
       assert.deepEqual(f.search(query).results, []);
-      await f.deliver(f.event('session_hybrid-prefix-negative-' + index, query));
+      const session = 'session_hybrid-prefix-negative-' + index; const result = await f.deliver(f.event(session, query));
       assert.equal(f.vector.length, 1); assert.equal(f.vector[0].query, query);
-      assert.equal(f.generated.length, 0); assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, clarification);
+      assert.equal(result.result.status, 'unresolved'); unresolved(f, session);
       assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 0);
     }
   });

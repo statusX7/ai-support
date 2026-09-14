@@ -11,6 +11,7 @@ const {signEnvelope,envelopeMarker} = require('../scripts/provider-envelope.js')
 const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens,normalizeApiBase} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
+const digest = value => crypto.createHash('sha256').update(String(value)).digest('hex');
 async function until(condition,message,timeout=3000) {
   const end=Date.now()+timeout;
   while(!condition()&&Date.now()<end)await sleep(5);
@@ -735,6 +736,137 @@ async function main() {
       assert.deepEqual(exhausted.calls.map(call=>call.index),[0,1,2]);
       const recent=(await exhausted.get('recent')).records;assert.equal(recent.length,3);assert(recent.every(item=>item.outcome==='failed'&&item.error_class==='invalid_response'));
     }finally{await exhausted.close();}
+  });
+  await test('旧 generic 成功缓存只允许同身份下一代失效一次，合法答案和安全拒答不重推理',async()=>{
+    const f=await fixture(2);try {
+      const questions=path.join(f.directory,'data/provider-router/questions');fs.mkdirSync(questions,{recursive:true});
+      const pool=read(f.poolFile),primary=pool.primary_id;
+      const binding=(envelope,generation)=>digest(JSON.stringify([
+        envelope.scope||'conversation',envelope.session_key,envelope.generation,
+        envelope.runtime_revision,envelope.pool_revision,generation,
+      ]));
+      const seed=(envelope,result)=>json(path.join(questions,envelope.question_id+'.json'),{
+        id:envelope.question_id,binding:binding(envelope,1),attempt_generation:1,
+        revision:pool.revision,deadline:envelope.deadline_at,attempts:1,
+        stages:{answer:{tried:[primary],result}},created_at:Date.now(),
+      });
+
+      const generic=f.envelope('answer',{attempt_generation:1});
+      seed(generic,chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'));
+      const old=await f.post(sample,generic);assert.equal(old.status,400,old.text);
+      assert.equal(old.value.error.code,'invalid_response');
+      assert.equal(f.calls.length,0,'同代读取旧缓存不能在 adapter 内暗自增加调用');
+      const recovered=await f.post(sample,{...generic,attempt_generation:2,deadline_at:Date.now()+90000});
+      assert.equal(recovered.status,200,recovered.text);
+      assert.equal(recovered.value.choices[0].message.content,'验证回答');
+      assert.deepEqual(f.calls.map(call=>call.index),[1],'旧主接口 generic 应跳过已尝试条目并使用下一候选');
+      const stored=read(path.join(questions,generic.question_id+'.json'));
+      assert.equal(stored.attempt_generation,2);
+      assert.equal(stored.attempts,2,'输出策略恢复不得重置既有调用预算');
+      assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
+      assert.equal(stored.output_policy_recovery.to_attempt_generation,2);
+      assert.match(stored.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
+      assert.equal(stored.stages.answer.invalidated_result.reason,'current_output_policy_non_answer');
+      const again=await f.post(sample,{...generic,attempt_generation:3,deadline_at:Date.now()+90000});
+      assert.equal(again.status,400);assert.equal(again.value.error.code,'question_conflict');
+      assert.equal(f.calls.length,1,'同一责任不得再次借代次递增重置并重推理');
+
+      const valid=f.envelope('answer',{attempt_generation:1});seed(valid,chat('已有合法业务答案'));
+      const validRetry=await f.post(sample,{...valid,attempt_generation:2,deadline_at:Date.now()+90000});
+      assert.equal(validRetry.status,400);assert.equal(validRetry.value.error.code,'question_conflict');
+      const refusal=f.envelope('answer',{attempt_generation:1});
+      seed(refusal,{id:'cached-refusal',model:'fixture-model-0',choices:[{message:{role:'assistant',content:null,
+        refusal:'无法协助该请求'},finish_reason:'stop'}]});
+      const refusalRetry=await f.post(sample,{...refusal,attempt_generation:2,deadline_at:Date.now()+90000});
+      assert.equal(refusalRetry.status,400);assert.equal(refusalRetry.value.error.code,'question_conflict');
+      assert.equal(f.calls.length,1,'合法旧答案与安全拒答都不得触发新供应商调用');
+
+      for(const [protectedResult,sameGenerationCode] of [
+        [{id:'cross-stage-refusal',choices:[{message:{role:'assistant',content:null,refusal:'无法协助该请求'},finish_reason:'stop'}]},'safety_refusal'],
+        [{id:'cross-stage-filter',choices:[{message:{role:'assistant',content:''},finish_reason:'content_filter'}]},'safety_refusal'],
+        [{id:'cross-stage-malformed',choices:[]},'invalid_response'],
+      ]) {
+        const crossStage=f.envelope('answer',{attempt_generation:1});
+        const file=path.join(questions,crossStage.question_id+'.json');
+        json(file,{id:crossStage.question_id,binding:binding(crossStage,1),attempt_generation:1,
+          revision:pool.revision,deadline:crossStage.deadline_at,attempts:2,
+          stages:{vision:{tried:[primary],result:protectedResult},answer:{tried:[primary],
+            result:chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。')}},created_at:Date.now()});
+        const sameGeneration=await f.post(sample,crossStage);
+        assert.equal(sameGeneration.status,400);assert.equal(sameGeneration.value.error.code,sameGenerationCode);
+        const blocked=await f.post(sample,{...crossStage,attempt_generation:2,deadline_at:Date.now()+90000});
+        assert.equal(blocked.status,400);assert.equal(blocked.value.error.code,'question_conflict');
+        assert.equal(read(file).stages.answer.result.choices[0].message.content.includes('最希望先解决'),true);
+      }
+      const swapped=f.envelope('vision',{attempt_generation:1});
+      const swappedFile=path.join(questions,swapped.question_id+'.json');
+      json(swappedFile,{id:swapped.question_id,binding:binding(swapped,1),attempt_generation:1,
+        revision:pool.revision,deadline:swapped.deadline_at,attempts:2,
+        stages:{vision:{tried:[primary],result:chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。')},
+          answer:{tried:[primary],result:{id:'swapped-refusal',choices:[{message:{role:'assistant',content:null,
+            refusal:'无法协助该请求'},finish_reason:'stop'}]}}},created_at:Date.now()});
+      const swappedRetry=await f.post(sample,{...swapped,attempt_generation:2,deadline_at:Date.now()+90000});
+      assert.equal(swappedRetry.status,400);assert.equal(swappedRetry.value.error.code,'question_conflict');
+      assert.equal(read(swappedFile).output_policy_recovery,undefined);
+
+      for(const [requestStage,cachedStage,protectedResult,expected] of [
+        ['answer','vision',{id:'orphan-vision-refusal',choices:[{message:{role:'assistant',content:null,
+          refusal:'无法协助该请求'},finish_reason:'stop'}]},'safety_refusal'],
+        ['vision','answer',{id:'orphan-answer-filter',choices:[{message:{role:'assistant',content:''},
+          finish_reason:'content_filter'}]},'safety_refusal'],
+        ['answer','vision',{id:'orphan-vision-malformed',choices:[]},'invalid_response'],
+      ]) {
+        const orphanStage=f.envelope(requestStage,{attempt_generation:1});
+        const orphanFile=path.join(questions,orphanStage.question_id+'.json');
+        json(orphanFile,{id:orphanStage.question_id,binding:binding(orphanStage,1),attempt_generation:1,
+          revision:pool.revision,deadline:orphanStage.deadline_at,attempts:1,
+          stages:{[cachedStage]:{tried:[primary],result:protectedResult}},created_at:Date.now()});
+        const callsBefore=f.calls.length;
+        const sameGeneration=await f.post(sample,orphanStage);
+        assert.equal(sameGeneration.status,400);assert.equal(sameGeneration.value.error.code,expected);
+        assert.equal(f.calls.length,callsBefore,'当前阶段缺结果也不得绕过另一阶段安全门禁');
+        const nextGeneration=await f.post(sample,{...orphanStage,attempt_generation:2,deadline_at:Date.now()+90000});
+        assert.equal(nextGeneration.status,400);assert.equal(nextGeneration.value.error.code,'question_conflict');
+        assert.equal(f.calls.length,callsBefore,'下一代不得从跨阶段不安全缓存取得恢复调用权');
+        assert.equal(read(orphanFile).output_policy_recovery,undefined);
+      }
+
+      const wrongIdentity=f.envelope('answer',{attempt_generation:1});
+      seed(wrongIdentity,chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'));
+      const conflict=await f.post(sample,{...wrongIdentity,scope:'conversation',session_key:'a'.repeat(64),
+        generation:0,attempt_generation:2,deadline_at:Date.now()+90000});
+      assert.equal(conflict.status,400);assert.equal(conflict.value.error.code,'question_conflict');
+      assert.equal(f.calls.length,1,'不同 question/session/runtime/pool 身份不得复用旧缓存恢复权限');
+    }finally{await f.close();}
+  });
+  await test('旧 generic 单接口及失败备用不重置累计预算，失效凭证跨恢复轮持久保留',async()=>{
+    const genericText='你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
+    const exercise=async(count,maxAttempts,failBackup)=>{
+      const f=await fixture(count,{max_attempts:maxAttempts});try {
+        const envelope=f.envelope('answer',{attempt_generation:1});
+        const pool=read(f.poolFile),file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+        const binding=generation=>digest(JSON.stringify([envelope.scope||'conversation',envelope.session_key,
+          envelope.generation,envelope.runtime_revision,envelope.pool_revision,generation]));
+        fs.mkdirSync(path.dirname(file),{recursive:true});
+        json(file,{id:envelope.question_id,binding:binding(1),attempt_generation:1,
+          revision:pool.revision,deadline:envelope.deadline_at,attempts:1,
+          stages:{answer:{tried:[pool.primary_id],result:chat(genericText)}},created_at:Date.now()});
+        if(failBackup)f.behavior=async(_call,response)=>{response.writeHead(503);response.end('{}');return true;};
+        const second=await f.post(sample,{...envelope,attempt_generation:2,deadline_at:Date.now()+90000});
+        assert.equal(second.status,400,second.text);
+        let stored=read(file);assert.equal(stored.attempts,Math.min(maxAttempts,count));
+        assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
+        assert.match(stored.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
+        const callsAfterSecond=f.calls.length;
+        const third=await f.post(sample,{...envelope,attempt_generation:3,deadline_at:Date.now()+90000});
+        stored=read(file);assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
+        assert.equal(stored.attempts,Math.min(maxAttempts,count));
+        assert.equal(f.calls.length,callsAfterSecond,'累计调用上限耗尽后不得借新代次重置预算');
+        assert.equal(third.status,400);assert.equal(third.value.error.code,'question_budget_exhausted');
+      }finally{await f.close();}
+    };
+    await exercise(1,1,false);
+    await exercise(2,2,true);
   });
   await test('A13 多候选连续挂起共享总期限，剩余时间不够时不继续遍历',async()=>{
     const f=await fixture(3,{call_timeout_ms:1200,connect_timeout_ms:200,question_timeout_ms:2000});try {

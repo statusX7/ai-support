@@ -17,6 +17,7 @@ NON_INTERACTIVE=0
 SKIP_START=0
 RECONFIGURE=0
 COMMAND_PATH=""
+INSTALL_CONFIGURATION_TRANSACTION=""
 
 handle_install_interrupt() {
   # timeout 和终端可能把同一中断同时投递给进程及进程组；收尾期间忽略重复信号，
@@ -31,6 +32,18 @@ trap handle_install_interrupt INT TERM
 handle_install_exit() {
   local status=$? phase=failed
   trap - EXIT
+  if [[ -n "${INSTALL_CONFIGURATION_TRANSACTION:-}" ]]; then
+    if install_configuration_transaction_rollback "$DEPLOY_DIR" \
+      "$INSTALL_CONFIGURATION_TRANSACTION" >/dev/null; then
+      warn '本次重新配置未完成；原环境、反代片段与 Caddy 运行状态已恢复'
+    else
+      warn '本次重新配置未完成，且自动恢复未完整通过；已保留受限恢复副本，请勿继续切换接入配置'
+    fi
+    INSTALL_CONFIGURATION_TRANSACTION=""
+    # 事务未走到 Provider 成功提交点即使误返回 0，也不能
+    # 对外宣称安装成功。
+    (( status != 0 )) || status=1
+  fi
   if [[ -n "${DEPLOY_DIR:-}" && -f "${DEPLOY_DIR}/${INSTALL_MARKER}" ]]; then
     if (( status == 0 )) || { (( status == 2 )) && [[ "$(installation_state "$DEPLOY_DIR")" == local-ready ]]; }; then
       phase=complete
@@ -56,7 +69,7 @@ validate_preserved_installation() {
   local -a required_env_keys=(
     DEPLOY_DIR BIND_ADDRESS N8N_PORT ANYTHINGLLM_PORT N8N_HOST PUBLIC_WEBHOOK_URL TIMEZONE
     N8N_ENCRYPTION_KEY POSTGRES_PASSWORD ANYTHINGLLM_AUTH_TOKEN ANYTHINGLLM_JWT_SECRET
-    ANYTHINGLLM_SIG_KEY ANYTHINGLLM_SIG_SALT AI_API_BASE_URL AI_API_KEY AI_MODEL
+    ANYTHINGLLM_SIG_KEY ANYTHINGLLM_SIG_SALT PROVIDER_ADAPTER_KEY AI_API_BASE_URL AI_API_KEY AI_MODEL
     AI_API_MODE AI_SUPPORTS_VISION AI_MODEL_TOKEN_LIMIT AI_MAX_OUTPUT_TOKENS
     ANYTHINGLLM_API_KEY ANYTHINGLLM_WORKSPACE ANYTHINGLLM_CHAT_MODE
     CRISP_WEBSITE_ID CRISP_TOKEN_TIER CRISP_TOKEN_IDENTIFIER CRISP_TOKEN_KEY
@@ -252,8 +265,8 @@ usage() {
   --deploy-dir PATH   指定部署目录，默认 /opt/crisp-ai
   --command-path PATH 高级：管理入口的绝对路径，默认 /usr/local/bin/crispai
   --non-interactive   从环境变量读取配置，不进行交互
-  --skip-start        只安装文件，不启动 Docker 服务
-  --reconfigure       重复安装时重新配置 Provider 与 Crisp
+  --skip-start        只暂存新安装文件，不启动 Docker 服务
+  --reconfigure       重复安装时重新配置 Provider 与 Crisp（不能与 --skip-start 同用）
   --version           显示版本
   --help              显示帮助
 EOF
@@ -339,6 +352,16 @@ if [[ -d "$DEPLOY_DIR" ]] && find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -
           warn "检测到未完成的部署状态（${PREVIOUS_STATE}），现有配置不完整，将返回快速初始化"
         fi
         ;;
+      staged)
+        if (( RECONFIGURE )); then
+          warn '检测到已暂存但尚未启动的部署，本次将按 --reconfigure 重新配置'
+        elif installation_config_is_reusable "$DEPLOY_DIR"; then
+          REUSE_PRESERVED_CONFIG=1
+          REUSE_CONFIG_REASON=staged
+        else
+          warn '检测到已暂存部署，但保存的配置不完整，将返回快速初始化'
+        fi
+        ;;
       uninstalled-data-kept)
         if (( RECONFIGURE )); then
           warn "检测到安全卸载后的保留数据，本次将按 --reconfigure 重新配置"
@@ -362,14 +385,30 @@ acquire_maintenance_lock "$DEPLOY_DIR"
 if (( REUSE_PRESERVED_CONFIG )); then
   validate_preserved_installation "$DEPLOY_DIR"
   EXISTING=1
-  if [[ "$REUSE_CONFIG_REASON" == incomplete ]]; then
-    info '已验证未完成部署的 .env 与实际配置；本次将直接复用并继续，不重新输入凭据'
-  else
-    info '已验证安全卸载保留的 .env 与实际配置；本次将直接复用，不重新输入凭据'
-  fi
+  case "$REUSE_CONFIG_REASON" in
+    incomplete)
+      info '已验证未完成部署的 .env 与实际配置；本次将直接复用并继续，不重新输入凭据'
+      ;;
+    staged)
+      info '已验证暂存部署的 .env 与实际配置；本次将直接启动并验收，不重新输入凭据'
+      ;;
+    *)
+      info '已验证安全卸载保留的 .env 与实际配置；本次将直接复用，不重新输入凭据'
+      ;;
+  esac
 fi
 if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
   die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
+fi
+
+# --skip-start 只允许新安装暂存文件或复用完整 staged 配置。已有实例的
+# --reconfigure 会探测并原子应用接口池，受管 HTTPS 还可能协调 Caddy 运行代；
+# 必须由正常安装路径完成，不能在“仅暂存”模式下产生隐式服务变更。
+if (( SKIP_START && RECONFIGURE )) && [[ "$PREVIOUS_STATE" != new ]] \
+  && [[ -e "${DEPLOY_DIR}/.env" || -L "${DEPLOY_DIR}/.env" ]]; then
+  [[ -f "${DEPLOY_DIR}/.env" && ! -L "${DEPLOY_DIR}/.env" ]] \
+    || die '已有实例的 .env 不是安全普通文件；未执行仅暂存重新配置'
+  die '已有实例不能同时使用 --reconfigure 与 --skip-start；重新配置需要验证并应用运行组件。请移除 --skip-start 后重试'
 fi
 
 WIZARD_RESULT="${DEPLOY_DIR}/tmp/quick-init.json"
@@ -396,7 +435,20 @@ if (( SKIP_START == 0 )); then
     || die "Docker 自动安装或真实运行验证失败；修复提示的问题后重新运行，配置进度不会丢失"
 fi
 
+# 先记录真实的 installing 阶段；这个状态不是业务配置，失败后
+# 必须保留，使下一次同版运行能识别并继续。
 write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" installing
+
+# 只要本次将执行 Provider/Crisp 配置且已有 .env（包括从
+# collecting 重新开始的向导），就在任何环境投影、反代片段或
+# Caddy 运行代可能变化前保留受限快照。Provider 候选通过真实
+# 适配器验证后才删除；中途任何失败统一由 EXIT trap 恢复，
+# 不形成新 Hook+旧 Provider 的混合代。
+if (( EXISTING == 0 || RECONFIGURE == 1 )) \
+  && [[ -e "${DEPLOY_DIR}/.env" || -L "${DEPLOY_DIR}/.env" ]]; then
+  INSTALL_CONFIGURATION_TRANSACTION=$(install_configuration_transaction_begin "$DEPLOY_DIR") \
+    || die '无法为重新配置创建安全恢复点；未改写现有接入配置'
+fi
 if (( SKIP_START == 0 )); then
   set_installation_fact "$DEPLOY_DIR" dependencies ready
 else
@@ -476,6 +528,7 @@ ensure_secret "$ENV_FILE" ANYTHINGLLM_AUTH_TOKEN 24
 ensure_secret "$ENV_FILE" ANYTHINGLLM_JWT_SECRET 32
 ensure_secret "$ENV_FILE" ANYTHINGLLM_SIG_KEY 32
 ensure_secret "$ENV_FILE" ANYTHINGLLM_SIG_SALT 32
+ensure_secret "$ENV_FILE" PROVIDER_ADAPTER_KEY 32
 LEGACY_WEBHOOK_SECRET=$(env_get "$ENV_FILE" CRISP_WEBHOOK_SECRET 2>/dev/null || true)
 WEBSITE_HOOK_SECRET=$(env_get "$ENV_FILE" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
 if is_placeholder "$WEBSITE_HOOK_SECRET"; then
@@ -541,11 +594,21 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
   fi
   validate_env_value "$CRISP_KEY_VALUE" || die "Crisp Token Key 无效"
   validate_env_value "$ANYTHING_KEY_VALUE" || die "AnythingLLM API Key 无效"
+  AI_MODEL_CANDIDATE_VALUE=${AI_MODEL:-${DEFAULT_AI_MODEL:-}}
+  validate_model_identifier "$AI_MODEL_CANDIDATE_VALUE" || die "AI 模型标识无效或为空"
 
   CRISP_AUTH_VALUE=$(crisp_auth_b64 "$CRISP_IDENTIFIER_VALUE" "$CRISP_KEY_VALUE")
+  # Webhook/Caddy 仍先于 Provider 切换提交，保持 v1.2.1 已有的线上失败
+  # 恢复顺序。全新安装此时尚未把 Provider/Crisp 投影写入 .env；仅向本次
+  # Compose 候选预检传入已验证的内存值，函数返回后不形成第二份配置源。
+  N8N_HOST="$N8N_HOST_VALUE" \
+  AI_MODEL="$AI_MODEL_CANDIDATE_VALUE" \
+  ANYTHINGLLM_API_KEY="$ANYTHING_KEY_VALUE" \
+  CRISP_AUTH_B64="$CRISP_AUTH_VALUE" \
+  CRISP_WEBSITE_ID="$CRISP_WEBSITE_VALUE" \
+    configure_webhook_access "$DEPLOY_DIR" "$WEBHOOK_MODE_VALUE" "$PUBLIC_URL_VALUE" \
+      "$WEBHOOK_PRODUCTION_VALUE" "$N8N_HOST_VALUE"
   env_set "$ENV_FILE" N8N_HOST "$N8N_HOST_VALUE"
-  configure_webhook_access "$DEPLOY_DIR" "$WEBHOOK_MODE_VALUE" "$PUBLIC_URL_VALUE" \
-    "$WEBHOOK_PRODUCTION_VALUE" "$N8N_HOST_VALUE"
   env_set "$ENV_FILE" N8N_PROTOCOL "$( [[ "$PUBLIC_URL_VALUE" == https://* ]] && printf https || printf http )"
   env_set "$ENV_FILE" N8N_SECURE_COOKIE "$( [[ "$PUBLIC_URL_VALUE" == https://* ]] && printf true || printf false )"
   env_set "$ENV_FILE" TIMEZONE "$TIMEZONE_VALUE"
@@ -562,7 +625,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
   if [[ -e "${DEPLOY_DIR}/config/provider-pool-applied.json" \
     || -L "${DEPLOY_DIR}/config/provider-pool-applied.json" ]]; then
     configure_provider_pool_primary "$DEPLOY_DIR" "${AI_API_BASE_URL:-}" \
-      "${AI_API_KEY:-}" "${AI_MODEL:-}" "${AI_API_MODE:-auto}" \
+      "${AI_API_KEY:-}" "$AI_MODEL_CANDIDATE_VALUE" "${AI_API_MODE:-auto}" \
       "${AI_SUPPORTS_VISION:-false}" \
       || die '新主接口未通过真实适配器验证或运行回读；原接口池、秘密及兼容配置已保留'
   else
@@ -570,6 +633,12 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
       && ! -L "${DEPLOY_DIR}/config/provider-pool.yaml" ]] \
       || die '检测到主备池源但有效投影缺失；未用旧单接口流程覆盖，请先恢复有效配置'
     configure_provider "$DEPLOY_DIR" 1
+  fi
+  if [[ -n "$INSTALL_CONFIGURATION_TRANSACTION" ]]; then
+    install_configuration_transaction_discard "$DEPLOY_DIR" \
+      "$INSTALL_CONFIGURATION_TRANSACTION" \
+      || die '新 Webhook 与 Provider 已验证，但受限恢复副本未能安全清理；安装已停止'
+    INSTALL_CONFIGURATION_TRANSACTION=""
   fi
   if (( NON_INTERACTIVE == 0 )); then
     PROMPT_MODE_VALUE=$(jq -r '.prompt.mode // "default"' "$WIZARD_RESULT")

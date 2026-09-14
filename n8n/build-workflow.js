@@ -5,12 +5,23 @@ const path = require('path');
 const crypto = require('crypto');
 const root = path.resolve(__dirname, '..');
 const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim();
+const n8nRunnerConcurrency = 10;
+const backgroundProcessingPermits = 8;
+const ordinaryProcessingPermits = 7;
 const runtimeFile = fs.readFileSync(path.join(__dirname, 'runtime.js'), 'utf8');
 const lexicalFile = fs.readFileSync(path.join(__dirname, 'knowledge-lexical.js'), 'utf8');
+const visitorOutputFile = fs.readFileSync(path.join(root, 'scripts', 'visitor-output.js'), 'utf8');
 const lexicalSource = lexicalFile.replace(/^module\.exports[^\n]+\n?$/m, '');
-const runtimeSource = runtimeFile.replace(/^const \{ searchKnowledgeLexical \} = require\('\.\/knowledge-lexical\.js'\);\n?/m, '')
+const visitorOutputSource = visitorOutputFile.replace(/^'use strict';\n?/m, '')
+  .replace(/^module\.exports[^\n]+\n?$/m, '');
+const runtimeSource = runtimeFile.replace(/^const \{\s*searchKnowledgeLexical\s*\} = require\('\.\/knowledge-lexical\.js'\);\r?\n/m, '')
+  .replace(/^const \{\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\.\.\/scripts\/visitor-output\.js'\);\r?\n/m, '')
   .replace(/^if \(typeof module[^\n]+\n?$/m, '');
-const source = (lexicalSource + '\n' + runtimeSource).replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
+if (/require\(['"](?:\.\/knowledge-lexical\.js|\.\.\/scripts\/visitor-output\.js)['"]\)/.test(runtimeSource)) {
+  throw new Error('运行时内联失败：仍包含宿主模块导入');
+}
+const source = (lexicalSource + '\n' + visitorOutputSource + '\n' + runtimeSource)
+  .replace(/ai_support_version: 'v[^']+'/g, "ai_support_version: '" + version + "'");
 const makeNode = (name, type, parameters, x, y, typeVersion = 2) => ({ name, id: crypto.createHash('md5').update('ai-support:' + name).digest('hex').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5'), type: 'n8n-nodes-base.' + type, typeVersion, position: [x, y], parameters });
 const code = (body) => source + '\nconst runtime = createRuntime($env);\n' + body;
 const nodes = [
@@ -19,7 +30,7 @@ const nodes = [
   makeNode('返回 Webhook', 'respondToWebhook', { respondWith: 'json', responseBody: '={{ JSON.stringify({accepted: $json.accepted, reason: $json.reason}) }}', options: { responseCode: '={{ $json.statusCode }}' } }, 480, 0, 1.5),
   makeNode('处理持久任务', 'code', { jsCode: code("const item = $input.first().json;\nif (!item.accepted || item.route !== 'process') return [{json:{status:'ignored'}}];\nreturn [{json:await runtime.process(item.key,item.jobId)}];") }, 720, 0),
   makeNode('每五秒恢复与重试', 'scheduleTrigger', { rule: { interval: [{ field: 'seconds', secondsInterval: 5 }] } }, 0, 260, 1.2),
-  makeNode('扫描持久会话与任务', 'code', { jsCode: code('const jobs = await runtime.scan();\nconst results = await Promise.all(jobs.map((job) => runtime.process(job.key,job.jobId)));\nreturn [{json:{processed:results.length,failed:results.filter((result)=>result.status===\'failed\').length}}];') }, 240, 260),
+  makeNode('扫描持久会话与任务', 'code', { jsCode: code('const jobs = await runtime.scan();\n// 本地已持久任务与 Crisp REST 漏收补偿并行：外部超时不得阻塞本地队列。\nconst processing = Promise.all(jobs.map((job) => runtime.process(job.key,job.jobId)));\nconst catchingUp = runtime.catchup();\nconst [results,catchup] = await Promise.all([processing,catchingUp]);\nreturn [{json:{processed:results.length,failed:results.filter((result)=>result.status===\'failed\').length,catchup:catchup.status}}];') }, 240, 260),
   makeNode('公开欢迎配置', 'webhook', { httpMethod: 'GET', path: 'crispai-public-config', responseMode: 'responseNode', options: {} }, 0, 520, 2.1),
   makeNode('只读公开显示选项', 'code', { jsCode: code('return [{json:await runtime.publicConfig($input.first().json.query || {})}];') }, 240, 520),
   makeNode('返回公开配置', 'respondToWebhook', { respondWith: 'json', responseBody: '={{ JSON.stringify($json) }}', options: { responseCode: 200, responseHeaders: { entries: [{ name: 'Cache-Control', value: 'no-store' }, { name: 'Access-Control-Allow-Origin', value: '*' }, { name: 'X-Content-Type-Options', value: 'nosniff' }] } } }, 480, 520, 1.5),
@@ -33,7 +44,9 @@ const workflow = {
   id: '5d2c37c9-1c8e-45d0-8f53-c0a6e79b3a40', name: 'Crisp AI 客服', nodes,
   connections: { 'Crisp Webhook': edge('校验并持久接收'), '校验并持久接收': edge('返回 Webhook'), '返回 Webhook': edge('处理持久任务'), '每五秒恢复与重试': edge('扫描持久会话与任务'), '公开欢迎配置': edge('只读公开显示选项'), '只读公开显示选项': edge('返回公开配置'), '网页接入脚本': edge('读取固定网页脚本'), '读取固定网页脚本': edge('返回网页脚本') },
   active: false, settings: { executionOrder: 'v1', saveManualExecutions: false, saveDataErrorExecution: 'none', saveDataSuccessExecution: 'none', saveExecutionProgress: false, callerPolicy: 'workflowsFromSameOwner' },
-  versionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', meta: { templateCredsSetupCompleted: true, aiSupportVersion: version, runtimeSha256: crypto.createHash('sha256').update(source).digest('hex'), runtimeFileSha256: crypto.createHash('sha256').update(runtimeFile).digest('hex'), lexicalFileSha256: crypto.createHash('sha256').update(lexicalFile).digest('hex') }, tags: [],
+  versionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', meta: { templateCredsSetupCompleted: true,
+    aiSupportVersion: version, n8nRunnerConcurrency, backgroundProcessingPermits, ordinaryProcessingPermits,
+    runtimeSha256: crypto.createHash('sha256').update(source).digest('hex'), runtimeFileSha256: crypto.createHash('sha256').update(runtimeFile).digest('hex'), lexicalFileSha256: crypto.createHash('sha256').update(lexicalFile).digest('hex'), visitorOutputFileSha256: crypto.createHash('sha256').update(visitorOutputFile).digest('hex') }, tags: [],
 };
 const rendered = JSON.stringify(workflow, null, 2) + '\n';
 const filename = path.join(__dirname, 'workflow.json');

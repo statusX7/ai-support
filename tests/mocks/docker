@@ -102,13 +102,18 @@ if [[ "${1:-}" == version ]]; then
 fi
 
 MOCK_PROJECT_DIR=''
+MOCK_ENV_FILE=''
 while (( $# > 0 )); do
   case "$1" in
     --project-directory)
       MOCK_PROJECT_DIR=$2
       shift 2
       ;;
-    --env-file|-f|--profile)
+    --env-file)
+      MOCK_ENV_FILE=$2
+      shift 2
+      ;;
+    -f|--profile)
       shift 2
       ;;
     *)
@@ -116,6 +121,26 @@ while (( $# > 0 )); do
       ;;
   esac
 done
+
+mock_caddy_state_get() {
+  local state
+  [[ -n "${MOCK_CADDY_STATE:-}" ]] || { printf 'unmanaged\n'; return 0; }
+  [[ -f "$MOCK_CADDY_STATE" && ! -L "$MOCK_CADDY_STATE" ]] || return 2
+  state=$(<"$MOCK_CADDY_STATE")
+  [[ "$state" == running || "$state" == stopped || "$state" == absent ]] || return 2
+  printf '%s\n' "$state"
+}
+
+mock_caddy_state_set() {
+  local state=$1 temporary
+  [[ -n "${MOCK_CADDY_STATE:-}" ]] || return 0
+  [[ -f "$MOCK_CADDY_STATE" && ! -L "$MOCK_CADDY_STATE" ]] || return 2
+  [[ "$state" == running || "$state" == stopped || "$state" == absent ]] || return 2
+  temporary=$(mktemp "${MOCK_CADDY_STATE}.tmp.XXXXXX")
+  printf '%s\n' "$state" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$MOCK_CADDY_STATE"
+}
 
 mock_anything_runtime() {
   local action=$1
@@ -258,6 +283,17 @@ if [[ "${MOCK_DOCKER_FAIL_IMPORT:-0}" == 1 && "$COMMAND" == exec && "$*" == *'im
 fi
 case "$COMMAND" in
   config)
+    if [[ " $* " == *' --help '* || " $* " == *' -h '* ]]; then
+      printf '%s\n' 'Usage: docker compose config [OPTIONS]'
+      exit 0
+    fi
+    if [[ "${MOCK_DOCKER_STRICT_CONFIG:-0}" == 1 ]]; then
+      [[ -f "$MOCK_ENV_FILE" && ! -L "$MOCK_ENV_FILE" ]] || exit 42
+      for required in PROVIDER_ADAPTER_KEY AI_MODEL ANYTHINGLLM_API_KEY CRISP_AUTH_B64 CRISP_WEBSITE_ID; do
+        value=${!required:-}
+        [[ -n "$value" ]] || grep -Eq "^${required}=.+$" "$MOCK_ENV_FILE" || exit 42
+      done
+    fi
     if [[ "$*" == *'--images'* ]]; then
       printf 'postgres:16.10-alpine\nmintplexlabs/anythingllm:1.16.1\ndocker.n8n.io/n8nio/n8n:2.33.0\n'
     elif [[ "$*" == *'--services'* ]]; then
@@ -317,12 +353,44 @@ case "$COMMAND" in
         mock_anything_runtime capture
       fi
     fi
+    if [[ -n "${MOCK_CADDY_STATE:-}" && " $* " == *' caddy '* ]]; then
+      if [[ "$COMMAND" == stop ]]; then
+        mock_caddy_state_set stopped
+      else
+        mock_caddy_state_set running
+      fi
+    fi
     exit 0
+    ;;
+  rm)
+    if [[ -n "${MOCK_CADDY_STATE:-}" && " $* " == *' caddy '* ]]; then
+      mock_caddy_state_set absent
+      exit 0
+    fi
+    printf 'docker compose rm 测试桩仅支持受管 Caddy。\n' >&2
+    exit 2
+    ;;
+  run)
+    if [[ " $* " == *' caddy validate '* ]]; then
+      [[ "${MOCK_CADDY_VALIDATE_FAIL:-0}" != 1 ]]
+      exit
+    fi
+    printf 'docker compose run 测试桩仅支持 Caddy 配置验证。\n' >&2
+    exit 2
     ;;
   ps)
     if [[ " $* " == *' -q '* ]]; then
       service=${!#}
-      [[ "$service" != caddy ]] || exit 0
+      if [[ "$service" == caddy ]]; then
+        if [[ -n "${MOCK_CADDY_STATE:-}" ]]; then
+          caddy_state=$(mock_caddy_state_get)
+          if [[ "$caddy_state" != absent ]] \
+            && { [[ "$caddy_state" == running ]] || [[ " $* " != *' status=running '* ]]; }; then
+            printf 'mock-caddy\n'
+          fi
+        fi
+        exit 0
+      fi
       [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]] || exit 0
       if [[ -n "${MOCK_DOCKER_SERVICE_STATE:-}" ]]; then
         [[ -f "$MOCK_DOCKER_SERVICE_STATE" && ! -L "$MOCK_DOCKER_SERVICE_STATE" ]] || exit 2
@@ -363,6 +431,10 @@ case "$COMMAND" in
       else
         printf 'postgres\nanythingllm\nn8n\n'
       fi
+      if [[ -n "${MOCK_CADDY_STATE:-}" \
+        && "$(mock_caddy_state_get)" == running ]]; then
+        printf 'caddy\n'
+      fi
     fi
     ;;
   exec)
@@ -379,11 +451,21 @@ case "$COMMAND" in
     elif [[ "$*" == *' anythingllm '* && "${!#}" == 'process.stdout.write(String(process.env.GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT || ""))' ]]; then
       mock_anything_runtime read
     elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* \
+      || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_VISITOR_OUTPUT'* \
       || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* || "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
       expected=''
-      IFS= read -r expected || [[ -n "$expected" ]]
+      if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_CADDY'* ]]; then
+        expected_domain=''
+        IFS= read -r expected_domain || [[ -n "$expected_domain" ]]
+        IFS= read -r expected || [[ -n "$expected" ]]
+        [[ -n "$expected_domain" ]] || exit 1
+      else
+        IFS= read -r expected || [[ -n "$expected" ]]
+      fi
       if [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_PROVIDER'* ]]; then
         binding_file="${MOCK_PROJECT_DIR}/scripts/provider-adapter.js"
+      elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_VISITOR_OUTPUT'* ]]; then
+        binding_file="${MOCK_PROJECT_DIR}/scripts/visitor-output.js"
       elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* ]]; then
         binding_file="${MOCK_PROJECT_DIR}/scripts/provider-router.js"
       elif [[ "$*" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
@@ -407,6 +489,9 @@ case "$COMMAND" in
           mock_provider_status
           ;;
         /internal/provider/probe)
+          if [[ -n "${MOCK_PROVIDER_MANAGEMENT_LOG:-}" ]]; then
+            printf 'probe\n' >> "$MOCK_PROVIDER_MANAGEMENT_LOG"
+          fi
           jq -e '.method=="POST" and (.payload.api_key|type=="string" and length>0) and
             (.payload.provider.model|type=="string" and length>0) and
             (.payload.provider.api_mode=="responses" or .payload.provider.api_mode=="chat_completions")' <<< "$payload" >/dev/null || exit 2

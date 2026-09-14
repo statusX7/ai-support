@@ -9,9 +9,18 @@ const {spawn} = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const resealProjection = value => {
+  value.source_components.knowledge = digest(canonical(value.knowledge));
+  value.source_sha256 = digest(canonical(value.source_components));
+  return value;
+};
 
 async function main() {
-  const evidenceRoot = path.join(root, '.work', 'v1.2.0');
+  const evidenceRoot = path.join(root, '.work', 'v1.3.0');
   fs.mkdirSync(evidenceRoot, {recursive:true});
   const work = fs.mkdtempSync(path.join(evidenceRoot, 'materials-'));
   const deploy = path.join(work, 'deploy');
@@ -19,7 +28,7 @@ async function main() {
     fs.mkdirSync(path.join(deploy, directory), {recursive:true});
   }
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=ready\n',{mode:0o600});
-  fs.writeFileSync(path.join(deploy,'VERSION'),'v1.2.0\n',{mode:0o600});
+  fs.writeFileSync(path.join(deploy,'VERSION'),'v1.3.0\n',{mode:0o600});
   for (const name of ['runtime','keyword','handoff','menu','tags','feedback']) {
     const target=path.join(deploy,`config/${name}.yaml`);
     fs.copyFileSync(path.join(root,`config/${name}.yaml.example`),target);
@@ -91,8 +100,40 @@ async function main() {
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const port=server.address().port;
   fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=synthetic-materials-key\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nANYTHINGLLM_EMBED_STATE_WAIT_SECONDS=0\n`,{mode:0o600});
+  const readbackFixture=path.join(deploy,'bin/materials-readback-fixture.js');
+  fs.writeFileSync(readbackFixture,`'use strict';
+const crypto=require('node:crypto'),fs=require('node:fs'),path=require('node:path');
+const deploy=process.argv[2];
+const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+const canonical=value=>Array.isArray(value)?'['+value.map(canonical).join(',')+']'
+  :value&&typeof value==='object'?'{'+Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+canonical(value[key])).join(',')+'}'
+    :JSON.stringify(value);
+const regular=(file,optional=false)=>{try{const stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size<1)throw new Error('unsafe');return fs.readFileSync(file);}
+  catch(error){if(optional&&error.code==='ENOENT')return null;throw error;}};
+const raw=regular(path.join(deploy,'config/materials-applied.json'));
+const value=JSON.parse(raw.toString('utf8'));
+if(value.schema_version!==2||value.state!=='applied')throw new Error('projection');
+if(digest(canonical(value.knowledge))!==value.source_components?.knowledge
+  ||digest(canonical(value.source_components))!==value.source_sha256)throw new Error('identity');
+const base=path.join(deploy,'data/runtime');
+const map=regular(path.join(base,'knowledge-map.json'));
+const settings=regular(path.join(base,'knowledge-settings.json'));
+const lexical=regular(path.join(base,'knowledge-lexical.json'));
+const profile=regular(path.join(base,'knowledge-profile.json'),true);
+if(digest(map)!==value.knowledge.map_sha256||digest(settings)!==value.knowledge.settings_sha256
+  ||digest(lexical)!==value.knowledge.lexical_sha256
+  ||(profile===null?'':digest(profile))!==value.knowledge.profile_sha256)throw new Error('runtime knowledge');
+const mapValue=JSON.parse(map.toString('utf8')),settingsValue=JSON.parse(settings.toString('utf8'));
+const envValue=Object.fromEntries(fs.readFileSync(path.join(deploy,'.env'),'utf8').split(/\\r?\\n/).filter(line=>line&&line.includes('=')&&!line.startsWith('#')).map(line=>{const index=line.indexOf('=');return [line.slice(0,index),line.slice(index+1).replace(/^"|"$/g,'')];}));
+if(mapValue.schema_version!==2||!Array.isArray(mapValue.documents)||mapValue.documents.length!==value.knowledge.enabled_document_count)throw new Error('map');
+if(settingsValue.schema_version!==1||settingsValue.workspace_slug!==(envValue.ANYTHINGLLM_WORKSPACE||'crisp-support'))throw new Error('settings');
+if(profile!==null){const profileValue=JSON.parse(profile.toString('utf8'));if(profileValue.schema_version!==1||profileValue.state!=='applied'
+  ||digest(canonical(profileValue.profile))!==profileValue.fingerprint)throw new Error('profile');}
+else if(value.knowledge.enabled_document_count>0)throw new Error('profile missing');
+process.stdout.write(digest(raw)+':'+value.revision+':ready');
+`,{mode:0o600});
   const docker=path.join(deploy,'bin/docker');
-  fs.writeFileSync(docker,`#!/usr/bin/env bash\nset -euo pipefail\nif [[ "$*" == *materials-applied.json* ]]; then sha256sum -- "${deploy}/config/materials-applied.json" | awk '{printf "%s",$1}'; exit 0; fi\nprintf 'fixture不支持请求\\n' >&2; exit 1\n`,{mode:0o755});
+  fs.writeFileSync(docker,`#!/usr/bin/env bash\nset -euo pipefail\nif [[ "$*" == *materials-applied.json* ]]; then\n  exec node "${readbackFixture}" "${deploy}"\nfi\nprintf 'fixture不支持请求\\n' >&2\nexit 1\n`,{mode:0o755});
 
   let passed=0;
   const pass=name=>{passed++;process.stdout.write(`通过 UNIT/CONTRACT：${name}\n`);};
@@ -104,6 +145,19 @@ async function main() {
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
   const ok=async(args)=>{const result=await invoke(args);assert.equal(result.code,0,`${args.join(' ')}\n${result.stderr}\n${result.stdout}`);return result;};
+  const invokeReadback=()=>new Promise(resolve=>{
+    const child=spawn('bash',['-c','source "$1"; materials_projection_readback "$2"','materials-readback',path.join(root,'scripts/materials.sh'),deploy],{
+      cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
+    });
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+  const writeProfile=()=>{
+    const value={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
+      passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
+    fs.writeFileSync(path.join(deploy,'data/runtime/knowledge-profile.json'),JSON.stringify({schema_version:1,state:'applied',
+      profile:value,fingerprint:digest(canonical(value)),applied_at:Date.now()})+'\n',{mode:0o640});
+  };
   try {
     prompt='## 尚未同步的远端 Prompt\n';
     let result=await invoke(['initialize']);
@@ -115,7 +169,22 @@ async function main() {
     assert.equal(initialized.state,'applied');
     assert.equal(fs.statSync(path.join(deploy,'config/materials-applied.json')).mode&0o777,0o640);
     assert.ok(fs.existsSync(path.join(deploy,'backups/config-history/materials.applied.tar.gz')));
-    pass('旧部署经外部 Prompt/知识回读后建立首份受限原子投影');
+    const emptyProjection=JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json')));
+    assert.equal(emptyProjection.schema_version,2);
+    assert.deepEqual(Object.keys(emptyProjection.source_components).sort(),
+      ['feedback','handoff','keyword','knowledge','menu','prompt','runtime','tags']);
+    assert.deepEqual(Object.keys(emptyProjection.knowledge).sort(),
+      ['catalog_revision','catalog_sha256','document_count','enabled_document_count','enabled_library_ids','lexical_sha256','library_count','manifest_sha256','map_sha256','profile_sha256','settings_sha256']);
+    assert.equal(emptyProjection.knowledge.enabled_document_count,0);
+    const emptyProfile=path.join(deploy,'data/runtime/knowledge-profile.json');
+    if(fs.existsSync(emptyProfile)) {
+      const profileValue=JSON.parse(fs.readFileSync(emptyProfile));
+      assert.equal(emptyProjection.knowledge.profile_sha256,sha(emptyProfile));
+      assert.equal(profileValue.fingerprint,digest(canonical(profileValue.profile)));
+    } else assert.equal(emptyProjection.knowledge.profile_sha256,'');
+    assert.equal(emptyProjection.source_components.knowledge,digest(canonical(emptyProjection.knowledge)));
+    assert.equal(emptyProjection.source_sha256,digest(canonical(emptyProjection.source_components)));
+    pass('旧部署经回读建立 schema v2 投影，空知识兼容无 profile 或同代有效 profile 且完整知识身份受保护');
 
     const projectionPath=path.join(deploy,'config/materials-applied.json');
     const stableHash=sha(projectionPath);
@@ -182,6 +251,7 @@ async function main() {
     }]})+'\n',{mode:0o640});
     const failedPrompt='## 等待修复的 Prompt\n';
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),failedPrompt,{mode:0o640});
+    writeProfile();
     embeddingFailures=1;
     result=await invoke(['apply']);
     assert.notEqual(result.code,0);
@@ -198,6 +268,7 @@ async function main() {
     assert.equal(JSON.parse((await invoke(['status'])).stdout).pending,true);
     pass('Prompt 已写外部而知识失败时恢复旧外部状态、旧投影以新代次生效且保留待修原文');
 
+    writeProfile();
     await ok(['apply']);
     const knowledgeApplied=JSON.parse(fs.readFileSync(projectionPath));
     const catalog=JSON.parse(fs.readFileSync(path.join(deploy,'knowledge/catalog.json')));
@@ -205,6 +276,36 @@ async function main() {
     assert.equal(knowledgeApplied.knowledge.document_count,1);assert.notEqual(knowledgeApplied.knowledge.map_sha256,'');
     assert.equal(prompt,failedPrompt);
     pass('重试后直接编辑的登记文档哈希、索引 map 与 Prompt 同代生效');
+
+    const settingsPath=path.join(deploy,'data/runtime/knowledge-settings.json');
+    const profilePath=path.join(deploy,'data/runtime/knowledge-profile.json');
+    const savedIdentity={projection:fs.readFileSync(projectionPath),settings:fs.readFileSync(settingsPath),profile:fs.readFileSync(profilePath)};
+    const identityCases=[
+      ['workspace错配',()=>{
+        const settings=JSON.parse(savedIdentity.settings);settings.workspace_slug='another-synthetic-workspace';
+        fs.writeFileSync(settingsPath,JSON.stringify(settings)+'\n',{mode:0o640});
+        const projection=JSON.parse(savedIdentity.projection);projection.knowledge.settings_sha256=sha(settingsPath);
+        fs.writeFileSync(projectionPath,JSON.stringify(resealProjection(projection))+'\n',{mode:0o640});
+      }],
+      ['profile正文与fingerprint错配',()=>{
+        const profile=JSON.parse(savedIdentity.profile);profile.profile.chunk_size+=1;
+        fs.writeFileSync(profilePath,JSON.stringify(profile)+'\n',{mode:0o640});
+        const projection=JSON.parse(savedIdentity.projection);projection.knowledge.profile_sha256=sha(profilePath);
+        fs.writeFileSync(projectionPath,JSON.stringify(resealProjection(projection))+'\n',{mode:0o640});
+      }],
+    ];
+    for(const [label,mutate] of identityCases) {
+      fs.writeFileSync(projectionPath,savedIdentity.projection,{mode:0o640});
+      fs.writeFileSync(settingsPath,savedIdentity.settings,{mode:0o640});
+      fs.writeFileSync(profilePath,savedIdentity.profile,{mode:0o640});
+      mutate();
+      result=await invoke(['validate']);assert.notEqual(result.code,0,label+' 的候选校验不得通过');
+      result=await invokeReadback();assert.notEqual(result.code,0,label+' 的容器回读不得通过');
+    }
+    fs.writeFileSync(projectionPath,savedIdentity.projection,{mode:0o640});
+    fs.writeFileSync(settingsPath,savedIdentity.settings,{mode:0o640});
+    fs.writeFileSync(profilePath,savedIdentity.profile,{mode:0o640});
+    pass('候选与容器回读均拒绝 workspace 错配及 profile 正文/fingerprint 错配，即使外层哈希已重封');
 
     const orphan=path.join(sourceDir,'doc_3333333333333333.txt');
     fs.writeFileSync(orphan,'未登记孤儿\n',{mode:0o640});
@@ -220,11 +321,25 @@ async function main() {
     await ok(['apply']);
     const configApplied=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(configApplied.configuration.runtime.enabled,false);
+    assert.equal(configApplied.configuration.runtime.disable_epoch,1,
+      '首次成功应用 true→false 必须递增受管停用代次');
     assert.deepEqual({promptUpdates,embeddingUpdates},beforeRequests);
     assert.equal(configApplied.configuration.runtime.revision,configApplied.revision);
     assert.equal(configApplied.configuration.runtime.applied_revision,configApplied.revision);
     assert.equal(JSON.parse(fs.readFileSync(runtimePath)).enabled,false);
+    assert.equal(JSON.parse(fs.readFileSync(runtimePath)).disable_epoch,1);
     pass('合法 YAML runtime 可初始化和应用，配置快路径规范写回且不触发付费模型、Prompt或知识重建');
+
+    const disabledRevision=configApplied.revision;
+    const enableRuntime=JSON.parse(fs.readFileSync(runtimePath));enableRuntime.enabled=true;
+    fs.writeFileSync(runtimePath,JSON.stringify(enableRuntime)+'\n',{mode:0o640});
+    await ok(['apply']);
+    const reenabled=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(reenabled.configuration.runtime.enabled,true);
+    assert.equal(reenabled.configuration.runtime.disable_epoch,1,
+      '重新启用和其它配置应用不得再次递增停用代次');
+    assert(reenabled.revision>disabledRevision);
+    pass('客服停用代次只在成功停用边界递增，重新启用保持同一代次');
 
     const beforeForced={promptUpdates,workspaceReads};
     prompt='## WebUI 漂移的虚构 Prompt\n';

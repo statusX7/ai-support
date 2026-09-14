@@ -269,6 +269,10 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
     done
     knowledge_snapshot_modules_check "$PAYLOAD"
   fi
+  if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.2.2; then
+    [[ -f "${PAYLOAD}/scripts/visitor-output.js" && ! -L "${PAYLOAD}/scripts/visitor-output.js" ]] \
+      || die '访客输出策略快照缺少必要文件：scripts/visitor-output.js'
+  fi
   if [[ -e "${PAYLOAD}/config/provider-pool-applied.json" ]]; then
     python3 "${SCRIPT_DIR}/provider-pool.py" --deploy-dir "$PAYLOAD" list >/dev/null \
       || die '快照接口池与秘密代次不完整，未修改部署'
@@ -326,7 +330,7 @@ done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
 validate_optional_version_file "${PAYLOAD}/data/knowledge-projection.json" "${DEPLOY_DIR}/data/knowledge-projection.json" data/knowledge-projection.json
-for module in materials.sh logs.sh log-redact.py provider-adapter.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
+for module in materials.sh logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
 done
@@ -423,7 +427,7 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py provider-adapter.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
+for module in materials.sh logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   module_mode=0750
   case "$module" in *.js|*.py) module_mode=0640 ;; esac

@@ -8,7 +8,7 @@ const MAX_INDEX_BYTES = 16 * 1024 * 1024;
 const MAX_PASSAGE_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_SYNONYM_BYTES = 4096;
-const ALGORITHM = 'crispai-lexical-v1';
+const ALGORITHM = 'crispai-lexical-v2';
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
@@ -53,7 +53,7 @@ function checkedIndex(input, mapRaw) {
       index=JSON.parse(raw);
     }
   } catch (_) {unavailable('index_invalid');}
-  if(!record(index)||index.schema_version!==1||index.algorithm!==ALGORITHM||!digest(index.map_sha256)
+  if(!record(index)||index.schema_version!==2||index.algorithm!==ALGORITHM||!digest(index.map_sha256)
     ||!digest(index.payload_sha256)||typeof index.complete!=='boolean'||!record(index.coverage)||!Array.isArray(index.passages)) unavailable('index_invalid');
   const {payload_sha256:expected,...payload}=index;
   let actual;
@@ -64,18 +64,32 @@ function checkedIndex(input, mapRaw) {
   const coverage=index.coverage;
   if(!['source_documents','indexed_documents','omitted_documents','source_bytes','indexed_bytes','omitted_bytes'].every(key=>integer(coverage[key]))
     ||coverage.source_documents!==documents.size||coverage.indexed_documents+coverage.omitted_documents!==coverage.source_documents
-    ||coverage.indexed_bytes+coverage.omitted_bytes!==coverage.source_bytes||index.complete!==(coverage.omitted_bytes===0)
-    ||!Array.isArray(coverage.reasons)||coverage.reasons.some(reason=>!['index_capacity','passage_too_large'].includes(reason))) unavailable('index_invalid');
+    ||coverage.indexed_bytes+coverage.omitted_bytes!==coverage.source_bytes
+    ||index.complete!==(coverage.omitted_bytes===0&&coverage.omitted_documents===0)
+    ||!Array.isArray(coverage.reasons)||coverage.reasons.some(reason=>!['empty_source','index_capacity','passage_too_large'].includes(reason))) unavailable('index_invalid');
   let indexedBytes=0;
   const seen=new Set(), positions=new Map(), identities=new Map();
   for(const passage of index.passages) {
     const source=record(passage) && documents.get(passage.location);
+    const answerFields=['answer_start_byte','answer_end_byte','answer_sha256'];
+    const answerPresence=answerFields.map(key=>Object.hasOwn(passage,key));
     if(!source||!['library_id','document_id','projection','location'].every(key=>passage[key]===source[key])
       ||!text(passage.text,MAX_PASSAGE_BYTES,true)||!text(passage.question,MAX_PASSAGE_BYTES,true)
       ||!digest(passage.text_sha256)||hash(passage.text)!==passage.text_sha256
       ||!digest(passage.parsed_sha256)||!digest(passage.content_sha256)
       ||!integer(passage.start_byte)||!integer(passage.end_byte)||passage.end_byte<=passage.start_byte||passage.end_byte-passage.start_byte!==Buffer.byteLength(passage.text)
-      ||passage.start_byte<(positions.get(passage.location)||0)) unavailable('passage_invalid');
+      ||passage.start_byte<(positions.get(passage.location)||0)
+      ||answerPresence.some(Boolean)&&!answerPresence.every(Boolean)) unavailable('passage_invalid');
+    if(answerPresence.every(Boolean)) {
+      const body=Buffer.from(passage.text,'utf8');
+      const begin=passage.answer_start_byte-passage.start_byte;
+      const end=passage.answer_end_byte-passage.start_byte;
+      const answer=body.subarray(begin,end), answerText=answer.toString('utf8');
+      if(!integer(passage.answer_start_byte)||!integer(passage.answer_end_byte)
+        ||begin<0||end<=begin||end>body.length||!digest(passage.answer_sha256)
+        ||hash(answer)!==passage.answer_sha256||!text(answerText,MAX_PASSAGE_BYTES)
+        ||!Buffer.from(answerText,'utf8').equals(answer)) unavailable('passage_invalid');
+    }
     const identity={};
     for(const key of ['library_id','document_id','location','start_byte','end_byte','text_sha256']) identity[key]=passage[key];
     if(passage.id!=='lexical-'+hash(canonical(identity))||seen.has(passage.id)) unavailable('passage_invalid');
@@ -91,11 +105,16 @@ function checkedIndex(input, mapRaw) {
 function normalize(value) {
   return value.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{S}\s\p{Cf}]+/gu,'');
 }
+function strictQuestionKey(value) {
+  // 精确 FAQ 可以忽略大小写、首尾空白和末尾问号，但不能抹掉正文中的
+  // 运算符、版本点号等语义符号；例如 A+B 与 AB、1.2 与 12 不是同一问。
+  return value.normalize('NFKC').toLowerCase().trim().replace(/[?]+\s*$/u,'').trimEnd();
+}
 function managedQuestion(value) {
   // 这里只剥离一段完整、锚定的礼貌范围说明；它不是管理员身份或授权标记。
   // 任意访客也可能输入相同文字，因此引用、否定或复合问句不能因为正文中
   // 碰巧包含一条 FAQ 原问就跳过向量检索。
-  const matched=value.normalize('NFKC').match(/^\s*请根据现有知识库回答\s*:\s*([\s\S]*?)\s*$/u);
+  const matched=value.normalize('NFKC').match(/^\s*请根据现有知识库回答\s*[:：]\s*([\s\S]*?)\s*$/u);
   return matched?matched[1]:'';
 }
 const CHINESE_COMMON=/请问|告诉我|帮帮我|帮我|怎么办|怎么|如何|什么|哪个|是否|可以|需要|知道|一下|我要|咨询|问题|方法|使用|操作|为什么|谢谢|请|的|是|吗|呢|了/gu;
@@ -114,10 +133,8 @@ function tokens(value) {
 
 // 这是一组有界、与具体知识正文无关的紧义中文概念，只用于 FAQ 词法兜底。
 // 它不改变索引、映射或启停校验，也不把该分支提升为可跳过向量的 strong 命中。
-const INVOICE_TERMS=['开具发票','发票开具','开发票','开票','发票'];
 const CHINESE_CONCEPTS=[
   ['capability',['是否支持','是否可以','可不可以','能不能','不支持','不允许','不能','支持','提供','可以','能够','能否','可否','允许','能']],
-  ['invoice',INVOICE_TERMS],
   ['credential',['票据','凭证','凭条']],
   ['storage',['临时保管','寄存','存放','保管','暂存']],
   ['luggage',['行李箱','旅行箱','箱包','箱件','箱子','行李','箱']],
@@ -181,37 +198,12 @@ function semanticProfile(value) {
 }
 const POLITE_QUESTION_PREFIX=/^(?:你好|您好|嗨|麻烦(?:你|您)?|劳驾|打扰(?:一下)?|不好意思|请问|想请问|请教(?:一下)?)$/u;
 const INTENT_QUESTION_PREFIX=/^(?:我|我们)(?:也|还)?(?:想|希望|需要)(?:(?:知道|了解|咨询)(?:一下|下)?|(?:向|跟)(?:您|你)(?:咨询|了解)(?:一下|下)?)$/u;
-const COMPLEMENT_MODIFIER='(?:也|还|只|要|现在|目前|这次|就是|确实|真的)';
-const COMPLEMENT_INTENT='(?:想要|想|希望|需要|要)';
-const COMPLEMENT_INVOICE_PREFIX=new RegExp('^(?:我|我们)(?:(?:'+COMPLEMENT_MODIFIER+')?'+COMPLEMENT_INTENT
-  +'|'+COMPLEMENT_INTENT+'(?:'+COMPLEMENT_MODIFIER+')?)('+INVOICE_TERMS.join('|')+')$','u');
-const COMPLEMENT_SITE_REFERENCE=/^(?:本站|平台|这边|这里|店里)/u;
-function exhaustCapabilityClause(value) {
-  let residual=value.normalize('NFKC').replace(/\p{Cf}/gu,'');
-  const capability=CHINESE_CONCEPTS.find(concept=>concept.name==='capability');
-  for(const term of capability.terms) residual=term==='能'?stripModalNeng(residual).value:residual.split(term).join(' ');
-  residual=residual.replace(/是不是|办理|服务|业务|事项|功能|吗|呢|么|吧|呀|啊|嘛/gu,' ')
-    .replace(/[\s?？!！。]+/gu,'');
-  return residual.length===0;
-}
 function safeCommaQuestion(value) {
   const parts=value.split(/[,，]/u);
   if(parts.length!==2) return null;
   const prefix=(parts[0]||'').replace(/\s+/gu,'');
   if(POLITE_QUESTION_PREFIX.test(prefix)||INTENT_QUESTION_PREFIX.test(prefix)) return {kind:'empty_prefix',body:parts[1]};
-  const complement=prefix.match(COMPLEMENT_INVOICE_PREFIX);
-  if(!complement
-    ||(value.match(/[?？]/gu)||[]).length!==1||!/[?？]\s*$/u.test(value)) return null;
-  const rightClause=parts[1].trimStart(),siteReference=rightClause.match(COMPLEMENT_SITE_REFERENCE);
-  const cleanedRight=siteReference?rightClause.slice(siteReference[0].length):rightClause;
-  const left=semanticProfile(parts[0]),right=semanticProfile(cleanedRight);
-  const leftSubstantive=[...left.concepts.keys()].filter(name=>name!=='capability');
-  const rightSubstantive=[...right.concepts.keys()].filter(name=>name!=='capability');
-  if(leftSubstantive.length!==1||leftSubstantive[0]!=='invoice'||left.concepts.has('capability')
-    ||rightSubstantive.length!==0||!right.concepts.has('capability')||right.anchors.size!==0
-    ||!exhaustCapabilityClause(cleanedRight)) return null;
-  // 丢弃的仅是上面已完整约束的语法前缀；invoice 业务概念和能力问句均保留。
-  return {kind:'complementary',body:complement[1]+' '+cleanedRight};
+  return null;
 }
 function unsafeApproximateContent(normalized) {
   if(/[`'"<>\p{Ps}\p{Pe}\p{Pi}\p{Pf}]/u.test(normalized)
@@ -282,14 +274,41 @@ function safeCandidateStructure(value) {
   return (homogeneous||elliptical)&&sameQuestionNumbers(parts[0],parts[1]);
 }
 
+function exactFaq(checked,query) {
+  const managed=managedQuestion(query);
+  const target=strictQuestionKey(managed||query);
+  if(!target) return {status:'none'};
+  const matched=checked.passages.filter(passage=>passage.question&&strictQuestionKey(passage.question)===target);
+  if(!matched.length) return {status:'none'};
+  if(!checked.complete) return {status:'incomplete'};
+  const answers=[];
+  for(const passage of matched) {
+    if(!Object.hasOwn(passage,'answer_start_byte')||!Object.hasOwn(passage,'answer_end_byte')
+      ||!Object.hasOwn(passage,'answer_sha256')) return {status:'incomplete'};
+    const body=Buffer.from(passage.text,'utf8');
+    const answer=body.subarray(passage.answer_start_byte-passage.start_byte,
+      passage.answer_end_byte-passage.start_byte).toString('utf8');
+    answers.push({answer,sha256:passage.answer_sha256,passage});
+  }
+  const hashes=new Set(answers.map(item=>item.sha256));
+  if(hashes.size!==1) return {status:'conflict',sources:answers.slice(0,8).map(item=>({
+    id:item.passage.id,title:item.passage.projection,docpath:item.passage.location,
+    library_id:item.passage.library_id,document_id:item.passage.document_id,
+  }))};
+  return {status:'unique',answer_text:answers[0].answer,answer_sha256:answers[0].sha256,
+    sources:answers.slice(0,8).map(item=>({id:item.passage.id,title:item.passage.projection,
+      docpath:item.passage.location,library_id:item.passage.library_id,document_id:item.passage.document_id}))};
+}
+
 function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RESULT_BYTES}={}) {
   if(!text(query,40000)||!Number.isInteger(maxResults)||maxResults<1||maxResults>4
     ||!Number.isInteger(maxBytes)||maxBytes<1||maxBytes>MAX_RESULT_BYTES) unavailable('query_invalid');
   const checked=checkedIndex(index,mapRaw), queryTokens=tokens(query);
   const minimum=queryTokens.chinese?3:2;
-  const base={results:[],complete:checked.complete,coverage:checked.coverage};
+  const base={results:[],complete:checked.complete,coverage:checked.coverage,faq_exact:exactFaq(checked,query)};
   if(queryTokens.found.size<minimum||queryTokens.found.size>512) return base;
   const normalized=normalize(query),managedRaw=managedQuestion(query),managed=managedRaw?normalize(managedRaw):'';
+  const strictQuery=strictQuestionKey(query),strictManaged=managedRaw?strictQuestionKey(managedRaw):'';
   const synonymSafe=text(query,MAX_SYNONYM_BYTES)&&safeCandidateStructure(query);
   const approximateSafe=synonymSafe;
   const commaQuestion=safeCommaQuestion(query.normalize('NFKC').replace(/\p{Cf}/gu,''));
@@ -318,9 +337,9 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
       &&sameQuestionNumbers(query,item.surface)&&qualifierCompatible(querySemantic,item.semantic);
     let kind, priority,semanticRank=0;
     if(passage.question&&safeCandidateStructure(query)&&safeCandidateStructure(passage.question)
-      &&surface===normalized&&matched.length===queryTokens.found.size) {kind='exact_question'; priority=3;}
+      &&strictQuestionKey(passage.question)===strictQuery&&matched.length===queryTokens.found.size) {kind='exact_question'; priority=3;}
     // 固定礼貌范围说明不应稀释完整具体 FAQ；仍保留词项和全问数字约束。
-    else if(passage.question && surface.length>=6 && managed===surface
+    else if(passage.question && surface.length>=6 && strictManaged===strictQuestionKey(passage.question)
       &&safeCandidateStructure(managedRaw)&&safeCandidateStructure(passage.question)
       && item.features.size>=(/\p{Script=Han}/u.test(passage.question)?3:2)
       && [...item.features].every(token=>queryTokens.found.has(token))) {kind='exact_question'; priority=3;}
@@ -335,10 +354,7 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
       const {substantive,required}=semanticRule;
       const candidateSubstantive=[...item.semantic.concepts.keys()].filter(name=>name!=='capability');
       const anchors=[...querySemantic.anchors].filter(token=>item.semantic.anchors.has(token));
-      const explicitAnchorless=querySemantic.anchors.size===0&&item.semantic.anchors.size===0
-        &&substantive.length===1&&candidateSubstantive.length===1
-        &&substantive[0]==='invoice'&&candidateSubstantive[0]===substantive[0];
-      if(required.some(name=>!item.semantic.concepts.has(name))||(!explicitAnchorless&&anchors.length<1)
+      if(required.some(name=>!item.semantic.concepts.has(name))||anchors.length<1
         ||!shared.some(name=>actualSynonym(querySemantic,item.semantic,name))) continue;
       kind='synonym_overlap'; priority=.5; semanticRank=shared.length+Math.min(anchors.length,8)/10;
     }

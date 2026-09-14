@@ -560,7 +560,7 @@ doctor_system_check() {
 }
 
 doctor_files_and_config_check() {
-  local start relative missing='' invalid='' env_mode runtime_mode secret_count=0 value launcher_path launcher_digest expected_digest backup_count=0
+  local start relative missing='' invalid='' env_mode runtime_mode secret_count=0 value launcher_path launcher_digest expected_digest backup_count=0 installed_version
   local website tier hook_mode hook_secret identifier token auth expected_auth
   local runtime_config menu_config handoff_config
   local business_runtime_config business_menu_config business_handoff_config business_source business_projection_rc=0
@@ -582,6 +582,15 @@ doctor_files_and_config_check() {
     || version_at_least "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)" v1.2.1; then
     DOCTOR_POOL_ENABLED=1
     required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
+  fi
+  DOCTOR_VISITOR_OUTPUT_ENABLED=0
+  installed_version=$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)
+  if version_at_least "$installed_version" v1.2.2 \
+    || [[ -e "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" \
+      || -L "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" ]] \
+    || grep -Fq '/scripts/visitor-output.js' "${DOCTOR_DEPLOY_DIR}/docker-compose.yml" 2>/dev/null; then
+    DOCTOR_VISITOR_OUTPUT_ENABLED=1
+    required+=(scripts/visitor-output.js)
   fi
   start=$(doctor_now_ms)
   for relative in "${required[@]}"; do
@@ -832,6 +841,14 @@ doctor_file_bindings_check() {
   doctor_container_file_binding provider.adapter_code_binding 'Provider adapter 程序运行代' \
     provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-adapter.js" \
     /opt/crisp-ai/scripts/provider-adapter.js CRISPAI_EXPECTED_FILE_BINDING_PROVIDER
+  if (( DOCTOR_VISITOR_OUTPUT_ENABLED )); then
+    doctor_container_file_binding provider.visitor_output_code_binding '访客输出策略运行代' \
+      provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" \
+      /opt/crisp-ai/scripts/visitor-output.js CRISPAI_EXPECTED_FILE_BINDING_VISITOR_OUTPUT
+  else
+    doctor_skip provider.visitor_output_code_binding '访客输出策略运行代' \
+      '当前程序版本不包含独立访客输出策略模块' docker
+  fi
   if (( DOCTOR_POOL_ENABLED )); then
     doctor_container_file_binding provider.router_code_binding '主备路由程序运行代' \
       provider-adapter "${DOCTOR_DEPLOY_DIR}/scripts/provider-router.js" \
@@ -1194,6 +1211,8 @@ def checked_profile(module, applied):
     if (root / "data/runtime/knowledge-migration.json").exists() or (root / "data/runtime/knowledge-migration.json").is_symlink():
         return {"status": "FAIL", "summary": "知识迁移尚未完成或恢复，自动回复必须保持受阻止"}
     if current is None:
+        if applied.get("schema_version") == 2 and applied.get("knowledge", {}).get("enabled_document_count") == 0 and expected == "":
+            return {"status": "PASS", "summary": "当前没有启用知识文档，不要求知识索引代次文件；未执行模型请求"}
         legacy = expected == "" and not manifest.get("embedding_profile") and all(
             isinstance(item, dict) and not item.get("embedding_profile") and not item.get("cache_bindings")
             for item in manifest["files"].values())
@@ -1258,7 +1277,7 @@ try:
     applied, _ = read("config/materials-applied.json", 16777216, optional=True)
     if applied is None:
         result = {name: {"status": "WARN", "summary": "旧实例尚无有效资料投影，知识运行代次未确认"} for name in result}
-    elif not isinstance(applied, dict) or applied.get("schema_version") != 1 or applied.get("state") != "applied":
+    elif not isinstance(applied, dict) or applied.get("schema_version") != 2 or applied.get("state") != "applied":
         result = {name: {"status": "FAIL", "summary": "资料应用尚未完成，知识运行代次不能判为可用"} for name in result}
     else:
         for name, check in (("settings", lambda: checked_settings(applied)), ("profile", None)):
@@ -1344,7 +1363,7 @@ doctor_knowledge_lexical_check() {
     return
   fi
   if [[ ! -f "$projection" || -L "$projection" ]] \
-    || ! jq -e '.schema_version == 1 and .state == "applied"' "$projection" >/dev/null 2>&1; then
+    || ! jq -e '.schema_version == 2 and .state == "applied"' "$projection" >/dev/null 2>&1; then
     doctor_add knowledge.lexical '知识词法补召回' FAIL critical '资料应用尚未完成，词法索引不能判为可用' filesystem '完成当前受管知识应用或恢复；不要删除原资料' "$start"
     return
   fi
@@ -1409,10 +1428,11 @@ doctor_n8n_check() {
   fi
   # shellcheck disable=SC2016
   if (( DOCTOR_N8N_READY )) && doctor_compose_timeout 25 exec -T n8n sh -ec '
+    [ "${N8N_RUNNERS_MAX_CONCURRENCY:-}" = 10 ] || exit 1
     output=$(mktemp /tmp/crispai-doctor-workflow.XXXXXX)
     trap '\''rm -f "$output"'\'' EXIT
     timeout 20 n8n export:workflow --id="$1" --output="$output" >/dev/null 2>&1
-    node - "$output" "$1" "$2" "$3" /opt/crisp-ai/n8n/runtime.js /opt/crisp-ai/n8n/knowledge-lexical.js "$4" <<'\''NODE'\''
+    node - "$output" "$1" "$2" "$3" /opt/crisp-ai/n8n/runtime.js /opt/crisp-ai/n8n/knowledge-lexical.js /opt/crisp-ai/scripts/visitor-output.js "$4" "$5" <<'\''NODE'\''
 const fs=require("fs"),crypto=require("crypto");
 const raw=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
 const workflow=Array.isArray(raw)?raw[0]:raw;
@@ -1424,13 +1444,20 @@ const scanner=nodes.find(node=>String(node.type).includes("code") && String(node
 const scheduleTargets=(workflow.connections?.[schedule?.name]?.main||[]).flat().map(connection=>connection.node);
 const runtimeFile=fs.readFileSync(process.argv[6],"utf8");
 const lexicalFile=fs.readFileSync(process.argv[7],"utf8");
+const visitorOutputFile=fs.readFileSync(process.argv[8],"utf8");
 const lexicalSource=lexicalFile.replace(/^module\.exports[^\n]+\n?$/m,"");
-const runtimeSource=runtimeFile.replace(/^const \{ searchKnowledgeLexical \} = require\('\''\.\/knowledge-lexical\.js'\''\);\n?/m,"")
+const visitorOutputSource=visitorOutputFile.replace(/^\x27use strict\x27;\n?/m,"")
+  .replace(/^module\.exports[^\n]+\n?$/m,"");
+const runtimeSource=runtimeFile.replace(/^const \{\s*searchKnowledgeLexical\s*\} = require\('\''\.\/knowledge-lexical\.js'\''\);\r?\n/m,"")
+  .replace(/^const \{\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\''\.\.\/scripts\/visitor-output\.js'\''\);\r?\n/m,"")
   .replace(/^if \(typeof module[^\n]+\n?$/m,"");
-const source=(lexicalSource+"\n"+runtimeSource).replace(/ai_support_version: '\''v[^'\'']+'\''/g,"ai_support_version: '\''"+process.argv[4]+"'\''");
+if (/require\(["'\''](?:\.\/knowledge-lexical\.js|\.\.\/scripts\/visitor-output\.js)["'\'']\)/.test(runtimeSource)) process.exit(1);
+const source=(lexicalSource+"\n"+visitorOutputSource+"\n"+runtimeSource)
+  .replace(/ai_support_version: '\''v[^'\'']+'\''/g,"ai_support_version: '\''"+process.argv[4]+"'\''");
 const sourceHash=crypto.createHash("sha256").update(source).digest("hex");
 const fileHash=crypto.createHash("sha256").update(runtimeFile).digest("hex");
 const lexicalHash=crypto.createHash("sha256").update(lexicalFile).digest("hex");
+const visitorOutputHash=crypto.createHash("sha256").update(visitorOutputFile).digest("hex");
 const runtimePrefix=source+"\nconst runtime = createRuntime($env);\n";
 const runtimeNodeNames=["校验并持久接收","处理持久任务","扫描持久会话与任务","只读公开显示选项"];
 const runtimeNodesMatch=runtimeNodeNames.every(name=>{
@@ -1440,25 +1467,28 @@ const runtimeNodesMatch=runtimeNodeNames.every(name=>{
 if (workflow.id!==process.argv[3] || workflow.active!==true || !types.some(type=>type.endsWith(".webhook")) ||
     !schedule || !scanner || !scheduleTargets.includes(scanner.name) || !code.includes("runtime.receive") ||
     !code.includes("runtime.process") || !code.includes("runtime.scan") ||
-    workflow.meta?.aiSupportVersion!==process.argv[4] || workflow.meta?.runtimeFileSha256!==fileHash ||
+    workflow.meta?.aiSupportVersion!==process.argv[4] || workflow.meta?.n8nRunnerConcurrency!==10 ||
+    workflow.meta?.backgroundProcessingPermits!==8 || workflow.meta?.ordinaryProcessingPermits!==7 || workflow.meta?.runtimeFileSha256!==fileHash ||
     workflow.meta?.runtimeFileSha256!==process.argv[5] || workflow.meta?.runtimeSha256!==sourceHash ||
-    workflow.meta?.lexicalFileSha256!==lexicalHash || workflow.meta?.lexicalFileSha256!==process.argv[8] ||
+    workflow.meta?.lexicalFileSha256!==lexicalHash || workflow.meta?.lexicalFileSha256!==process.argv[9] ||
+    workflow.meta?.visitorOutputFileSha256!==visitorOutputHash || workflow.meta?.visitorOutputFileSha256!==process.argv[10] ||
     !runtimeNodesMatch) process.exit(1);
 process.stdout.write("verified\n");
 NODE
   ' sh "$WORKFLOW_ID" "$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION")" \
     "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/runtime.js" | cut -d ' ' -f 1)" \
     "$(sha256sum "${DOCTOR_DEPLOY_DIR}/n8n/knowledge-lexical.js" | cut -d ' ' -f 1)" \
+    "$(sha256sum "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" | cut -d ' ' -f 1)" \
     < /dev/null > "$workflow_output" 2>/dev/null \
     && grep -Fxq verified "$workflow_output"; then
-    doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，运行时及词法内联代码与当前挂载摘要一致' docker '' "$start"
+    doctor_add n8n.workflow 'n8n 生产工作流' PASS critical '目标 workflow 已激活，runner 并发预留、运行时及词法内联代码与当前挂载摘要一致' docker '' "$start"
   else
     if ! doctor_remaining >/dev/null 2>&1; then
       doctor_deadline_add n8n.workflow 'n8n 生产工作流' docker "$start"
       doctor_skip n8n.runtime 'n8n Code runner' '因自检总截止时间已到未检查' local-api
       return
     fi
-    doctor_add n8n.workflow 'n8n 生产工作流' FAIL critical '目标 workflow 未激活、版本偏离或无法导出验证' docker '从受管安装/更新流程重新导入并发布目标 workflow' "$start"
+    doctor_add n8n.workflow 'n8n 生产工作流' FAIL critical '目标 workflow 未激活、runner 并发不是 10、版本偏离或无法导出验证' docker '从受管安装/更新流程重新创建 n8n 并导入发布目标 workflow' "$start"
   fi
   start=$(doctor_now_ms)
   if ! doctor_remaining >/dev/null 2>&1; then
@@ -1518,6 +1548,7 @@ doctor_n8n_execution_backlog_check() {
             count(*) FILTER (WHERE COALESCE(\"startedAt\", \"createdAt\") < CURRENT_TIMESTAMP - INTERVAL '\''10 minutes'\'')
           FROM execution_entity
           WHERE \"workflowId\" = '\''${workflow_id}'\''
+            AND \"deletedAt\" IS NULL
             AND status IN ('\''new'\'', '\''running'\'', '\''waiting'\'');"
       ' > "$output" 2>/dev/null || rc=$?
   if (( rc != 0 )) || ! IFS='|' read -r active older_two older_ten < "$output" \
@@ -1924,6 +1955,8 @@ doctor_adapter_check() {
 doctor_runtime_state_check() {
   local start now sessions invalid legacy human timed permanent active_workers stale_workers pending_jobs file counts deadline_reached=0
   local feedback_pending=0 feedback_count=0
+  local responsibility_pending=0 unresolved_jobs=0 intentional_silence=0 unknown_deliveries=0
+  local oldest_unresolved=0 oldest_unknown=0 pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown
   start=$(doctor_now_ms)
   now=$(doctor_now_ms)
   sessions=0; invalid=0; legacy=0; human=0; timed=0; permanent=0; active_workers=0; stale_workers=0; pending_jobs=0
@@ -1959,12 +1992,26 @@ doctor_runtime_state_check() {
        ([.jobs[]? | select(.status != "done" and .status != "cancelled" and .status != "failed") |
           select(.plan.feedback_retired != true) |
           select(.plan.feedback_event != null or ([.plan.kind,.plan.purpose,.plan.action,.plan.type] |
-            any(. == "feedback" or (type == "string" and startswith("feedback_")))))]|length))
+            any(. == "feedback" or (type == "string" and startswith("feedback_")))))]|length)),
+      ([.jobs[]? | select((.status == "received" or .status == "processing") and
+        ((.responsibility_status // "pending") == "pending" or .responsibility_status == "unresolved_failure"))] | length),
+      ([.jobs[]? | select(.responsibility_status == "unresolved_failure")] | length),
+      ([.jobs[]? | select(.responsibility_status == "intentional_silence")] | length),
+      ([.outgoing[]? | select(.status == "unknown" or .status == "sending")] | length),
+      ([.jobs[]? | select(.responsibility_status == "unresolved_failure") | (.failure_since // .received_at // 0)] | min // 0),
+      ([.outgoing[]? | select(.status == "unknown" or .status == "sending") | (.created_at // 0)] | min // 0)
     ] | @tsv' "$file")
-    read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count <<< "$counts"
+    read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count \
+      pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown <<< "$counts"
     human=$((human+human_count)); timed=$((timed+timed_count)); permanent=$((permanent+permanent_count))
     active_workers=$((active_workers+active_count)); stale_workers=$((stale_workers+stale_count)); pending_jobs=$((pending_jobs+job_count))
     feedback_pending=$((feedback_pending+feedback_count))
+    responsibility_pending=$((responsibility_pending+pending_count))
+    unresolved_jobs=$((unresolved_jobs+unresolved_count))
+    intentional_silence=$((intentional_silence+silence_count))
+    unknown_deliveries=$((unknown_deliveries+unknown_count))
+    if (( file_oldest_unresolved > 0 && (oldest_unresolved == 0 || file_oldest_unresolved < oldest_unresolved) )); then oldest_unresolved=$file_oldest_unresolved; fi
+    if (( file_oldest_unknown > 0 && (oldest_unknown == 0 || file_oldest_unknown < oldest_unknown) )); then oldest_unknown=$file_oldest_unknown; fi
   done
   shopt -u nullglob
   if (( deadline_reached )); then
@@ -1979,6 +2026,22 @@ doctor_runtime_state_check() {
     doctor_add runtime.state '会话状态' PASS critical "会话 ${sessions}；人工 ${human}（定时 ${timed} / 永久 ${permanent}）；活跃 worker ${active_workers}；待处理 ${pending_jobs}" filesystem '' "$start"
   fi
   if (( deadline_reached || invalid > 0 )); then
+    doctor_add runtime.answer_responsibilities '应答责任' WARN critical \
+      '会话状态未完整读取，不能断言所有访客问题均已有结果或明确静默原因' filesystem \
+      '先修复会话状态读取；自检不会删除、重放或改写客户任务' "$start"
+  elif (( unresolved_jobs > 0 || (oldest_unknown > 0 && now - oldest_unknown > 300000) )); then
+    doctor_add runtime.answer_responsibilities '应答责任' FAIL critical \
+      "未完成故障 ${unresolved_jobs}；待处理/处理中 ${responsibility_pending}；未知发送 ${unknown_deliveries}；明确政策静默 ${intentional_silence}" filesystem \
+      '查看最老未完成责任、Provider/Crisp 状态和补偿水位；不要清空任务或解除人工来消除告警' "$start"
+  elif (( responsibility_pending > 0 || unknown_deliveries > 0 )); then
+    doctor_add runtime.answer_responsibilities '应答责任' WARN critical \
+      "待处理/处理中 ${responsibility_pending}；未知发送 ${unknown_deliveries}；明确政策静默 ${intentional_silence}" filesystem \
+      '短时处理属于正常；若持续超过五分钟，请检查调度、Provider 与 Crisp 发送对账' "$start"
+  else
+    doctor_add runtime.answer_responsibilities '应答责任' PASS critical \
+      "当前无未完成故障或未知发送；明确政策静默 ${intentional_silence}" filesystem '' "$start"
+  fi
+  if (( deadline_reached || invalid > 0 )); then
     doctor_add runtime.feedback '自动评价邀请' WARN warning '会话扫描未完整完成，未对未检查的旧评价状态作成功判断' filesystem '修复上述会话检查问题后重试；自检不会删除任何任务' "$start"
   elif (( feedback_pending > 0 )); then
     doctor_add runtime.feedback '自动评价邀请' WARN warning "发现 ${feedback_pending} 项旧评价上下文；新运行时禁止派发，等待正常扫描精确退役" filesystem '检查五秒扫描心跳；保留历史反馈及人工按钮，自检不会清空状态' "$start"
@@ -1989,10 +2052,335 @@ doctor_runtime_state_check() {
   fi
 }
 
+# 普通长任务与控制任务共用跨 Code execution 的后台执行许可，
+# 只读自检必须验证许可目录本身；否则坏 slot 会让任务永久回到
+# received，而容器/工作流检查仍可能全绿。
+# repair=1 只由显式 --fix 在 n8n 停写窗口调用，且只移除结构完整、已经过期的
+# 许可；活动许可、不安全成员和无法证明归属的内容一律保留。
+doctor_runtime_permits_inspect() {
+  local repair=${1:-0}
+  doctor_timeout 8 python3 -B - "$DOCTOR_DEPLOY_DIR" "$repair" <<'PY'
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import sys
+import time
+
+deploy = Path(sys.argv[1])
+repair = sys.argv[2] == "1"
+runtime_dir = deploy / "data" / "runtime"
+permit_root = runtime_dir / "ordinary-processing-permits"
+capacity = 8
+ordinary_capacity = 7
+lease_ms = 60_000
+slot_pattern = re.compile(r"^slot-([0-7])$")
+stale_pattern = re.compile(r"^\.stale-slot-([0-7])-[a-f0-9]{32}$")
+token_pattern = re.compile(r"^[a-f0-9]{32}$")
+
+
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def restricted_directory(info, expected_uid):
+    return (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and stat.S_IMODE(info.st_mode) == 0o700 and info.st_uid == expected_uid)
+
+
+def restricted_file(info, expected_uid):
+    return (stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600
+            and info.st_uid == expected_uid and info.st_size <= 4096)
+
+
+def public_stat(info):
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def snapshot(path, slot, expected_uid):
+    try:
+        directory = os.lstat(path)
+        if not restricted_directory(directory, expected_uid):
+            return {"unsafe": True}
+        names = sorted(os.listdir(path))
+        if len(names) > 2 or any(name not in ("heartbeat.json", "owner.json") for name in names):
+            return {"unsafe": True}
+        members = {}
+        values = {}
+        for name in names:
+            member_path = path / name
+            info = os.lstat(member_path)
+            if not restricted_file(info, expected_uid):
+                return {"unsafe": True}
+            members[name] = public_stat(info)
+            with open(member_path, "r", encoding="utf-8") as stream:
+                values[name] = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return {"unsafe": True}
+
+    result = {
+        "unsafe": False,
+        "directory": (directory.st_dev, directory.st_ino, directory.st_mtime_ns),
+        "names": names,
+        "members": members,
+        "partial": len(names) != 2,
+    }
+    file_activity_expires = (max([directory.st_mtime_ns / 1_000_000]
+                                 + [value[2] / 1_000_000 for value in members.values()])
+                             + lease_ms)
+    if result["partial"]:
+        owner = values.get("owner.json")
+        heartbeat = values.get("heartbeat.json")
+        if owner is not None:
+            if not (isinstance(owner, dict) and owner.get("schema_version") == 1
+                    and owner.get("slot") == slot and token_pattern.fullmatch(owner.get("token", ""))
+                    and owner.get("kind") in ("ordinary", "control")
+                    and (slot != 7 or owner.get("kind") == "control")
+                    and finite_number(owner.get("acquired_at")) and owner["acquired_at"] > 0
+                    and finite_number(owner.get("expires_at"))
+                    and owner["expires_at"] >= owner["acquired_at"]):
+                return {"unsafe": True}
+        if heartbeat is not None:
+            if not (isinstance(heartbeat, dict) and heartbeat.get("schema_version") == 1
+                    and token_pattern.fullmatch(heartbeat.get("token", ""))):
+                return {"unsafe": True}
+        result["expires_at"] = max(file_activity_expires,
+                                   owner["expires_at"] if owner is not None else 0)
+        return result
+
+    owner = values["owner.json"]
+    heartbeat = values["heartbeat.json"]
+    if not (isinstance(owner, dict) and owner.get("schema_version") == 1
+            and owner.get("slot") == slot and token_pattern.fullmatch(owner.get("token", ""))
+            and owner.get("kind") in ("ordinary", "control")
+            and (slot != 7 or owner.get("kind") == "control")
+            and finite_number(owner.get("acquired_at")) and owner["acquired_at"] > 0
+            and finite_number(owner.get("expires_at")) and owner["expires_at"] >= owner["acquired_at"]
+            and isinstance(heartbeat, dict) and heartbeat.get("schema_version") == 1
+            and heartbeat.get("token") == owner["token"]):
+        return {"unsafe": True}
+    result["token"] = owner["token"]
+    result["kind"] = owner["kind"]
+    result["expires_at"] = max(owner["expires_at"], members["heartbeat.json"][2] / 1_000_000 + lease_ms)
+    return result
+
+
+def same_snapshot(left, right):
+    return (left and right and not left.get("unsafe") and not right.get("unsafe")
+            and left["directory"] == right["directory"]
+            and left["names"] == right["names"] and left["members"] == right["members"])
+
+
+def restore_quarantine(quarantine, original):
+    try:
+        os.lstat(original)
+        return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    try:
+        os.rename(quarantine, original)
+        return True
+    except OSError:
+        return False
+
+
+def delete_snapshot(path, before, slot, expected_uid):
+    current = snapshot(path, slot, expected_uid)
+    if not same_snapshot(before, current):
+        return False
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_mtime_ns) != current["directory"]:
+            return False
+        for name in current["names"]:
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if public_stat(info) != current["members"][name]:
+                return False
+        for name in current["names"]:
+            os.unlink(name, dir_fd=descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def inspect():
+    report = {"schema_version": 1, "present": False, "capacity": capacity,
+              "ordinary_capacity": ordinary_capacity,
+              "active": 0, "creating": 0, "expired": 0, "quarantined": 0,
+              "ordinary_active": 0, "control_active": 0,
+              "unsafe": 0, "reclaimable": 0, "occupied": 0,
+              "ordinary_occupied": 0, "saturated": False, "ordinary_saturated": False}
+    records = []
+    try:
+        runtime_info = os.lstat(runtime_dir)
+    except OSError:
+        report["unsafe"] = 1
+        return report, records
+    if not stat.S_ISDIR(runtime_info.st_mode) or stat.S_ISLNK(runtime_info.st_mode):
+        report["unsafe"] = 1
+        return report, records
+    expected_uid = runtime_info.st_uid
+    try:
+        root_info = os.lstat(permit_root)
+    except FileNotFoundError:
+        return report, records
+    except OSError:
+        report["unsafe"] = 1
+        return report, records
+    report["present"] = True
+    if not restricted_directory(root_info, expected_uid):
+        report["unsafe"] = 1
+        return report, records
+    try:
+        names = sorted(os.listdir(permit_root))
+    except OSError:
+        report["unsafe"] = 1
+        return report, records
+    if len(names) > 128:
+        report["unsafe"] += 1
+    now = time.time() * 1000
+    occupied_slots = set()
+    for name in names[:129]:
+        slot_match = slot_pattern.fullmatch(name)
+        stale_match = stale_pattern.fullmatch(name)
+        if not slot_match and not stale_match:
+            report["unsafe"] += 1
+            continue
+        slot = int((slot_match or stale_match).group(1))
+        is_quarantine = stale_match is not None
+        record_path = permit_root / name
+        current = snapshot(record_path, slot, expected_uid)
+        if current is None or current.get("unsafe"):
+            report["unsafe"] += 1
+            if not is_quarantine:
+                occupied_slots.add(slot)
+            continue
+        if is_quarantine:
+            report["quarantined"] += 1
+        else:
+            occupied_slots.add(slot)
+        expired = current["expires_at"] <= now
+        if expired:
+            report["expired"] += 1
+            report["reclaimable"] += 1
+            records.append((record_path, slot, current, is_quarantine))
+        elif current["partial"]:
+            report["creating"] += 1
+        elif not is_quarantine:
+            report["active"] += 1
+            report[("control_active" if current.get("kind") == "control" else "ordinary_active")] += 1
+    report["occupied"] = len(occupied_slots)
+    report["ordinary_occupied"] = len([slot for slot in occupied_slots if slot < ordinary_capacity])
+    report["saturated"] = len(occupied_slots) >= capacity
+    report["ordinary_saturated"] = report["ordinary_occupied"] >= ordinary_capacity
+    return report, records
+
+
+def reclaim(path, slot, before, is_quarantine, expected_uid):
+    original = path
+    quarantine = path
+    if not is_quarantine:
+        quarantine = permit_root / (f".stale-slot-{slot}-{secrets.token_hex(16)}")
+        try:
+            os.rename(path, quarantine)
+        except OSError:
+            return False
+        moved = snapshot(quarantine, slot, expected_uid)
+        if not same_snapshot(before, moved) or moved["expires_at"] > time.time() * 1000:
+            restore_quarantine(quarantine, original)
+            return False
+        before = moved
+    if delete_snapshot(quarantine, before, slot, expected_uid):
+        return True
+    if not is_quarantine:
+        restore_quarantine(quarantine, original)
+    return False
+
+
+report, records = inspect()
+repaired = 0
+repair_failed = 0
+if repair and report["unsafe"] == 0 and records:
+    expected_uid = os.lstat(runtime_dir).st_uid
+    for record in records:
+        if reclaim(*record, expected_uid):
+            repaired += 1
+        else:
+            repair_failed += 1
+    report, _ = inspect()
+report["repaired"] = repaired
+report["repair_failed"] = repair_failed
+print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+doctor_runtime_permits_check() {
+  local start report rc=0 unsafe active creating expired quarantined occupied
+  start=$(doctor_now_ms)
+  report="${DOCTOR_TEMP_ROOT}/runtime-processing-permits.json"
+  if ! command -v python3 >/dev/null 2>&1; then
+    doctor_add runtime.processing_permits '后台任务执行许可' FAIL critical '缺少只读校验所需的 Python 运行环境' host '运行 crispai doctor --fix 补齐受支持依赖' "$start"
+    return
+  fi
+  doctor_runtime_permits_inspect 0 > "$report" 2>/dev/null || rc=$?
+  if (( rc != 0 )) || ! jq -e '.schema_version == 1 and .capacity == 8 and .ordinary_capacity == 7 and
+      ([.active,.creating,.expired,.quarantined,.ordinary_active,.control_active,.unsafe,.reclaimable,.occupied,.ordinary_occupied] |
+        all(type == "number" and . >= 0)) and
+      (.saturated | type == "boolean") and (.ordinary_saturated | type == "boolean")' "$report" >/dev/null 2>&1; then
+    if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null 2>&1; then
+      doctor_deadline_add runtime.processing_permits '后台任务执行许可' filesystem "$start"
+    else
+      doctor_add runtime.processing_permits '后台任务执行许可' FAIL critical '无法安全读取后台任务执行许可状态' filesystem '核对运行目录权限和异常成员；不要直接删除未知许可' "$start"
+    fi
+    return
+  fi
+  unsafe=$(jq -r '.unsafe' "$report"); active=$(jq -r '.active' "$report")
+  creating=$(jq -r '.creating' "$report"); expired=$(jq -r '.expired' "$report")
+  quarantined=$(jq -r '.quarantined' "$report"); occupied=$(jq -r '.occupied' "$report")
+  if (( unsafe > 0 )); then
+    doctor_add runtime.processing_permits '后台任务执行许可' FAIL critical \
+      "发现 ${unsafe} 个不安全或不可证明可回收的许可成员；后台任务可能持续延后" filesystem \
+      '停止 n8n 后核对目录归属、权限、链接及 JSON；安全修复不会删除未知内容' "$start"
+  elif jq -e '.saturated == true or .ordinary_saturated == true' "$report" >/dev/null; then
+    doctor_add runtime.processing_permits '后台任务执行许可' WARN warning \
+      "后台许可 ${occupied}/8 已占用（活动 ${active}，创建中 ${creating}，过期 ${expired}）；普通任务槽最多 7，Webhook 始终保留 2 个 runner" filesystem \
+      '短时满载可等待；若过期许可持续存在，可显式运行 crispai doctor --fix' "$start"
+  elif (( expired > 0 || quarantined > 0 || creating > 0 )); then
+    doctor_add runtime.processing_permits '后台任务执行许可' WARN warning \
+      "后台许可活动 ${active}/8；普通任务最多 7；过期 ${expired}，隔离中 ${quarantined}，创建中 ${creating}" filesystem \
+      '短时创建/释放属于正常并发；持续过期可显式运行 crispai doctor --fix' "$start"
+  else
+    doctor_add runtime.processing_permits '后台任务执行许可' PASS critical \
+      "后台许可活动 ${active}/8；普通任务最多 7；目录结构、权限和租约均正常" filesystem '' "$start"
+  fi
+}
+
 doctor_runtime_scheduler_check() {
   local start file now started completed age lock_state lock_file
   local isolated_count isolated_too_large isolated_invalid_json isolated_invalid_state
   local recovered_at recovered_age recovered_reason recovered_reason_cn recovered_status recovered_summary
+  local catchup_status catchup_checked catchup_watermark catchup_age catchup_lag catchup_pending
+  local catchup_recovered catchup_conversations catchup_unresolved catchup_unresolved_since
+  local catchup_error catchup_error_cn catchup_summary catchup_budget_used catchup_budget_limit
+  local catchup_budget_note
   start=$(doctor_now_ms)
   lock_file="${DOCTOR_DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
   lock_state=$(scheduler_scan_lock_state "$DOCTOR_DEPLOY_DIR")
@@ -2062,6 +2450,63 @@ doctor_runtime_scheduler_check() {
         else
           true
         end
+      ) and
+      (
+        if has("crisp_rest_catchup") then
+          (.crisp_rest_catchup as $catchup |
+            ($catchup | type == "object") and
+            ((($catchup | keys) - [
+              "status", "checked_at", "watermark", "lag_ms", "pending",
+              "recovered_messages", "checked_conversations", "unresolved_messages",
+              "unresolved_since", "request_budget_used", "request_budget_limit",
+              "request_budget_reset_at", "error_code"
+            ]) | length == 0) and
+            ($catchup.status == "bootstrap" or $catchup.status == "idle" or
+              $catchup.status == "ok" or $catchup.status == "warning") and
+            ($catchup.checked_at | nonnegative_integer and . <= 9007199254740991) and
+            ($catchup.watermark | nonnegative_integer and . <= 9007199254740991) and
+            ($catchup.lag_ms == null or ($catchup.lag_ms | nonnegative_integer and . <= 9007199254740991)) and
+            ($catchup.pending | type == "boolean") and
+            ($catchup.recovered_messages | nonnegative_integer) and
+            ($catchup.checked_conversations | nonnegative_integer) and
+            ((($catchup | has("unresolved_messages")) | not) or
+              ($catchup.unresolved_messages | nonnegative_integer)) and
+            ((($catchup | has("unresolved_since")) | not) or
+              ($catchup.unresolved_since == null or
+                ($catchup.unresolved_since | nonnegative_integer and . <= 9007199254740991))) and
+            ((($catchup.unresolved_messages // 0) == 0) or
+              (($catchup.unresolved_since // 0) > 0)) and
+            ((($catchup | has("request_budget_used")) | not) or
+              ($catchup.request_budget_used | nonnegative_integer)) and
+            ((($catchup | has("request_budget_limit")) | not) or
+              ($catchup.request_budget_limit | nonnegative_integer and . >= 4 and . <= 4000)) and
+            ((($catchup | has("request_budget_reset_at")) | not) or
+              ($catchup.request_budget_reset_at == null or
+                ($catchup.request_budget_reset_at | nonnegative_integer and . > 0 and . <= 9007199254740991))) and
+            ((($catchup | has("error_code")) | not) or
+              ($catchup.error_code == "authorization_failed" or
+               $catchup.error_code == "endpoint_unavailable" or
+               $catchup.error_code == "rate_limited" or
+               $catchup.error_code == "state_too_large" or
+               $catchup.error_code == "state_unsafe" or
+               $catchup.error_code == "state_invalid" or
+               $catchup.error_code == "local_persistence_failed" or
+               $catchup.error_code == "event_time_pending" or
+               $catchup.error_code == "message_invalid" or
+               $catchup.error_code == "messages_quarantined" or
+               $catchup.error_code == "unresolved_capacity" or
+               $catchup.error_code == "daily_budget_exhausted" or
+               $catchup.error_code == "network_unavailable" or
+               $catchup.error_code == "request_failed" or
+               $catchup.error_code == "clock_rewound" or
+               $catchup.error_code == "endpoint_changed" or
+               $catchup.error_code == "credentials_changed" or
+               $catchup.error_code == "not_initialized")) and
+            (($catchup.status == "warning") or (($catchup | has("error_code")) | not))
+          )
+        else
+          true
+        end
       )' "$file" >/dev/null 2>&1; then
     doctor_add runtime.scheduler '会话恢复扫描心跳' FAIL critical '扫描心跳文件无效或不安全' filesystem '检查 n8n runtime 挂载和原子写入；不要执行扫描来伪造健康' "$start"
     return
@@ -2085,6 +2530,90 @@ doctor_runtime_scheduler_check() {
       doctor_add runtime.scheduler '会话恢复扫描心跳' WARN warning "最近扫描在 ${age} 毫秒前完成，已超过正常五秒周期" filesystem '稍候复查；若继续增长请检查 workflow 调度' "$start"
     else
       doctor_add runtime.scheduler '会话恢复扫描心跳' FAIL critical "最近扫描已停滞 ${age} 毫秒" filesystem '检查 n8n workflow 调度与 Code runner；自检不会调用 scan 或修改会话' "$start"
+    fi
+  fi
+  if jq -e 'has("crisp_rest_catchup")' "$file" >/dev/null 2>&1; then
+    catchup_status=$(jq -r '.crisp_rest_catchup.status' "$file")
+    catchup_checked=$(jq -r '.crisp_rest_catchup.checked_at' "$file")
+    catchup_watermark=$(jq -r '.crisp_rest_catchup.watermark' "$file")
+    catchup_pending=$(jq -r '.crisp_rest_catchup.pending' "$file")
+    catchup_recovered=$(jq -r '.crisp_rest_catchup.recovered_messages' "$file")
+    catchup_conversations=$(jq -r '.crisp_rest_catchup.checked_conversations' "$file")
+    catchup_unresolved=$(jq -r '.crisp_rest_catchup.unresolved_messages // 0' "$file")
+    catchup_unresolved_since=$(jq -r '.crisp_rest_catchup.unresolved_since // 0' "$file")
+    catchup_budget_used=$(jq -r '.crisp_rest_catchup.request_budget_used // 0' "$file")
+    catchup_budget_limit=$(jq -r '.crisp_rest_catchup.request_budget_limit // 0' "$file")
+    catchup_budget_note=''
+    if (( catchup_budget_limit > 0 )); then
+      catchup_budget_note="；本周期补偿 REST 已用 ${catchup_budget_used}/${catchup_budget_limit}，其余站点配额保留给正文、控制与投递对账"
+    fi
+    catchup_error=$(jq -r '.crisp_rest_catchup.error_code // ""' "$file")
+    if (( catchup_watermark > now + 60000 || catchup_checked > now + 60000 )); then
+      doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' WARN warning \
+        'REST 补偿记录晚于本机时钟，无法可靠判断当前水位' filesystem \
+        '先同步系统时钟，再复查 n8n 调度；自检不会补发消息或改变会话状态' "$start"
+    else
+      if (( catchup_watermark > 0 && catchup_watermark <= now )); then
+        catchup_lag=$((now-catchup_watermark))
+      else
+        catchup_lag=-1
+      fi
+      if (( catchup_checked > 0 && catchup_checked <= now )); then
+        catchup_age=$((now-catchup_checked))
+      else
+        catchup_age=-1
+      fi
+      case "$catchup_error" in
+        authorization_failed) catchup_error_cn='当前 Crisp REST 凭据或权限校验失败' ;;
+        endpoint_unavailable) catchup_error_cn='当前 Crisp REST 端点不可用' ;;
+        rate_limited) catchup_error_cn='Crisp REST 当前限流' ;;
+        state_too_large) catchup_error_cn='补偿状态超过安全读取上限' ;;
+        state_unsafe) catchup_error_cn='补偿状态路径或权限不安全' ;;
+        state_invalid) catchup_error_cn='补偿状态内容无效' ;;
+        local_persistence_failed) catchup_error_cn='漏收消息尚未在本机可靠持久化，水位已停止推进' ;;
+        event_time_pending) catchup_error_cn='漏收消息已持久保存，原始事件时间尚待 Crisp 精确核验，水位已停止推进' ;;
+        message_invalid) catchup_error_cn='Crisp 返回的相关消息结构无效，水位已停止推进以避免漏答' ;;
+        messages_quarantined) catchup_error_cn='Crisp 返回的相关消息已进入持久待核查责任，其他会话继续补偿' ;;
+        unresolved_capacity) catchup_error_cn='Crisp 待核查消息已达到受管容量上限，新水位已停止推进' ;;
+        daily_budget_exhausted) catchup_error_cn='本周期 Crisp 补偿 REST 保守预算已用尽，游标与未完成责任均已保留' ;;
+        network_unavailable) catchup_error_cn='Crisp REST 网络暂不可达' ;;
+        clock_rewound) catchup_error_cn='本机时钟回拨，原补偿水位已保留并等待受控重放' ;;
+        endpoint_changed) catchup_error_cn='Crisp REST 地址已变更，原补偿水位已保留并等待新连接续扫' ;;
+        credentials_changed) catchup_error_cn='Crisp REST 凭据或权限层级已变更，旧成功事实已失效' ;;
+        not_initialized) catchup_error_cn='尚未建立 REST 补偿水位' ;;
+        request_failed) catchup_error_cn='Crisp REST 请求返回未识别故障' ;;
+        '') catchup_error_cn='最近补偿发现无法安全摄入的消息结构' ;;
+      esac
+      if [[ "$catchup_status" == bootstrap ]]; then
+        doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' WARN warning \
+          '已从当前时刻建立 REST 补偿水位；首次启用不会补答历史消息' filesystem \
+          '等待下一轮调度；若持续超过一分钟，请检查 n8n Code runner 与 Crisp REST 权限' "$start"
+      elif (( catchup_unresolved > 0 )); then
+        catchup_summary="存在 ${catchup_unresolved} 条持久待核查消息；扫描头水位不能代表这些责任已经完成"
+        if (( catchup_unresolved_since > 0 && catchup_unresolved_since <= now )); then
+          catchup_summary+="，最早未完整覆盖范围距今 $((now-catchup_unresolved_since)) 毫秒"
+        fi
+        doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' FAIL critical \
+          "$catchup_summary" filesystem \
+          '使用受管诊断核对待查消息；自检不会删除责任、解除人工屏障或把畸形响应当作已处理' "$start"
+      elif [[ "$catchup_status" == warning ]]; then
+        catchup_summary="${catchup_error_cn}；最近一次补入 ${catchup_recovered} 条通知${catchup_budget_note}"
+        if (( catchup_lag >= 0 )); then catchup_summary+="，水位距今 ${catchup_lag} 毫秒"; fi
+        doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' WARN warning \
+          "$catchup_summary" filesystem \
+          '实时 Website Hook 仍是主路径；核对当前 Crisp 权限、网络与 n8n 调度，补偿不会自动回复历史消息' "$start"
+      elif [[ "$catchup_pending" == true ]] \
+        || (( catchup_lag < 0 || catchup_lag > 600000 || catchup_age < 0 || catchup_age > 600000 )); then
+        catchup_summary="REST 补偿正在分段推进或最近结果已过期；最近一次补入 ${catchup_recovered} 条通知"
+        if (( catchup_lag >= 0 )); then catchup_summary+="，水位距今 ${catchup_lag} 毫秒"; fi
+        doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' WARN warning \
+          "$catchup_summary" filesystem \
+          '稍候复查；若水位持续超过十分钟，请检查 Crisp REST、n8n 调度及受管状态目录' "$start"
+      else
+        doctor_add runtime.crisp_rest_catchup 'Crisp 漏收补偿' PASS warning \
+          "REST 漏收补偿最近完成（生产周期至少 60 秒、单轮最多 4 次 REST 请求）；水位距今 ${catchup_lag} 毫秒，最近一次检查 ${catchup_conversations} 个会话并补入 ${catchup_recovered} 条通知${catchup_budget_note}" \
+          filesystem '' "$start"
+      fi
     fi
   fi
   if jq -e 'has("isolated_sessions") and .isolated_sessions.count > 0' "$file" >/dev/null 2>&1; then
@@ -2427,7 +2956,8 @@ doctor_provider_inference_failure() {
     retrieval_error|retrieval_invalid|retrieval_unavailable|source_unmapped|source_ambiguous|context_invalid) DOCTOR_PROVIDER_FAILURE_SUMMARY='知识检索或启用资料映射未通过'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 5 核对索引与来源，再执行菜单 16 → 6 资料应用' ;;
     context_preparation_incomplete|invalid_input|no_capable_provider) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前接口能力、上下文容量或最终请求结构不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对模型协议/容量/图片能力和已应用 Prompt；未发送不完整请求' ;;
     pool_cooling|pool_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本题预算内没有接口成功返回'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 查看近期切换记录，逐项定位鉴权、限流、超时或响应格式' ;;
-    question_budget_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本次推理已达到总时间或调用次数上限'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='查看近期切换记录并修复前序故障；不会继续放大请求' ;;
+    question_timeout|question_budget_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本次推理已达到总时间或调用次数上限'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='查看近期切换记录并修复前序故障；不会继续放大请求' ;;
+    question_interrupted) DOCTOR_PROVIDER_FAILURE_SUMMARY='先前推理在 adapter 重启或执行权丢失后已安全终止'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='确认 adapter 已稳定运行后重新执行一次完整自检；旧结果不会继续出站' ;;
     state_changed|question_cancelled) DOCTOR_PROVIDER_FAILURE_SUMMARY='检测期间配置或控制状态发生变化，结果已作废'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='刷新当前状态后重新执行完整自检' ;;
     safety_refusal) DOCTOR_PROVIDER_FAILURE_SUMMARY='模型对合成检查作出安全拒绝'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='这不是连接成功证据，也不会切换接口规避模型安全限制' ;;
     *) DOCTOR_PROVIDER_FAILURE_SUMMARY='实际推理未完成，错误类别未能安全确认'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='依次核对菜单 5 的知识、菜单 3 的接口及菜单 2 的组件结果' ;;
@@ -2497,6 +3027,11 @@ doctor_run_checks() {
     doctor_skip n8n.execution_backlog 'n8n 生产执行积压' '离线范围不访问数据库' docker
     doctor_skip provider.adapter 'Provider adapter' '离线范围未检查' docker
     doctor_skip provider.adapter_code_binding 'Provider adapter 程序运行代' '离线范围未检查单文件挂载' docker
+    if (( DOCTOR_VISITOR_OUTPUT_ENABLED )); then
+      doctor_skip provider.visitor_output_code_binding '访客输出策略运行代' '离线范围未检查单文件挂载' docker
+    else
+      doctor_skip provider.visitor_output_code_binding '访客输出策略运行代' '当前程序版本不包含独立访客输出策略模块' docker
+    fi
     doctor_skip caddy.file_binding 'Caddy 配置运行代' '离线范围未检查单文件挂载' docker
     doctor_skip provider.adapter_binding 'Provider adapter 运行代' '离线范围未检查' docker
     doctor_skip anything.provider_binding 'AnythingLLM Provider 运行代' '离线范围未检查' docker
@@ -2514,6 +3049,7 @@ doctor_run_checks() {
   doctor_knowledge_metadata_check
   doctor_knowledge_lexical_check
   doctor_runtime_state_check
+  doctor_runtime_permits_check
   doctor_runtime_scheduler_check
   doctor_logs_check
   doctor_external_check
@@ -2525,6 +3061,8 @@ doctor_result_status() {
 
 doctor_safe_fix() {
   local launcher_path access_mode service service_status permissions_status dependency_status daemon_status compose_status install_state scheduler_state
+  local permit_status permit_report permit_reclaimable=0 permit_unsafe=0 permit_active=0 permit_creating=0
+  local permit_repair_report permit_repair_rc=0 permit_stopped_n8n=0 permit_restart_rc=0
   if (( EUID != 0 )); then
     doctor_fix_add fix.authorization '修复授权' FAIL '安全修复需要 root；未执行任何修复'
     return
@@ -2598,6 +3136,59 @@ doctor_safe_fix() {
     else
       doctor_fix_add fix.runtime.scheduler_lock '迁移旧版会话扫描锁' FAIL '锁形态不符合旧版空目录；为保护调度所有权未自动删除'
     fi
+
+    permit_status=$(doctor_result_status runtime.processing_permits)
+    permit_report="${DOCTOR_TEMP_ROOT}/runtime-processing-permits.json"
+    if [[ -f "$permit_report" && ! -L "$permit_report" ]]; then
+      permit_reclaimable=$(jq -r '.reclaimable // 0' "$permit_report" 2>/dev/null || printf 0)
+      permit_unsafe=$(jq -r '.unsafe // 1' "$permit_report" 2>/dev/null || printf 1)
+      permit_active=$(jq -r '.active // 0' "$permit_report" 2>/dev/null || printf 0)
+      permit_creating=$(jq -r '.creating // 0' "$permit_report" 2>/dev/null || printf 0)
+    fi
+    if [[ "$permit_reclaimable" =~ ^[0-9]+$ && "$permit_active" =~ ^[0-9]+$ \
+      && "$permit_creating" =~ ^[0-9]+$ && "$permit_unsafe" == 0 ]] \
+      && (( permit_reclaimable > 0 && (permit_active > 0 || permit_creating > 0) )); then
+      doctor_fix_add fix.runtime.processing_permits '回收过期后台任务许可' SKIP \
+        "仍有 ${permit_active} 个活动许可和 ${permit_creating} 个创建中许可；为避免中断正常客户任务，本次未停止 n8n 或回收过期项"
+    elif [[ "$permit_reclaimable" =~ ^[0-9]+$ && "$permit_unsafe" == 0 ]] \
+      && (( permit_reclaimable > 0 )); then
+      service_status=$(doctor_result_status container.n8n)
+      if [[ "$service_status" == PASS || "$service_status" == WARN ]]; then
+        if doctor_compose_timeout 30 stop n8n >/dev/null 2>&1; then
+          permit_stopped_n8n=1
+        else
+          permit_repair_rc=1
+        fi
+      elif [[ "$service_status" != FAIL ]] || ! grep -Fxq n8n "$DOCTOR_RESTARTABLE_SERVICES"; then
+        permit_repair_rc=1
+      fi
+      permit_repair_report="${DOCTOR_TEMP_ROOT}/runtime-processing-permits-repair.json"
+      if (( permit_repair_rc == 0 )); then
+        doctor_runtime_permits_inspect 1 > "$permit_repair_report" 2>/dev/null || permit_repair_rc=$?
+        if (( permit_repair_rc == 0 )) && ! jq -e \
+          '.schema_version == 1 and .unsafe == 0 and .expired == 0 and .repair_failed == 0' \
+          "$permit_repair_report" >/dev/null 2>&1; then
+          permit_repair_rc=1
+        fi
+      fi
+      if (( permit_stopped_n8n )); then
+        doctor_compose_timeout 45 up -d n8n >/dev/null 2>&1 || permit_restart_rc=$?
+      fi
+      if (( permit_repair_rc == 0 && permit_restart_rc == 0 )); then
+        doctor_fix_add fix.runtime.processing_permits '回收过期后台任务许可' PASS \
+          '已在 n8n 停写窗口精确回收结构完整且明确过期的许可；活动及未知成员未删除'
+      else
+        doctor_fix_add fix.runtime.processing_permits '回收过期后台任务许可' FAIL \
+          '无法完成停写、精确回收或服务恢复；已保留活动、变化中及未知许可'
+      fi
+    elif [[ "$permit_status" == FAIL ]]; then
+      doctor_fix_add fix.runtime.processing_permits '回收过期后台任务许可' FAIL \
+        '许可目录包含不安全或不可证明归属的内容；安全修复未删除任何未知成员'
+    else
+      doctor_fix_add fix.runtime.processing_permits '回收过期后台任务许可' SKIP \
+        '未发现结构完整且明确过期的许可；活动许可和合法短时满载保持不变'
+    fi
+
     access_mode=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)
     for service in postgres anythingllm n8n provider-adapter; do
       service_status=$(doctor_result_status "container.${service}")

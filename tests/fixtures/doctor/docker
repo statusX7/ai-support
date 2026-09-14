@@ -181,6 +181,8 @@ const request = async (url, options) => {
   if (providerMode === "model") return {status: 404, body: {error: {message: "synthetic model failure"}}};
   if (providerMode === "upstream") return {status: 503, body: {error: {message: "synthetic upstream failure"}}};
   if (providerMode === "protocol") return {status: 400, body: {error: {code: "protocol_error", message: "synthetic route mismatch"}}};
+  if (providerMode === "question-timeout") return {status: 400, body: {error: {code: "question_timeout", message: "synthetic question deadline"}}};
+  if (providerMode === "question-interrupted") return {status: 400, body: {error: {code: "question_interrupted", message: "synthetic interrupted question"}}};
   if (providerMode === "empty") return {status: 200, body: {choices: []}};
   if (providerMode === "error-json") return {status: 200, body: {error: {message: "synthetic protocol failure"}}};
   if (providerMode === "timeout") { const error = new Error("请求超时"); error.name = "AbortError"; throw error; }
@@ -218,6 +220,12 @@ require(root + "/n8n/admin-query.js");
       [[ "${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
       [[ "$expected" == "$actual" ]] || exit 1
       printf 'matched\n'
+    elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_VISITOR_OUTPUT'* ]]; then
+      expected=$(cat)
+      actual=$(sha256sum -- "${DOCTOR_FIXTURE_DEPLOY:?}/scripts/visitor-output.js" | awk '{print $1}')
+      [[ "${DOCTOR_FIXTURE_VISITOR_OUTPUT_CODE_MISMATCH:-0}" != 1 ]] || actual=$(printf '%064d' 0)
+      [[ "$expected" == "$actual" ]] || exit 1
+      printf 'matched\n'
     elif [[ "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_ROUTER'* || "$joined" == *'CRISPAI_EXPECTED_FILE_BINDING_ENVELOPE'* ]]; then
       expected=$(cat)
       module=provider-router.js
@@ -232,6 +240,7 @@ require(root + "/n8n/admin-query.js");
       [[ "$expected" == "$actual" ]] || exit 1
       printf 'matched\n'
     elif [[ "$joined" == *' postgres '* && "$joined" == *'execution_entity'* ]]; then
+      [[ "$joined" == *'AND \"deletedAt\" IS NULL'* ]] || exit 1
       IFS= read -r managed_user
       IFS= read -r managed_db
       IFS= read -r managed_password
@@ -240,6 +249,9 @@ require(root + "/n8n/admin-query.js");
         && "$workflow_id" == 5d2c37c9-1c8e-45d0-8f53-c0a6e79b3a40 \
         && -f "${DOCTOR_FIXTURE_DB_PASSWORD_FILE:-}" \
         && "$managed_password" == "$(<"$DOCTOR_FIXTURE_DB_PASSWORD_FILE")" ]] || exit 1
+      [[ "${DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS:-0}" =~ ^[0-9]+$ ]] || exit 1
+      [[ -z "${DOCTOR_FIXTURE_LOG:-}" ]] || printf 'execution-backlog deleted-filter=true soft-deleted=%s\n' \
+        "${DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS:-0}" >> "$DOCTOR_FIXTURE_LOG"
       printf '%s|%s|%s\n' "${DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS:-0}" \
         "${DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES:-0}" "${DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES:-0}"
     elif [[ "$joined" == *' postgres '* && "$joined" == *'SELECT 1'* ]]; then
@@ -319,7 +331,8 @@ assert call[:2] == ["node", "-"]
 paths = {"$output": deploy / "n8n/workflow.json",
          "/opt/crisp-ai/n8n/runtime.js": deploy / "n8n/runtime.js",
          "/opt/crisp-ai/n8n/knowledge-lexical.js": pathlib.Path(os.environ.get(
-             "DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE", str(deploy / "n8n/knowledge-lexical.js")))}
+             "DOCTOR_FIXTURE_LEXICAL_RUNNING_FILE", str(deploy / "n8n/knowledge-lexical.js"))),
+         "/opt/crisp-ai/scripts/visitor-output.js": deploy / "scripts/visitor-output.js"}
 arguments = []
 for token in call[2:]:
     if token in paths:

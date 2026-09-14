@@ -209,6 +209,8 @@ fi
   || fail '回滚 v1.1.0 后残留新代 get.sh'
 [[ ! -e "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]] \
   || fail '回滚 v1.1.0 后残留新代 doctor.sh'
+[[ ! -e "${DEPLOY_DIR}/scripts/visitor-output.js" && ! -L "${DEPLOY_DIR}/scripts/visitor-output.js" ]] \
+  || fail '回滚 v1.1.0 后残留新代访客输出策略模块'
 for relative in install.sh manage.sh update.sh uninstall.sh scripts/common.sh scripts/rollback.sh \
   scripts/launcher.sh n8n/runtime.js; do
   cmp -s -- "${LEGACY_SOURCE}/${relative}" "${DEPLOY_DIR}/${relative}" \
@@ -222,6 +224,8 @@ grep -Fq '目标快照不含 get.sh，已移除当前版本的受管模块' \
   "${TEST_ROOT}/legacy-rollback.log" || fail '回滚日志未记录 get.sh 降代移除'
 grep -Fq '目标快照不含 scripts/doctor.sh，已移除当前版本的受管模块' \
   "${TEST_ROOT}/legacy-rollback.log" || fail '回滚日志未记录 doctor.sh 降代移除'
+grep -Fq '目标快照不含 scripts/visitor-output.js，已移除当前版本的受管模块' \
+  "${TEST_ROOT}/legacy-rollback.log" || fail '回滚日志未记录访客输出策略降代移除'
 grep -Fq 'pg_restore' "$MOCK_DOCKER_LOG" || fail '旧版快照未实际执行数据库恢复路径'
 grep -Fq -- '--force-recreate anythingllm' "$MOCK_DOCKER_LOG" \
   || fail '旧版快照未实际重建 AnythingLLM bind mount'

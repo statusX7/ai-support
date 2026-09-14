@@ -93,7 +93,7 @@ migration_export() (
     chmod 600 "${stage}/config/${name}.yaml"
   done
   temporary=$(mktemp "${stage}/config/runtime.XXXXXX")
-  jq -M '.revision=0 | .applied_revision=0' "${stage}/config/runtime.yaml" > "$temporary"
+  jq -M '.revision=0 | .applied_revision=0 | .disable_epoch=0' "${stage}/config/runtime.yaml" > "$temporary"
   mv -f -- "$temporary" "${stage}/config/runtime.yaml"
   if jq -M -e '.provider | type == "object"' "${deploy_dir}/config/provider.yaml" >/dev/null 2>&1; then
     jq -M --arg base "$(env_get "${deploy_dir}/.env" AI_API_PROBE_BASE_URL 2>/dev/null || true)" '{schema_version:2,provider:{type:"openai-compatible",base_url:(if $base != "" then $base else .provider.base_url end),model:.provider.model,api_mode:.provider.api_mode,api_key_env:"AI_API_KEY"}}' "${deploy_dir}/config/provider.yaml" > "${stage}/config/provider.yaml"

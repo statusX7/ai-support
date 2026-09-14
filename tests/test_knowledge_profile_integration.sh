@@ -24,7 +24,7 @@ import unittest
 import uuid
 
 ROOT = Path(sys.argv[1]).resolve()
-AREA = ROOT / '.work/v1.2.1'
+AREA = ROOT / '.work/v1.3.0'
 AREA.mkdir(parents=True, exist_ok=True)
 WORK = Path(tempfile.mkdtemp(prefix='knowledge-profile-integration-', dir=AREA))
 WORK.chmod(0o700)
@@ -71,6 +71,33 @@ def load(file):
     return json.loads(file.read_text(encoding='utf-8'))
 
 
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+
+def json_digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def seal_materials(value):
+    runtime = dict(value['configuration']['runtime'])
+    runtime.pop('revision', None)
+    runtime.pop('applied_revision', None)
+    knowledge = value['knowledge']
+    value['source_components'] = {
+        'runtime': json_digest(runtime),
+        'handoff': json_digest(value['configuration']['handoff']),
+        'keyword': json_digest(value['configuration']['keyword']),
+        'menu': json_digest(value['configuration']['menu']),
+        'tags': json_digest(value['configuration']['tags']),
+        'feedback': json_digest(value['configuration']['feedback']),
+        'prompt': value['prompt']['sha256'],
+        'knowledge': json_digest(knowledge),
+    }
+    value['source_sha256'] = json_digest(value['source_components'])
+    return value
+
+
 def write(file, value, mode=0o600):
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(value, encoding='utf-8')
@@ -112,6 +139,44 @@ def save(path, value):
     temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + '\n')
     temporary.chmod(0o600)
     os.replace(temporary, path)
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+def projection_readback():
+    raw = MATERIALS.read_bytes()
+    value = json.loads(raw.decode('utf-8'))
+    if value.get('schema_version') != 2 or value.get('state') != 'applied': reject()
+    runtime = dict(value.get('configuration', {}).get('runtime', {}))
+    if runtime.get('revision') != value.get('revision') or runtime.get('applied_revision') != value.get('revision'): reject()
+    runtime.pop('revision', None)
+    runtime.pop('applied_revision', None)
+    embedded = {'runtime': runtime, **{name: value['configuration'][name]
+                for name in ('handoff', 'keyword', 'menu', 'tags', 'feedback')}}
+    for name, item in embedded.items():
+        if digest(canonical(item)) != value.get('source_components', {}).get(name): reject()
+    if digest(value['prompt']['text'].encode('utf-8')) != value['prompt']['sha256'] \
+            or value['source_components'].get('prompt') != value['prompt']['sha256']: reject()
+    knowledge = value['knowledge']
+    if digest(canonical(knowledge)) != value['source_components'].get('knowledge') \
+            or digest(canonical(value['source_components'])) != value.get('source_sha256'): reject()
+    paths = {'map': D / 'data/runtime/knowledge-map.json', 'settings': D / 'data/runtime/knowledge-settings.json',
+             'profile': D / 'data/runtime/knowledge-profile.json', 'lexical': D / 'data/runtime/knowledge-lexical.json'}
+    for name, path in paths.items():
+        actual = digest(path.read_bytes()) if path.is_file() and not path.is_symlink() else ''
+        if actual != knowledge[name + '_sha256']: reject()
+    map_value = read(paths['map'])
+    settings_value = read(paths['settings'])
+    if map_value.get('schema_version') != 2 or not isinstance(map_value.get('documents'), list) \
+            or len(map_value['documents']) != knowledge['enabled_document_count']: reject()
+    if settings_value.get('schema_version') != 1 \
+            or settings_value.get('workspace_slug') != env().get('ANYTHINGLLM_WORKSPACE', 'crisp-support'): reject()
+    profile_value = read(paths['profile'])
+    if profile_value is not None:
+        if profile_value.get('schema_version') != 1 or profile_value.get('state') != 'applied' \
+                or digest(canonical(profile_value.get('profile'))) != profile_value.get('fingerprint'): reject()
+    elif knowledge['enabled_document_count'] > 0: reject()
+    return digest(raw), value['revision']
 def phase():
     profile = read(PROFILE, {})
     materials = read(MATERIALS, {})
@@ -216,8 +281,10 @@ elif mode == 'docker':
         log('projection_readback')
         if control.get('fault') == 'readback' and control.get('syncs', 0) and not control.get('fault_consumed'):
             update_control(fault_consumed=True)
-            print('0' * 64, end='')
-        else: print(hashlib.sha256(MATERIALS.read_bytes()).hexdigest(), end='')
+            print('0' * 64 + ':0:ready', end='')
+        else:
+            projection_hash, revision = projection_readback()
+            print(f'{projection_hash}:{revision}:ready', end='')
     else: reject()
 elif mode == 'admin-query':
     if len(args) != 2 or args[0] != str(D): reject()
@@ -424,6 +491,11 @@ class Integration(unittest.TestCase):
             PROJECTION: {'sha256': sha(raw), 'locations': [LOCATION]}}, 'pending_files': {}, 'garbage_locations': []})
         save(self.deploy / 'data/knowledge-projection.json', [PROJECTION])
         save(self.deploy / LEXICAL, {'schema_version': 1, 'fixture': 'old-lexical', 'documents': []}, 0o640)
+        old_profile = {'engine': 'native', 'model': MINI, 'chunk_size': 1000, 'chunk_overlap': 20,
+                       'passage_prefix': '', 'query_prefix': '', 'component_version': '1.16.1',
+                       'splitter': 'AnythingLLM-1.16.1-TextSplitter'}
+        save(self.deploy / PROFILE, {'schema_version': 1, 'state': 'applied', 'profile': old_profile,
+             'fingerprint': json_digest(old_profile), 'applied_at': 1000}, 0o640)
         for relative in PROTECTED:
             save(self.deploy / relative, {'generation': 4, 'mode': 'human', 'resume_at': 0,
                                          'event': 'before-migration', 'jobs': ['old']})
@@ -483,24 +555,53 @@ class Integration(unittest.TestCase):
 
     def assert_hashes(self):
         projection = load(self.deploy / 'config/materials-applied.json')
+        self.assertEqual(projection['schema_version'], 2)
+        self.assertEqual(sorted(projection['source_components']),
+                         ['feedback', 'handoff', 'keyword', 'knowledge', 'menu', 'prompt', 'runtime', 'tags'])
+        self.assertEqual(sorted(projection['configuration']),
+                         ['feedback', 'handoff', 'keyword', 'menu', 'runtime', 'tags'])
+        self.assertEqual(sorted(projection['knowledge']), ['catalog_revision', 'catalog_sha256', 'document_count',
+                         'enabled_document_count', 'enabled_library_ids', 'lexical_sha256', 'library_count',
+                         'manifest_sha256', 'map_sha256', 'profile_sha256', 'settings_sha256'])
         for key, relative in (('manifest_sha256', 'data/knowledge-manifest.json'),
                               ('map_sha256', 'data/runtime/knowledge-map.json'),
                               ('settings_sha256', SETTINGS), ('lexical_sha256', LEXICAL),
                               ('profile_sha256', PROFILE)):
             expected = sha(self.deploy / relative) if (self.deploy / relative).exists() else ''
             self.assertEqual(projection['knowledge'][key], expected, key)
+        runtime = dict(projection['configuration']['runtime'])
+        runtime.pop('revision', None)
+        runtime.pop('applied_revision', None)
+        for name, value in {'runtime': runtime, **{item: projection['configuration'][item]
+                            for item in ('handoff', 'keyword', 'menu', 'tags', 'feedback')}}.items():
+            self.assertEqual(projection['source_components'][name], json_digest(value), name)
+        self.assertEqual(projection['source_components']['prompt'], projection['prompt']['sha256'])
+        self.assertEqual(projection['source_components']['knowledge'], json_digest(projection['knowledge']))
+        self.assertEqual(projection['source_sha256'], json_digest(projection['source_components']))
+        self.assertEqual(projection['knowledge']['enabled_document_count'],
+                         len(load(self.deploy / 'data/runtime/knowledge-map.json')['documents']))
+        profile_path = self.deploy / PROFILE
+        if profile_path.exists():
+            profile = load(profile_path)
+            self.assertRegex(projection['knowledge']['profile_sha256'], r'^[a-f0-9]{64}$')
+            self.assertEqual(projection['knowledge']['profile_sha256'], sha(profile_path))
+            self.assertEqual(profile['fingerprint'], json_digest(profile['profile']))
+        else:
+            self.assertEqual(projection['knowledge']['profile_sha256'], '')
+            self.assertEqual(projection['knowledge']['enabled_document_count'], 0)
 
     def baseline(self):
         return {'storage': inventory(self.deploy / 'data/anythingllm'),
                 'settings': (self.deploy / SETTINGS).read_bytes(),
                 'lexical': (self.deploy / LEXICAL).read_bytes(),
+                'profile': (self.deploy / PROFILE).read_bytes(),
                 'projection': load(self.deploy / 'config/materials-applied.json')}
 
     def assert_restored(self, before, concurrent=False):
         self.assertEqual(inventory(self.deploy / 'data/anythingllm'), before['storage'])
         self.assertEqual((self.deploy / SETTINGS).read_bytes(), before['settings'])
         self.assertEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
-        self.assertFalse((self.deploy / PROFILE).exists())
+        self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
         current = load(self.deploy / 'config/materials-applied.json')
         for key in ('prompt', 'knowledge', 'source_components', 'source_sha256'):
@@ -541,11 +642,54 @@ class Integration(unittest.TestCase):
         self.assertEqual(load(self.control)['syncs'], 1)
         self.assertEqual(load(self.deploy / SETTINGS)['temperature'], 0.25)
         self.assertNotEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
-        self.assertEqual(load(self.deploy / LEXICAL)['algorithm'], 'crispai-lexical-v1')
+        self.assertEqual(load(self.deploy / LEXICAL)['algorithm'], 'crispai-lexical-v2')
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
         refreshes = [event['arguments'] for event in events if event['event'] == 'python_refresh-bindings_before']
         self.assertEqual(refreshes, [['--allow-migration', '--validate-only'],
                                      ['--allow-migration'], ['--allow-migration']])
+        self.assert_hashes()
+        self.assert_protected()
+
+    def test_materials_schema_v1_migrates_once_and_preserves_exact_legacy_input(self):
+        projection_path = self.deploy / 'config/materials-applied.json'
+        legacy = load(projection_path)
+        legacy['schema_version'] = 1
+        save(projection_path, legacy, 0o640)
+        legacy_bytes = projection_path.read_bytes()
+        before = set((self.deploy / 'backups/config-history').glob('materials-v1-migration.*'))
+        result = json.loads(self.ok('initialize').stdout)
+        self.assertTrue(result['migrated_from_schema_v1'])
+        self.assert_hashes()
+        created = set((self.deploy / 'backups/config-history').glob('materials-v1-migration.*')) - before
+        self.assertEqual(len(created), 1)
+        archive = next(iter(created))
+        self.assertEqual((archive / 'materials-applied-v1.json').read_bytes(), legacy_bytes)
+        migrated_hash = sha(projection_path)
+        self.ok('initialize')
+        self.assertEqual(sha(projection_path), migrated_hash)
+        self.assertEqual(set((self.deploy / 'backups/config-history').glob('materials-v1-migration.*')) - before,
+                         created)
+
+    def test_materials_schema_v2_rejects_component_and_knowledge_identity_tamper(self):
+        projection_path = self.deploy / 'config/materials-applied.json'
+        original = projection_path.read_bytes()
+        mutations = {
+            'embedded': lambda value: value['configuration']['runtime'].__setitem__('enabled', False),
+            'knowledge': lambda value: value['knowledge'].__setitem__('catalog_sha256', 'f' * 64),
+            'aggregate': lambda value: (value['source_components'].__setitem__('knowledge', 'e' * 64),
+                                        value.__setitem__('source_sha256', json_digest(value['source_components']))),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                value = json.loads(original)
+                mutate(value)
+                save(projection_path, value, 0o640)
+                damaged = projection_path.read_bytes()
+                result = self.call('initialize')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(projection_path.read_bytes(), damaged)
+                projection_path.write_bytes(original)
+                projection_path.chmod(0o640)
         self.assert_hashes()
         self.assert_protected()
 
@@ -667,7 +811,7 @@ class Integration(unittest.TestCase):
         save(mapping_path, mapping)
         materials = load(self.deploy / 'config/materials-applied.json')
         materials['knowledge']['map_sha256'] = sha(mapping_path)
-        save(self.deploy / 'config/materials-applied.json', materials)
+        save(self.deploy / 'config/materials-applied.json', seal_materials(materials))
         question = self.prepare_query([second_location])
         write(self.fixture / 'events.jsonl', '')
         result = self.ok('query-library')
@@ -695,7 +839,7 @@ class Integration(unittest.TestCase):
         save(mapping_path, mapping)
         materials = load(self.deploy / 'config/materials-applied.json')
         materials['knowledge']['map_sha256'] = sha(mapping_path)
-        save(self.deploy / 'config/materials-applied.json', materials)
+        save(self.deploy / 'config/materials-applied.json', seal_materials(materials))
         self.prepare_query([location])
         result = self.call('query-all')
         self.assertNotEqual(result.returncode, 0)
@@ -733,7 +877,7 @@ class Integration(unittest.TestCase):
         mapping = load(self.deploy / 'data/runtime/knowledge-map.json')
         materials = load(self.deploy / 'config/materials-applied.json')
         materials['knowledge']['map_sha256'] = sha(self.deploy / 'data/runtime/knowledge-map.json')
-        save(self.deploy / 'config/materials-applied.json', materials)
+        save(self.deploy / 'config/materials-applied.json', seal_materials(materials))
         self.set_control(query_mutate_map=False, query_failure=True)
         result = self.call('query-all')
         self.assertNotEqual(result.returncode, 0)
@@ -931,7 +1075,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.baseline(), before)
         self.assertTrue(load(self.fixture / 'running.json'))
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
-        self.assertFalse((self.deploy / PROFILE).exists())
+        self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
         self.assertFalse(any(event['event'] in ('configure', 'forced_sync', 'python_activate_before') for event in self.events()))
         self.assert_protected()
 

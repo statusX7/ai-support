@@ -9,7 +9,7 @@ fi
 # shellcheck source=scripts/knowledge.sh
 source "${MATERIALS_SCRIPT_DIR}/knowledge.sh"
 
-readonly MATERIALS_SCHEMA_VERSION=1
+readonly MATERIALS_SCHEMA_VERSION=2
 readonly MATERIALS_PROJECTION_MAX_BYTES=16777216
 readonly MATERIALS_CATALOG_MAX_BYTES=536870912
 readonly MATERIALS_PROMPT_MAX_BYTES=262144
@@ -26,6 +26,20 @@ materials_sha_or_empty() {
   fi
 }
 
+materials_json_hash() {
+  local file=$1
+  python3 - "$file" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(encoded).hexdigest())
+PY
+}
+
 materials_validate_private_file() {
   local file=$1 maximum=$2 description=$3 size mode
   [[ -f "$file" && ! -L "$file" ]] \
@@ -36,6 +50,21 @@ materials_validate_private_file() {
   mode=$(stat -c '%a' -- "$file")
   (( (8#$mode & 0027) == 0 )) \
     || { materials_error "${description}权限过宽（要求不得由 group 写入且不得向 other 开放）"; return 1; }
+}
+
+materials_required_hash() {
+  local file=$1 maximum=$2 description=$3
+  materials_validate_private_file "$file" "$maximum" "$description" || return 1
+  materials_sha_or_empty "$file"
+}
+
+materials_optional_hash() {
+  local file=$1 maximum=$2 description=$3
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    printf '\n'
+    return 0
+  fi
+  materials_required_hash "$file" "$maximum" "$description"
 }
 
 materials_validate_prompt_file() {
@@ -182,8 +211,53 @@ PY
   knowledge_catalog_validate "$output" || return 1
 }
 
-materials_projection_validate() {
+materials_projection_validate_configuration() {
   local file=$1 stage name temporary
+  stage=$(mktemp -d "${file}.validate.XXXXXXXX")
+  for name in runtime handoff keyword menu tags feedback; do
+    temporary="${stage}/${name}.json"
+    jq -M ".configuration.${name}" "$file" > "$temporary" || { rm -rf -- "$stage"; return 1; }
+    configuration_validate "$name" "$temporary" || { rm -rf -- "$stage"; return 1; }
+  done
+  rm -rf -- "$stage"
+}
+
+materials_projection_validate_legacy() {
+  local file=$1
+  [[ -f "$file" && ! -L "$file" && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
+  jq -M -e '
+    .schema_version == 1 and (.revision | type == "number" and floor == . and . >= 1) and
+    (.state == "applied" or .state == "applying") and
+    (.applied_at | type == "number" and floor == . and . >= 0) and
+    (.source_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+    (.configuration | type == "object") and
+    (.prompt | type == "object") and (.prompt.text | type == "string" and length > 0) and
+    (.prompt.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+    (.prompt.bytes | type == "number" and floor == . and . >= 1 and . <= 262144) and
+    (.knowledge | type == "object") and
+    (.configuration.runtime.revision == .revision) and
+    (.configuration.runtime.applied_revision | type == "number" and floor == . and . >= 0) and
+    (.configuration.runtime.applied_revision <= .revision) and
+    (if .state == "applied" then .configuration.runtime.applied_revision == .revision else true end)
+  ' "$file" >/dev/null || return 1
+  python3 - "$file" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+raw = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+encoded = raw["prompt"]["text"].encode("utf-8")
+if not encoded or b"\x00" in encoded or len(encoded) != raw["prompt"]["bytes"]:
+    raise SystemExit(1)
+if hashlib.sha256(encoded).hexdigest() != raw["prompt"]["sha256"]:
+    raise SystemExit(1)
+PY
+  materials_projection_validate_configuration "$file"
+}
+
+materials_projection_validate() {
+  local file=$1
   [[ -f "$file" && ! -L "$file" && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
   jq -M -e --argjson schema "$MATERIALS_SCHEMA_VERSION" '
     .schema_version == $schema and (.revision | type == "number" and floor == . and . >= 1) and
@@ -191,18 +265,30 @@ materials_projection_validate() {
     (.applied_at | type == "number" and floor == . and . >= 0) and
     (.source_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
     (.source_components | type == "object") and
+    ((.source_components | keys) == ["feedback","handoff","keyword","knowledge","menu","prompt","runtime","tags"]) and
     all(.source_components[]; type == "string" and test("^[a-f0-9]{64}$")) and
     (.configuration | type == "object") and
-    (.prompt | type == "object") and (.prompt.text | type == "string" and length > 0) and
+    ((.configuration | keys) == ["feedback","handoff","keyword","menu","runtime","tags"]) and
+    (.prompt | type == "object") and ((.prompt | keys) == ["bytes","sha256","text"]) and
+    (.prompt.text | type == "string" and length > 0) and
     (.prompt.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
     (.prompt.bytes | type == "number" and floor == . and . >= 1 and . <= 262144) and
     (.knowledge | type == "object") and
+    ((.knowledge | keys) == ["catalog_revision","catalog_sha256","document_count","enabled_document_count",
+      "enabled_library_ids","lexical_sha256","library_count","manifest_sha256","map_sha256","profile_sha256","settings_sha256"]) and
     all([.knowledge.catalog_sha256,.knowledge.manifest_sha256,.knowledge.map_sha256,
-         (.knowledge.settings_sha256 // ""),(.knowledge.profile_sha256 // ""),(.knowledge.lexical_sha256 // "") ][];
-      type == "string" and (. == "" or test("^[a-f0-9]{64}$"))) and
+         .knowledge.settings_sha256,.knowledge.lexical_sha256][];
+      type == "string" and test("^[a-f0-9]{64}$")) and
+    (.knowledge.profile_sha256 | type == "string" and
+      (. == "" or test("^[a-f0-9]{64}$"))) and
+    (.knowledge.catalog_revision | type == "number" and floor == . and . >= 0) and
     (.knowledge.enabled_library_ids | type == "array" and all(type == "string" and test("^kb_([a-f0-9]{16}|default)$"))) and
+    ((.knowledge.enabled_library_ids | unique | length) == (.knowledge.enabled_library_ids | length)) and
     (.knowledge.library_count | type == "number" and floor == . and . >= 0 and . <= 100) and
+    ((.knowledge.enabled_library_ids | length) <= .knowledge.library_count) and
     (.knowledge.document_count | type == "number" and floor == . and . >= 0 and . <= 1000000) and
+    (.knowledge.enabled_document_count | type == "number" and floor == . and . >= 0 and . <= .knowledge.document_count) and
+    (if .knowledge.enabled_document_count > 0 then (.knowledge.profile_sha256 | test("^[a-f0-9]{64}$")) else true end) and
     (if .state == "applied" then
        .configuration.runtime.revision == .revision and .configuration.runtime.applied_revision == .revision
      else .configuration.runtime.revision == .revision and
@@ -213,27 +299,48 @@ materials_projection_validate() {
   python3 - "$file" <<'PY'
 import hashlib
 import json
+import pathlib
 import sys
-raw = json.load(open(sys.argv[1], encoding="utf-8"))
+
+raw = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 encoded = raw["prompt"]["text"].encode("utf-8")
-if len(encoded) != raw["prompt"]["bytes"]:
+if not encoded or b"\x00" in encoded or len(encoded) != raw["prompt"]["bytes"]:
     raise SystemExit(1)
 if hashlib.sha256(encoded).hexdigest() != raw["prompt"]["sha256"]:
     raise SystemExit(1)
+
+knowledge = raw["knowledge"]
+canonical = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+runtime = dict(raw["configuration"]["runtime"])
+runtime.pop("revision", None)
+runtime.pop("applied_revision", None)
+embedded_components = {
+    "runtime": runtime,
+    "handoff": raw["configuration"]["handoff"],
+    "keyword": raw["configuration"]["keyword"],
+    "menu": raw["configuration"]["menu"],
+    "tags": raw["configuration"]["tags"],
+    "feedback": raw["configuration"]["feedback"],
+}
+for name, value in embedded_components.items():
+    if hashlib.sha256(canonical(value)).hexdigest() != raw["source_components"][name]:
+        raise SystemExit(1)
+if raw["source_components"]["prompt"] != raw["prompt"]["sha256"]:
+    raise SystemExit(1)
+if hashlib.sha256(canonical(knowledge)).hexdigest() != raw["source_components"]["knowledge"]:
+    raise SystemExit(1)
+if hashlib.sha256(canonical(raw["source_components"])).hexdigest() != raw["source_sha256"]:
+    raise SystemExit(1)
 PY
-  stage=$(mktemp -d "${file}.validate.XXXXXXXX")
-  for name in runtime handoff keyword menu tags feedback; do
-    temporary="${stage}/${name}.json"
-    jq -M ".configuration.${name}" "$file" > "$temporary" || { rm -rf -- "$stage"; return 1; }
-    configuration_validate "$name" "$temporary" || { rm -rf -- "$stage"; return 1; }
-  done
-  rm -rf -- "$stage"
+  materials_projection_validate_configuration "$file"
 }
 
 materials_prepare_candidate() {
   local deploy_dir=$1 stage=$2 revision=$3 state=${4:-applied}
-  local name prompt_hash prompt_bytes catalog_hash manifest_hash map_hash settings_hash profile_hash lexical_hash source_hash now lexical_result
-  local components="${stage}/components.json" candidate="${stage}/materials-applied.json" runtime_semantic
+  local name prompt_hash prompt_bytes catalog_hash manifest_hash map_hash settings_hash profile_hash lexical_hash knowledge_hash source_hash now lexical_result
+  local expected_workspace profile_fingerprint profile_actual
+  local enabled_document_count
+  local components="${stage}/components.json" candidate="${stage}/materials-applied.json" runtime_semantic knowledge_identity
   mkdir -p -- "${stage}/config" "${stage}/knowledge"
   for name in runtime handoff keyword menu tags feedback; do
     materials_normalize_configuration "$name" "${deploy_dir}/config/${name}.yaml" "${stage}/config/${name}.json" || return 1
@@ -244,34 +351,50 @@ materials_prepare_candidate() {
 
   prompt_hash=$(materials_sha_or_empty "${stage}/prompt.md")
   prompt_bytes=$(stat -c '%s' -- "${stage}/prompt.md")
-  catalog_hash=$(materials_sha_or_empty "${stage}/knowledge/catalog-semantic.json")
-  manifest_hash=$(materials_sha_or_empty "${deploy_dir}/data/knowledge-manifest.json")
-  map_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-map.json")
-  settings_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-settings.json")
-  profile_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-profile.json")
-  lexical_hash=$(materials_sha_or_empty "${deploy_dir}/data/runtime/knowledge-lexical.json")
-  if [[ -f "${deploy_dir}/data/runtime/knowledge-map.json" ]]; then
-    [[ ! -L "${deploy_dir}/data/runtime/knowledge-map.json" && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-map.json") -le $MATERIALS_PROJECTION_MAX_BYTES ]] \
-      || { materials_error '运行时知识映射超过 16777216 字节或文件类型不安全'; return 1; }
-    jq -M -e '.schema_version == 2 and (.documents | type == "array")' "${deploy_dir}/data/runtime/knowledge-map.json" >/dev/null \
-      || { materials_error '运行时知识映射格式无效'; return 1; }
-  fi
-  [[ -f "${deploy_dir}/data/runtime/knowledge-settings.json" && ! -L "${deploy_dir}/data/runtime/knowledge-settings.json" \
-      && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-settings.json") -le 65536 ]] \
+  catalog_hash=$(materials_json_hash "${stage}/knowledge/catalog-semantic.json")
+  manifest_hash=$(materials_required_hash "${deploy_dir}/data/knowledge-manifest.json" "$MATERIALS_PROJECTION_MAX_BYTES" '知识清单') || return 1
+  jq -M -e '.version == 1 and (.files | type == "object") and (.pending_files | type == "object")' \
+    "${deploy_dir}/data/knowledge-manifest.json" >/dev/null \
+    || { materials_error '知识清单格式无效'; return 1; }
+  map_hash=$(materials_required_hash "${deploy_dir}/data/runtime/knowledge-map.json" "$MATERIALS_PROJECTION_MAX_BYTES" '运行时知识映射') || return 1
+  jq -M -e '.schema_version == 2 and (.documents | type == "array")' "${deploy_dir}/data/runtime/knowledge-map.json" >/dev/null \
+    || { materials_error '运行时知识映射格式无效'; return 1; }
+  enabled_document_count=$(jq -M -r '.documents | length' "${deploy_dir}/data/runtime/knowledge-map.json")
+  settings_hash=$(materials_required_hash "${deploy_dir}/data/runtime/knowledge-settings.json" 65536 '知识运行设置') \
     || { materials_error '知识运行设置尚未通过工作区回读'; return 1; }
-  jq -M -e '.schema_version == 1 and (.workspace_slug | type == "string" and test("^[A-Za-z0-9_-]{1,128}$")) and
+  expected_workspace=$(env_get "${deploy_dir}/.env" ANYTHINGLLM_WORKSPACE) \
+    || { materials_error '当前 AnythingLLM 工作区配置缺失'; return 1; }
+  [[ "$expected_workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]] \
+    || { materials_error '当前 AnythingLLM 工作区配置无效'; return 1; }
+  jq -M -e --arg workspace "$expected_workspace" '.schema_version == 1 and .workspace_slug == $workspace and
     (.temperature | type == "number" and isfinite and . >= 0 and . <= 2) and
     (.observed_at | type == "number" and floor == . and . >= 0)' "${deploy_dir}/data/runtime/knowledge-settings.json" >/dev/null \
-    || { materials_error '知识运行设置格式无效'; return 1; }
+    || { materials_error '知识运行设置与当前工作区不一致'; return 1; }
+  profile_hash=$(materials_optional_hash "${deploy_dir}/data/runtime/knowledge-profile.json" 65536 '知识索引代次') || return 1
   if [[ -n "$profile_hash" ]]; then
     jq -M -e '.schema_version == 1 and .state == "applied" and
       (.fingerprint | type == "string" and test("^[a-f0-9]{64}$")) and (.profile | type == "object")' \
       "${deploy_dir}/data/runtime/knowledge-profile.json" >/dev/null \
       || { materials_error '知识索引代次尚未完整应用'; return 1; }
+    profile_fingerprint=$(jq -M -er '.fingerprint' "${deploy_dir}/data/runtime/knowledge-profile.json") || return 1
+    profile_actual=$(python3 - "${deploy_dir}/data/runtime/knowledge-profile.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["profile"]
+encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(encoded).hexdigest())
+PY
+    ) || return 1
+    [[ "$profile_actual" == "$profile_fingerprint" ]] \
+      || { materials_error '知识索引代次指纹与当前配置不一致'; return 1; }
+  elif (( enabled_document_count > 0 )); then
+    materials_error '已有启用知识文档，但知识索引代次缺失'
+    return 1
   fi
-  [[ -f "${deploy_dir}/data/runtime/knowledge-lexical.json" && ! -L "${deploy_dir}/data/runtime/knowledge-lexical.json" \
-      && $(stat -c '%s' -- "${deploy_dir}/data/runtime/knowledge-lexical.json") -le $MATERIALS_PROJECTION_MAX_BYTES ]] \
-    || { materials_error '词法补召回索引缺失、超过 16777216 字节或文件类型不安全'; return 1; }
+  lexical_hash=$(materials_required_hash "${deploy_dir}/data/runtime/knowledge-lexical.json" "$MATERIALS_PROJECTION_MAX_BYTES" '词法补召回索引') || return 1
   lexical_result=$(mktemp "${stage}/knowledge-lexical-verify.XXXXXXXX")
   if ! python3 -B "${MATERIALS_SCRIPT_DIR}/knowledge-lexical.py" verify --deploy-dir "$deploy_dir" > "$lexical_result" 2>/dev/null \
     || ! jq -e --arg map "$map_hash" '.ok == true and .read_only == true and .map_sha256 == $map and (.complete | type == "boolean")' "$lexical_result" >/dev/null 2>&1; then
@@ -282,17 +405,30 @@ materials_prepare_candidate() {
   rm -f -- "$lexical_result"
   runtime_semantic="${stage}/config/runtime-semantic.json"
   jq -M 'del(.revision,.applied_revision)' "${stage}/config/runtime.json" > "$runtime_semantic"
+  knowledge_identity="${stage}/knowledge/runtime-identity.json"
+  jq -M -n --arg catalog "$catalog_hash" --arg manifest "$manifest_hash" --arg map "$map_hash" \
+    --arg settings "$settings_hash" --arg profile "$profile_hash" --arg lexical "$lexical_hash" \
+    --slurpfile catalog_value "${stage}/knowledge/catalog.json" --argjson enabled_document_count "$enabled_document_count" \
+    '{catalog_revision:($catalog_value[0].revision // 0),catalog_sha256:$catalog,
+      manifest_sha256:$manifest,map_sha256:$map,settings_sha256:$settings,
+      profile_sha256:$profile,lexical_sha256:$lexical,
+      enabled_library_ids:[$catalog_value[0].libraries[] | select(.enabled) | .id],
+      library_count:($catalog_value[0].libraries|length),
+      document_count:([$catalog_value[0].libraries[].documents[]]|length),
+      enabled_document_count:$enabled_document_count}' \
+    > "$knowledge_identity"
+  knowledge_hash=$(materials_json_hash "$knowledge_identity")
   jq -M -n \
-    --arg runtime "$(materials_sha_or_empty "$runtime_semantic")" \
-    --arg handoff "$(materials_sha_or_empty "${stage}/config/handoff.json")" \
-    --arg keyword "$(materials_sha_or_empty "${stage}/config/keyword.json")" \
-    --arg menu "$(materials_sha_or_empty "${stage}/config/menu.json")" \
-    --arg tags "$(materials_sha_or_empty "${stage}/config/tags.json")" \
-    --arg feedback "$(materials_sha_or_empty "${stage}/config/feedback.json")" \
-    --arg prompt "$prompt_hash" --arg catalog "$catalog_hash" \
-    '{runtime:$runtime,handoff:$handoff,keyword:$keyword,menu:$menu,tags:$tags,feedback:$feedback,prompt:$prompt,knowledge:$catalog}' \
+    --arg runtime "$(materials_json_hash "$runtime_semantic")" \
+    --arg handoff "$(materials_json_hash "${stage}/config/handoff.json")" \
+    --arg keyword "$(materials_json_hash "${stage}/config/keyword.json")" \
+    --arg menu "$(materials_json_hash "${stage}/config/menu.json")" \
+    --arg tags "$(materials_json_hash "${stage}/config/tags.json")" \
+    --arg feedback "$(materials_json_hash "${stage}/config/feedback.json")" \
+    --arg prompt "$prompt_hash" --arg knowledge "$knowledge_hash" \
+    '{runtime:$runtime,handoff:$handoff,keyword:$keyword,menu:$menu,tags:$tags,feedback:$feedback,prompt:$prompt,knowledge:$knowledge}' \
     > "$components"
-  source_hash=$(sha256sum -- "$components" | awk '{print $1}')
+  source_hash=$(materials_json_hash "$components")
   now=$(date +%s)
   jq -M -n --argjson schema "$MATERIALS_SCHEMA_VERSION" --argjson revision "$revision" \
     --arg state "$state" --argjson now "$now" --arg source_hash "$source_hash" \
@@ -304,21 +440,14 @@ materials_prepare_candidate() {
     --slurpfile tags "${stage}/config/tags.json" \
     --slurpfile feedback "${stage}/config/feedback.json" \
     --rawfile prompt "${stage}/prompt.md" --arg prompt_hash "$prompt_hash" --argjson prompt_bytes "$prompt_bytes" \
-    --slurpfile catalog "${stage}/knowledge/catalog.json" --arg catalog_hash "$catalog_hash" \
-    --arg manifest_hash "$manifest_hash" --arg map_hash "$map_hash" --arg settings_hash "$settings_hash" \
-    --arg profile_hash "$profile_hash" --arg lexical_hash "$lexical_hash" '
+    --slurpfile knowledge "$knowledge_identity" '
       {schema_version:$schema,revision:$revision,state:$state,applied_at:$now,
        source_sha256:$source_hash,source_components:$components[0],
        configuration:{
          runtime:($runtime[0] + {schema_version:2,revision:$revision,applied_revision:(if $state == "applied" then $revision else ($runtime[0].applied_revision // 0) end)}),
          handoff:$handoff[0],keyword:$keyword[0],menu:$menu[0],tags:$tags[0],feedback:$feedback[0]},
        prompt:{text:$prompt,sha256:$prompt_hash,bytes:$prompt_bytes},
-       knowledge:{catalog_revision:($catalog[0].revision // 0),catalog_sha256:$catalog_hash,
-         manifest_sha256:$manifest_hash,map_sha256:$map_hash,settings_sha256:$settings_hash,
-         profile_sha256:$profile_hash,lexical_sha256:$lexical_hash,
-         enabled_library_ids:[$catalog[0].libraries[] | select(.enabled) | .id],
-         library_count:($catalog[0].libraries|length),
-         document_count:([$catalog[0].libraries[].documents[]]|length)}}
+       knowledge:$knowledge[0]}
     ' > "$candidate"
   materials_projection_validate "$candidate" \
     || { materials_error '候选生效投影未通过内部一致性校验'; return 1; }
@@ -333,15 +462,91 @@ materials_projection_write() {
   mv -f -- "$temporary" "$target"
 }
 
+materials_projection_write_legacy() {
+  local deploy_dir=$1 input=$2 target="${1}/config/materials-applied.json" temporary
+  materials_projection_validate_legacy "$input" || { materials_error '拒绝写入无效的旧资料投影'; return 1; }
+  temporary=$(mktemp "${target}.tmp.XXXXXX")
+  install -m 640 -- "$input" "$temporary"
+  chown root:1000 "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$target"
+}
+
+# 候选第一次生成后，发布前再从当前受管原文和运行投影独立重算一次身份。
+# 维护锁由调用方持有；二次结果不一致时保留旧投影，不发布混合代次。
+materials_projection_write_current() {
+  local deploy_dir=$1 input=$2 revision state verify_stage expected actual
+  materials_projection_validate "$input" || { materials_error '拒绝发布无效的资料投影'; return 1; }
+  revision=$(jq -M -er '.revision' "$input") || return 1
+  state=$(jq -M -er '.state' "$input") || return 1
+  verify_stage=$(mktemp -d "${deploy_dir}/tmp/materials-publish-verify.XXXXXXXX")
+  if ! materials_prepare_candidate "$deploy_dir" "$verify_stage" "$revision" "$state"; then
+    rm -rf -- "$verify_stage"
+    materials_error '发布前资料身份复核失败，上一有效投影保持不变'
+    return 1
+  fi
+  expected=$(jq -McS '{revision,state,source_sha256}' "$input") || { rm -rf -- "$verify_stage"; return 1; }
+  actual=$(jq -McS '{revision,state,source_sha256}' "${verify_stage}/materials-applied.json") \
+    || { rm -rf -- "$verify_stage"; return 1; }
+  if [[ "$expected" != "$actual" ]]; then
+    rm -rf -- "$verify_stage"
+    materials_error '资料在候选生成后发生变化，未发布混合代次；请重新应用'
+    return 1
+  fi
+  materials_projection_write "$deploy_dir" "$input"
+  rm -rf -- "$verify_stage"
+}
+
 materials_projection_readback() {
-  local deploy_dir=$1 expected actual
+  local deploy_dir=$1 expected actual revision
   expected=$(materials_sha_or_empty "${deploy_dir}/config/materials-applied.json")
+  revision=$(jq -M -er '.revision' "${deploy_dir}/config/materials-applied.json") || return 1
   actual=$(docker_compose "$deploy_dir" exec -T n8n node -e '
     const fs=require("fs"),crypto=require("crypto");
-    const value=fs.readFileSync("/opt/crisp-ai/config/materials-applied.json");
-    process.stdout.write(crypto.createHash("sha256").update(value).digest("hex"));
+    const digest=value=>crypto.createHash("sha256").update(value).digest("hex");
+    const canonical=value=>Array.isArray(value)?"["+value.map(canonical).join(",")+"]"
+      :value&&typeof value==="object"?"{"+Object.keys(value).sort().map(key=>JSON.stringify(key)+":"+canonical(value[key])).join(",")+"}"
+      :JSON.stringify(value);
+    const regular=(file,maximum,optional=false)=>{
+      try { const stat=fs.lstatSync(file); if(!stat.isFile()||stat.isSymbolicLink()||stat.size<1||stat.size>maximum) throw new Error("unsafe"); return fs.readFileSync(file); }
+      catch(error){ if(optional&&error.code==="ENOENT") return null; throw error; }
+    };
+    const projectionRaw=regular("/opt/crisp-ai/config/materials-applied.json",16777216);
+    const value=JSON.parse(projectionRaw.toString("utf8"));
+    if(value.schema_version!==2||value.state!=="applied"||value.configuration?.runtime?.revision!==value.revision
+      ||value.configuration.runtime.applied_revision!==value.revision) throw new Error("projection");
+    const runtime={...value.configuration.runtime}; delete runtime.revision; delete runtime.applied_revision;
+    const embedded={runtime,handoff:value.configuration.handoff,keyword:value.configuration.keyword,
+      menu:value.configuration.menu,tags:value.configuration.tags,feedback:value.configuration.feedback};
+    for(const [name,item] of Object.entries(embedded)) if(digest(canonical(item))!==value.source_components?.[name]) throw new Error("component");
+    if(digest(value.prompt.text)!==value.prompt.sha256||Buffer.byteLength(value.prompt.text)!==value.prompt.bytes
+      ||value.source_components.prompt!==value.prompt.sha256) throw new Error("prompt");
+    if(digest(canonical(value.knowledge))!==value.source_components.knowledge
+      ||digest(canonical(value.source_components))!==value.source_sha256) throw new Error("identity");
+    const base="/opt/crisp-ai/data/runtime/";
+    const map=regular(base+"knowledge-map.json",16777216);
+    const settings=regular(base+"knowledge-settings.json",65536);
+    const lexical=regular(base+"knowledge-lexical.json",16777216);
+    const profile=regular(base+"knowledge-profile.json",65536,true);
+    if(digest(map)!==value.knowledge.map_sha256||digest(settings)!==value.knowledge.settings_sha256
+      ||digest(lexical)!==value.knowledge.lexical_sha256
+      ||(profile===null?"":digest(profile))!==value.knowledge.profile_sha256) throw new Error("runtime knowledge");
+    const mapValue=JSON.parse(map.toString("utf8"));
+    const settingsValue=JSON.parse(settings.toString("utf8"));
+    if(mapValue?.schema_version!==2||!Array.isArray(mapValue.documents)
+      ||mapValue.documents.length!==value.knowledge.enabled_document_count) throw new Error("map count");
+    if(settingsValue?.schema_version!==1||settingsValue.workspace_slug!==String(process.env.ANYTHINGLLM_WORKSPACE||"crisp-support")
+      ||typeof settingsValue.temperature!=="number"||!Number.isFinite(settingsValue.temperature)
+      ||settingsValue.temperature<0||settingsValue.temperature>2
+      ||!Number.isSafeInteger(settingsValue.observed_at)||settingsValue.observed_at<0) throw new Error("settings");
+    if(profile!==null) {
+      const profileValue=JSON.parse(profile.toString("utf8"));
+      if(profileValue?.schema_version!==1||profileValue.state!=="applied"
+        ||!/^[a-f0-9]{64}$/.test(profileValue.fingerprint||"")
+        ||digest(canonical(profileValue.profile))!==profileValue.fingerprint) throw new Error("profile");
+    } else if(value.knowledge.enabled_document_count>0) throw new Error("profile missing");
+    process.stdout.write(digest(projectionRaw)+":"+value.revision+":ready");
   ' 2>/dev/null) || return 1
-  [[ -n "$expected" && "$actual" == "$expected" ]]
+  [[ -n "$expected" && "$actual" == "${expected}:${revision}:ready" ]]
 }
 
 materials_snapshot_create() {
@@ -408,14 +613,19 @@ materials_external_restore() {
 }
 
 materials_publish_old_generation() {
-  local deploy_dir=$1 old=$2 revision=$3 state=$4 output
+  local deploy_dir=$1 old=$2 revision=$3 state=$4 output schema
   output=$(mktemp "${deploy_dir}/tmp/materials-old.XXXXXX")
   jq -M --argjson revision "$revision" --arg state "$state" --argjson now "$(date +%s)" '
     .revision=$revision | .state=$state | .applied_at=$now |
     .configuration.runtime.revision=$revision |
     .configuration.runtime.applied_revision=(if $state == "applied" then $revision else (.configuration.runtime.applied_revision // 0) end)
   ' "$old" > "$output"
-  materials_projection_write "$deploy_dir" "$output"
+  schema=$(jq -M -er '.schema_version' "$output") || { rm -f -- "$output"; return 1; }
+  if [[ "$schema" == 1 ]]; then
+    materials_projection_write_legacy "$deploy_dir" "$output"
+  else
+    materials_projection_write "$deploy_dir" "$output"
+  fi
   rm -f -- "$output"
 }
 
@@ -433,11 +643,47 @@ materials_finalize_runtime_source() {
   mv -f -- "$temporary" "$target"
 }
 
+materials_set_runtime_disable_epoch() {
+  local deploy_dir=$1 epoch=$2 target="${1}/config/runtime.yaml" normalized temporary
+  [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch <= 2147483647 )) || {
+    materials_error '客服停用控制代次已达到安全边界，拒绝应用未受保护的配置'
+    return 1
+  }
+  normalized=$(mktemp "${deploy_dir}/tmp/runtime-disable-epoch.XXXXXX")
+  materials_normalize_configuration runtime "$target" "$normalized" \
+    || { rm -f -- "$normalized"; return 1; }
+  temporary=$(mktemp "${target}.tmp.XXXXXX")
+  jq -M --argjson epoch "$epoch" '.schema_version=2 | .disable_epoch=$epoch' "$normalized" > "$temporary" \
+    || { rm -f -- "$normalized" "$temporary"; return 1; }
+  rm -f -- "$normalized"
+  chmod 640 "$temporary"
+  chown root:1000 "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$target"
+}
+
 materials_initialize() (
   local deploy_dir=$1 projection="${1}/config/materials-applied.json" stage revision snapshot candidate_snapshot runtime_normalized
-  [[ ! -e "$projection" && ! -L "$projection" ]] \
-    || { materials_projection_validate "$projection" || { materials_error '现有资料投影损坏，拒绝回退读取可编辑原文'; return 1; }; return 0; }
+  local had_projection=false legacy=false legacy_archive='' failed=false
+  if [[ -e "$projection" || -L "$projection" ]]; then
+    if materials_projection_validate "$projection"; then
+      return 0
+    elif materials_projection_validate_legacy "$projection"; then
+      had_projection=true
+      legacy=true
+    else
+      materials_error '现有资料投影损坏，拒绝回退读取可编辑原文'
+      return 1
+    fi
+  fi
   acquire_maintenance_lock "$deploy_dir"
+  # 锁建立后重新核对；等待期间其他维护任务可能已经完成迁移。
+  if [[ -e "$projection" || -L "$projection" ]]; then
+    if materials_projection_validate "$projection"; then return 0; fi
+    materials_projection_validate_legacy "$projection" \
+      || { materials_error '资料投影在迁移前发生变化，拒绝继续'; return 1; }
+    had_projection=true
+    legacy=true
+  fi
   configuration_runtime_init "$deploy_dir"
   knowledge_catalog_migrate "$deploy_dir"
   configuration_prompt_verify_file "$deploy_dir" "${deploy_dir}/config/prompt.md" \
@@ -448,22 +694,52 @@ materials_initialize() (
   materials_normalize_configuration runtime "${deploy_dir}/config/runtime.yaml" "$runtime_normalized" \
     || { rm -f -- "$runtime_normalized"; return 1; }
   revision=$(jq -M -r '[(.revision // 0),(.applied_revision // 0)] | max | if . < 1 then 1 else . end' "$runtime_normalized")
+  if [[ "$legacy" == true ]]; then
+    revision=$(jq -M -r --argjson runtime "$revision" '[.revision,$runtime] | max' "$projection")
+    legacy_archive=$(mktemp -d "${deploy_dir}/backups/config-history/materials-v1-migration.XXXXXXXX")
+    chmod 700 "$legacy_archive"
+    install -m 600 -- "$projection" "${legacy_archive}/materials-applied-v1.json"
+    if [[ -f "${deploy_dir}/backups/config-history/materials.applied.tar.gz" \
+      && ! -L "${deploy_dir}/backups/config-history/materials.applied.tar.gz" ]]; then
+      install -m 600 -- "${deploy_dir}/backups/config-history/materials.applied.tar.gz" \
+        "${legacy_archive}/materials.applied.tar.gz"
+    fi
+  fi
   rm -f -- "$runtime_normalized"
   stage=$(mktemp -d "${deploy_dir}/tmp/materials-initialize.XXXXXXXX")
+  install -m 600 -- "${deploy_dir}/config/runtime.yaml" "${stage}/runtime.previous.yaml"
+  if [[ "$had_projection" == true ]]; then
+    install -m 600 -- "$projection" "${stage}/materials.previous.json"
+  fi
   materials_prepare_candidate "$deploy_dir" "$stage" "$revision" applied || { rm -rf -- "$stage"; return 1; }
   candidate_snapshot="${stage}/materials.applied.tar.gz"
   materials_snapshot_create "$deploy_dir" "$candidate_snapshot" || { rm -rf -- "$stage"; return 1; }
-  materials_finalize_runtime_source "$deploy_dir" "$revision"
-  materials_projection_write "$deploy_dir" "${stage}/materials-applied.json"
-  if ! materials_projection_readback "$deploy_dir"; then
-    rm -f -- "$projection"
-    materials_error '运行容器未读到首份资料投影'
+  materials_finalize_runtime_source "$deploy_dir" "$revision" || failed=true
+  if [[ "$failed" == false ]]; then
+    materials_projection_write_current "$deploy_dir" "${stage}/materials-applied.json" || failed=true
+  fi
+  if [[ "$failed" == false ]]; then
+    materials_projection_readback "$deploy_dir" || failed=true
+  fi
+  if [[ "$failed" == true ]]; then
+    install -m 640 -- "${stage}/runtime.previous.yaml" "${deploy_dir}/config/runtime.yaml"
+    chown root:1000 "${deploy_dir}/config/runtime.yaml" 2>/dev/null || true
+    if [[ "$had_projection" == true ]]; then
+      if [[ "$legacy" == true ]]; then
+        materials_projection_write_legacy "$deploy_dir" "${stage}/materials.previous.json" || true
+      else
+        materials_projection_write "$deploy_dir" "${stage}/materials.previous.json" || true
+      fi
+    else
+      rm -f -- "$projection"
+    fi
+    materials_error '运行容器未确认同一代资料投影；上一配置已恢复，自动回复保持受阻止直到重新应用'
     rm -rf -- "$stage"
     return 1
   fi
   snapshot="${deploy_dir}/backups/config-history/materials.applied.tar.gz"
   install -m 600 -- "$candidate_snapshot" "$snapshot"
-  jq -M '{initialized:true,revision,state,source_sha256}' "$projection"
+  jq -M --argjson migrated "$legacy" '{initialized:true,migrated_from_schema_v1:$migrated,revision,state,source_sha256}' "$projection"
   rm -rf -- "$stage"
 )
 
@@ -471,6 +747,14 @@ materials_apply() (
   local deploy_dir=$1 knowledge_mode=${2:-none} projection="${1}/config/materials-applied.json" old_snapshot old='' stage='' revision=0
   local prompt_changed knowledge_changed config_changed final_stage='' rollback_revision history candidate_snapshot result=0 recovering=false
   local transition_started=false transition_committed=false signal_status=0
+  local old_disable_epoch=0 candidate_disable_epoch=0 desired_disable_epoch=0 old_enabled=true candidate_enabled=true
+  if [[ -f "$projection" && ! -L "$projection" ]] \
+    && ! materials_projection_validate "$projection" \
+    && materials_projection_validate_legacy "$projection"; then
+    # 旧 schema 只作为迁移输入；先生成并回读当前 schema，再进入普通应用事务。
+    materials_initialize "$deploy_dir" >/dev/null \
+      || { materials_error '旧资料投影尚未完成安全迁移，未开始本次应用'; return 1; }
+  fi
   # shellcheck disable=SC2317
   materials_apply_on_signal() {
     signal_status=$1
@@ -517,6 +801,25 @@ materials_apply() (
   stage=$(mktemp -d "${deploy_dir}/tmp/materials-candidate.XXXXXXXX")
   materials_prepare_candidate "$deploy_dir" "$stage" "$revision" applied \
     || { rm -f -- "$old"; rm -rf -- "$stage"; return 1; }
+  old_disable_epoch=$(jq -M -er '.configuration.runtime.disable_epoch // 0' "$old") || return 1
+  candidate_disable_epoch=$(jq -M -er '.configuration.runtime.disable_epoch // 0' "${stage}/materials-applied.json") || return 1
+  old_enabled=$(jq -M -er '.configuration.runtime.enabled' "$old") || return 1
+  candidate_enabled=$(jq -M -er '.configuration.runtime.enabled' "${stage}/materials-applied.json") || return 1
+  desired_disable_epoch=$old_disable_epoch
+  if [[ "$old_enabled" == true && "$candidate_enabled" == false ]]; then
+    (( old_disable_epoch < 2147483647 )) \
+      || { materials_error '客服停用控制代次已达到安全边界，拒绝应用未受保护的配置'; return 1; }
+    desired_disable_epoch=$((old_disable_epoch + 1))
+  fi
+  if (( candidate_disable_epoch != desired_disable_epoch )); then
+    # 该内部代次只由上一份有效投影决定。失败重试不会重复递增，导入包和
+    # 直接编辑也不能把旧待处理消息重新变成可发送任务。
+    materials_set_runtime_disable_epoch "$deploy_dir" "$desired_disable_epoch" || return 1
+    rm -rf -- "$stage"
+    stage=$(mktemp -d "${deploy_dir}/tmp/materials-candidate.XXXXXXXX")
+    materials_prepare_candidate "$deploy_dir" "$stage" "$revision" applied \
+      || { rm -f -- "$old"; rm -rf -- "$stage"; return 1; }
+  fi
   if [[ "$recovering" == false && "$knowledge_mode" == none && $(jq -M -r '.source_sha256' "$old") == $(jq -M -r '.source_sha256' "${stage}/materials-applied.json") ]]; then
     jq -M -n --argjson revision "$(jq -M -r '.revision' "$old")" '{applied:true,changed:false,revision:$revision}'
     rm -f -- "$old"; rm -rf -- "$stage"; return 0
@@ -572,7 +875,7 @@ materials_apply() (
   if (( result == 0 )); then
     transition_started=true
     materials_finalize_runtime_source "$deploy_dir" "$revision"
-    materials_projection_write "$deploy_dir" "${final_stage}/materials-applied.json"
+    materials_projection_write_current "$deploy_dir" "${final_stage}/materials-applied.json"
     materials_projection_readback "$deploy_dir" || result=1
   fi
   if (( result == 0 )); then
@@ -663,6 +966,10 @@ materials_status() {
     if materials_projection_validate "$projection"; then
       applied_hash=$(jq -M -r '.source_sha256' "$projection")
       state=$(jq -M -r '.state' "$projection")
+      revision=$(jq -M -r '.revision' "$projection")
+    elif materials_projection_validate_legacy "$projection"; then
+      applied_valid=false
+      state=migration_required
       revision=$(jq -M -r '.revision' "$projection")
     else
       applied_valid=false

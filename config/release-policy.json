@@ -1,0 +1,10 @@
+{
+  "project": "ai-support",
+  "authorized_release": "v1.3.0",
+  "allowed_new_release_tags": [
+    "v1.3.0"
+  ],
+  "allow_auto_version_bump": false,
+  "max_new_releases": 1,
+  "require_target_a_acceptance": true
+}

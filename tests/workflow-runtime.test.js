@@ -7,8 +7,8 @@ const crypto = require('crypto');
 const vm = require('vm');
 const { createRuntime } = require('../n8n/runtime');
 const project = path.resolve(__dirname, '..');
-fs.mkdirSync(path.join(project, '.work', 'v1.1.0'), { recursive: true });
-const root = fs.mkdtempSync(path.join(project, '.work', 'v1.1.0', 'runtime-test-'));
+fs.mkdirSync(path.join(project, '.work', 'v1.3.0'), { recursive: true });
+const root = fs.mkdtempSync(path.join(project, '.work', 'v1.3.0', 'runtime-test-'));
 fs.mkdirSync(path.join(root, 'config'), { recursive: true });
 fs.mkdirSync(path.join(root, 'data', 'runtime'), { recursive: true });
 for (const name of ['keyword', 'handoff', 'menu', 'tags', 'feedback', 'provider']) fs.copyFileSync(path.join(project, 'config', name + '.yaml.example'), path.join(root, 'config', name + '.yaml'));
@@ -24,6 +24,62 @@ fs.writeFileSync(path.join(root, 'data/runtime/knowledge-map.json'), JSON.string
   library_id: 'kb_1111111111111111', document_id: 'doc_2222222222222222', projection,
   location: 'custom-documents/' + projection + '-33333333-3333-4333-8333-333333333333.json',
 }] }));
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const writeJson = (file, value) => fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+const materialsKnowledge = () => {
+  const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
+  const mapRaw = fs.readFileSync(mapFile);
+  const map = JSON.parse(mapRaw);
+  const settingsFile = path.join(root, 'data/runtime/knowledge-settings.json');
+  const settings = { schema_version: 1, workspace_slug: env.ANYTHINGLLM_WORKSPACE, temperature: 0.7, observed_at: Date.now() };
+  writeJson(settingsFile, settings);
+  const profileValue = { engine: 'native', model: 'synthetic-embedding', chunk_size: 1000, chunk_overlap: 20,
+    passage_prefix: '', query_prefix: '', component_version: 'synthetic' };
+  const profileFile = path.join(root, 'data/runtime/knowledge-profile.json');
+  writeJson(profileFile, { schema_version: 1, state: 'applied', profile: profileValue,
+    fingerprint: digest(canonical(profileValue)), applied_at: Date.now() });
+  const payload = { schema_version: 2, algorithm: 'crispai-lexical-v2', map_sha256: digest(mapRaw), complete: false,
+    coverage: { source_documents: map.documents.length, indexed_documents: 0, omitted_documents: map.documents.length,
+      source_bytes: map.documents.length, indexed_bytes: 0, omitted_bytes: map.documents.length,
+      reasons: map.documents.length ? ['index_capacity'] : [] }, passages: [] };
+  const lexicalFile = path.join(root, 'data/runtime/knowledge-lexical.json');
+  writeJson(lexicalFile, { ...payload, payload_sha256: digest(canonical(payload)) });
+  const enabledLibraries = [...new Set(map.documents.map(item => item.library_id))].sort();
+  return {
+    catalog_revision: 1,
+    catalog_sha256: digest(canonical({ fixture: 'catalog', documents: map.documents })),
+    manifest_sha256: digest(canonical({ fixture: 'manifest', locations: map.documents.map(item => item.location) })),
+    map_sha256: digest(mapRaw),
+    settings_sha256: digest(fs.readFileSync(settingsFile)),
+    profile_sha256: digest(fs.readFileSync(profileFile)),
+    lexical_sha256: digest(fs.readFileSync(lexicalFile)),
+    enabled_library_ids: enabledLibraries,
+    library_count: enabledLibraries.length,
+    document_count: map.documents.length,
+    enabled_document_count: map.documents.length,
+  };
+};
+const sealMaterials = value => {
+  const runtime = { ...value.configuration.runtime };
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  value.source_components = {
+    runtime: digest(canonical(runtime)), handoff: digest(canonical(value.configuration.handoff)),
+    keyword: digest(canonical(value.configuration.keyword)), menu: digest(canonical(value.configuration.menu)),
+    tags: digest(canonical(value.configuration.tags)), feedback: digest(canonical(value.configuration.feedback)),
+    prompt: value.prompt.sha256, knowledge: digest(canonical(value.knowledge)),
+  };
+  value.source_sha256 = digest(canonical(value.source_components));
+  return value;
+};
+const makeMaterials = (configuration, prompt, revision) => sealMaterials({
+  schema_version: 2, revision, state: 'applied', applied_at: Date.now(), source_sha256: '', source_components: {},
+  configuration, prompt: { text: prompt, sha256: digest(prompt), bytes: Buffer.byteLength(prompt) },
+  knowledge: materialsKnowledge(),
+});
 const messagesOf = body => body.messages || body.input;
 const textOf = message => typeof message.content === 'string' ? message.content
   : message.content.filter(part => ['text', 'input_text', 'output_text'].includes(part.type)).map(part => part.text).join('\n');
@@ -31,6 +87,7 @@ const textOfRequest = body => messagesOf(body).map(textOf).join('\n');
 let now = Date.now();
 let sequence = 1000;
 let delayed;
+let delayedAll;
 let modelFailure = false;
 let tagFailure = false;
 let crispFailure = false;
@@ -46,6 +103,7 @@ let imageMode = 'valid';
 let visualAnswer = '受控视觉协议回答';
 let modelAnswerOverride = null;
 let delayedVision;
+let delayedControlLookups;
 let abortSignalProbe;
 const sent = [];
 const histories = new Map();
@@ -64,7 +122,10 @@ const request = async (url, options = {}) => {
     const history = histories.get(session) || [];
     if (crispFailure) return { status: 403, body: { error: true } };
     if (suffix === '/messages') return { status: 200, body: { error: false, data: history } };
-    if (suffix.startsWith('/message/')) return { status: 200, body: { error: false, data: history.find((message) => String(message.fingerprint) === suffix.slice(9)) || {} } };
+    if (suffix.startsWith('/message/')) {
+      if (delayedControlLookups) await delayedControlLookups;
+      return { status: 200, body: { error: false, data: history.find((message) => String(message.fingerprint) === suffix.slice(9)) || {} } };
+    }
     if (suffix === '/meta' && options.method === 'GET') return { status: tagFailure ? 403 : 200, body: { error: tagFailure, data: { segments: segments.get(session) || ['external-vip'] } } };
     if (suffix === '/meta' && options.method === 'PATCH') { segments.set(session, options.body.segments); return { status: 200, body: { error: false } }; }
     if (suffix === '/message') {
@@ -127,6 +188,7 @@ const request = async (url, options = {}) => {
     } else {
       modelRequests.push(structuredClone(options.body));
       assert.equal(options.body.temperature, 0.7);
+      if (delayedAll) await delayedAll;
       if (delayed) { const pending = delayed; delayed = null; await pending; }
       if (modelFailure) return { status: 503, body: { error: 'provider_failed' } };
       answer = modelAnswerOverride ?? '受控协议回答：' + textOf(messagesOf(options.body).at(-1)).slice(-25);
@@ -152,6 +214,21 @@ const receive = async (body) => {
 const deliver = async (body) => { const entry = await receive(body); if (entry.route === 'process') return runtime.process(entry.key, entry.jobId); return entry; };
 const state = (session) => runtime.readState(runtime.stateKey(env.CRISP_WEBSITE_ID, session));
 const key = (session) => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
+const assertUnresolved = (session, result, code) => {
+  assert.equal(result.status, 'unresolved');
+  const job = state(session).jobs.find((item) => item.id === result.jobId); assert(job);
+  assert.equal(job.status, 'received'); assert.equal(job.responsibility_status, 'unresolved_failure');
+  assert.equal(job.failure_code, code); assert(Number.isFinite(job.retry_at)); return job;
+};
+const recoverUnresolved = async (session, result) => {
+  await runtime.transaction(result.key, (current) => {
+    const job = current.jobs.find((item) => item.id === result.jobId); assert(job); job.retry_at = 0;
+  });
+  const before = sent.filter((item) => item.session_id === session).length;
+  assert.equal((await runtime.process(result.key, result.jobId)).status, 'sent');
+  assert.equal(sent.filter((item) => item.session_id === session).length, before + 1);
+  assert.equal(state(session).jobs.find((item) => item.id === result.jobId).responsibility_status, 'answered_confirmed');
+};
 const click = (session, card, index = 0, event = 'message:updated') => ({ website_id: env.CRISP_WEBSITE_ID, event, timestamp: now, data: { session_id: session, fingerprint: card.fingerprint, ...(event === 'message:send' ? { type: 'picker', from: 'user' } : {}), content: { ...card.content, choices: card.content.choices.map((choice, at) => ({ ...choice, selected: at === index })) } } });
 const operator = async (session, overrides = {}) => {
   const body = { ...message(session, '真人公开处理进度', { from: 'operator', automated: false, ...overrides }), event: 'message:received' };
@@ -160,6 +237,50 @@ const operator = async (session, overrides = {}) => {
 };
 let passed = 0;
 const test = async (name, action) => { await action(); passed += 1; process.stdout.write('通过 UNIT/CONTRACT ' + name + '\n'); };
+const waitForPermitSlot = async (slot) => {
+  const target = path.join(root, 'data/runtime/ordinary-processing-permits', 'slot-' + slot);
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (fs.existsSync(path.join(target, 'owner.json'))) return target;
+    await wait(5);
+  }
+  throw new Error('未在期限内观察到后台任务许可 slot-' + slot);
+};
+const replacePermitOwner = (slot, kind) => {
+  const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+  const slotPath = path.join(permitRoot, 'slot-' + slot);
+  const quarantine = path.join(permitRoot, '.stale-slot-' + slot + '-' + crypto.randomBytes(16).toString('hex'));
+  fs.renameSync(slotPath, quarantine);
+  fs.mkdirSync(slotPath, { mode: 0o700 });
+  const token = crypto.randomBytes(16).toString('hex');
+  const at = Date.now();
+  fs.writeFileSync(path.join(slotPath, 'owner.json'), JSON.stringify({ schema_version: 1, slot, token, kind,
+    acquired_at: at, expires_at: at + 60000 }), { mode: 0o600 });
+  fs.writeFileSync(path.join(slotPath, 'heartbeat.json'), JSON.stringify({ schema_version: 1, token }), { mode: 0o600 });
+  const remove = (directory) => {
+    try {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('测试许可目录异常');
+      for (const name of fs.readdirSync(directory)) {
+        if (!['owner.json', 'heartbeat.json'].includes(name)) throw new Error('测试许可成员异常');
+        fs.unlinkSync(path.join(directory, name));
+      }
+      fs.rmdirSync(directory);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  };
+  return { token, slotPath, quarantine, cleanup() { remove(slotPath); remove(quarantine); } };
+};
+const abortablePending = (signal, started) => {
+  started();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('许可丢失未在期限内中止网络请求')), 1500);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason || Object.assign(new Error('请求已取消'), { name: 'AbortError', code: 'ABORT_ERR' }));
+    };
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+};
 
 (async () => {
   await test('鉴权模式、网站、时间窗和不安全会话', async () => {
@@ -274,20 +395,30 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
     assert.equal(sent.length, before + 1);
   });
-  await test('P0 不确定 operator 仍无法归属时建立代次栅栏，但不吞掉其后的新问题', async () => {
+  await test('P0 不确定 operator 仍无法归属时保留屏障，确认自动化后才放行其后问题', async () => {
     const before = sent.length;
     const item = await deferredOperatorCase('unknown', {});
     const previousGeneration = state(item.session).generation;
-    await runtime.process(item.control.key, item.control.jobId);
-    assert.equal(state(item.session).generation, previousGeneration + 1);
-    assert.equal(item.visitorJob().generation, state(item.session).generation);
+    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'deferred');
+    assert.equal(state(item.session).generation, previousGeneration);
+    assert(state(item.session).uncertain_events.includes(item.control.jobId));
     assert.equal(item.visitorJob().status, 'received');
+    assert.equal(item.visitorJob().deferred_control, true);
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'idle');
+    assert.equal(sent.length, before);
+    const history = histories.get(item.session);
+    history[0].automated = true;
+    const control = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    now = Math.max(now + 1, control.retry_at + 1);
+    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'sent');
+    assert.equal(state(item.session).uncertain_events.length, 0);
+    assert.equal(item.visitorJob().deferred_control, undefined);
     assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
     assert.equal(sent.length, before + 1);
   });
   await test('P0 同一时间戳按持久 sequence 判断先后，控制后的访客消息仍处理一次', async () => {
     const before = sent.length;
-    const item = await deferredOperatorCase('same-timestamp', {}, 0);
+    const item = await deferredOperatorCase('same-timestamp', { automated: true }, 0);
     assert.equal(item.visitorJob().event_time, state(item.session).jobs.find((job) => job.id === item.control.jobId).event_time);
     assert(item.visitorJob().sequence > state(item.session).jobs.find((job) => job.id === item.control.jobId).sequence);
     await runtime.process(item.control.key, item.control.jobId);
@@ -318,10 +449,10 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal(sent.length, before + 1);
   });
   await test('P0 多个未决 operator 逐次建立栅栏，最后归属前不提前释放访客任务', async () => {
-    for (const [suffix, resolutions, shouldSend] of [
-      ['unknown-then-automated', [{}, { automated: true }], true],
-      ['unknown-then-unknown', [{}, {}], true],
-      ['unknown-then-human', [{}, { automated: false }], false],
+    for (const [suffix, resolutions, outcome] of [
+      ['unknown-then-automated', [{}, { automated: true }], 'send'],
+      ['unknown-then-unknown', [{}, {}], 'pending'],
+      ['unknown-then-human', [{}, { automated: false }], 'human'],
     ]) {
       const before = sent.length;
       const session = 'session_multi-control-' + suffix;
@@ -342,15 +473,22 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       assert.equal(state(session).uncertain_events.length, 1);
       assert.equal(visitorJob().deferred_control, true, '尚有第二个未决控制时不能提前释放');
       await runtime.process(controls[1].key, controls[1].jobId);
-      if (shouldSend) {
+      if (outcome === 'send') {
         assert.equal(state(session).mode, 'ai');
         assert.equal(visitorJob().status, 'received');
         assert.equal(visitorJob().deferred_control, undefined);
         assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'sent');
         assert.equal(sent.length, before + 1);
-      } else {
+      } else if (outcome === 'human') {
         assert.equal(state(session).mode, 'human');
         assert.equal(visitorJob().status, 'cancelled');
+        assert.equal(sent.length, before);
+      } else {
+        assert.equal(state(session).mode, 'ai');
+        assert.equal(visitorJob().status, 'received');
+        assert.equal(visitorJob().deferred_control, true);
+        assert.equal(state(session).uncertain_events.length, 1);
+        assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'idle');
         assert.equal(sent.length, before);
       }
     }
@@ -358,7 +496,6 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
   await test('P0 operator 归属事务后崩溃重放保持幂等，不取消恢复期间的新消息', async () => {
     for (const [suffix, resolved, expectedResult] of [
       ['not-human', { automated: true }, 'not-human'],
-      ['unknown', {}, 'unknown'],
       ['human', { automated: false }, 'human'],
     ]) {
       const item = await deferredOperatorCase('resolution-replay-' + suffix, resolved);
@@ -398,27 +535,36 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       }
     }
   });
-  await test('P0 兼容旧版已移除 uncertain ID 的崩溃状态，不重复 unknown 栅栏', async () => {
+  await test('P0 兼容旧版误终结 unknown 的崩溃状态，恢复屏障后精确确认才放行', async () => {
     const item = await deferredOperatorCase('legacy-resolution-replay', {});
     const originalData = structuredClone(state(item.session).jobs.find((job) => job.id === item.control.jobId).data);
     await runtime.process(item.control.key, item.control.jobId);
-    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'idle');
     const firstGeneration = state(item.session).generation;
     await runtime.transaction(item.control.key, (current) => {
       const stored = current.jobs.find((job) => job.id === item.control.jobId);
-      delete stored.operator_resolution;
-      stored.status = 'processing';
-      stored.lease_until = now - 1;
+      stored.operator_resolution = { schema_version: 1, result: 'unknown', human_changed: false };
+      stored.status = 'done';
+      stored.lease_until = 0;
       stored.data = originalData;
       delete stored.plan;
+      current.uncertain_events = current.uncertain_events.filter((id) => id !== stored.id);
     });
     const sentBefore = sent.length;
     now += 1;
     const later = await receive(message(item.session, '旧版崩溃状态恢复后的新问题'));
     runtime = createRuntime(env, runtimeOptions);
+    await runtime.scan();
+    let recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    assert.equal(recovered.status, 'received');
+    assert.equal(recovered.failure_code, 'operator_identity_pending');
+    assert(state(item.session).uncertain_events.includes(item.control.jobId));
+    assert.equal(state(item.session).jobs.find((job) => job.id === later.jobId).deferred_control, true);
+    histories.set(item.session, [{ ...originalData, automated: true }, ...(histories.get(item.session) || [])]);
+    now += 6000;
     await runtime.process(item.control.key, item.control.jobId);
-    const recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId);
-    assert.equal(recovered.operator_resolution.legacy_recovered, true);
+    recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    assert.equal(recovered.operator_resolution.result, 'not-human');
     assert.equal(state(item.session).generation, firstGeneration);
     assert.equal((await runtime.process(later.key, later.jobId)).status, 'sent');
     assert.equal(sent.length, sentBefore + 1);
@@ -607,39 +753,156 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal((await runtime.process(fresh.key, fresh.jobId)).status, 'sent');
     assert.equal(state(activeSession).worker.token, 'active-token', '其他会话恢复不得触碰活跃 worker');
   });
-  await test('P0 人工接管中止已登记但仍挂起的 Crisp 出站，A 不补发且 B 独立', async () => {
-    let release;
-    delayedCrisp = new Promise((resolve) => { release = resolve; });
-    const session = 'session_crisp-send-race';
-    const attempts = sendAttempts;
-    const beforeA = sent.filter((entry) => entry.session_id === session).length;
-    const entry = await receive(message(session, '等待发送的普通问题'));
-    let pendingSettled = false;
-    const pending = runtime.process(entry.key, entry.jobId).then((result) => { pendingSettled = true; return result; },
-      (error) => { pendingSettled = true; throw error; });
-    for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
-    assert.equal(sendAttempts, attempts + 1, '普通回答必须已经进入受控 Crisp POST');
-    now += 5;
-    const controlRuntime = createRuntime(env, runtimeOptions);
-    const human = { ...message(session, '另一运行时实例收到真人公开回复', { from: 'operator', automated: false }), event: 'message:received' };
-    const history = histories.get(session) || []; history.push(human.data); histories.set(session, history);
-    const accepted = await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
-    assert.equal(accepted.accepted, true);
-    if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
-    for (let tries = 0; tries < 100 && (!pendingSettled || !Object.values(state(session).outgoing)
-      .some(record => record.cancellation_reason === 'conversation_state_changed')); tries += 1) await wait(10);
-    assert.equal(pendingSettled, true, '原 worker 仍存活时必须由持久状态轮询中止网络请求');
-    const result = await pending;
-    release();
-    assert.equal(result.status, 'cancelled');
-    assert.equal(state(session).mode, 'human');
-    assert.equal(sent.filter((item) => item.session_id === session).length, beforeA, '挂起出站必须在写入远端记录前中止');
-    const outgoing = Object.values(state(session).outgoing).at(-1);
-    assert.equal(outgoing.status, 'cancelled', '人工接管后本地发送尝试必须终止，不能继续作为待对账发送');
-    assert.equal(outgoing.delivery_uncertain, true, '已经进入 HTTP 层的尝试仍须如实标记远端收包不确定');
-    assert.equal(outgoing.cancellation_reason, 'conversation_state_changed');
-    assert.equal(Object.hasOwn(outgoing, 'body'), false, '取消后的记录不得长期保留待发送正文');
-    assert.equal(state(session).jobs.find((job) => job.id === entry.jobId).status, 'cancelled');
+  await test('P0 人工接管中止已开始的 Crisp 出站，只保留 unknown 对账且 B 独立', async () => {
+    const analytics = path.join(root, 'data/analytics/events.jsonl');
+    const countEvents = type => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
+      .map(line => JSON.parse(line)).filter(event => event.type === type).length : 0;
+    const normalReplies = countEvents('ai_reply');
+    const interruptAfterPostStarted = async (session) => {
+      let release;
+      delayedCrisp = new Promise((resolve) => { release = resolve; });
+      const attempts = sendAttempts;
+      const before = sent.filter((item) => item.session_id === session).length;
+      const entry = await receive(message(session, '等待发送的普通问题'));
+      let pendingSettled = false;
+      const pending = runtime.process(entry.key, entry.jobId).then((result) => {
+        pendingSettled = true; return result;
+      }, (error) => { pendingSettled = true; throw error; });
+      for (let tries = 0; tries < 200 && sendAttempts === attempts; tries += 1) await wait(5);
+      assert.equal(sendAttempts, attempts + 1, '普通回答必须已经进入受控 Crisp POST');
+      now += 5;
+      const controlRuntime = createRuntime(env, runtimeOptions);
+      const human = { ...message(session, '另一运行时实例收到真人公开回复', {
+        from: 'operator', automated: false,
+      }), event: 'message:received' };
+      const history = histories.get(session) || [];
+      history.push(human.data); histories.set(session, history);
+      const accepted = await controlRuntime.receive({ body: human,
+        query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+      assert.equal(accepted.accepted, true);
+      if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
+      for (let tries = 0; tries < 100 && (!pendingSettled || !Object.values(state(session).outgoing)
+        .some(record => record.cancellation_reason === 'conversation_state_changed')); tries += 1) await wait(10);
+      assert.equal(pendingSettled, true, '原 worker 仍存活时必须由持久状态轮询中止网络请求');
+      const result = await pending;
+      release();
+      assert.equal(result.status, 'cancelled');
+      const current = state(session);
+      assert.equal(current.mode, 'human');
+      assert.equal(sent.filter((item) => item.session_id === session).length, before,
+        '挂起出站必须在写入受控远端记录前中止');
+      const outgoing = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
+      const job = current.jobs.find((item) => item.id === entry.jobId);
+      assert(outgoing && job, '人工接管后必须保留原 job 与出站对账身份');
+      assert.equal(outgoing.status, 'unknown');
+      assert.equal(outgoing.delivery_uncertain, true);
+      assert.equal(outgoing.resend_forbidden, true, '人工接管后未知结果只能对账，绝不能重发');
+      assert.equal(outgoing.recovery_deferred, true);
+      assert(outgoing.next_action_at > now, '未知回执必须登记后续只读对账时间');
+      assert.equal(outgoing.cancellation_reason, 'conversation_state_changed');
+      const fingerprint = String(outgoing.body.fingerprint);
+      assert.equal(current.outgoing[fingerprint], outgoing,
+        '原 fingerprint 必须继续指向同一未知出站记录');
+      assert.equal(typeof outgoing.body.content, 'string');
+      assert(outgoing.body.content.length > 0, '未知回执必须保留原正文供同 fingerprint 对账');
+      assert.equal(job.status, 'cancelled');
+      assert.equal(job.responsibility_status, 'intentional_silence');
+      assert.equal(job.responsibility_reason, 'human_reply');
+      return { entry, body: structuredClone(outgoing.body), fingerprint };
+    };
+    const assertSingleJobAcrossMaintenance = async (runtimeInstance, tracked) => {
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        let snapshot = runtimeInstance.readState(tracked.entry.key);
+        assert.equal(snapshot.jobs.filter((item) => item.id === tracked.entry.jobId).length, 1,
+          'cancelled+unknown 责任经 read 后仍只能保留一个原 job ID');
+        assert.equal(snapshot.outgoing[tracked.fingerprint].status, 'unknown');
+        assert.equal(snapshot.outgoing[tracked.fingerprint].resend_forbidden, true);
+        const transactionCount = await runtimeInstance.transaction(tracked.entry.key, (current) =>
+          current.jobs.filter((item) => item.id === tracked.entry.jobId).length);
+        assert.equal(transactionCount, 1,
+          'expire 的 pendingJobs/completedJobs 分组不得把同一 cancelled+unknown job 重复追加');
+        const scheduled = (await runtimeInstance.scan()).filter((item) =>
+          item.key === tracked.entry.key && item.jobId === tracked.entry.jobId);
+        assert(scheduled.length <= 1, '同一应答责任不得在一次扫描中产生重复调度项');
+        snapshot = runtimeInstance.readState(tracked.entry.key);
+        assert.equal(snapshot.jobs.filter((item) => item.id === tracked.entry.jobId).length, 1,
+          '多次 transaction/scan 后原 job ID 数量必须始终为 1');
+        assert.equal(snapshot.jobs.find((item) => item.id === tracked.entry.jobId).responsibility_status,
+          'intentional_silence');
+      }
+    };
+
+    const absentSession = 'session_crisp-send-race-absent';
+    const absent = await interruptAfterPostStarted(absentSession);
+    await assertSingleJobAcrossMaintenance(runtime, absent);
+    const attemptsAfterAbort = sendAttempts;
+    let exactMisses = 0;
+    const missingRuntime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === absentSession
+        && match[2] === '/message/' + absent.fingerprint) {
+        exactMisses += 1;
+        return { status: 404, body: { error: true, reason: 'not_found' } };
+      }
+      return request(url, options);
+    } });
+    now += 10000;
+    assert.equal((await missingRuntime.process(absent.entry.key, absent.entry.jobId)).status, 'retry');
+    let current = missingRuntime.readState(absent.entry.key);
+    let record = current.outgoing[absent.fingerprint];
+    let job = current.jobs.find((item) => item.id === absent.entry.jobId);
+    assert.equal(exactMisses, 1);
+    assert.equal(record.status, 'unknown');
+    assert.equal(record.resend_forbidden, true);
+    assert.deepEqual(record.body, absent.body,
+      '首次精确 404 后必须完整保留原 fingerprint/body，等待第二次只读确认');
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    now += 5000;
+    assert.equal((await missingRuntime.process(absent.entry.key, absent.entry.jobId)).status, 'cancelled_reconciled');
+    current = missingRuntime.readState(absent.entry.key);
+    record = current.outgoing[absent.fingerprint];
+    job = current.jobs.find((item) => item.id === absent.entry.jobId);
+    assert.equal(exactMisses, 2);
+    assert.equal(record.status, 'cancelled');
+    assert.equal(record.confirmed_absent_at, now);
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(sendAttempts, attemptsAfterAbort, '两次精确 404 只能取消未知记录，不能再次 POST');
+
+    const foundSession = 'session_crisp-send-race-found';
+    const found = await interruptAfterPostStarted(foundSession);
+    const attemptsBeforeFound = sendAttempts;
+    let exactHits = 0;
+    const foundRuntime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === foundSession
+        && match[2] === '/message/' + found.fingerprint) {
+        exactHits += 1;
+        return { status: 200, body: { error: false, data: {
+          ...found.body, fingerprint: Number(found.fingerprint), timestamp: now - 1000,
+        } } };
+      }
+      return request(url, options);
+    } });
+    now += 10000;
+    assert.equal((await foundRuntime.process(found.entry.key, found.entry.jobId)).status, 'dispatched_after_cancel');
+    current = foundRuntime.readState(found.entry.key);
+    record = current.outgoing[found.fingerprint];
+    job = current.jobs.find((item) => item.id === found.entry.jobId);
+    assert.equal(exactHits, 1);
+    assert.equal(record.status, 'sent');
+    assert.equal(record.state_changed_before_receipt, true);
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(sendAttempts, attemptsBeforeFound, '精确命中只能收敛原 fingerprint，不能重新 POST');
+    assert.equal(countEvents('ai_reply'), normalReplies,
+      '人工接管后的迟到送达不得计作正常 AI 回答');
+
     await deliver(message('session_crisp-send-race-b', '另一会话继续工作'));
     assert.equal(sent.at(-1).session_id, 'session_crisp-send-race-b');
   });
@@ -702,6 +965,38 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     await operator('session_timeline01', { timestamp: start + 2000 }); assert.equal(state('session_timeline01').resume_at, start + 16000);
     now = start + 10000; await runtime.list(); assert.equal(state('session_timeline01').mode, 'human');
     now = start + 16001; await runtime.scan(); assert.equal(state('session_timeline01').mode, 'ai'); await deliver(message('session_timeline01', '恢复后的新问题')); assert.equal(sent.at(-1).session_id, 'session_timeline01');
+  });
+  await test('P0 人工恢复后缺时间戳消息先精确核对，旧消息不补答而真正新消息仍回复', async () => {
+    const session = 'session_exact-event-time';
+    const start = now += 100;
+    await operator(session);
+    const resumeAt = state(session).resume_at;
+    now = resumeAt + 1;
+    await runtime.scan();
+    assert.equal(state(session).mode, 'ai');
+    assert.equal(state(session).control_watermark, resumeAt);
+
+    const oldBody = message(session, '人工期内已发送但延迟投递的问题');
+    const oldExact = { ...oldBody.data, timestamp: start + 1 };
+    histories.set(session, [...(histories.get(session) || []), oldExact]);
+    delete oldBody.timestamp; delete oldBody.data.timestamp;
+    const oldAccepted = await runtime.receive({ body: oldBody, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    assert.equal(oldAccepted.route, 'process');
+    assert.equal((await runtime.process(oldAccepted.key, oldAccepted.jobId)).status, 'discarded');
+    assert.equal(state(session).jobs.find((job) => job.id === oldAccepted.jobId).status, 'done');
+
+    const before = sent.filter((entry) => entry.session_id === session).length;
+    const modelsBefore = modelRequests.length;
+    const freshBody = message(session, '恢复后真正的新问题');
+    const freshExact = { ...freshBody.data, timestamp: now + 1 };
+    histories.set(session, [...(histories.get(session) || []), freshExact]);
+    delete freshBody.timestamp; freshBody.data.timestamp = 'invalid-time';
+    const freshAccepted = await runtime.receive({ body: freshBody, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    assert.equal(freshAccepted.route, 'process');
+    assert.equal((await runtime.process(freshAccepted.key, freshAccepted.jobId)).status, 'sent');
+    assert.equal(sent.filter((entry) => entry.session_id === session).length, before + 1);
+    assert.equal(modelRequests.length, modelsBefore + 1);
+    assert.equal(state(session).mode, 'ai');
   });
   await test('T30/T31 零秒人工重建runtime与八天后不丢失', async () => {
     const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 0; writeConfig('handoff', handoff);
@@ -821,13 +1116,20 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
   await test('T40/T41 标签并集、权限失败、检索未知与历史负反馈保留', async () => {
     await deliver(message('session_tags0001', '有资料的问题')); assert(segments.get('session_tags0001').includes('external-vip')); assert(segments.get('session_tags0001').includes('ai_replied')); assert(!segments.get('session_tags0001').includes('ai_resolved'));
     tagFailure = true; await deliver(message('session_tagsfail1', '标签失败正文仍发送')); assert.equal(sent.at(-1).session_id, 'session_tagsfail1'); tagFailure = false;
-    miss = true; await deliver(message('session_miss0001', '知识未命中')); miss = false;
+    const beforeMiss = sent.length; miss = true; const missResult = await deliver(message('session_miss0001', '知识未命中')); miss = false;
+    assert.equal(sent.length, beforeMiss); assertUnresolved('session_miss0001', missResult, 'knowledge_miss');
+    await recoverUnresolved('session_miss0001', missResult);
     low = true; await deliver(message('session_low00001', '低分问题')); low = false;
     const beforeInvalidRetrieval = modelRequests.length;
-    unknownSources = true; await deliver(message('session_unknown1', '元数据缺失')); unknownSources = false;
+    const beforeInvalidSend = sent.length; unknownSources = true;
+    const invalidResult = await deliver(message('session_unknown1', '元数据缺失')); unknownSources = false;
     assert.equal(modelRequests.length, beforeInvalidRetrieval, '缺失来源元数据不可进入生成，也不能冒充无命中');
-    assert.equal(sent.at(-1).content, '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。');
-    modelFailure = true; await deliver(message('session_modelerror', '接口失败')); modelFailure = false;
+    assert.equal(sent.length, beforeInvalidSend); assertUnresolved('session_unknown1', invalidResult, 'retrieval_invalid');
+    await recoverUnresolved('session_unknown1', invalidResult);
+    const beforeModelSend = sent.length; modelFailure = true;
+    const modelResult = await deliver(message('session_modelerror', '接口失败')); modelFailure = false;
+    assert.equal(sent.length, beforeModelSend); assertUnresolved('session_modelerror', modelResult, 'upstream_unavailable');
+    await recoverUnresolved('session_modelerror', modelResult);
     const eventFile = path.join(root, 'data', 'analytics', 'events.jsonl');
     const historicalFeedback = { type: 'feedback', at: new Date(now).toISOString(), answer_id: 'synthetic-historical-answer', session: 'synthetic-history', question: '[历史问题指纹]', feedback: 'negative' };
     fs.appendFileSync(eventFile, JSON.stringify(historicalFeedback) + '\n');
@@ -856,6 +1158,11 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
   await test('生产生成Code采用同一实现，SDK无密钥且状态决定展开', async () => {
     const workflow = JSON.parse(fs.readFileSync(path.join(project, 'n8n', 'workflow.json'), 'utf8'));
     const node = workflow.nodes.find((entry) => entry.name === '校验并持久接收');
+    const scanNode = workflow.nodes.find((entry) => entry.name === '扫描持久会话与任务');
+    assert(scanNode.parameters.jsCode.includes('const processing = Promise.all(jobs.map'));
+    assert(scanNode.parameters.jsCode.includes('const catchingUp = runtime.catchup()'));
+    assert(scanNode.parameters.jsCode.includes('Promise.all([processing,catchingUp])'),
+      'REST 补偿不得串行阻塞已持久本地任务');
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const execute = new AsyncFunction('$input', '$env', 'require', node.parameters.jsCode.replace('createRuntime($env)', 'createRuntime($env, {root:' + JSON.stringify(root) + '})'));
     const response = await execute({ first: () => ({ json: { body: message('session_generated', '测试'), query: { key: 'invalid' } } }) }, env, require); assert.equal(response[0].json.statusCode, 401);
@@ -894,7 +1201,10 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     assert.equal(next.started_at, now);
     assert.equal(next.completed_at, now);
     assert(next.completed_at > first.completed_at);
-    assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'control_cursor', 'health_recovered', 'isolated_sessions', 'ordinary_cursor', 'schema_version', 'started_at']);
+    assert.deepEqual(Object.keys(next).sort(), ['completed_at', 'control_cursor', 'crisp_rest_catchup', 'health_recovered',
+      'isolated_sessions', 'ordinary_cursor', 'schema_version', 'started_at']);
+    assert(['bootstrap', 'idle', 'ok', 'warning'].includes(next.crisp_rest_catchup.status));
+    assert(!JSON.stringify(next.crisp_rest_catchup).includes('session_'));
     assert.deepEqual(Object.keys(next.isolated_sessions.reasons).sort(), ['invalid_json', 'invalid_state', 'too_large']);
     assert.equal(next.isolated_sessions.count, Object.values(next.isolated_sessions.reasons)
       .reduce((total, count) => total + count, 0));
@@ -918,8 +1228,9 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       if (index === 1) {
         value.jobs.push({ id: 'a'.repeat(64), event: 'message:send', control: false, status: 'received',
           received_at: now, retry_at: now + 60000, lease_until: 0, attempts: 1, data: { type: 'text' },
-          plan: { type: 'text', ordinary: true, purpose: 'safe_error', safe_error_context: 'text',
-            content: '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。', tags: ['low_confidence'] } });
+          responsibility_status: 'unresolved_failure', failure_code: 'legacy_generic_non_answer',
+          plan: { type: 'internal', ordinary: true, purpose: 'technical_unresolved', safe_error_context: 'text',
+            content: '', answer_responsibility: 'unresolved_failure', diagnostic_code: 'legacy_generic_non_answer', tags: [] } });
       }
       if (index === 2) {
         value.jobs.push({ id: 'b'.repeat(64), event: 'message:send', purpose: 'feedback', feedback_retired: true,
@@ -1027,16 +1338,12 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const file = path.join(root, 'config/materials-applied.json');
     const originalKeyword = fs.readFileSync(path.join(root, 'config/keyword.yaml'));
     const originalPrompt = fs.readFileSync(path.join(root, 'config/prompt.md'));
-    const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
-    const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
     const prompt = '完整中文提示 😀\n' + 'x'.repeat(31000) + '\nSYNTHETIC_PROMPT_TAIL';
-    const projection = { schema_version: 1, revision: 400, state: 'applied', applied_at: now,
-      source_sha256: digest('synthetic-source'), configuration,
-      prompt: { text: prompt, sha256: digest(prompt), bytes: Buffer.byteLength(prompt) },
-      knowledge: { map_sha256: fs.existsSync(mapFile) ? digest(fs.readFileSync(mapFile)) : '' } };
-    projection.configuration.runtime = { ...configuration.runtime, enabled: true, revision: 400, applied_revision: 400 };
+    configuration.runtime = { ...configuration.runtime, enabled: true, revision: 400, applied_revision: 400 };
+    const projection = makeMaterials(configuration, prompt, 400);
     projection.configuration.keyword.rules.unshift({ id: 'projection-test', enabled: true, keywords: ['资料应用测试'], match_mode: 'exact', action: 'reply', text: '已应用版本一' });
     const publish = () => {
+      sealMaterials(projection);
       fs.writeFileSync(file + '.candidate', JSON.stringify(projection)); fs.renameSync(file + '.candidate', file);
     };
     try {
@@ -1077,13 +1384,14 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
     const file = path.join(root, 'config/materials-applied.json');
     const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
     const originalMap = fs.existsSync(mapFile) ? fs.readFileSync(mapFile) : null;
-    const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
     const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));
     const text = fs.readFileSync(path.join(root, 'config/prompt.md'), 'utf8');
-    const projection = { schema_version: 1, revision: 500, state: 'applied', applied_at: now, source_sha256: digest('synthetic-source'), configuration,
-      prompt: { text, sha256: digest(text), bytes: Buffer.byteLength(text) }, knowledge: { map_sha256: originalMap ? digest(originalMap) : '' } };
-    projection.configuration.runtime = { ...configuration.runtime, enabled: true, revision: 500, applied_revision: 500 };
-    const publish = () => { fs.writeFileSync(file + '.candidate', JSON.stringify(projection)); fs.renameSync(file + '.candidate', file); };
+    configuration.runtime = { ...configuration.runtime, enabled: true, revision: 500, applied_revision: 500 };
+    const projection = makeMaterials(configuration, text, 500);
+    const publish = () => {
+      sealMaterials(projection);
+      fs.writeFileSync(file + '.candidate', JSON.stringify(projection)); fs.renameSync(file + '.candidate', file);
+    };
     let finish;
     try {
       publish();
@@ -1121,6 +1429,499 @@ const test = async (name, action) => { await action(); passed += 1; process.stdo
       if (originalMap) fs.writeFileSync(mapFile, originalMap); else if (fs.existsSync(mapFile)) fs.unlinkSync(mapFile);
       fs.unlinkSync(file);
     }
+  });
+  await test('V122-R03 普通长任务跨执行限为七个，Webhook/人工控制不等待并保留扫描公平性', async () => {
+    const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+    let releaseSlow;
+    delayedAll = new Promise((resolve) => { releaseSlow = resolve; });
+    const entries = [];
+    for (let index = 0; index < 15; index += 1) {
+      entries.push(await receive(message('session_capacity-' + String(index).padStart(2, '0'), '容量测试问题 ' + index)));
+    }
+    const workers = Array.from({ length: 7 }, () => createRuntime(env, runtimeOptions));
+    const running = entries.slice(0, 7).map((entry, index) => workers[index].process(entry.key, entry.jobId));
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const count = fs.existsSync(permitRoot)
+        ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length : 0;
+      if (count === 7) break;
+      await wait(5);
+    }
+    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length, 7,
+      '七个不同 runtime 实例必须共享同一许可容量');
+
+    const deferredStarted = Date.now();
+    const deferred = await Promise.race([
+      runtime.process(entries[7].key, entries[7].jobId),
+      wait(500).then(() => ({ status: 'timeout' })),
+    ]);
+    const deferredElapsed = Date.now() - deferredStarted;
+    assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
+    assert(deferredElapsed < 500, '拿不到许可时不得在 Code node 内等待');
+    const deferredState = state('session_capacity-07');
+    const deferredJob = deferredState.jobs.find((job) => job.id === entries[7].jobId);
+    assert.equal(deferredJob.status, 'received');
+    assert.equal(deferredJob.lease_until, 0);
+    assert.equal(deferredState.worker, null);
+    assert.equal(deferredJob.retry_at, now + 1000);
+
+    const controlStarted = Date.now();
+    const control = await Promise.race([
+      operator('session_capacity-control'),
+      wait(500).then(() => ({ status: 'timeout' })),
+    ]);
+    assert.notEqual(control.status, 'timeout', '人工控制不得被普通任务许可阻塞');
+    assert(Date.now() - controlStarted < 500);
+    assert.equal(state('session_capacity-control').mode, 'human');
+
+    now += 1001;
+    const firstOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
+    const secondOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
+    assert(firstOrdinary.length > 0 && firstOrdinary.length <= 7, '每轮扫描最多返回许可容量个普通任务');
+    assert(secondOrdinary.length > 0 && secondOrdinary.length <= 7);
+    assert(new Set([...firstOrdinary, ...secondOrdinary].map((entry) => entry.key)).size > firstOrdinary.length,
+      '公平游标必须让上轮未选中的普通任务进入下一轮');
+
+    releaseSlow();
+    await Promise.all(running);
+    delayedAll = null;
+    assert.equal((await runtime.process(entries[7].key, entries[7].jobId)).status, 'sent');
+    await Promise.all(entries.slice(8).map((entry) => runtime.process(entry.key, entry.jobId)));
+    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length, 0,
+      '完成后必须释放全部普通任务许可');
+  });
+  await test('V122-R03 控制任务总后台限为八个，普通满载仍可控制且控制积压不阻塞接收', async () => {
+    const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+    let releaseControls;
+    delayedControlLookups = new Promise((resolve) => { releaseControls = resolve; });
+    const entries = [];
+    for (let index = 0; index < 10; index += 1) {
+      const session = 'session_control-capacity-' + String(index).padStart(2, '0');
+      const body = { ...message(session, '待核验人工事件 ' + index,
+        { from: 'operator', automated: undefined }), event: 'message:received' };
+      const history = histories.get(session) || [];
+      history.push(body.data);
+      histories.set(session, history);
+      entries.push(await runtime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } }));
+      assert.equal(entries.at(-1).route, 'process');
+    }
+    const workers = Array.from({ length: 8 }, () => createRuntime(env, runtimeOptions));
+    const running = entries.slice(0, 7).map((entry, index) => workers[index].process(entry.key, entry.jobId));
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const count = fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length;
+      if (count === 7) break;
+      await wait(5);
+    }
+    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 7);
+
+    const ordinaryEntry = await receive(message('session_control-capacity-ordinary', '控制满载下的普通问题'));
+    const ordinaryResult = await Promise.race([
+      runtime.process(ordinaryEntry.key, ordinaryEntry.jobId),
+      wait(500).then(() => ({ status: 'timeout' })),
+    ]);
+    assert.equal(ordinaryResult.status, 'sent', '七个控制任务时仍须为普通任务保留一个后台槽');
+
+    const eighth = workers[7].process(entries[7].key, entries[7].jobId);
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const count = fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length;
+      if (count === 8) break;
+      await wait(5);
+    }
+    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 8,
+      '控制任务最多占八个后台许可');
+
+    const deferredStarted = Date.now();
+    const deferred = await Promise.race([
+      runtime.process(entries[8].key, entries[8].jobId),
+      wait(500).then(() => ({ status: 'timeout' })),
+    ]);
+    assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
+    assert(Date.now() - deferredStarted < 500, '第九个控制任务不得在 Code node 内等待');
+    const deferredJob = state('session_control-capacity-08').jobs.find((job) => job.id === entries[8].jobId);
+    assert.equal(deferredJob.status, 'received');
+    assert.equal(deferredJob.retry_at, now + 1000);
+
+    const receiveStarted = Date.now();
+    const accepted = await Promise.race([
+      receive(message('session_control-capacity-receive', '控制积压期间的新消息')),
+      wait(500).then(() => ({ status: 'timeout' })),
+    ]);
+    assert.notEqual(accepted.status, 'timeout');
+    assert.equal(accepted.accepted, true);
+    assert(Date.now() - receiveStarted < 500, '控制积压时持久接收仍须迅速完成');
+
+    releaseControls();
+    await Promise.all([...running, eighth]);
+    delayedControlLookups = null;
+    now += 1001;
+    assert.notEqual((await runtime.process(entries[8].key, entries[8].jobId)).status, 'deferred');
+    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 0);
+  });
+  await test('V122-R03 过期许可续租竞态不误删，稳定过期可回收且异常链接失败关闭', async () => {
+    const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+    fs.mkdirSync(permitRoot, { recursive: true, mode: 0o700 });
+    fs.chmodSync(permitRoot, 0o700);
+    const staleSlot = path.join(permitRoot, 'slot-0');
+    fs.mkdirSync(staleSlot, { mode: 0o700 });
+    const staleToken = 'a'.repeat(32);
+    fs.writeFileSync(path.join(staleSlot, 'owner.json'), JSON.stringify({ schema_version: 1, slot: 0,
+      token: staleToken, kind: 'ordinary', acquired_at: 1, expires_at: 2 }), { mode: 0o600 });
+    fs.writeFileSync(path.join(staleSlot, 'heartbeat.json'), JSON.stringify({ schema_version: 1,
+      token: staleToken }), { mode: 0o600 });
+    fs.utimesSync(path.join(staleSlot, 'heartbeat.json'), new Date(1), new Date(1));
+
+    // 精确制造 TOCTOU：回收者已把旧 slot rename 到 quarantine，并完成第一次
+    // moved snapshot 后，旧执行仍通过打开的 descriptor 续租。第二次快照必须
+    // 比较 heartbeat mtime/size，拒绝删除并把许可恢复到原 slot。
+    const heartbeatDescriptor = fs.openSync(path.join(staleSlot, 'heartbeat.json'), 'r+');
+    const originalRenameSync = fs.renameSync;
+    const originalLstatSync = fs.lstatSync;
+    let quarantinePath = '';
+    let quarantineStats = 0;
+    fs.renameSync = (source, target) => {
+      const result = originalRenameSync(source, target);
+      if (source === staleSlot && /\.stale-slot-0-[a-f0-9]{32}$/.test(target)) quarantinePath = target;
+      return result;
+    };
+    fs.lstatSync = (target, ...args) => {
+      if (target === quarantinePath && ++quarantineStats === 2) {
+        const renewed = new Date();
+        fs.futimesSync(heartbeatDescriptor, renewed, renewed);
+        fs.fsyncSync(heartbeatDescriptor);
+      }
+      return originalLstatSync(target, ...args);
+    };
+    try {
+      const raced = await deliver(message('session_capacity-raced-renewal', '竞态续租保护'));
+      assert.equal(raced.status, 'sent');
+      assert(fs.existsSync(staleSlot), 'rename 后续租的旧许可必须恢复，不能被当作稳定过期删除');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(staleSlot, 'owner.json'), 'utf8')).token, staleToken);
+    } finally {
+      fs.renameSync = originalRenameSync;
+      fs.lstatSync = originalLstatSync;
+      fs.closeSync(heartbeatDescriptor);
+    }
+
+    fs.utimesSync(path.join(staleSlot, 'heartbeat.json'), new Date(1), new Date(1));
+    const recovered = await deliver(message('session_capacity-stale', '回收过期许可'));
+    assert.equal(recovered.status, 'sent');
+    assert(!fs.existsSync(staleSlot), '过期许可回收并完成任务后不应残留');
+
+    const outside = path.join(root, 'outside-permit-sentinel');
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.writeFileSync(path.join(outside, 'keep'), '保留', { mode: 0o600 });
+    for (let slot = 0; slot < 7; slot += 1) fs.symlinkSync(outside, path.join(permitRoot, 'slot-' + slot));
+    const entry = await receive(message('session_capacity-unsafe', '异常许可目录'));
+    const unsafe = await runtime.process(entry.key, entry.jobId);
+    assert.deepEqual(unsafe, { status: 'deferred', reason: 'processing_capacity' });
+    assert.equal(fs.readFileSync(path.join(outside, 'keep'), 'utf8'), '保留');
+    for (let slot = 0; slot < 7; slot += 1) fs.unlinkSync(path.join(permitRoot, 'slot-' + slot));
+    fs.unlinkSync(path.join(outside, 'keep')); fs.rmdirSync(outside);
+    now += 1001;
+    assert.equal((await runtime.process(entry.key, entry.jobId)).status, 'sent');
+
+    const writeFixedPermit = (slot, kind, suffix) => {
+      const item = path.join(permitRoot, 'slot-' + slot);
+      fs.mkdirSync(item, { mode: 0o700 });
+      const token = String(suffix).repeat(32).slice(0, 32);
+      const owner = { schema_version: 1, slot, token, acquired_at: Date.now() - 1000,
+        expires_at: Date.now() + 120000 };
+      if (kind !== undefined) owner.kind = kind;
+      fs.writeFileSync(path.join(item, 'owner.json'), JSON.stringify(owner), { mode: 0o600 });
+      fs.writeFileSync(path.join(item, 'heartbeat.json'), JSON.stringify({ schema_version: 1, token }), { mode: 0o600 });
+    };
+    const clearFixedPermits = () => {
+      for (const name of fs.readdirSync(permitRoot)) {
+        const item = path.join(permitRoot, name);
+        for (const member of fs.readdirSync(item)) fs.unlinkSync(path.join(item, member));
+        fs.rmdirSync(item);
+      }
+    };
+    for (const [caseIndex, [kind, label]] of [[undefined, '缺失 kind'], ['invalid', '非法 kind']].entries()) {
+      for (let slot = 0; slot < 7; slot += 1) writeFixedPermit(slot, kind, slot + 1);
+      const malformedEntry = await receive(message('session_capacity-malformed-' + caseIndex, label));
+      assert.deepEqual(await runtime.process(malformedEntry.key, malformedEntry.jobId),
+        { status: 'deferred', reason: 'processing_capacity' }, label + ' 必须失败关闭');
+      assert.equal(fs.readdirSync(permitRoot).length, 7, label + ' 不得被当作过期许可删除');
+      clearFixedPermits();
+    }
+
+    // slot 7 是控制任务专用保留槽；即使 owner 其余字段合法，
+    // kind=ordinary 也必须视为不安全，不回收、不重用。
+    for (let slot = 0; slot < 7; slot += 1) writeFixedPermit(slot, 'ordinary', slot + 1);
+    writeFixedPermit(7, 'ordinary', 8);
+    const invalidSlotSession = 'session_capacity-slot7-ordinary';
+    const invalidSlotBody = { ...message(invalidSlotSession, '待核验人工事件',
+      { from: 'operator', automated: undefined }), event: 'message:received' };
+    histories.set(invalidSlotSession, [invalidSlotBody.data]);
+    const invalidSlotEntry = await runtime.receive({ body: invalidSlotBody,
+      query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    assert.deepEqual(await runtime.process(invalidSlotEntry.key, invalidSlotEntry.jobId),
+      { status: 'deferred', reason: 'processing_capacity' }, 'slot 7 ordinary owner 必须失败关闭');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(permitRoot, 'slot-7/owner.json'), 'utf8')).kind, 'ordinary');
+    clearFixedPermits();
+  });
+  await test('P0 普通推理失去许可立即中止，不计业务失败且可有界恢复', async () => {
+    const session = 'session_permit-lost-provider';
+    const beforeSent = sent.filter((entry) => entry.session_id === session).length;
+    let startedResolve;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    const guarded = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (parsed.hostname === 'provider.invalid' && /\/(?:chat\/completions|responses)$/.test(parsed.pathname)) {
+          return abortablePending(options.signal, startedResolve);
+        }
+        return request(url, options);
+      } });
+    const body = message(session, '请处理许可换代后的恢复问题');
+    histories.set(session, [{ ...body.data }]);
+    const entry = await guarded.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const running = guarded.process(entry.key, entry.jobId);
+    await started;
+    await waitForPermitSlot(0);
+    const replacement = replacePermitOwner(0, 'ordinary');
+    const result = await Promise.race([running, wait(1000).then(() => ({ status: 'timeout' }))]);
+    assert.deepEqual(result, { status: 'deferred', reason: 'processing_permit_lost' });
+    let stored = guarded.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.attempts, 0, '许可换代不得消耗业务失败次数');
+    assert.equal(stored.processing_permit_losses, 1);
+    assert.equal(stored.retry_at, now + 1000);
+    assert.equal(stored.execution_token, undefined);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(replacement.slotPath, 'owner.json'), 'utf8')).token,
+      replacement.token, '旧执行 finally 不得删除新持有者');
+    replacement.cleanup();
+
+    now += 1001;
+    const recovered = createRuntime(env, runtimeOptions);
+    assert.equal((await recovered.process(entry.key, entry.jobId)).status, 'sent');
+    stored = recovered.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.processing_permit_losses, undefined);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+  });
+  await test('P0 忽略取消的旧请求返回后仍被 fence 丢弃，不覆盖新执行代次', async () => {
+    const session = 'session_permit-lost-superseded';
+    const beforeSent = sent.filter((entry) => entry.session_id === session).length;
+    let startedResolve, releaseProvider;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    const release = new Promise((resolve) => { releaseProvider = resolve; });
+    const staleRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (parsed.hostname === 'provider.invalid' && /\/(?:chat\/completions|responses)$/.test(parsed.pathname)) {
+          startedResolve();
+          await release; // 故意忽略 signal，验证 await 返回后的所有权 fence。
+        }
+        return request(url, options);
+      } });
+    const body = message(session, '请验证旧执行不覆盖新执行');
+    histories.set(session, [{ ...body.data }]);
+    const entry = await staleRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const running = staleRuntime.process(entry.key, entry.jobId);
+    await started;
+    await waitForPermitSlot(0);
+    const replacement = replacePermitOwner(0, 'ordinary');
+    const newerToken = 'f'.repeat(24);
+    await staleRuntime.transaction(entry.key, (current) => {
+      const stored = current.jobs.find((job) => job.id === entry.jobId);
+      stored.execution_token = newerToken;
+      stored.status = 'processing';
+      stored.attempts = 41;
+      stored.lease_until = now + 300000;
+      current.worker = { job: stored.id, token: newerToken, until: now + 300000 };
+    });
+    releaseProvider();
+    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+    const stored = staleRuntime.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+    assert.equal(stored.execution_token, newerToken);
+    assert.equal(stored.status, 'processing');
+    assert.equal(stored.attempts, 41);
+    assert.equal(staleRuntime.readState(entry.key).worker.token, newerToken);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+    replacement.cleanup();
+    await staleRuntime.transaction(entry.key, (current) => {
+      const currentJob = current.jobs.find((job) => job.id === entry.jobId);
+      currentJob.status = 'cancelled'; currentJob.lease_until = 0; delete currentJob.execution_token;
+      current.worker = null;
+    });
+  });
+  await test('P0 控制任务失去许可不提前释放人工归属栅栏', async () => {
+    const session = 'session_permit-lost-control';
+    let startedResolve;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    const controlRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (/\/message\/[^/]+$/.test(parsed.pathname)) return abortablePending(options.signal, startedResolve);
+        return request(url, options);
+      } });
+    const data = message(session, '待核验人工公开回复', { from: 'operator', automated: undefined }).data;
+    histories.set(session, [{ ...data }]);
+    const entry = await controlRuntime.receive({ body: { website_id: env.CRISP_WEBSITE_ID,
+      event: 'message:received', timestamp: now, data }, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const running = controlRuntime.process(entry.key, entry.jobId);
+    await started;
+    await waitForPermitSlot(7);
+    const replacement = replacePermitOwner(7, 'control');
+    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+    const current = controlRuntime.readState(entry.key);
+    const stored = current.jobs.find((job) => job.id === entry.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.attempts, 0);
+    assert.equal(stored.operator_resolution, undefined);
+    assert(current.uncertain_events.includes(entry.jobId), '未确认归属前必须保留栅栏');
+    assert.equal(current.mode, 'ai');
+    replacement.cleanup();
+    now += 1001;
+    const recovered = createRuntime(env, runtimeOptions);
+    assert.notEqual((await recovered.process(entry.key, entry.jobId)).status, 'failed');
+    assert.equal(recovered.readState(entry.key).uncertain_events.includes(entry.jobId), false);
+
+    // 同一栅栏还要覆盖 control 的旧执行迟到：新代次已接管后，
+    // 旧 resolve_operator 不得写入 unknown/human，也不得改变新任务的尝试次数。
+    const staleSession = 'session_permit-lost-control-stale';
+    let staleStartedResolve, releaseLookup;
+    const staleStarted = new Promise((resolve) => { staleStartedResolve = resolve; });
+    const lookupRelease = new Promise((resolve) => { releaseLookup = resolve; });
+    const staleControl = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (/\/message\/[^/]+$/.test(parsed.pathname)) {
+          staleStartedResolve();
+          await lookupRelease; // 故意忽略 signal，由返回后 fence 拒绝旧结果。
+        }
+        return request(url, options);
+      } });
+    const staleData = message(staleSession, '另一条待核验人工回复',
+      { from: 'operator', automated: undefined }).data;
+    histories.set(staleSession, [{ ...staleData }]);
+    const staleEntry = await staleControl.receive({ body: { website_id: env.CRISP_WEBSITE_ID,
+      event: 'message:received', timestamp: now, data: staleData }, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const staleRunning = staleControl.process(staleEntry.key, staleEntry.jobId);
+    await staleStarted;
+    await waitForPermitSlot(7);
+    const staleReplacement = replacePermitOwner(7, 'control');
+    const newerToken = 'e'.repeat(24);
+    await staleControl.transaction(staleEntry.key, (state) => {
+      const job = state.jobs.find((item) => item.id === staleEntry.jobId);
+      job.execution_token = newerToken; job.status = 'processing'; job.attempts = 23;
+      job.lease_until = now + 300000;
+    });
+    releaseLookup();
+    assert.deepEqual(await staleRunning, { status: 'deferred', reason: 'processing_permit_lost' });
+    const staleState = staleControl.readState(staleEntry.key);
+    const staleJob = staleState.jobs.find((item) => item.id === staleEntry.jobId);
+    assert.equal(staleJob.execution_token, newerToken);
+    assert.equal(staleJob.status, 'processing');
+    assert.equal(staleJob.attempts, 23);
+    assert.equal(staleJob.operator_resolution, undefined);
+    assert(staleState.uncertain_events.includes(staleEntry.jobId));
+    staleReplacement.cleanup();
+    await staleControl.transaction(staleEntry.key, (state) => {
+      const job = state.jobs.find((item) => item.id === staleEntry.jobId);
+      job.status = 'cancelled'; job.lease_until = 0; delete job.execution_token;
+    });
+  });
+  await test('P0 Crisp POST 中失去许可保留 unknown 对账，回执确认后不重新推理或重复发送', async () => {
+    const session = 'session_permit-lost-outgoing';
+    let startedResolve;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    const beforeModels = modelRequests.length;
+    const beforeSent = sent.filter((entry) => entry.session_id === session).length;
+    const outgoingRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && match[2] === '/message' && options.method === 'POST') {
+          const body = options.body;
+          const history = histories.get(session) || [];
+          sent.push({ ...body, session_id: session });
+          history.push({ ...body, timestamp: now });
+          histories.set(session, history);
+          return abortablePending(options.signal, startedResolve);
+        }
+        return request(url, options);
+      } });
+    const body = message(session, '请验证未知回执只对账不重发');
+    histories.set(session, [{ ...body.data }]);
+    const entry = await outgoingRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const running = outgoingRuntime.process(entry.key, entry.jobId);
+    await started;
+    await waitForPermitSlot(0);
+    const replacement = replacePermitOwner(0, 'ordinary');
+    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+    let current = outgoingRuntime.readState(entry.key);
+    const unknown = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
+    assert.equal(unknown.status, 'unknown');
+    assert.equal(unknown.delivery_uncertain, true);
+    assert.equal(unknown.cancellation_reason, 'processing_permit_lost');
+    assert.equal(current.jobs.find((job) => job.id === entry.jobId).status, 'received');
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+    const afterFirstModels = modelRequests.length;
+    assert.equal(afterFirstModels, beforeModels + 1);
+    replacement.cleanup();
+
+    now += 1001;
+    const recovered = createRuntime(env, runtimeOptions);
+    assert.equal((await recovered.process(entry.key, entry.jobId)).status, 'sent');
+    current = recovered.readState(entry.key);
+    assert.equal(Object.values(current.outgoing).find((record) => record.job_id === entry.jobId).status, 'sent');
+    assert.equal(current.jobs.find((job) => job.id === entry.jobId).status, 'done');
+    assert.equal(modelRequests.length, afterFirstModels, '对账确认不得重新调用模型');
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1,
+      '相同 fingerprint 已确认后不得重复 POST');
+  });
+  await test('P0 答案已确定发送后标签阶段失去许可，仍保持 sent 且不重排', async () => {
+    const session = 'session_permit-lost-after-sent';
+    let startedResolve;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    const beforeSent = sent.filter((entry) => entry.session_id === session).length;
+    const sentRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && match[2] === '/meta' && options.method === 'GET') {
+          return abortablePending(options.signal, startedResolve);
+        }
+        return request(url, options);
+      } });
+    const body = message(session, '请验证已发送回执不回滚');
+    histories.set(session, [{ ...body.data }]);
+    const entry = await sentRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const running = sentRuntime.process(entry.key, entry.jobId);
+    await started;
+    await waitForPermitSlot(0);
+    const replacement = replacePermitOwner(0, 'ordinary');
+    const result = await running;
+    assert.equal(result.status, 'sent');
+    const current = sentRuntime.readState(entry.key);
+    const stored = current.jobs.find((job) => job.id === entry.jobId);
+    const outgoing = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.retry_at, null);
+    assert.equal(stored.execution_token, undefined);
+    assert.equal(outgoing.status, 'sent');
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+    replacement.cleanup();
+  });
+  await test('V122-R03 控制优先时仍为普通会话保留一个扫描名额', async () => {
+    const ordinary = await receive(message('session_capacity-fair-ordinary', '普通待处理问题'));
+    const controlKeys = new Set();
+    for (let index = 0; index < 16; index += 1) {
+      const session = 'session_capacity-fair-control-' + String(index).padStart(2, '0');
+      const data = message(session, '待核验 operator', { from: 'operator', automated: undefined }).data;
+      const item = await receive({ website_id: env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: now,
+        data: { ...data, session_id: session } });
+      assert.equal(item.route, 'process');
+      controlKeys.add(item.key);
+    }
+    const selected = await runtime.scan();
+    assert.equal(selected.length, 8);
+    assert.equal(selected.filter((entry) => entry.control).length, 7);
+    assert(selected.some((entry) => !entry.control),
+      '控制任务很多时仍须保留至少一个普通任务名额');
   });
   await test('L08 请求/解析异常落盘前采用白名单，不泄漏秘密或用户正文', async () => {
     const injected = 'synthetic-private-text & $ # = " 引号\n第二行';

@@ -8,7 +8,7 @@ FIXTURE_BIN="${SCRIPT_DIR}/fixtures/doctor"
 ORIGINAL_PATH=$PATH
 PASSED=0
 LAST_RC=0
-TEST_WORK_ROOT="${PROJECT_ROOT}/.work/v1.2.0"
+TEST_WORK_ROOT="${PROJECT_ROOT}/.work/v1.3.0"
 mkdir -p -- "$TEST_WORK_ROOT"
 TEST_ROOT=$(mktemp -d "${TEST_WORK_ROOT}/doctor-test.XXXXXXXX")
 DEPLOY="${TEST_ROOT}/deploy"
@@ -68,6 +68,7 @@ fixture_env() {
     DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS="${DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS:-0}" \
     DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES="${DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES:-0}" \
     DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES="${DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES:-0}" \
+    DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS="${DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS:-0}" \
     DOCTOR_FIXTURE_ADAPTER_FAIL="${DOCTOR_FIXTURE_ADAPTER_FAIL:-0}" \
     DOCTOR_FIXTURE_PROVIDER_FAIL="${DOCTOR_FIXTURE_PROVIDER_FAIL:-0}" \
     DOCTOR_FIXTURE_PROVIDER_MODE="${DOCTOR_FIXTURE_PROVIDER_MODE:-}" \
@@ -85,6 +86,7 @@ fixture_env() {
     DOCTOR_FIXTURE_MATERIALS_MISMATCH="${DOCTOR_FIXTURE_MATERIALS_MISMATCH:-0}" \
     DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH="${DOCTOR_FIXTURE_WORKSPACE_PROMPT_MISMATCH:-0}" \
     DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH="${DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH:-0}" \
+    DOCTOR_FIXTURE_VISITOR_OUTPUT_CODE_MISMATCH="${DOCTOR_FIXTURE_VISITOR_OUTPUT_CODE_MISMATCH:-0}" \
     DOCTOR_FIXTURE_CADDY_FILE_MISMATCH="${DOCTOR_FIXTURE_CADDY_FILE_MISMATCH:-0}" \
     DOCTOR_FIXTURE_STDIN_PROBE="${DOCTOR_FIXTURE_STDIN_PROBE:-0}" \
     CRISPAI_LOGS_SYSTEMD_TEST=1 \
@@ -110,6 +112,41 @@ business_hash() {
     find .env config knowledge data/runtime -type f ! -type l ! -name scheduler-health.json -print0 \
       | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
   )
+}
+
+reseal_materials_fixture() {
+  local projection=${1:-${DEPLOY}/config/materials-applied.json}
+  python3 -B - "$projection" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+target = Path(sys.argv[1])
+value = json.loads(target.read_text(encoding="utf-8"))
+canonical = lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+digest = lambda item: hashlib.sha256(canonical(item)).hexdigest()
+runtime = dict(value["configuration"]["runtime"])
+runtime.pop("revision", None)
+runtime.pop("applied_revision", None)
+knowledge = value["knowledge"]
+identity = {name: knowledge[name + "_sha256"] for name in ("catalog", "manifest", "map", "settings", "profile", "lexical")}
+value["source_components"] = {
+    "runtime": digest(runtime),
+    "handoff": digest(value["configuration"]["handoff"]),
+    "keyword": digest(value["configuration"]["keyword"]),
+    "menu": digest(value["configuration"]["menu"]),
+    "tags": digest(value["configuration"]["tags"]),
+    "feedback": digest(value["configuration"]["feedback"]),
+    "prompt": value["prompt"]["sha256"],
+    "knowledge": digest(identity),
+}
+value["source_sha256"] = digest(value["source_components"])
+temporary = target.with_name(target.name + ".reseal")
+temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+temporary.chmod(0o640)
+temporary.replace(target)
+PY
 }
 
 write_binding_state() {
@@ -168,10 +205,12 @@ prepare_fixture() {
   for name in workflow.json runtime.js runtime-cli.js build-workflow.js web-chat.js admin-query.js knowledge-lexical.js; do
     cp -p -- "${PROJECT_ROOT}/n8n/${name}" "${DEPLOY}/n8n/${name}"
   done
+  # build-workflow 会在生成时内联统一访客出站守卫，必须先提供该生产依赖。
+  cp -p -- "${PROJECT_ROOT}/scripts/visitor-output.js" "${DEPLOY}/scripts/visitor-output.js"
   node "${DEPLOY}/n8n/build-workflow.js"
   jq -M '.active=true' "${DEPLOY}/n8n/workflow.json" > "${DEPLOY}/n8n/workflow.json.new"
   mv -f -- "${DEPLOY}/n8n/workflow.json.new" "${DEPLOY}/n8n/workflow.json"
-  for name in common.sh doctor.sh healthcheck.sh provider.sh configuration.sh provider-adapter.js launcher.sh bootstrap.sh \
+  for name in common.sh doctor.sh healthcheck.sh provider.sh configuration.sh provider-adapter.js visitor-output.js launcher.sh bootstrap.sh \
     wizard.sh package-release.sh knowledge.sh migration.sh crisp-settings.sh full-backup.sh archive-guard.py \
     backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh materials.sh logs.sh log-redact.py \
     knowledge-profile.py knowledge-profile.sh knowledge-component.js knowledge-lexical.py; do
@@ -402,6 +441,7 @@ elif case == "settings-hash": materials["knowledge"]["settings_sha256"] = "f" * 
 elif case in ("missing-referenced", "legacy"):
     (root / paths["profile"]).unlink()
     if case == "legacy":
+        materials["schema_version"] = 1
         materials["knowledge"]["profile_sha256"] = ""
         manifest.pop("embedding_profile")
         record.pop("embedding_profile")
@@ -410,11 +450,13 @@ elif case in ("missing-referenced", "legacy"):
         materials["knowledge"]["manifest_sha256"] = module.digest(root / paths["manifest"])
 module.atomic(root / paths["materials"], materials, 0o640)
 PY
+    [[ "$case_name" == legacy ]] || reseal_materials_fixture
     changed_hash=$(business_hash)
     cache_hash=$(find "${DEPLOY}/data/anythingllm/vector-cache" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')
     invoke --offline
     case "$case_name" in
-      legacy|minilm) assert_result knowledge.profile WARN ;;
+      minilm) assert_result knowledge.profile WARN ;;
+      legacy) assert_result knowledge.profile FAIL ;;
       settings-*) assert_result knowledge.profile PASS; assert_result knowledge.settings FAIL ;;
       healthy) assert_result knowledge.profile PASS; assert_result knowledge.settings PASS ;;
       *) assert_result knowledge.profile FAIL ;;
@@ -431,7 +473,7 @@ PY
   cp -p -- "$original/manifest.json" "${DEPLOY}/data/knowledge-manifest.json"
   cp -p -- "$original/materials.json" "${DEPLOY}/config/materials-applied.json"
   [[ "$state_hash" == "$(business_hash)" ]] || fail '知识只读专项未恢复原合成配置'
-  pass '知识 profile/settings 14 个只读正负例：应用状态、正文指纹、文档缓存绑定和旧代警告'
+  pass '知识 profile/settings 14 个只读正负例：应用状态、正文指纹、文档缓存绑定和旧投影迁移门禁'
 }
 
 doctor_lexical_cases() {
@@ -476,14 +518,18 @@ materials["knowledge"]["lexical_sha256"] = hashlib.sha256(target.read_bytes()).h
 if case == "lexical-hash": materials["knowledge"]["lexical_sha256"] = "f" * 64
 elif case in ("lexical-missing", "lexical-legacy"):
     target.unlink()
-    if case == "lexical-legacy": materials["knowledge"]["lexical_sha256"] = ""
+    if case == "lexical-legacy":
+        materials["schema_version"] = 1
+        materials["knowledge"]["lexical_sha256"] = ""
 projection.write_text(json.dumps(materials, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 PY
+    [[ "$case_name" == lexical-legacy ]] || reseal_materials_fixture
     changed_hash=$(business_hash)
     source_hash=$(sha256sum "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json" | awk '{print $1}')
     invoke --offline
     case "$case_name" in
-      lexical-partial|lexical-legacy) assert_result knowledge.lexical WARN ;;
+      lexical-partial) assert_result knowledge.lexical WARN ;;
+      lexical-legacy) assert_result knowledge.lexical FAIL ;;
       lexical-healthy) assert_result knowledge.lexical PASS ;;
       *) assert_result knowledge.lexical FAIL ;;
     esac
@@ -534,6 +580,187 @@ doctor_workflow_lexical_cases() {
   done
 }
 
+doctor_permit_reset() {
+  local permit_root="${DEPLOY}/data/runtime/ordinary-processing-permits"
+  if [[ -L "$permit_root" ]]; then
+    unlink -- "$permit_root"
+  elif [[ -d "$permit_root" ]]; then
+    find "$permit_root" -depth -delete
+  elif [[ -e "$permit_root" ]]; then
+    rm -f -- "$permit_root"
+  fi
+}
+
+doctor_write_permits() {
+  local mode=$1
+  doctor_permit_reset
+  python3 -B - "$DEPLOY" "$mode" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+deploy = Path(sys.argv[1])
+mode = sys.argv[2]
+runtime = deploy / "data" / "runtime"
+root = runtime / "ordinary-processing-permits"
+runtime_info = os.lstat(runtime)
+uid, gid = runtime_info.st_uid, runtime_info.st_gid
+root.mkdir(mode=0o700)
+os.chown(root, uid, gid)
+if mode == "bad-root-mode":
+    root.chmod(0o755)
+    raise SystemExit
+now = time.time() * 1000
+if mode == "mixed":
+    slots = range(2)
+elif mode in ("missing-kind", "invalid-kind"):
+    slots = [0]
+elif mode == "slot7-ordinary":
+    slots = [7]
+else:
+    slots = range(7)
+for slot in slots:
+    item = root / f"slot-{slot}"
+    item.mkdir(mode=0o700)
+    token = format(slot + 1, "032x")
+    if mode == "active" or (mode == "mixed" and slot == 0):
+        acquired, expires = now - 1000, now + 120_000
+        heartbeat_seconds = time.time()
+    else:
+        acquired, expires = 1, 2
+        heartbeat_seconds = 1
+    owner = item / "owner.json"
+    heartbeat = item / "heartbeat.json"
+    owner_value = {"schema_version": 1, "slot": slot, "token": token,
+                   "acquired_at": acquired, "expires_at": expires}
+    if mode != "missing-kind":
+        owner_value["kind"] = "invalid" if mode == "invalid-kind" else "ordinary"
+    owner.write_text(json.dumps(owner_value), encoding="utf-8")
+    heartbeat.write_text(json.dumps({"schema_version": 1, "token": token}), encoding="utf-8")
+    owner.chmod(0o600)
+    heartbeat.chmod(0o600)
+    os.utime(heartbeat, (heartbeat_seconds, heartbeat_seconds))
+    os.chown(owner, uid, gid)
+    os.chown(heartbeat, uid, gid)
+    os.chown(item, uid, gid)
+    if mode == "expired-unreclaimable":
+        item.chmod(0o500)
+if mode == "bad-json":
+    target = root / "slot-3" / "owner.json"
+    target.write_text("{not-json\n", encoding="utf-8")
+    target.chmod(0o600)
+    os.chown(target, uid, gid)
+PY
+}
+
+doctor_permit_tree_hash() {
+  local permit_root="${DEPLOY}/data/runtime/ordinary-processing-permits"
+  find -P "$permit_root" -printf '%P|%y|%m|%U|%G|%s|%T@|%l\n' 2>/dev/null \
+    | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+doctor_permit_cases() {
+  local permit_root="${DEPLOY}/data/runtime/ordinary-processing-permits" before_hash sentinel
+
+  doctor_write_permits bad-root-mode
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --offline
+  (( LAST_RC == 1 )) || fail '权限异常的后台任务许可根目录应退出 1'
+  assert_result runtime.processing_permits FAIL
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '只读自检改写了权限异常许可目录'
+
+  doctor_permit_reset
+  sentinel="${TEST_ROOT}/permit-link-sentinel"
+  mkdir -m 0700 -- "$sentinel"
+  printf '保留\n' > "${sentinel}/keep"
+  ln -s -- "$sentinel" "$permit_root"
+  invoke --offline
+  (( LAST_RC == 1 )) || fail '许可根链接应退出 1'
+  assert_result runtime.processing_permits FAIL
+  [[ -L "$permit_root" && -f "${sentinel}/keep" ]] || fail '只读自检跟随或删除了许可根链接'
+  doctor_permit_reset
+  rm -f -- "${sentinel}/keep"; rmdir -- "$sentinel"
+
+  doctor_write_permits bad-json
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --offline
+  (( LAST_RC == 1 )) || fail '许可 owner JSON 损坏应退出 1'
+  assert_result runtime.processing_permits FAIL
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '只读自检改写了损坏许可 JSON'
+
+  local malformed
+  for malformed in missing-kind invalid-kind slot7-ordinary; do
+    doctor_write_permits "$malformed"
+    before_hash=$(doctor_permit_tree_hash)
+    invoke --offline
+    (( LAST_RC == 1 )) || fail "许可 owner ${malformed} 应失败关闭并退出 1"
+    assert_result runtime.processing_permits FAIL
+    [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] \
+      || fail "只读自检改写了 ${malformed} 异常许可"
+  done
+
+  doctor_write_permits active
+  sentinel="${TEST_ROOT}/permit-slot-link-sentinel"
+  mkdir -m 0700 -- "$sentinel"
+  printf '保留\n' > "${sentinel}/keep"
+  find "${permit_root}/slot-0" -depth -delete
+  ln -s -- "$sentinel" "${permit_root}/slot-0"
+  invoke --offline
+  (( LAST_RC == 1 )) || fail '许可 slot 链接应退出 1'
+  assert_result runtime.processing_permits FAIL
+  [[ -L "${permit_root}/slot-0" && -f "${sentinel}/keep" ]] || fail '只读自检跟随或删除了许可 slot 链接'
+  doctor_permit_reset
+  rm -f -- "${sentinel}/keep"; rmdir -- "$sentinel"
+
+  doctor_write_permits expired-unreclaimable
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --offline
+  (( LAST_RC == 1 )) || fail '七个过期但权限不安全的许可应退出 1'
+  assert_result runtime.processing_permits FAIL
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '只读自检清理了不可证明安全的过期许可'
+
+  doctor_write_permits active
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --offline
+  (( LAST_RC == 2 )) || fail '七个合法短时活动许可应警告而非故障'
+  assert_result runtime.processing_permits WARN
+  jq -e 'any(.results[]; .id == "runtime.processing_permits" and
+    (.summary | contains("活动 7") and contains("Webhook 始终保留 2 个 runner")))' "$OUT" >/dev/null \
+    || fail '合法短时饱和没有给出准确说明'
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '只读自检续租或删除了活动许可'
+
+  doctor_write_permits mixed
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --local --fix
+  (( LAST_RC == 2 )) || fail '活动许可存在时显式修复应保留过期项并返回警告'
+  assert_result runtime.processing_permits WARN
+  jq -e 'any(.fix.actions[]; .id == "fix.runtime.processing_permits" and .status == "SKIP" and
+    (.summary | contains("为避免中断正常客户任务")))' "$OUT" >/dev/null \
+    || fail '活动许可存在时未记录跳过回收的业务保护'
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '显式修复在活动任务存在时改写许可'
+  ! grep -Eq ' stop n8n$' "$FIXTURE_LOG" || fail '活动许可存在时显式修复错误停止 n8n'
+
+  doctor_write_permits expired
+  before_hash=$(doctor_permit_tree_hash)
+  invoke --offline
+  (( LAST_RC == 2 )) || fail '结构完整的过期许可在只读模式应警告'
+  assert_result runtime.processing_permits WARN
+  [[ "$before_hash" == "$(doctor_permit_tree_hash)" ]] || fail '默认 doctor 自动回收了过期许可'
+  invoke --local --fix
+  (( LAST_RC == 0 )) || fail '显式安全修复未回收明确过期许可并恢复健康'
+  assert_result runtime.processing_permits PASS
+  jq -e 'any(.fix.actions[]; .id == "fix.runtime.processing_permits" and .status == "PASS")' "$OUT" >/dev/null \
+    || fail '过期许可修复缺少结构化动作结果'
+  [[ ! -e "$permit_root" || -z "$(find "$permit_root" -mindepth 1 -print -quit)" ]] \
+    || fail '显式修复后仍残留明确过期许可'
+  grep -Eq ' stop n8n$' "$FIXTURE_LOG" || fail '过期许可修复未先停止 n8n 写入'
+  grep -Eq ' up -d n8n$' "$FIXTURE_LOG" || fail '过期许可修复后未恢复 n8n'
+  doctor_permit_reset
+  pass '许可 doctor 区分坏权限/链接/不可回收过期与合法短时饱和，且仅显式停写修复明确过期项'
+}
+
 if [[ "${DOCTOR_TEST_FOCUS:-}" == workflow ]]; then
   doctor_workflow_lexical_cases
   pass '工作流实际 Node 校验的 6 个词法内联、挂载与漏件正负例'
@@ -547,6 +774,10 @@ elif [[ "${DOCTOR_TEST_FOCUS:-}" == knowledge ]]; then
   doctor_knowledge_cases
   doctor_lexical_cases
   printf '知识自检聚焦完成：22 个场景，%s 组通过。\n' "$PASSED"
+  exit 0
+elif [[ "${DOCTOR_TEST_FOCUS:-}" == permits ]]; then
+  doctor_permit_cases
+  printf '后台任务执行许可自检聚焦完成，%s 组通过。\n' "$PASSED"
   exit 0
 fi
 
@@ -614,6 +845,7 @@ assert_result n8n.execution_backlog PASS
 assert_result provider.adapter PASS
 assert_result provider.adapter_binding PASS
 assert_result provider.adapter_code_binding PASS
+assert_result provider.visitor_output_code_binding PASS
 assert_result anything.provider_binding PASS
 assert_result n8n.runtime_binding PASS
 assert_result caddy.file_binding SKIP
@@ -715,6 +947,8 @@ assert_result logs.n8n_execution SKIP
 [[ "$before" == "$(business_hash)" ]] || fail 'offline 自检改动了业务状态'
 pass 'offline 静态核对日志/n8n配置，运行容器项明确跳过而不误报故障'
 
+doctor_permit_cases
+
 doctor_knowledge_cases
 doctor_lexical_cases
 
@@ -777,6 +1011,34 @@ unset DOCTOR_FIXTURE_MATERIALS_MISMATCH
 [[ "$before" == "$(business_hash)" ]] || fail '资料投影自检没有恢复原业务状态'
 pass '资料 doctor 区分原文待应用/损坏、有效投影、applying 与运行代偏离'
 
+materials_tamper_baseline=$(business_hash)
+for materials_tamper in embedded knowledge-aggregate; do
+  python3 -B - "${DEPLOY}/config/materials-applied.json" "$materials_tamper" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+target, mode = Path(sys.argv[1]), sys.argv[2]
+value = json.loads(target.read_text(encoding="utf-8"))
+if mode == "embedded":
+    value["configuration"]["runtime"]["enabled"] = not value["configuration"]["runtime"]["enabled"]
+else:
+    value["source_components"]["knowledge"] = "e" * 64
+    canonical = json.dumps(value["source_components"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    value["source_sha256"] = hashlib.sha256(canonical).hexdigest()
+target.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+target.chmod(0o640)
+PY
+  invoke --offline
+  (( LAST_RC == 1 )) || fail "schema v2 ${materials_tamper} 篡改应退出 1"
+  assert_result materials.applied FAIL
+  assert_result materials.runtime_binding SKIP
+  cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+done
+[[ "$materials_tamper_baseline" == "$(business_hash)" ]] || fail 'schema v2 篡改专项未恢复原资料投影'
+pass '资料 doctor 拒绝未重签的内嵌组件与伪造外层摘要的知识聚合篡改'
+
 # catalog 有启用文档但 manifest 映射和 workspace 同时为空时，两个 location
 # 集合都会是 []；必须在集合比较前拒绝缺失的逐文档 hash/location 映射。
 manifest_saved="${TEST_ROOT}/knowledge-manifest.saved.json"
@@ -790,9 +1052,10 @@ assert_result knowledge.catalog FAIL
 grep -q '索引映射' "$OUT" || fail '缺失逐文档映射未给出准确故障摘要'
 
 doc_hash=$(jq -M -r '.libraries[] | select(.enabled) | .documents[0].sha256' "${DEPLOY}/knowledge/catalog.json")
-jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
+pending_started_at=$(date -u '+%s')
+jq -M --arg hash "$doc_hash" --argjson pending_started_at "$pending_started_at" '
   .files={} | .pending_files={"fixture.md":{
-    sha256:$hash,locations:["custom-documents/pending-fixture.json"],old_locations:[],started_at:$now
+    sha256:$hash,locations:["custom-documents/pending-fixture.json"],old_locations:[],started_at:$pending_started_at
   }}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
 invoke --local
 (( LAST_RC == 1 )) || fail '已绑定模型代次的 pending 文档必须保持故障，不能提前宣称索引应用完成'
@@ -801,7 +1064,7 @@ assert_result knowledge.profile FAIL
 assert_result knowledge.lexical PASS
 grep -q '仍在服务端对账' "$OUT" || fail '正常 pending 未给出处理中说明'
 
-# 真正无 profile 绑定的旧实例仍保留原有 pending 警告，不借新代文件冒充旧代。
+# 无 profile 绑定的 schema v1 投影必须明确要求迁移；不能借旧代文件冒充 schema v2 就绪。
 pending_materials_saved="${TEST_ROOT}/pending-materials.saved.json"
 pending_profile_saved="${TEST_ROOT}/pending-profile.saved.json"
 cp -p -- "${DEPLOY}/config/materials-applied.json" "$pending_materials_saved"
@@ -811,25 +1074,26 @@ jq 'del(.embedding_profile)' "${DEPLOY}/data/knowledge-manifest.json" > "${TEST_
 # profile 校验会正确地把 world-readable 文件判为 FAIL，掩盖本例要验证的 legacy WARN。
 install -m 0600 -- "${TEST_ROOT}/pending-legacy-manifest.json" "${DEPLOY}/data/knowledge-manifest.json"
 jq --arg manifest_hash "$(sha256sum "${DEPLOY}/data/knowledge-manifest.json" | awk '{print $1}')" \
-  '.knowledge.profile_sha256="" | .knowledge.manifest_sha256=$manifest_hash' \
+  '.schema_version=1 | .knowledge.profile_sha256="" | .knowledge.manifest_sha256=$manifest_hash' \
   "$pending_materials_saved" > "${DEPLOY}/config/materials-applied.json"
 invoke --local
-(( LAST_RC == 2 )) || fail '无 profile 绑定旧代的正常 pending 文档应保留警告 2'
+(( LAST_RC == 1 )) || fail '无 profile 绑定的 schema v1 投影应保持迁移门禁并退出 1'
 assert_result knowledge.catalog WARN
-assert_result knowledge.profile WARN
-assert_result knowledge.lexical PASS
+assert_result knowledge.profile FAIL
+assert_result knowledge.lexical FAIL
 mv -- "$pending_profile_saved" "${DEPLOY}/data/runtime/knowledge-profile.json"
 cp -p -- "$pending_materials_saved" "${DEPLOY}/config/materials-applied.json"
 
-jq -M --arg hash "$doc_hash" --argjson now "$(date -u '+%s')" '
+jq -M --arg hash "$doc_hash" --argjson pending_started_at "$pending_started_at" '
   .files={} | .pending_files={"unrelated.md":{
-    sha256:$hash,locations:["custom-documents/unrelated.json"],old_locations:[],started_at:$now
+    sha256:$hash,locations:["custom-documents/unrelated.json"],old_locations:[],started_at:$pending_started_at
   }}' "$manifest_saved" > "${DEPLOY}/data/knowledge-manifest.json"
 invoke --local
 (( LAST_RC == 1 )) || fail '无关 pending 不得掩盖目标启用文档映射缺失'
 assert_result knowledge.catalog FAIL
 unset DOCTOR_FIXTURE_EMPTY_WORKSPACE
 cp -p -- "$manifest_saved" "${DEPLOY}/data/knowledge-manifest.json"
+unset pending_started_at
 pass '逐文档区分有效 pending 与缺失映射，无关 pending 不掩盖损坏'
 
 # 在线安装与管理菜单都在真实终端内调用 doctor。docker compose exec -T 仍会
@@ -1048,6 +1312,116 @@ jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null 
 jq -e 'all(.results[]; .id != "runtime.scheduler_health_recovery")' "$OUT" >/dev/null \
   || fail '空恢复记录不应增加诊断结果'
 pass 'scheduler 隔离字段全零、空恢复记录及公平游标兼容，且不改变既有健康结果'
+
+# REST 漏收补偿事实来自同一 scheduler 心跳，只展示匿名水位、结果和计数。
+# doctor 不发网络请求、不补消息，也不能接受可夹带会话身份的扩展字段。
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:null,
+  crisp_rest_catchup:{status:"ok",checked_at:($now - 1000),watermark:($now - 5000),
+    lag_ms:5000,pending:false,recovered_messages:2,checked_conversations:3,
+    request_budget_used:12,request_budget_limit:3000,request_budget_reset_at:($now + 86400000)}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 0 )) || fail '最近完成的 REST 漏收补偿不应降低本地自检退出码'
+assert_result runtime.scheduler PASS
+assert_result runtime.crisp_rest_catchup PASS
+jq -e 'any(.results[]; .id == "runtime.crisp_rest_catchup" and
+  (.summary | contains("周期至少 60 秒") and contains("单轮最多 4 次 REST 请求") and
+    contains("水位距今") and contains("检查 3 个会话") and contains("补入 2 条通知") and
+    contains("已用 12/3000") and contains("配额保留给正文、控制与投递对账")))' "$OUT" >/dev/null \
+  || fail 'REST 补偿正常事实未展示匿名水位和最近计数'
+! grep -Eq 'session[-_][[:alnum:]_-]+|crisp-rest-catchup\.json|CRISP_(AUTH|WEBSITE|TOKEN)' "$OUT" \
+  || fail 'REST 补偿正常事实泄漏会话身份、内部路径或凭据字段'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:null,
+  crisp_rest_catchup:{status:"warning",checked_at:($now - 1000),watermark:($now - 5000),
+    lag_ms:5000,pending:true,recovered_messages:0,checked_conversations:0,
+    error_code:"credentials_changed"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+catchup_health_hash=$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')
+catchup_business_hash=$(business_hash)
+catchup_session_hash=$(sha256sum "$SESSION_FILE" | awk '{print $1}')
+invoke --local
+(( LAST_RC == 2 )) || fail 'Crisp REST 凭据代次变化应以降级警告退出 2'
+assert_result runtime.scheduler PASS
+assert_result runtime.crisp_rest_catchup WARN
+jq -e 'any(.results[]; .id == "runtime.crisp_rest_catchup" and
+  (.summary | contains("凭据或权限层级已变更") and contains("旧成功事实已失效") and contains("水位距今")))' "$OUT" >/dev/null \
+  || fail 'REST 补偿凭据代次变化缺少安全的中文原因和保留水位'
+! grep -Fq 'credentials_changed' "$OUT" \
+  || fail '普通结构化诊断摘要不应暴露内部 REST 补偿错误枚举'
+
+invoke --local --fix
+(( LAST_RC == 2 )) || fail 'doctor --fix 不应掩盖或修改 REST 补偿凭据代次警告'
+assert_result runtime.crisp_rest_catchup WARN
+[[ "$catchup_health_hash" == "$(sha256sum "${DEPLOY}/data/runtime/scheduler-health.json" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 修改了 REST 补偿水位或结果'
+[[ "$catchup_business_hash" == "$(business_hash)" ]] \
+  || fail 'doctor --fix 因 REST 补偿警告修改了业务配置'
+[[ "$catchup_session_hash" == "$(sha256sum "$SESSION_FILE" | awk '{print $1}')" ]] \
+  || fail 'doctor --fix 因 REST 补偿警告修改了会话状态'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:null,
+  crisp_rest_catchup:{status:"warning",checked_at:($now - 1000),watermark:($now - 5000),
+    lag_ms:5000,pending:true,recovered_messages:0,checked_conversations:0,
+    request_budget_used:3000,request_budget_limit:3000,request_budget_reset_at:($now + 3600000),
+    error_code:"daily_budget_exhausted"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 2 )) || fail '补偿 REST 保守预算用尽应降级警告且不冒充本地组件故障'
+assert_result runtime.scheduler PASS
+assert_result runtime.crisp_rest_catchup WARN
+jq -e 'any(.results[]; .id == "runtime.crisp_rest_catchup" and
+  (.summary | contains("保守预算已用尽") and contains("游标与未完成责任均已保留") and
+    contains("已用 3000/3000") and contains("配额保留给正文、控制与投递对账")))' "$OUT" >/dev/null \
+  || fail 'REST 补偿预算警告没有说明责任保护与站点配额保留'
+! grep -Fq 'daily_budget_exhausted' "$OUT" \
+  || fail '普通诊断输出不应暴露内部补偿预算错误枚举'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0}},
+  health_recovered:null,
+  crisp_rest_catchup:{status:"warning",checked_at:($now - 1000),watermark:($now - 5000),
+    lag_ms:5000,pending:false,recovered_messages:1,checked_conversations:4,
+    unresolved_messages:2,unresolved_since:($now - 120000),error_code:"messages_quarantined"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '存在持久待核查消息时必须以故障退出 1，不能用扫描头水位假绿'
+assert_result runtime.crisp_rest_catchup FAIL
+jq -e 'any(.results[]; .id == "runtime.crisp_rest_catchup" and
+  (.summary | contains("2 条持久待核查消息") and contains("扫描头水位不能代表") and
+    contains("最早未完整覆盖范围")))' "$OUT" >/dev/null \
+  || fail 'REST 待核查责任没有显示数量和最早未覆盖范围'
+! grep -Eq 'session[-_][[:alnum:]_-]+|fingerprint|unresolved_messages|messages_quarantined' "$OUT" \
+  || fail 'REST 待核查诊断泄漏会话身份或内部字段'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  crisp_rest_catchup:{status:"ok",checked_at:$now,watermark:$now,lag_ms:0,pending:false,
+    recovered_messages:0,checked_conversations:0,session_id:"session_must_not_escape"}
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 1 )) || fail 'REST 补偿健康事实包含未允许字段时应判心跳无效'
+assert_result runtime.scheduler FAIL
+jq -e 'all(.results[]; .id != "runtime.crisp_rest_catchup")' "$OUT" >/dev/null \
+  || fail '畸形 REST 补偿事实不得生成可信结果'
+! grep -Fq 'session_must_not_escape' "$OUT" \
+  || fail '畸形 REST 补偿事实中的会话身份不得进入诊断输出'
+pass 'REST 漏收补偿以脱敏水位/最近结果呈现，故障只读降级且拒绝夹带身份字段'
 
 # 隔离统计必须是严格的非负整数，并且原因之和必须等于总数。
 jq -M -n --argjson now "$(date -u '+%s%3N')" '{
@@ -1289,6 +1663,17 @@ assert_result n8n.runtime PASS
 assert_result n8n.execution_backlog WARN
 unset DOCTOR_FIXTURE_N8N_ACTIVE_EXECUTIONS DOCTOR_FIXTURE_N8N_OLDER_TWO_MINUTES DOCTOR_FIXTURE_N8N_OLDER_TEN_MINUTES
 pass 'n8n 执行积压结合生产 Code runner 状态定位调度饥饿，恢复后保留历史告警'
+export DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS=73
+invoke --local
+(( LAST_RC == 0 )) || fail 'n8n 已软删除的运行态墓碑不应被误报为执行积压'
+assert_result n8n.execution_backlog PASS
+jq -e 'any(.results[]; .id == "n8n.execution_backlog" and
+  (.summary | contains("当前未终止执行 0 个")))' "$OUT" >/dev/null \
+  || fail 'n8n 软删除墓碑未从未终止执行计数中排除'
+grep -Fq 'execution-backlog deleted-filter=true soft-deleted=73' "$FIXTURE_LOG" \
+  || fail 'n8n execution fixture 未证明 SQL 使用 deletedAt IS NULL'
+unset DOCTOR_FIXTURE_N8N_SOFT_DELETED_EXECUTIONS
+pass 'n8n execution 只统计 deletedAt 为空的活动记录，软删除墓碑不占 runner'
 export DOCTOR_FIXTURE_ADAPTER_FAIL=1
 invoke --local
 (( LAST_RC == 1 )) || fail 'adapter 容器路径故障应退出 1'
@@ -1300,6 +1685,12 @@ invoke --local
 (( LAST_RC == 1 )) || fail 'provider-adapter 仍读取旧脚本挂载时应退出 1'
 assert_result provider.adapter_code_binding FAIL
 unset DOCTOR_FIXTURE_ADAPTER_CODE_MISMATCH
+
+export DOCTOR_FIXTURE_VISITOR_OUTPUT_CODE_MISMATCH=1
+invoke --local
+(( LAST_RC == 1 )) || fail '访客输出策略仍读取旧脚本挂载时应退出 1'
+assert_result provider.visitor_output_code_binding FAIL
+unset DOCTOR_FIXTURE_VISITOR_OUTPUT_CODE_MISMATCH
 
 cp -p -- "${DEPLOY}/config/Caddyfile.example" "${DEPLOY}/config/Caddyfile"
 env_set "${DEPLOY}/.env" WEBHOOK_ACCESS_MODE managed_https
@@ -1314,7 +1705,7 @@ assert_result caddy.file_binding FAIL
 unset DOCTOR_FIXTURE_CADDY_FILE_MISMATCH
 env_set "${DEPLOY}/.env" WEBHOOK_ACCESS_MODE external_proxy
 rm -f -- "${DEPLOY}/config/Caddyfile"
-pass 'AnythingLLM、workflow、Code runner 与 adapter 故障可独立定位'
+pass 'AnythingLLM、workflow、Code runner、adapter 与访客输出策略故障可独立定位'
 
 export DOCTOR_FIXTURE_REMOTE_CONTEXT=1
 invoke --local
@@ -1352,6 +1743,8 @@ model|当前模型原名或推理端点不可用|模型、协议及 Base URL
 upstream|上游服务或容器网络连接不可用|DNS/TLS
 protocol|接口协议、地址路径或请求格式不兼容|Chat Completions / Responses
 timeout|实际推理在限定时间内未完成|主备总预算
+question-timeout|本次推理已达到总时间或调用次数上限|不会继续放大请求
+question-interrupted|先前推理在 adapter 重启或执行权丢失后已安全终止|旧结果不会继续出站
 empty|上游返回空正文、非 JSON 或与所选协议不符|Chat/Responses
 error-json|上游返回空正文、非 JSON 或与所选协议不符|Chat/Responses
 PROVIDER_DIAGNOSTIC_CASES

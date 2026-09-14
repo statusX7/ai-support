@@ -45,7 +45,7 @@ write_health unknown
 before=$(business_hash)
 invoke --local
 (( LAST_RC == 2 )) || fail '单主未检测应警告，不假绿、不认定接口故障'
-for id in provider.configuration provider.pending provider.rag_transaction provider.rag_configuration provider.secret_permissions provider.adapter provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback; do assert_result "$id" PASS; done
+for id in provider.configuration provider.pending provider.rag_transaction provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
 ! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '主备默认doctor执行付费推理'

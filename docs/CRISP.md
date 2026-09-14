@@ -57,7 +57,7 @@
 | `message:updated` | picker 选择更新，可能没有 from/type | 必选，v1.0.1 升级必须补查 |
 | `session:sync:events` | 可选网页 SDK 的加载/打开欢迎信号 | 使用相应欢迎模式时增加 |
 
-这四项当前均支持 Website Hook。不要订阅 `session:set_opened` 来表示访客开聊天框，它表示 operator 打开会话；在线、输入、已读也不代表真人回复。Website Hook 无签名，依靠随机 URL Secret 与网站/会话校验；Plugin Hook 使用签名，两者不得混用。官方对 Website Hook 不提供 Plugin 相同的失败重试保证，维护停机不能承诺追回所有未收到消息。依据：[Web Hooks 事件与可用模式](https://docs.crisp.chat/references/web-hooks/v1/)。
+这四项当前均支持 Website Hook。不要订阅 `session:set_opened` 来表示访客开聊天框，它表示 operator 打开会话；在线、输入、已读也不代表真人回复。Website Hook 无签名，依靠随机 URL Secret 与网站/会话校验；Plugin Hook 使用签名，两者不得混用。官方对 Website Hook 不提供 Plugin 相同的失败重试保证；v1.3.0 会用当前凭据、持久水位和逐会话游标做有限 REST 补偿，首次启用仍不追溯接入前历史。停机、限流或分页未完成时保留固定覆盖范围，不能把有限单轮预算当作已覆盖。生产补偿至少间隔 60 秒，每轮最多发出 1 次会话列表和 3 次消息/精确核验请求，并使用跨重启的 24 小时保守预算：默认最多 3000 次、硬上限 4000 次，余下站点配额留给正文、人工控制与未知投递对账。凭据长期失效、平台历史不可查或 REST 不可用仍不能承诺追回；doctor 会显示水位、待核查数和预算，而不是用高频轮询制造假保证。依据：[Web Hooks 事件与可用模式](https://docs.crisp.chat/references/web-hooks/v1/)。
 
 登记后执行 `crispai doctor` 或 `10 → 6`。REST 认证、公网端点和真实 Hook 收件是不同事实；错误 Secret 返回项目特有 401 只能证明生产接收节点存在，不能证明 Crisp 已真实投递。Crisp 官方接受成功的 2xx 响应，重定向不算成功；后台最后调用状态可能延迟约一分钟。还要按下一节发送测试消息，核对 `10 → 12` 的当前配置观察。若后台看不到登记情况，不能仅凭 REST 身份 200 推断 Hook 已建好。依据：[官方 Hook 检查说明](https://docs.crisp.chat/guides/web-hooks/website-hooks/)。
 

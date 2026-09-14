@@ -29,6 +29,11 @@ case "$EXTERNAL_PENDING_MODE" in
   0|1) ;;
   *) printf '失败：[STATIC] AI_SUPPORT_EXTERNAL_VALIDATION_PENDING 只能是 0 或 1\n' >&2; exit 1 ;;
 esac
+CURRENT_TEST_VERSION=$(<"${PROJECT_ROOT}/VERSION")
+if (( RELEASE_MODE && EXTERNAL_PENDING_MODE )) && [[ "$CURRENT_TEST_VERSION" == v1.3.0 ]]; then
+  printf '失败：[STATIC] v1.3.0 发布验收不允许 External Validation Pending\n' >&2
+  exit 1
+fi
 if (( EXTERNAL_PENDING_MODE && RELEASE_MODE == 0 )); then
   printf '失败：[STATIC] External Validation Pending 只能与 AI_SUPPORT_RELEASE_TEST=1 同时使用\n' >&2
   exit 1
@@ -99,14 +104,14 @@ SHELL_FILES=(
   get.sh install.sh manage.sh update.sh uninstall.sh
   scripts/common.sh scripts/healthcheck.sh scripts/backup.sh scripts/restore.sh
   scripts/analytics.sh scripts/snapshot.sh scripts/rollback.sh scripts/bootstrap.sh
-  scripts/wizard.sh scripts/package-release.sh scripts/doctor.sh scripts/materials.sh scripts/logs.sh
+  scripts/wizard.sh scripts/package-release.sh scripts/publish-release.sh scripts/doctor.sh scripts/materials.sh scripts/logs.sh
   scripts/configuration.sh scripts/knowledge.sh scripts/provider.sh scripts/migration.sh
   scripts/knowledge-profile.sh
   scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/crisp-settings.sh scripts/full-backup.sh
   tests/run.sh tests/test_manage_contract.sh tests/test_workflow_contract.sh tests/test_workflow_runtime.sh
   tests/test_static_security.sh tests/test_archive_security.sh tests/test_deployment_integration.sh
   tests/test_external_e2e.sh tests/test_bootstrap.sh tests/test_wizard.sh tests/test_release_package.sh
-  tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
+  tests/test_knowledge_timeout.sh tests/test_health_wait.sh tests/test_get.sh tests/test_install_resume.sh tests/test_doctor.sh tests/test_public_distribution.sh tests/test_legacy_rollback.sh
   tests/test_caddy_routing.sh tests/test_caddy_callers.sh tests/test_logs.sh tests/test_doctor_pool.sh
   tests/test_provider_menu.sh
   tests/test_knowledge_profile_integration.sh
@@ -149,6 +154,9 @@ pass "依赖与 Docker 自动引导专项"
 "${SCRIPT_DIR}/test_get.sh"
 pass "独立在线入口、固定正式版校验与 TTY 专项"
 
+"${SCRIPT_DIR}/test_install_resume.sh"
+pass "首次 Compose 候选、暂存续装与重新配置失败恢复专项"
+
 python3 "${SCRIPT_DIR}/test_launcher.py"
 pass "正式 crispai 与受管 crisp 兼容入口及外来命令保护专项"
 
@@ -170,6 +178,9 @@ pass "新手文档、真实帮助入口与菜单限制独立核对专项"
 
 python3 "${SCRIPT_DIR}/test_release_gate.py"
 pass "同包实机回执、源码身份和发布前阻断专项"
+
+python3 "${SCRIPT_DIR}/test_release_identity.py"
+pass "固定 Git tree、规范归档与单一发布入口身份专项"
 
 python3 "${SCRIPT_DIR}/test_provider_log_redaction.py"
 pass "当前、历史与草稿接口秘密的落盘/跟踪脱敏专项"
@@ -212,18 +223,21 @@ jq empty \
   "${PROJECT_ROOT}/config/handoff.yaml.example" \
   "${PROJECT_ROOT}/config/tags.yaml.example" \
   "${PROJECT_ROOT}/config/feedback.yaml.example"
-PROJECT_VERSION=$(<"${PROJECT_ROOT}/VERSION")
+PROJECT_VERSION=$CURRENT_TEST_VERSION
 [[ "$PROJECT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "VERSION 格式无效"
 grep -Fq "version: ${PROJECT_VERSION}" "${PROJECT_ROOT}/config/app.yaml" || fail "app.yaml 版本未同步"
 jq -e --arg version "$PROJECT_VERSION" \
   --arg runtime_hash "$(sha256sum "${PROJECT_ROOT}/n8n/runtime.js" | awk '{print $1}')" \
-  '.meta.aiSupportVersion == $version and .meta.runtimeFileSha256 == $runtime_hash' \
+  '.meta.aiSupportVersion == $version and .meta.runtimeFileSha256 == $runtime_hash
+    and .meta.n8nRunnerConcurrency == 10 and .meta.backgroundProcessingPermits == 8
+    and .meta.ordinaryProcessingPermits == 7' \
   "${PROJECT_ROOT}/n8n/workflow.json" >/dev/null || fail 'n8n workflow 版本或真实运行模块 hash 未同步'
 pass "版本与 JSON/YAML 格式"
 
 grep -Fq 'no-new-privileges:true' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 缺少权限收紧"
 grep -Fq '127.0.0.1' "${PROJECT_ROOT}/docker-compose.yml" || fail "Compose 未默认绑定本机"
 grep -Fq 'N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"' "${PROJECT_ROOT}/docker-compose.yml" || fail "n8n 无法读取受控环境变量"
+grep -Fq 'N8N_RUNNERS_MAX_CONCURRENCY: "10"' "${PROJECT_ROOT}/docker-compose.yml" || fail "n8n runner 并发未固定为 10"
 grep -Fq 'NODE_FUNCTION_ALLOW_BUILTIN: crypto,fs' "${PROJECT_ROOT}/docker-compose.yml" || fail "n8n 内置模块白名单无效"
 grep -Fq "source: \${DEPLOY_DIR:-/opt/crisp-ai}/data/postgres" "${PROJECT_ROOT}/docker-compose.yml" || fail "PostgreSQL 数据未集中保存"
 grep -Fq "source: \${DEPLOY_DIR:-/opt/crisp-ai}/data/analytics" "${PROJECT_ROOT}/docker-compose.yml" || fail "匿名统计数据未集中保存"
@@ -289,6 +303,7 @@ if command -v node >/dev/null 2>&1; then
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_provider_pool.js"
   node "${SCRIPT_DIR}/test_runtime_provider_pool.js"
+  node "${SCRIPT_DIR}/test_runtime_provider_failure_reply.js"
   "${SCRIPT_DIR}/test_provider_menu.sh"
   pass "主备池生产协议与管理专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_runtime_missing_reply_p0.js"
@@ -484,6 +499,7 @@ printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" "$TEST
   > "$MOCK_FORBIDDEN_ARG_FILE"
 
 expect_local_ready_install env \
+  MOCK_DOCKER_STRICT_CONFIG=1 \
   AI_API_BASE_URL=https://provider.invalid \
   AI_API_KEY="$TEST_PROVIDER_KEY" \
   AI_MODEL=gpt-vision-test \
@@ -503,6 +519,7 @@ assert_file "${DEPLOY_DIR}/.crisp-ai-installation"
 assert_file "${TEST_ROOT}/bin/crispai"
 [[ "$(cd / && "${TEST_ROOT}/bin/crispai" --version)" == "$PROJECT_VERSION" ]] || fail "陌生工作目录无法使用受管命令版本入口"
 assert_file "${DEPLOY_DIR}/config/provider.yaml"
+assert_file "${DEPLOY_DIR}/scripts/visitor-output.js"
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail "安装版本错误"
 assert_file "${DEPLOY_DIR}/config/tags.yaml"
 assert_file "${DEPLOY_DIR}/config/feedback.yaml"
@@ -1428,6 +1445,8 @@ fi
 grep -Fq '已在 n8n 停写窗口迁移旧版会话扫描空锁' "${TEST_ROOT}/update.log" \
   || fail '升级未报告旧版扫描锁迁移结果'
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
+cmp -s -- "${PROJECT_ROOT}/scripts/visitor-output.js" "${DEPLOY_DIR}/scripts/visitor-output.js" \
+  || fail '更新后访客输出策略模块不是当前源码代'
 jq -e '
   .handoff.disable_ai == true and .handoff.notify_user.enabled == true and
   (.handoff.keywords | index("转人工") != null) and
@@ -1435,7 +1454,9 @@ jq -e '
   .handoff.message == "正在为您转接人工客服，请稍候。" and
   (.handoff | has("topic_keywords") | not) and
   (.handoff | has("on_low_confidence") | not) and
-  (.handoff.no_answer_message | contains("转接人工") | not)
+  .handoff.no_answer_message == "" and
+  .handoff.low_confidence_message == "" and
+  .handoff.failure_message == ""
 ' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null || fail "旧人工接管配置未安全迁移"
 jq -e '
   .tags.ai_resolved == "customer_resolved" and

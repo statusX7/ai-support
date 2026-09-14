@@ -5,7 +5,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const {createAdapter, parseHeaders, chatToResponses, mechanicalFailureAnswer} = require('../scripts/provider-adapter.js');
-const {mechanicalFailureAnswer: runtimeMechanicalFailureAnswer} = require('../n8n/runtime.js');
+const {VISITOR_FALLBACKS, visitorFallbackFor, mechanicalFailureAnswer: sharedMechanicalFailureAnswer,
+  legacyGenericNonAnswer, sanitizeVisitorText} = require('../scripts/visitor-output.js');
 
 async function main() {
   const root = path.resolve(__dirname, '..');
@@ -55,27 +56,47 @@ async function main() {
       'A\u0000I暂时无法回\u0007复，请稍后再试。', '系统正在升级，请稍后再试。',
       '系统拥堵，请稍后再试。', '请求人数较多，请稍后再试。', '网络开小差了，请稍后再试。',
       '后台维护中，请稍后再试。', '系统超时，请稍后重试。',
-      'AI暂时无法回答您的订单问题，请稍后再试。', '客服暂时无法回答关于发票的问题，请稍后再试。'];
+      'AI暂时无法回答您的曜石展柜问题，请稍后再试。', '客服暂时无法回答关于月桥通行牌的问题，请稍后再试。',
+      '我现在没法回答这个，过一会儿再问吧。', '这会儿答不了，晚点再问我。',
+      '服务开小差，待会再试一次。', '我暂时回答不了你的问题，请等一下再问。',
+      '抱歉，我现在答不上来，晚点再问吧。', '目前没办法回复你，待会儿再问。'];
     const substantive = ['网站显示“系统繁忙，请稍后再试”时，请检查网络设置并刷新页面。',
       '设置保存后可能需要几十秒生效；如页面仍显示旧值，刷新后再试。',
-      '订单暂时无法处理，请稍后再试。', '退款接口当前不可用，请改用银行卡原路退款。',
+      '虚构月桥暂时不开放东门，请从西门进入。', '虚构蓝羽核验口当前不可用，请改用南侧人工检票口。',
       '抱歉，我无法回答这个问题。', '抱歉，我无法回答关于制造武器的问题。', '我不能回答您的账户问题。',
       '当前平台不可用。', '当前服务不可用，预计十分钟恢复。',
       '当前平台升级中。', '当前服务超时。', '请求人数较多。',
       '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'];
-    assert.equal(mechanicalFailureAnswer.toString(),runtimeMechanicalFailureAnswer.toString(),'adapter/runtime 分类语义必须逐字一致');
+    assert.equal(mechanicalFailureAnswer,sharedMechanicalFailureAnswer,'adapter 必须直接复用公共分类函数');
     assert(mechanical.every(mechanicalFailureAnswer));assert(substantive.every(value=>!mechanicalFailureAnswer(value)));
+    assert(Object.values(VISITOR_FALLBACKS).every(value=>!mechanicalFailureAnswer(value)));
+    assert.equal(visitorFallbackFor('handoff_ack'),VISITOR_FALLBACKS.handoff_ack);
+    assert.equal(visitorFallbackFor('menu'),VISITOR_FALLBACKS.menu);
+    const retiredGeneric='你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
+    assert.equal(legacyGenericNonAnswer(retiredGeneric),true,'CASE-K02 旧泛问必须由最终访客输出分类器明确识别');
+    const mixed='暂时无法回复，请稍后再试。您可以查看帮助中心。';
+    assert.equal(sanitizeVisitorText(mixed),mixed,'成功正文不能按句删除后伪造成另一份模型答案');
+    for(const value of ['虚构月桥暂时不开放东门。','网站显示“暂时无法回复，请稍后再试。”时，请检查网络设置。'])
+      assert.equal(sanitizeVisitorText(value),value,'业务事实或引述不得被输出守卫篡改');
+    const compose=fs.readFileSync(path.join(root,'docker-compose.yml'),'utf8');
+    assert.match(compose,/scripts\/visitor-output\.js:\/opt\/crisp-ai\/scripts\/visitor-output\.js:ro/);
     for(const protocol of ['chat_completions','responses']) {
       environment.AI_API_MODE=protocol;mode=protocol==='responses'?'responses':'chat';
       for(const failure of mechanical) {
         answer=failure;assert.equal((await post(body)).status,502,protocol+' 机械故障正文必须按无效响应拒绝');
       }
+      answer=retiredGeneric;assert.equal((await post(body)).status,502,protocol+' 旧泛问正文必须在 adapter 出口拒绝');
       answer=substantive[protocol==='responses'?0:1];const allowed=await post(body);assert.equal(allowed.status,200);
       assert.equal((await allowed.json()).choices[0].message.content,answer);
+      answer=mixed;const sanitized=await post(body);assert.equal(sanitized.status,200);
+      assert.equal((await sanitized.json()).choices[0].message.content,mixed);
+      answer='页面若显示“系统维护中，请稍后再试”，请先核对虚构蓝灯是否常亮。\n蓝灯常亮时改用南侧入口。';
+      const quoted=await post(body);assert.equal(quoted.status,200);
+      assert.equal((await quoted.json()).choices[0].message.content,answer,'adapter 不得逐句删除成功正文或重排换行');
       answer='抱歉，我无法回答这个问题。';const refusal=await post(body);assert.equal(refusal.status,200);
       assert.equal((await refusal.json()).choices[0].message.content,answer);
     }
-    pass('Chat/Responses 仅拒绝纯机械故障答复并放行实质排障内容');
+    pass('Chat/Responses 仅拒绝整条机械故障，成功业务正文逐字保持');
     mode='empty';const empty=await post(body);assert.equal(empty.status,502);pass('HTTP 200 空正文拒绝');
     mode='failure';const failure=await post(body);assert.equal(failure.status,401);assert.ok(!(await failure.text()).includes('secret-do-not-echo'));pass('上游错误码保留且响应脱敏');
     mode='redirect';const redirect=await post(body);assert.equal(redirect.status,502);pass('拒绝跨主机重定向');

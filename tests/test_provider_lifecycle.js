@@ -10,7 +10,8 @@ const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 
 const project = path.resolve(__dirname, '..');
-const baseWork = path.join(project, '.work/v1.2.1');
+const baseWork = path.join(project, '.work/v1.3.0');
+const currentVersion = fs.readFileSync(path.join(project, 'VERSION'), 'utf8').trim();
 const knowledgeModules = ['scripts/knowledge-component.js','scripts/knowledge-profile.py',
   'scripts/knowledge-profile.sh','scripts/knowledge-lexical.py','n8n/admin-query.js','n8n/knowledge-lexical.js'];
 fs.mkdirSync(baseWork, {recursive:true});
@@ -49,8 +50,8 @@ async function fixture() {
   fs.copyFileSync(path.join(project,'config/prompt.md.example'),path.join(deploy,'config/prompt.md'));
   fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
   fs.copyFileSync(path.join(project,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker')); fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
-  write(path.join(deploy,'VERSION'),'v1.2.1\n');
-  write(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+project+'\ninstalled_version=v1.2.1\n');
+  write(path.join(deploy,'VERSION'),currentVersion+'\n');
+  write(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+project+'\ninstalled_version='+currentVersion+'\n');
   write(path.join(deploy,'config/.crispai-launcher'),path.join(work,'crispai')+'\n');
   let prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8');
   const f={deploy,calls:[],rejectModel:'',adapter:null,adapterBase:'',secret:'synthetic-lifecycle-primary-key',header:'synthetic-lifecycle-header-value'};
@@ -251,7 +252,7 @@ async function main(){
       const payload=path.join(directory,'payload'),pool=read(path.join(payload,'config/provider-pool-applied.json'));
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
-      for(const name of ['provider-adapter.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
+      for(const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
       for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert.equal(fs.statSync(path.join(payload,'data/knowledge-projection.json')).mode&0o777,0o600);
@@ -284,6 +285,7 @@ async function main(){
         ['partial-module',payload=>fs.unlinkSync(path.join(payload,knowledgeModules[0])),/知识快照模块不完整/],
         ['missing-runtime',payload=>fs.unlinkSync(path.join(payload,'n8n/runtime.js')),/缺少必要文件.*runtime/],
         ['missing-adapter',payload=>fs.unlinkSync(path.join(payload,'scripts/provider-adapter.js')),/主备版本快照缺少必要文件.*provider-adapter/],
+        ['missing-visitor-output',payload=>fs.unlinkSync(path.join(payload,'scripts/visitor-output.js')),/访客输出策略快照缺少必要文件.*visitor-output/],
         ['linked-module',payload=>{fs.unlinkSync(path.join(payload,knowledgeModules[0]));fs.symlinkSync('synthetic-missing',path.join(payload,knowledgeModules[0]));},/链接或特殊文件/],
         ['declared-lexical',payload=>clearNewModules(payload),/声明了缺失的词法/],
         ['retained-profile',payload=>{clearNewModules(payload);clearLexicalMetadata(payload);write(path.join(payload,'data/runtime/knowledge-profile.json'),{state:'applied'});},/保留新索引代次/],
@@ -322,13 +324,13 @@ async function main(){
       const previous=f.pool(),previousSecret=f.secretEntries(),newRouter=fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'));
       assert(!fs.existsSync(path.join(legacy,'data/knowledge-projection.json')));
       assert(fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
-      write(path.join(f.deploy,'data/runtime/synthetic-current-only.json'),{synthetic:true,version:'v1.2.1'});
+      write(path.join(f.deploy,'data/runtime/synthetic-current-only.json'),{synthetic:true,version:currentVersion});
       write(f.snapshotEnv.MOCK_DOCKER_LOG,'');write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\nprovider-adapter\n');
       f.adapter.closeAllConnections();await new Promise(resolve=>f.adapter.close(resolve));f.adapter=null;
       const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],legacyEnv);
       write(path.join(work,'legacy-rollback.log'),result.stdout+result.stderr);assert.equal(result.code,0,result.stdout+result.stderr);
       for(const name of ['VERSION','install.sh','manage.sh','scripts/common.sh','scripts/provider.sh','n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(legacy,name)));
-      for(const name of ['provider-router.js','provider-envelope.js','provider-pool.py','menu-display.py','menu-provider-ui.sh'])assert(!fs.existsSync(path.join(f.deploy,'scripts',name)));
+      for(const name of ['visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','menu-display.py','menu-provider-ui.sh'])assert(!fs.existsSync(path.join(f.deploy,'scripts',name)));
       for(const name of knowledgeModules)assert(!fs.existsSync(path.join(f.deploy,name)),name);
       assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool-applied.json')));assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool.yaml')));
@@ -345,7 +347,7 @@ async function main(){
       const protectedFiles=files(path.join(f.deploy,'knowledge')).concat(files(path.join(f.deploy,'data/runtime')));
       const before=Object.fromEntries(protectedFiles.map(file=>[file,digest(fs.readFileSync(file))]));
       await checked('bash',['-c','set -euo pipefail\nsource "$1/scripts/common.sh"\ncopy_project_files "$1" "$2"','--',project,f.deploy]);
-      for(const name of [...knowledgeModules,'n8n/runtime.js','n8n/workflow.json'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(project,name)),name);
+      for(const name of ['scripts/visitor-output.js',...knowledgeModules,'n8n/runtime.js','n8n/workflow.json'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(project,name)),name);
       for(const [file,hash] of Object.entries(before))assert.equal(digest(fs.readFileSync(file)),hash,file);
       assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       // 此组只验证真实升级的程序复制阶段，不冒充组件启动或索引迁移验收。

@@ -325,7 +325,7 @@ manager_configuration_view() {
     return 2
   fi
   if (( status == 0 )) && ! jq -M -e --slurpfile actual "$actual" \
-    'def business: del(.revision,.applied_revision,.updated_at); business==($actual[0]|business)' "$source" >/dev/null; then pending=true; fi
+      'def business: del(.revision,.applied_revision,.updated_at,.disable_epoch); business==($actual[0]|business)' "$source" >/dev/null; then pending=true; fi
   if (( MANAGE_JSON )); then
     jq -M -n --arg target "$name" --argjson pending "$pending" --argjson valid "$([[ "$status" == 0 ]] && printf true || printf false)" \
       --slurpfile value "$actual" '{ok:$valid,target:$target,applied:true,pending:$pending,value:$value[0]}'
@@ -368,7 +368,7 @@ manager_apply_checked() {
   fi
   if ! manager_tool configuration get "$name" > "$source" || ! manager_applied_read "$name" "$actual" \
     || ! jq -M -e --slurpfile source "$source" --slurpfile expected "$candidate" \
-      'def business: del(.revision,.applied_revision,.updated_at); (business)==($source[0]|business) and (business)==($expected[0]|business)' "$actual" >/dev/null; then
+      'def business: del(.revision,.applied_revision,.updated_at,.disable_epoch); (business)==($source[0]|business) and (business)==($expected[0]|business)' "$actual" >/dev/null; then
     manager_checked_error '保存后的原文、候选与已应用状态不一致，不能声明本次操作成功；请运行菜单 2 自检'
     return 1
   fi

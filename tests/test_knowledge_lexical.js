@@ -7,7 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {spawnSync} = require('node:child_process');
 const project = path.resolve(__dirname, '..');
-const area = path.join(project, '.work/v1.2.1');
+const area = path.join(project, '.work/v1.3.0');
 fs.mkdirSync(area, {recursive:true});
 const evidence = fs.mkdtempSync(path.join(area, 'knowledge-lexical-'));
 const script = path.join(project, 'scripts/knowledge-lexical.py');
@@ -151,7 +151,10 @@ test('L12 完整50MiB合法正文生成明确部分索引，保留显式尾问�
   const f=fixture('partial',[text]); const index=built(f);
   assert(fs.statSync(f.indexPath).size<=16777216); assert.equal(index.complete,false);
   assert(index.coverage.omitted_bytes>0); assert(index.coverage.reasons.includes('index_capacity'));
-  assert.equal(f.search(question).results[0].text.includes(answer),true);
+  const exact=f.search(question);
+  assert.equal(exact.results[0].text.includes(answer),true);
+  assert.equal(exact.faq_exact.status,'incomplete','部分索引不能把已选中的FAQ冒充全库唯一');
+  assert.equal('answer_text' in exact.faq_exact,false);
   for(const marker of ['头部窗口标记','中部窗口标记','尾部窗口标记']) assert(index.passages.some(p=>p.text.includes(marker)),marker);
 });
 test('L13 单个过大明确问答跳过并记录，不能截断后假装完整',()=>{
@@ -243,6 +246,10 @@ test('L20 完整且锚定的礼貌范围说明可剥离为完整FAQ强命中，�
   assert.equal(pairedResult.results.length,1);
   assert.equal(pairedResult.results[0].lexical.kind,'exact_question');
   assert.equal(pairedResult.results[0].text,pairedQa);
+  assert.equal(pairedResult.faq_exact.status,'unique');
+  assert.equal(pairedResult.faq_exact.answer_text,'仅可寄存带有虚构蓝羽标记的行李箱。');
+  assert.equal(pairedResult.faq_exact.answer_sha256,hash(pairedResult.faq_exact.answer_text));
+  assert.equal(pairedResult.faq_exact.sources.length,1);
 });
 test('L21 范围说明、否定引用、复述改问、复合问题、短泛问及数字冲突不能绕过门槛',()=>{
   const f=fixture('prefix-negative',[qa,'问：可以吗？\n答：请先说明具体事项。\n',
@@ -463,6 +470,48 @@ test('L28 所有近似分支统一拒绝危险结构、冲突限定、来源独�
   assert(Buffer.byteLength(longQuestion)>4096);
   const oversized=fixture('approximate-oversized-candidate',['问：'+longQuestion+'\n答：这是虚构长问题说明。\n']); built(oversized);
   assert.deepEqual(oversized.search('北京苍蓝行李寄存服务如何办理').results,[]);
+});
+test('L29 v2 FAQ绑定完整多行答案字节范围，严格短问在近似token门槛前仍可唯一命中',()=>{
+  const faqQuestion='星钥？';
+  const faqAnswer='第一步核对虚构星钥编号。\n第二步在蓝色门廊完成启用。';
+  const source='问题：'+faqQuestion+'\n回答：'+faqAnswer+'\n';
+  const f=fixture('structured-faq',[source]);
+  const index=built(f);
+  assert.equal(index.schema_version,2);
+  assert.equal(index.algorithm,'crispai-lexical-v2');
+  const passage=index.passages.find(item=>item.question===faqQuestion);
+  assert(passage,'FAQ passage必须与原来源字节区间绑定');
+  assert.equal(passage.answer_sha256,hash(faqAnswer));
+  const relativeStart=passage.answer_start_byte-passage.start_byte;
+  const relativeEnd=passage.answer_end_byte-passage.start_byte;
+  assert(relativeStart>=0&&relativeEnd>relativeStart);
+  assert.equal(Buffer.from(passage.text).subarray(relativeStart,relativeEnd).toString('utf8'),faqAnswer);
+  const result=f.search('星钥');
+  assert.equal(result.faq_exact.status,'unique');
+  assert.equal(result.faq_exact.answer_text,faqAnswer);
+  assert.equal(result.faq_exact.answer_sha256,hash(faqAnswer));
+  assert.equal(result.results[0].lexical.kind,'exact_question');
+});
+test('L30 严格同问同答案可汇总来源，不同答案即使落在结果上限外也判冲突并禁止直答',()=>{
+  const sharedQuestion='虚构月桥在周三开放吗？';
+  const sharedAnswer='虚构月桥每周三开放。';
+  const same=fixture('faq-same-answer',Array.from({length:3},()=>`问：${sharedQuestion}\n答：${sharedAnswer}\n`));
+  built(same);
+  const merged=same.search(sharedQuestion);
+  assert.equal(merged.faq_exact.status,'unique');
+  assert.equal(merged.faq_exact.answer_text,sharedAnswer);
+  assert.equal(merged.faq_exact.answer_sha256,hash(sharedAnswer));
+  assert.equal(merged.faq_exact.sources.length,3,'同一完整答案允许保留全部来源证据');
+
+  const conflicting=fixture('faq-conflict',Array.from({length:6},(_,index)=>
+    `问：${sharedQuestion}\n回答：虚构规则版本${index+1}。\n`));
+  built(conflicting);
+  const result=conflicting.search(sharedQuestion,{maxResults:4});
+  assert.equal(result.results.length,4,'普通结果仍遵守上限');
+  assert.equal(result.faq_exact.status,'conflict','唯一性必须在截断普通结果前检查全部严格候选');
+  assert.equal(result.faq_exact.sources.length,6);
+  assert.equal('answer_text' in result.faq_exact,false);
+  assert.equal('answer_sha256' in result.faq_exact,false);
 });
 process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:path.relative(project,evidence),synthetic_only:true})+'\n');
 process.exitCode=failed?1:0;
