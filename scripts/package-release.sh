@@ -122,6 +122,7 @@ REQUIRED_RELEASE_FILES=(
   n8n/runtime-cli.js n8n/admin-query.js n8n/web-chat.js config/provider.yaml.example
   tests/run.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh
   tests/test_legacy_rollback.sh tests/test_install_resume.sh tests/test_runtime_missing_reply_p0.js
+  tests/test_provider_recovery_contract.js tests/test_runtime_process_fencing.js
   tests/test_runtime_provider_failure_reply.js tests/test_release_gate.py tests/test_release_identity.py
 )
 for required in "${REQUIRED_RELEASE_FILES[@]}"; do

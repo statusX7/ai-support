@@ -89,6 +89,8 @@ tests/test_configuration_guards.js
 tests/test_configuration_protocol.js
 tests/test_feedback_runtime.js
 tests/test_provider_pool.js
+tests/test_provider_recovery_contract.js
+tests/test_runtime_process_fencing.js
 tests/test_runtime_provider_pool.js
 tests/test_runtime_provider_failure_reply.js
 tests/test_runtime_missing_reply_p0.js
