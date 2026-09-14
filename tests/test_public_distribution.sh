@@ -58,6 +58,18 @@ extract_recommended_command() {
   ' "$file"
 }
 
+strict_checksum_record_count() {
+  local name=$1 file=$2
+  awk -v name="$name" '
+    NF == 2 \
+      && length($1) == 64 \
+      && $1 ~ /^[0-9a-fA-F]+$/ \
+      && $2 == name \
+      && $0 == $1 "  " $2 { count += 1 }
+    END { print count + 0 }
+  ' "$file"
+}
+
 VERSION_VALUE=$(<"${PROJECT_ROOT}/VERSION")
 [[ "$VERSION_VALUE" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
   || fail 'VERSION 不是稳定语义版本'
@@ -127,6 +139,28 @@ set -e
 (( INVALID_STATUS == 64 )) || fail 'get.sh 未以 64 拒绝非法 release'
 [[ ! -e "$SIDE_EFFECT_LOG" ]] || fail '非法 release 在拒绝前发生副作用'
 pass 'help/version/非法参数在无网络副作用下完成'
+
+CHECKSUM_FIXTURE_NAME='ai-support-v9.8.7.tar.gz'
+CHECKSUM_FIXTURE_SHA='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+printf '%s  %s\n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME" \
+  > "${TEST_ROOT}/checksum-valid"
+[[ "$(strict_checksum_record_count "$CHECKSUM_FIXTURE_NAME" \
+  "${TEST_ROOT}/checksum-valid")" == 1 ]] \
+  || fail '可移植 SHA256SUMS 校验拒绝了合法严格记录'
+{
+  printf '%s %s\n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME"
+  printf '%s   %s\n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME"
+  printf '%s\t%s\n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME"
+  printf '%s  %s\n' "${CHECKSUM_FIXTURE_SHA%?}" "$CHECKSUM_FIXTURE_NAME"
+  printf '%sx  %s\n' "${CHECKSUM_FIXTURE_SHA%?}" "$CHECKSUM_FIXTURE_NAME"
+  printf ' %s  %s\n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME"
+  printf '%s  %s \n' "$CHECKSUM_FIXTURE_SHA" "$CHECKSUM_FIXTURE_NAME"
+  printf '%s  %s\n' "$CHECKSUM_FIXTURE_SHA" 'ai-support-v9.8.8.tar.gz'
+} > "${TEST_ROOT}/checksum-invalid"
+[[ "$(strict_checksum_record_count "$CHECKSUM_FIXTURE_NAME" \
+  "${TEST_ROOT}/checksum-invalid")" == 0 ]] \
+  || fail '可移植 SHA256SUMS 校验接受了非严格记录'
+pass 'mawk 可移植的 SHA256SUMS 长度、字符、字段和双空格边界'
 
 README_COMMAND=$(extract_recommended_command "${PROJECT_ROOT}/README.md") \
   || fail 'README 没有唯一、单行的推荐安装命令标记'
@@ -267,10 +301,8 @@ DOWNLOAD_ROOT="https://github.com/${REPOSITORY}/releases/download/${VERSION_VALU
 ARCHIVE_NAME="ai-support-${VERSION_VALUE}.tar.gz"
 anonymous_download "${DOWNLOAD_ROOT}/${ARCHIVE_NAME}" "${TEST_ROOT}/${ARCHIVE_NAME}"
 anonymous_download "${DOWNLOAD_ROOT}/SHA256SUMS" "${TEST_ROOT}/SHA256SUMS"
-CHECKSUM_RECORDS=$(awk -v name="$ARCHIVE_NAME" '
-  $0 ~ /^[0-9a-fA-F]{64}  [^[:space:]]+$/ && $2 == name { count += 1 }
-  END { print count + 0 }
-' "${TEST_ROOT}/SHA256SUMS")
+CHECKSUM_RECORDS=$(strict_checksum_record_count "$ARCHIVE_NAME" \
+  "${TEST_ROOT}/SHA256SUMS")
 NONEMPTY_RECORDS=$(awk 'NF { count += 1 } END { print count + 0 }' \
   "${TEST_ROOT}/SHA256SUMS")
 (( CHECKSUM_RECORDS == 1 && NONEMPTY_RECORDS == 1 )) \
@@ -359,7 +391,7 @@ PY
   || fail '正式包内部 VERSION 不一致'
 ARCHIVE_MEMBERS=$(tar -tzf "${TEST_ROOT}/${ARCHIVE_NAME}") \
   || fail '无法读取正式包成员清单'
-if grep -Eq '(^|/)(\.git|\.work|\.env|data|logs|backups)(/|$)' \
+if grep -Eq '(^|/)(\.git|\.work)(/|$)|^[^/]+/(\.env|data|logs|backups)(/|$)' \
     <<< "$ARCHIVE_MEMBERS"; then
   fail '正式包包含 Git、运行数据、秘密或开发证据目录'
 fi
