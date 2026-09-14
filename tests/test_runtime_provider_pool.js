@@ -75,7 +75,9 @@ async function fixture(label) {
       lexical_sha256:digest(fs.readFileSync(lexicalPath)),enabled_library_ids:['kb_1111111111111111'],
       library_count:1,document_count:1,enabled_document_count:1}}));
   let sequence=10000, runtime;
-  const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,adapterRestarts:0,answerRequests:[],answerResponses:[],sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
+  const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,
+    adapterRestarts:0,answerRequests:[],answerResponses:[],adapterInternalRequests:[],
+    dropNextAdapterResponse:false,sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
   const upstream=http.createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw||'{}');
     const index=Number(/^\/p(\d)\//.exec(req.url)?.[1]);
@@ -115,8 +117,8 @@ async function fixture(label) {
     PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,
   });
   assert.equal(verifiedPool.code,0,verifiedPool.stderr+verifiedPool.stdout);
-  const postAdapter=async(body,headers={},timeout=10000)=>{
-    const response=await fetch(adapterBase+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
+  const postAdapter=async(body,headers={},timeout=10000,route='/v1/chat/completions')=>{
+    const response=await fetch(adapterBase+route,{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
     return{status:response.status,body:await response.json()};
   };
   const rag=http.createServer(async(req,res)=>{
@@ -155,6 +157,10 @@ async function fixture(label) {
     }
     assert.equal(parsed.hostname,'127.0.0.1');
     if(options.headers?.['x-crispai-question']){
+      if(['/internal/provider/replay','/internal/provider/settle'].includes(parsed.pathname)){
+        f.adapterInternalRequests.push(parsed.pathname);
+        return postAdapter(options.body||{},options.headers,options.timeout||10000,parsed.pathname);
+      }
       assert.equal(parsed.pathname,'/v1/chat/completions');
       const captured={body:structuredClone(options.body),headers:structuredClone(options.headers),envelope:verifyEnvelope(options.headers['x-crispai-question'],internal)};
       if(captured.envelope.stage==='vision')f.visionRequest=captured;
@@ -167,6 +173,7 @@ async function fixture(label) {
       // 重启会更换本地随机端口；始终解析当前 adapter，模拟部署中不变的服务地址。
       const response=await postAdapter(captured.body,captured.headers,options.timeout||10000);
       if(captured.envelope.stage==='answer')f.answerResponses.push(response);
+      if(f.dropNextAdapterResponse){f.dropNextAdapterResponse=false;const error=new Error('受控 adapter 回程丢失');error.code='ECONNRESET';throw error;}
       return response;
     }
     const response=await fetch(url,{method:options.method||'GET',headers:{'content-type':'application/json',...options.headers},body:options.body?JSON.stringify(options.body):undefined,signal:AbortSignal.timeout(options.timeout||10000)});
@@ -357,7 +364,7 @@ async function recoverOnce(f,event,result){
     assertUnresolved(f,event,result,'invalid_response');assert.equal(f.state(session).mode,'ai');
     await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
-  await test('旧 Provider generic 缓存不会让同一责任永久 conflict，下一代仅发一份有效答案',async f=>{
+  await test('旧 Provider generic 缓存及 adapter 回程丢失不会永久 replay，下一代仅发一份有效答案',async f=>{
     const generic='你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
     let seeded=false;
     f.beforeAnswer=async request=>{
@@ -372,12 +379,28 @@ async function recoverOnce(f,event,result){
           choices:[{message:{role:'assistant',content:generic},finish_reason:'stop'}]}}},created_at:Date.now(),
       });
     };
+    f.dropNextAdapterResponse=true;
     const event=f.event('session_pool_legacy-generic-cache','合成知识问题'),first=await f.deliver(event);
-    assertUnresolved(f,event,first,'invalid_response');
+    assertUnresolved(f,event,first,'provider_response_unknown');
     assert.equal(f.calls.length,0,'首次只读取旧缓存，不得伪造新的上游调用');
     assert.equal(f.sent.length,0,'旧 generic 缓存不得出站');
+    let firstStored=f.state(event.data.session_id).jobs.find(job=>job.id===first.jobId);
+    assert.equal(firstStored.provider_result_receipt?.state,'unknown',
+      'adapter 回程丢失必须先保守进入 replay-only，不能直接取得第二次推理权');
+    assert.equal(firstStored.inference?.attempt_generation,1);
     let question=f.question(first.jobId);assert.equal(question.attempt_generation,1);
     assert.equal(question.stages.answer.result.choices[0].message.content,generic);
+
+    await f.makeDue(event.data.session_id,first.jobId);
+    const replayRejected=await f.process(first.key,first.jobId);
+    assertUnresolved(f,event,replayRejected,'question_result_rejected');
+    assert.deepEqual(f.adapterInternalRequests,['/internal/provider/replay']);
+    firstStored=f.state(event.data.session_id).jobs.find(job=>job.id===first.jobId);
+    assert.equal(firstStored.provider_result_receipt,undefined,
+      'router 的精确拒绝结论必须释放 replay-only 回执，允许唯一下一恢复代');
+    assert.equal(firstStored.inference,undefined,
+      '已确认不可见的旧 generic 不能永久占住同一推理代');
+    assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);
 
     await f.makeDue(event.data.session_id,first.jobId);await wait(1100);
     const recovered=await f.process(first.key,first.jobId);
@@ -391,6 +414,7 @@ async function recoverOnce(f,event,result){
     assert.match(question.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
     const stored=f.state(event.data.session_id).jobs.find(job=>job.id===first.jobId);
     assert.equal(stored.status,'done');assert.equal(stored.responsibility_status,'answered_confirmed');
+    assert.deepEqual(f.adapterInternalRequests,['/internal/provider/replay','/internal/provider/settle']);
     assert.equal((await f.receive(event)).reason,'重复事件已忽略');
     assert.equal(f.calls.length,1);assert.equal(f.sent.length,1);
   });

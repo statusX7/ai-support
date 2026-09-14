@@ -538,6 +538,8 @@ async function fixture(label, behavior) {
     },
     readbackPath: path.join(root, 'config/provider-pool-readback.json'),
     process: (key, jobId) => runtime.process(key, jobId),
+    mutateState: (session, mutate) => runtime.transaction(
+      runtime.stateKey(env.CRISP_WEBSITE_ID, session), mutate, env.CRISP_WEBSITE_ID, session),
     question: (jobId) => readJson(path.join(root, 'data/provider-router/questions', `${jobId}.json`)),
     close,
     adapterErrors: () => adapterErrors,
@@ -902,6 +904,34 @@ async function test(name, action) {
     assert.equal((await f.process(first.key, first.jobId)).status, 'idle');
     assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 1);
     assert.equal(f.sent.length, 1);
+  });
+
+  await test('损坏的伪结算完成记录保留终态责任，只有完整完成记录到期后才允许清理', async (f) => {
+    const event = f.event('settlement-retention');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'sent');
+    let stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    const completed = structuredClone(stored.provider_settlement);
+
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      job.received_at = f.now() - 8 * 86400000;
+      job.provider_settlement = { ...completed, settled_at: -1 };
+    });
+    await f.mutateState(event.data.session_id, () => {});
+    stored = pendingJob(f, event, first.jobId);
+    assert(stored, '损坏的完成记录不能让旧终态责任被保留期清理');
+    assert.equal(stored.provider_settlement.settled_at, -1);
+
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      job.provider_settlement = { ...completed, settled_at: f.now() };
+    });
+    await f.mutateState(event.data.session_id, () => {});
+    assert.equal(pendingJob(f, event, first.jobId), undefined,
+      '完整结算记录在既有保留期外仍应按正常生命周期清理');
+    assertSingleBusinessReply(f);
   });
 
   await test('router结算后本地写回失败仍保留已生成计划，恢复时不再推理', async (f) => {

@@ -1998,7 +1998,17 @@ doctor_runtime_state_check() {
       continue
     fi
     ((sessions += 1))
-    counts=$(jq -r --argjson now "$now" '[
+    counts=$(jq -r --argjson now "$now" '
+      def nonnegative_safe_integer:
+        type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
+      def provider_settlement_finished:
+        type == "object" and .schema_version == 1 and
+        (.state == "settled" or .state == "absent") and
+        ((.plan_sha256 // "") | test("^[a-f0-9]{64}$")) and
+        (.response_generation | nonnegative_safe_integer) and
+        (.attempts | nonnegative_safe_integer) and .attempts >= 1 and
+        (.settled_at | nonnegative_safe_integer);
+      [
       (if .mode == "human" then 1 else 0 end),
       (if .mode == "human" and .resume_at != null then 1 else 0 end),
       (if .mode == "human" and .resume_at == null then 1 else 0 end),
@@ -2018,9 +2028,14 @@ doctor_runtime_state_check() {
       ([.outgoing[]? | select(.status == "unknown" or .status == "sending")] | length),
       ([.jobs[]? | select(.responsibility_status == "unresolved_failure") | (.failure_since // .received_at // 0)] | min // 0),
       ([.outgoing[]? | select(.status == "unknown" or .status == "sending") | (.created_at // 0)] | min // 0),
-      ([.jobs[]? | select(.provider_settlement.state == "pending" or
-        .provider_settlement.state == "deferred" or .provider_settlement.state == "invalid")] | length),
-      ([.jobs[]? | select(.provider_settlement.state == "invalid")] | length)
+      ([.jobs[]? | select(.provider_settlement != null) |
+        .provider_settlement as $settlement |
+        select(($settlement | provider_settlement_finished) | not)] | length),
+      ([.jobs[]? | select(.provider_settlement != null) |
+        .provider_settlement as $settlement |
+        select(if ($settlement | type) != "object" then true
+          elif ($settlement.state == "pending" or $settlement.state == "deferred") then false
+          else (($settlement | provider_settlement_finished) | not) end)] | length)
     ] | @tsv' "$file")
     read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count \
       pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown \
@@ -2993,6 +3008,7 @@ doctor_provider_inference_failure() {
     upstream_unavailable|connection_failed) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游服务或容器网络连接不可用'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='检查 DNS/TLS、上游状态和容器实际地址；宿主可连不等于容器可连' ;;
     protocol_error) DOCTOR_PROVIDER_FAILURE_SUMMARY='接口协议、地址路径或请求格式不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 核对该接口的 Chat Completions / Responses 模式、Base URL 前缀及实际推理端点' ;;
     invalid_response) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回空正文、非 JSON 或与所选协议不符'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对 Chat/Responses 协议及地址路径；不要只依据 /models 判定可用' ;;
+    question_result_rejected) DOCTOR_PROVIDER_FAILURE_SUMMARY='旧推理结果未通过当前访客输出规则'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='原问题已保留并进入受控恢复；若持续出现，请检查知识输入与 Provider 原始结果类别' ;;
     retrieval_error|retrieval_invalid|retrieval_unavailable|source_unmapped|source_ambiguous|context_invalid) DOCTOR_PROVIDER_FAILURE_SUMMARY='知识检索或启用资料映射未通过'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 5 核对索引与来源，再执行菜单 16 → 6 资料应用' ;;
     context_preparation_incomplete|invalid_input|no_capable_provider) DOCTOR_PROVIDER_FAILURE_SUMMARY='当前接口能力、上下文容量或最终请求结构不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对模型协议/容量/图片能力和已应用 Prompt；未发送不完整请求' ;;
     pool_cooling|pool_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='本题预算内没有接口成功返回'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 查看近期切换记录，逐项定位鉴权、限流、超时或响应格式' ;;

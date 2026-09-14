@@ -74,6 +74,12 @@ async function fixture(count=1,policy={}) {
     const response=await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json',...(bound? {'x-crispai-question':signEnvelope(bound,f.key)}:{})},body:JSON.stringify(body),...options});
     const text=await response.text();let value;try{value=JSON.parse(text);}catch(_){}return{status:response.status,value,text};
   };
+  f.replay = async (envelope,body=sample) => {
+    const bound={...envelope,...requestContract(body)};
+    const response=await fetch(f.base+'/internal/provider/replay',{method:'POST',headers:{authorization:'Bearer '+f.key,
+      'content-type':'application/json','x-crispai-question':signEnvelope(bound,f.key)},body:'{}'});
+    const text=await response.text();let value;try{value=JSON.parse(text);}catch(_){}return{status:response.status,value,text};
+  };
   f.get = async action => (await fetch(f.base+'/internal/provider/'+action,{headers:{authorization:'Bearer '+f.key}})).json();
   f.cli = (args,environment={}) => command(['--deploy-dir',directory,...args],{PROVIDER_ADAPTER_MANAGEMENT_URL:f.base,...environment});
   f.file = value => { const file=path.join(directory,'candidate-'+crypto.randomBytes(4).toString('hex')+'.json');json(file,value);return file; };
@@ -761,8 +767,11 @@ async function main() {
       const generic=f.envelope('answer',{attempt_generation:1});
       seed(generic,chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'));
       const old=await f.post(sample,generic);assert.equal(old.status,400,old.text);
-      assert.equal(old.value.error.code,'invalid_response');
+      assert.equal(old.value.error.code,'question_result_rejected');
       assert.equal(f.calls.length,0,'同代读取旧缓存不能在 adapter 内暗自增加调用');
+      const oldReplay=await f.replay(generic);assert.equal(oldReplay.status,400,oldReplay.text);
+      assert.equal(oldReplay.value.error.code,'question_result_rejected');
+      assert.equal(f.calls.length,0,'旧 runtime 的 replay-only 路径必须得到可恢复的精确拒绝结论');
       const recovered=await f.post(sample,{...generic,attempt_generation:2,deadline_at:Date.now()+90000});
       assert.equal(recovered.status,200,recovered.text);
       assert.equal(recovered.value.choices[0].message.content,'验证回答');

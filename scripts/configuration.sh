@@ -458,6 +458,7 @@ configuration_query_failure() {
     no_capable_provider) message='没有同时满足当前协议、上下文或图片能力的已启用接口' ;;
     question_budget_exhausted|question_timeout) message='本次测试已达到总时间或调用次数上限；不会继续放大请求' ;;
     question_interrupted) message='先前推理在接口适配器重启或执行权丢失后已安全终止；旧结果不会继续出站' ;;
+    question_result_rejected) message='旧推理结果未通过当前访客输出规则；已保留原问题并进入受控恢复' ;;
     safety_refusal) message='模型对合成检查作出安全拒绝；这不是连接成功证据，也不会改用接口规避安全限制' ;;
     *) code=admin_query_failed; message='知识问答测试未完成；请分别检查检索、接口池、协议和组件状态' ;;
   esac

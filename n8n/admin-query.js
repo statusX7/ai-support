@@ -25,6 +25,7 @@ const {createRuntime} = require('./runtime');
     'invalid_response', 'invalid_input', 'context_preparation_incomplete',
     'configuration_applying', 'pool_cooling', 'pool_exhausted', 'no_capable_provider',
     'question_budget_exhausted', 'question_timeout', 'question_interrupted', 'question_cancelled',
+    'question_result_rejected',
     'safety_refusal', 'protocol_error',
     'provider_inference_failed',
   ]);

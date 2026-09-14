@@ -566,7 +566,7 @@ function createRuntime(env = {}, options = {}) {
       'upstream_timeout', 'upstream_unavailable', 'connection_failed', 'invalid_response', 'invalid_input',
       'context_preparation_incomplete', 'configuration_applying', 'pool_cooling', 'pool_exhausted',
       'no_capable_provider', 'question_budget_exhausted', 'question_timeout', 'question_interrupted',
-      'question_cancelled', 'question_result_absent', 'question_owner_changed', 'question_settled',
+      'question_cancelled', 'question_result_absent', 'question_result_rejected', 'question_owner_changed', 'question_settled',
       'question_conflict', 'question_persistence_failed', 'provider_request_identity_unknown', 'provider_response_unknown',
       'safety_refusal', 'protocol_error']);
     const upstream = String(response?.body?.error?.code || '');
@@ -1211,10 +1211,19 @@ function createRuntime(env = {}, options = {}) {
   const priorityConfirmation = (job) => job.control === true && job.action === 'confirm_handoff'
     && job.priority_confirmation === true && !['done', 'cancelled', 'failed'].includes(job.status);
   const terminalJob = (job) => ['done', 'cancelled', 'failed'].includes(job?.status);
+  const providerSettlementFinished = (record) => Boolean(record
+    && typeof record === 'object' && !Array.isArray(record)
+    && record.schema_version === 1 && ['settled', 'absent'].includes(record.state)
+    && /^[a-f0-9]{64}$/.test(record.plan_sha256 || '')
+    && Number.isSafeInteger(record.response_generation) && record.response_generation >= 0
+    && Number.isSafeInteger(record.attempts) && record.attempts >= 1
+    && Number.isSafeInteger(record.settled_at) && record.settled_at >= 0);
+  // 只有明确完成的结算记录才可释放保护。未知/损坏状态宁可保持责任并报错，
+  // 也不能因字段拼写或半次写入被当成“没有待结算”而清理答案缓存。
   const providerSettlementOutstanding = (job) => Boolean(job?.provider_settlement
-    && ['pending', 'deferred', 'invalid'].includes(job.provider_settlement.state));
+    && !providerSettlementFinished(job.provider_settlement));
   const providerSettlementDue = (job, at = clock()) => Boolean(providerSettlementOutstanding(job)
-    && job.provider_settlement.state !== 'invalid'
+    && ['pending', 'deferred'].includes(job.provider_settlement.state)
     && !(job.provider_settlement.next_action_at > at)
     && !(job.provider_settlement.lease_until > at));
   const normalizeFrozenDeliveryRecords = (state) => {
@@ -3414,7 +3423,7 @@ function createRuntime(env = {}, options = {}) {
         providerReceiptRecord(job, stage, 'available'));
       return response;
     }
-    if (['question_result_absent', 'question_interrupted'].includes(code)) {
+    if (['question_result_absent', 'question_result_rejected', 'question_interrupted'].includes(code)) {
       await writeProviderReceipt(key, job, execution,
         providerReceiptRecord(job, stage, 'absent', undefined, code));
       throw providerCallError(code);
@@ -3453,7 +3462,7 @@ function createRuntime(env = {}, options = {}) {
     const available = response.status >= 200 && response.status < 300
       && response.body && !response.body.error;
     const code = available ? '' : providerDiagnosticCode(response);
-    const definitelyAbsent = ['question_result_absent', 'question_interrupted'].includes(code);
+    const definitelyAbsent = ['question_result_absent', 'question_result_rejected', 'question_interrupted'].includes(code);
     await writeProviderReceipt(key, job, execution, providerReceiptRecord(job, stage,
       available ? 'available' : definitelyAbsent ? 'absent' : 'unknown', context ?? null,
       code, contract));

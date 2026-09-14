@@ -217,6 +217,35 @@ jq '.jobs[0].provider_settlement={schema_version:1,state:"invalid",next_action_a
 invoke --local
 assert_result runtime.provider_settlements FAIL
 (( LAST_RC == 1 )) || fail '推理结算身份损坏必须阻止自检假绿'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"corrupt",next_action_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '未知推理结算状态必须保留责任并阻止自检假绿'
+jq '.jobs[0].provider_settlement="corrupt"' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '非对象推理结算记录必须被诊断而不能使自检崩溃'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"settled",settled_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '缺少结果身份的伪结算完成状态必须阻止自检假绿'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"settled",plan_sha256:("a"*64),response_generation:-1,attempts:0,settled_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '越界或零次数的伪结算完成状态必须阻止自检假绿'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"absent",plan_sha256:("a"*64),response_generation:0.5,attempts:1.5,settled_at:-1}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '小数代次、次数或负完成时间不能伪装为已完成结算'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"settled",plan_sha256:("a"*64),response_generation:0,attempts:1,settled_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements PASS
 cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
 pass '推理结果结算延后与身份损坏分层报告，默认自检不删责任'
 

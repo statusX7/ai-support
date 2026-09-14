@@ -801,11 +801,17 @@ function createRouter(environment, invoke) {
       throw terminal('invalid_response','跨阶段缓存结果未通过当前输出策略');
     }
     if (existing?.result) {
+      const disposition = cachedResultDisposition(existing.result);
+      if (disposition === 'non_answer') {
+        // v1.2.x 缓存没有请求摘要，但 responsibility/question 身份仍能证明
+        // 这份正文属于同一应答责任。已知空泛正文在任何请求下都不可见，
+        // 因此可以安全拒绝；合法答案仍必须有完整请求契约才能读取。
+        throw terminal('question_result_rejected','缓存结果未通过当前访客输出策略');
+      }
       if (!contract || !sameRequestContract(requestContract(existing.request_contract),contract)) {
         throw terminal('provider_request_identity_unknown',
           '缓存结果缺少与当前请求及知识上下文一致的身份');
       }
-      const disposition = cachedResultDisposition(existing.result);
       if (disposition === 'answer' || disposition === 'safety_refusal') return existing.result;
       throw terminal('invalid_response','缓存结果未通过当前输出策略');
     }
@@ -931,10 +937,13 @@ function createRouter(environment, invoke) {
       if (question.settlement) throw terminal('question_settled','该问题已由运行时持久接管');
       const phase = question.stages?.[envelope.stage || 'answer'];
       if (phase?.result !== undefined) {
+        const disposition = cachedResultDisposition(phase.result);
+        if (disposition === 'non_answer') {
+          throw terminal('question_result_rejected','缓存结果未通过当前访客输出策略');
+        }
         if (!sameRequestContract(requestContract(phase.request_contract),contract)) {
           throw terminal('provider_request_identity_unknown','缓存结果与原请求或知识上下文身份不一致');
         }
-        const disposition = cachedResultDisposition(phase.result);
         if (disposition === 'answer' || disposition === 'safety_refusal') {
           bestEffortState(() => record({at:Date.now(),question_id:question.id,stage:envelope.stage || 'answer',
             pool_revision:pool.revision,outcome:'cached_replay',attempt:question.attempts}));
