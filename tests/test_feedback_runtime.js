@@ -1859,6 +1859,13 @@ const recoverSameJobOnce = async (fixture, session, jobId, expectedContent) => {
       assert.equal(fixture.postAttempts.length, 1);
       assert.notEqual(String(fixture.postAttempts[0].fingerprint), String(oldFingerprint),
         '恢复答案必须使用新一代稳定 fingerprint');
+      fixture.restart(); assert.deepEqual(await fixture.runtime().scan(), []);
+      const stable = fixture.rawState(session).jobs.find(item => item.id === job.id);
+      assert.equal(stable.status, 'done');
+      assert.equal(stable.responsibility_status, 'answered_confirmed');
+      assert.equal(stable.response_generation, 1,
+        '旧代 generic 不能在有效恢复答复完成后再次降级当前责任');
+      assert.equal(fixture.postAttempts.length, 1);
     };
 
     const delivered = makeFixture('mechanical-cached-unknown-found'), deliveredSession = 'session_mechanical-unknown-found';
@@ -1889,6 +1896,9 @@ const recoverSameJobOnce = async (fixture, session, jobId, expectedContent) => {
     const sentPlan = { ...deliveredPlan, fingerprint: 77224 };
     const sentJob = sentReceipt.makeJob(sentSession, 'sent-found', sentPlan);
     const sentOutgoing = sentReceipt.makeOutgoing(sentJob, sentPlan.content, 'sent');
+    Object.assign(sentOutgoing, { purpose: 'ai_text', message_type: 'text',
+      semantic_intent: 'answer', semantic_status: 'valid_answer', response_generation: 0,
+      content_sha256: digest(canonical({ type: 'text', content: sentPlan.content })) });
     delete sentOutgoing.body;
     await sentReceipt.seed(sentSession, state => { state.jobs.push(sentJob); state.outgoing['77224'] = sentOutgoing; });
     sentReceipt.restart();
@@ -1928,6 +1938,134 @@ const recoverSameJobOnce = async (fixture, session, jobId, expectedContent) => {
     assert.equal(deferred.data.content, absentJob.data.content);
     assert.equal(absent.postAttempts.length, 0); assert.equal(absent.sent.length, 0);
     assert.equal(absent.exactRequests.length, 2);
+  });
+
+  await test('F72 旧 positive 语义不能掩盖 terminal generic，迁移只留受控责任且不批量重放', async () => {
+    const retained = makeFixture('terminal-generic-retained-input');
+    const retainedSession = 'session_terminal-generic-retained-input';
+    const retainedPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: clarification, fingerprint: 77590 };
+    const retainedJob = retained.makeJob(retainedSession, 'terminal-generic-retained-input', retainedPlan, {
+      status: 'done', responsibility_status: 'answered_confirmed', response_generation: 0,
+    });
+    const retainedOutgoing = retained.makeOutgoing(retainedJob, clarification, 'sent');
+    Object.assign(retainedOutgoing, { purpose: 'ai_text', message_type: 'text', semantic_intent: 'answer',
+      semantic_status: 'valid_answer', content_sha256: digest(canonical({ type: 'text', content: clarification })) });
+    delete retainedOutgoing.body;
+    await retained.seed(retainedSession, (state) => {
+      state.jobs.push(retainedJob);
+      state.outgoing[String(retainedPlan.fingerprint)] = retainedOutgoing;
+    });
+    retained.restart();
+    assert.deepEqual(await retained.runtime().scan(), []);
+    let stored = retained.rawState(retainedSession);
+    let migrated = stored.jobs.find((job) => job.id === retainedJob.id);
+    assert.equal(stored.outgoing[String(retainedPlan.fingerprint)].status, 'sent', '物理投递事实必须保留');
+    assert.equal(stored.outgoing[String(retainedPlan.fingerprint)].semantic_intent, 'non_answer');
+    assert.equal(stored.outgoing[String(retainedPlan.fingerprint)].semantic_status, 'delivered_non_answer');
+    assert.equal(migrated.status, 'failed');
+    assert.equal(migrated.responsibility_status, 'unresolved_failure');
+    assert.equal(migrated.failure_code, 'legacy_non_answer_requires_review');
+    assert.equal(migrated.recovery_requires_review, true);
+    assert.equal(migrated.response_generation, 1);
+    assert(migrated.data, '仍存在的原问题必须保留');
+    assert.equal(Object.hasOwn(migrated, 'plan'), false);
+    assert.equal(retained.postAttempts.length, 0); assert.equal(retained.modelRequests.length, 0);
+    retained.restart(); assert.deepEqual(await retained.runtime().scan(), []);
+    stored = retained.rawState(retainedSession);
+    migrated = stored.jobs.find((job) => job.id === retainedJob.id);
+    assert.equal(migrated.response_generation, 1, '重复扫描不得再次推进恢复代');
+    assert.equal(retained.postAttempts.length, 0); assert.equal(retained.modelRequests.length, 0);
+    retained.advance(8 * 86400000); retained.restart();
+    assert.deepEqual(await retained.runtime().scan(), []);
+    stored = retained.rawState(retainedSession);
+    migrated = stored.jobs.find((job) => job.id === retainedJob.id);
+    assert(migrated, '超过普通七天详情保留期后，未解决责任仍必须保留');
+    assert.equal(migrated.responsibility_status, 'unresolved_failure');
+    assert.equal(migrated.recovery_requires_review, true);
+    assert.equal(migrated.response_generation, 1);
+    assert(stored.outgoing[String(retainedPlan.fingerprint)],
+      '与未解决责任绑定的冻结投递语义不得按普通日志轮转删除');
+    assert.equal(stored.outgoing[String(retainedPlan.fingerprint)].semantic_status, 'delivered_non_answer');
+    assert.equal(retained.postAttempts.length, 0); assert.equal(retained.modelRequests.length, 0);
+
+    const stripped = makeFixture('terminal-generic-stripped-input');
+    const strippedSession = 'session_terminal-generic-stripped-input';
+    const strippedJob = stripped.makeJob(strippedSession, 'terminal-generic-stripped-input', null, {
+      status: 'done', responsibility_status: 'answered_confirmed', response_generation: 0,
+    });
+    delete strippedJob.data;
+    const strippedFingerprint = 77591;
+    const strippedOutgoing = {
+      status: 'sent', created_at: stripped.now() - 15000, sent_at: stripped.now() - 10000,
+      attempts: 1, job_id: strippedJob.id, generation: 0, response_generation: 0,
+      purpose: 'ai_text', message_type: 'text', semantic_intent: 'answer', semantic_status: 'valid_answer',
+      content_sha256: digest(canonical({ type: 'text', content: clarification })),
+    };
+    await stripped.seed(strippedSession, (state) => {
+      state.jobs.push(strippedJob);
+      state.outgoing[String(strippedFingerprint)] = strippedOutgoing;
+    });
+    stripped.restart(); assert.deepEqual(await stripped.runtime().scan(), []);
+    const strippedState = stripped.rawState(strippedSession);
+    const strippedMigrated = strippedState.jobs.find((job) => job.id === strippedJob.id);
+    assert.equal(strippedState.outgoing[String(strippedFingerprint)].semantic_status, 'delivered_non_answer');
+    assert.equal(strippedMigrated.status, 'failed');
+    assert.equal(strippedMigrated.responsibility_status, 'unresolved_failure');
+    assert.equal(strippedMigrated.failure_code, 'legacy_non_answer_input_unavailable');
+    assert.equal(strippedMigrated.recovery_requires_review, true);
+    assert.equal(strippedMigrated.response_generation, 1);
+    assert.equal(Object.hasOwn(strippedMigrated, 'data'), false);
+    assert.equal(stripped.postAttempts.length, 0); assert.equal(stripped.modelRequests.length, 0);
+    stripped.restart(); assert.deepEqual(await stripped.runtime().scan(), []);
+    assert.equal(stripped.rawState(strippedSession).jobs.find((job) => job.id === strippedJob.id).response_generation, 1);
+    assert.equal(stripped.postAttempts.length, 0); assert.equal(stripped.modelRequests.length, 0);
+
+    const silenceCases = [
+      { label: 'human-reply', reason: 'human_reply', mode: 'human', generation: 3,
+        resume_at: null, pause_reason: 'operator_reply' },
+      { label: 'handoff-button', reason: 'human_handoff', mode: 'human', generation: 4,
+        resume_at: 4102444800000, pause_reason: 'confirmed_handoff' },
+      { label: 'global-disabled', reason: 'global_disabled', mode: 'ai', generation: 5,
+        resume_at: null, pause_reason: '' },
+    ];
+    for (const [index, scenario] of silenceCases.entries()) {
+      const silent = makeFixture('terminal-generic-intentional-silence-' + scenario.label);
+      if (scenario.reason === 'global_disabled') silent.writeConfig('runtime', {
+        schema_version: 2, enabled: false, revision: 2, applied_revision: 2,
+      });
+      const silentSession = 'session_terminal-generic-intentional-silence-' + scenario.label;
+      const silentPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+        content: clarification, fingerprint: 77592 + index };
+      const silentJob = silent.makeJob(silentSession, 'terminal-generic-intentional-silence', silentPlan, {
+        status: 'cancelled', responsibility_status: 'intentional_silence',
+        responsibility_reason: scenario.reason, response_generation: 0, generation: scenario.generation,
+      });
+      const silentOutgoing = silent.makeOutgoing(silentJob, clarification, 'sent');
+      Object.assign(silentOutgoing, { purpose: 'ai_text', message_type: 'text', semantic_intent: 'answer',
+        semantic_status: 'valid_answer', response_generation: 0, generation: scenario.generation,
+        content_sha256: digest(canonical({ type: 'text', content: clarification })) });
+      delete silentOutgoing.body;
+      await silent.seed(silentSession, (state) => {
+        state.mode = scenario.mode; state.generation = scenario.generation;
+        state.resume_at = scenario.resume_at; state.pause_reason = scenario.pause_reason;
+        state.last_human_at = silent.now() - 1000; state.control_watermark = silent.now() - 1000;
+        state.jobs.push(silentJob); state.outgoing[String(silentPlan.fingerprint)] = silentOutgoing;
+      });
+      const before = silent.rawState(silentSession);
+      silent.restart(); assert.deepEqual(await silent.runtime().scan(), []);
+      const after = silent.rawState(silentSession);
+      const silentStored = after.jobs.find((job) => job.id === silentJob.id);
+      assert.equal(silentStored.status, 'cancelled');
+      assert.equal(silentStored.responsibility_status, 'intentional_silence');
+      assert.equal(silentStored.responsibility_reason, scenario.reason);
+      assert.equal(silentStored.response_generation, 0);
+      assert.equal(Object.hasOwn(silentStored, 'legacy_non_answer_migrated'), false);
+      for (const field of ['mode', 'generation', 'resume_at', 'pause_reason', 'last_human_at', 'control_watermark']) {
+        assert.deepEqual(after[field], before[field], scenario.label + ' 不得被迁移改写会话控制字段 ' + field);
+      }
+      assert.equal(silent.postAttempts.length, 0); assert.equal(silent.modelRequests.length, 0);
+    }
   });
 
   await test('F54 升级遗留的超龄 orphan unknown 不删除，标记可恢复故障并保留原发送事实', async () => {
@@ -2216,6 +2354,32 @@ const recoverSameJobOnce = async (fixture, session, jobId, expectedContent) => {
     assert(unresolved.data, '语义未知时必须保留原始访客责任供管理员核查');
     assert.equal(f.events().filter((event) => event.type === 'ai_reply').length, 0);
     assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+
+    const planOnly = makeFixture('legacy-sent-plan-only-stale-positive');
+    const planOnlySession = 'session_legacy-sent-plan-only';
+    const planOnlyFingerprint = 77411;
+    const planOnlyPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: clarification, fingerprint: planOnlyFingerprint };
+    const planOnlyJob = planOnly.makeJob(planOnlySession, 'legacy-sent-plan-only', planOnlyPlan);
+    const planOnlyOutgoing = planOnly.makeOutgoing(planOnlyJob, planOnlyPlan.content, 'sent');
+    Object.assign(planOnlyOutgoing, { semantic_intent: 'answer', semantic_status: 'valid_answer',
+      purpose: 'ai_text', message_type: 'text' });
+    delete planOnlyOutgoing.body;
+    await planOnly.seed(planOnlySession, (state) => {
+      state.jobs.push(planOnlyJob);
+      state.outgoing[String(planOnlyFingerprint)] = planOnlyOutgoing;
+    });
+    planOnly.restart();
+    assert.equal((await planOnly.runtime().process(planOnly.key(planOnlySession), planOnlyJob.id)).status,
+      'delivery_semantic_unknown');
+    const planOnlyStored = planOnly.rawState(planOnlySession);
+    assert.equal(planOnlyStored.outgoing[String(planOnlyFingerprint)].semantic_status, 'semantic_unknown',
+      '没有冻结正文摘要时，不得用当前可变 plan 反推旧 sent 的实际语义');
+    const planOnlyUnresolved = planOnlyStored.jobs.find((item) => item.id === planOnlyJob.id);
+    assert.equal(planOnlyUnresolved.status, 'received');
+    assert.equal(planOnlyUnresolved.responsibility_status, 'unresolved_failure');
+    assert.equal(planOnlyUnresolved.failure_code, 'delivery_semantic_unknown');
+    assert.equal(planOnly.postAttempts.length, 0); assert.equal(planOnly.sent.length, 0);
   });
 
   await test('F59 首次 receipt_current 冻结后不被后续人工或配置状态追溯改判', async () => {

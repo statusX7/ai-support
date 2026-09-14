@@ -1148,7 +1148,26 @@ const abortablePending = (signal, started) => {
     assert.equal(textOfRequest(generated).split('恢复后的新问题').length - 1, 1);
     assert.deepEqual(retrievalRequests.find(entry => entry.query === '恢复后的新问题'), { query: '恢复后的新问题' });
     assert.equal('sessionId' in generated, false); assert.equal('reset' in generated, false);
-    const prior = runtime.transcript([{ from: 'operator', type: 'note', content: '内部内容', fingerprint: 100, timestamp: now }, { from: 'operator', type: 'text', content: '秘密', stealth: true, timestamp: now }, { from: 'user', type: 'text', content: '本条', fingerprint: 101, timestamp: now }, { from: 'user', type: 'text', content: '公开', fingerprint: 102, timestamp: now }], { data: { fingerprint: 101 }, event_time: now }, state('session_client-b')); assert.equal(prior.length, 1); assert.equal(prior[0].content, '公开');
+    const generic = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
+    const transcriptState = structuredClone(state('session_client-b'));
+    transcriptState.outgoing['107'] = { status: 'sent', created_at: now };
+    const prior = runtime.transcript([
+      { from: 'operator', type: 'note', content: '内部内容', fingerprint: 100, timestamp: now },
+      { from: 'operator', type: 'text', content: '秘密', stealth: true, timestamp: now },
+      { from: 'user', type: 'text', content: '本条', fingerprint: 101, timestamp: now },
+      { from: 'user', type: 'text', content: '公开', fingerprint: 102, timestamp: now },
+      { from: 'operator', type: 'text', content: generic, automated: true, fingerprint: 103, timestamp: now },
+      { from: 'operator', type: 'text', content: '暂时无法回复，请稍后再试。', automated: true, fingerprint: 104, timestamp: now },
+      { from: 'operator', type: 'text', content: generic, automated: false, fingerprint: 105, timestamp: now },
+      { from: 'operator', type: 'text', content: '此前已确认保存成功。', automated: true, fingerprint: 106, timestamp: now },
+      { from: 'operator', type: 'text', content: generic, fingerprint: 107, timestamp: now },
+      { from: 'user', type: 'text', content: generic, fingerprint: 108, timestamp: now },
+      { from: 'operator', type: 'text', content: generic, fingerprint: 109, timestamp: now },
+    ], { data: { fingerprint: 101 }, event_time: now }, transcriptState);
+    assert.deepEqual(prior.map((message) => message.content), [
+      '公开', '[人工公开回复] ' + generic, '此前已确认保存成功。', generic,
+      '[人工公开回复] ' + generic,
+    ]);
   });
   await test('旧版本持久人工迁移及永久模式保留', async () => {
     const session = 'session_legacy001'; const legacy = { aiEnabled: false, aiResumeAt: 0, handoffGeneration: 3, lastOperatorAt: now, welcomeSent: true, fingerprints: [] };

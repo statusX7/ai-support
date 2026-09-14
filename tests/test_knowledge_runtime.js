@@ -14,6 +14,7 @@ const evidence = fs.mkdtempSync(path.join(area, 'knowledge-runtime-'));
 const lexicalBuilder = path.join(project, 'scripts/knowledge-lexical.py');
 const question = '展厅周日开放吗？';
 const reference = '周日闭馆，周一至周六开放。';
+const retiredGeneric = '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
 const fragment = '问题：展厅周日开放吗？\n回答：' + reference;
 const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
   : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
@@ -177,6 +178,11 @@ function fixture(label, allowAdmin = false) {
     return accepted.route === 'process' ? runtime.process(accepted.key, accepted.jobId) : accepted;
   };
   f.state = session => runtime.readState(runtime.stateKey(env.CRISP_WEBSITE_ID, session));
+  f.key = session => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
+  f.runtime = runtime;
+  f.registerOwnedHistory = (session, fingerprint) => runtime.transaction(f.key(session), (state) => {
+    state.outgoing[String(fingerprint)] = { status: 'sent', created_at: Date.now() };
+  }, env.CRISP_WEBSITE_ID, session);
   return f;
 }
 
@@ -198,13 +204,62 @@ async function test(name, action) {
   });
   await test('K02 旧历史参与生成但不污染检索，其他会话不串入', async () => {
     const f = fixture('history'); f.applyKnowledgeSettings(0.2);
-    f.history.set('session_knowledge-history', [{from: 'user', type: 'text', content: '此前讨论的是停车位。'.repeat(100), fingerprint: 7001, timestamp: Date.now()-2000}]);
-    await f.deliver(f.event('session_knowledge-history', question));
+    const session = 'session_knowledge-history';
+    await f.registerOwnedHistory(session, 7002);
+    f.history.set(session, [
+      {from: 'user', type: 'text', content: '此前讨论的是停车位。'.repeat(100), fingerprint: 7001, timestamp: Date.now()-2000},
+      {from: 'operator', type: 'text', content: retiredGeneric, fingerprint: 7002, timestamp: Date.now()-1000},
+    ]);
+    const first = await f.deliver(f.event(session, question));
     assert.equal(f.queries[0]?.query, question);
     assert(JSON.stringify(f.generated[0]).includes('此前讨论的是停车位'));
+    assert(!JSON.stringify(f.generated[0]).includes(retiredGeneric), '本项目旧 generic 不得污染后续模型上下文');
+    let current = f.state(session);
+    let jobs = current.jobs.filter(job => job.id === first.jobId);
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'done');
+    assert.equal(jobs[0].responsibility_status, 'answered_confirmed');
+    assert.equal(f.sent.filter(item => item.session_id === session).length, 1);
+    assert.equal(f.sent.find(item => item.session_id === session)?.content, reference);
+    assert(!f.sent.some(item => typeof item.content === 'string' && item.content.includes(retiredGeneric)));
+
+    const follow = await f.deliver(f.event(session, '请问，周日可以参观展厅吗？'));
+    current = f.state(session); jobs = current.jobs.filter(job => job.id === follow.jobId);
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'done');
+    assert.equal(jobs[0].responsibility_status, 'answered_confirmed');
+    assert.equal(f.sent.filter(item => item.session_id === session).length, 2);
+    assert(f.sent.filter(item => item.session_id === session).every(item => item.content === reference));
+    assert(!JSON.stringify(f.generated.at(-1)).includes(retiredGeneric));
+
     await f.deliver(f.event('session_knowledge-other', question));
-    assert(!JSON.stringify(f.generated[1]).includes('此前讨论的是停车位'));
-    assert.equal(f.sent.length, 2); assert(f.sent.every(item => item.content === reference));
+    assert(!JSON.stringify(f.generated.at(-1)).includes('此前讨论的是停车位'));
+    assert.equal(f.sent.length, 3); assert(f.sent.every(item => item.content === reference));
+
+    const recovering = fixture('history-provider-recovery'); recovering.applyKnowledgeSettings(0.2);
+    const recoveringSession = 'session_knowledge-history-recovery';
+    await recovering.registerOwnedHistory(recoveringSession, 7012);
+    recovering.history.set(recoveringSession, [
+      {from: 'user', type: 'text', content: '此前讨论的是停车位。', fingerprint: 7011, timestamp: Date.now()-2000},
+      {from: 'operator', type: 'text', content: retiredGeneric, fingerprint: 7012, timestamp: Date.now()-1000},
+    ]);
+    recovering.providerError = Object.assign(new Error('synthetic-timeout'), {code: 'ETIMEDOUT'});
+    const failed = await recovering.deliver(recovering.event(recoveringSession, question));
+    assert.equal(recovering.sent.length, 0, '技术失败不能再次发送旧 generic 或其它可见兜底');
+    current = recovering.state(recoveringSession);
+    jobs = current.jobs.filter(job => job.id === failed.jobId);
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'received');
+    assert.equal(jobs[0].responsibility_status, 'unresolved_failure');
+    recovering.providerError = null;
+    await recovering.runtime.transaction(failed.key, state => {
+      const job = state.jobs.find(item => item.id === failed.jobId); assert(job); job.retry_at = 0;
+    });
+    const recovered = await recovering.runtime.process(failed.key, failed.jobId);
+    assert.equal(recovered.status, 'sent');
+    current = recovering.state(recoveringSession);
+    jobs = current.jobs.filter(job => job.id === failed.jobId);
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'done');
+    assert.equal(jobs[0].responsibility_status, 'answered_confirmed');
+    assert.equal(recovering.sent.length, 1); assert.equal(recovering.sent[0].content, reference);
+    assert(!JSON.stringify(recovering.generated.at(-1)).includes(retiredGeneric));
   });
   await test('K03 停用来源不再进入模型，不因旧检索结果误记命中', async () => {
     const f = fixture('disabled'); f.mapping.documents=[]; f.write('data/runtime/knowledge-map.json', f.mapping); f.fragments=[];

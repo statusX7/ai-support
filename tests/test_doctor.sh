@@ -1138,6 +1138,15 @@ assert_result n8n.workflow FAIL
 cp -p -- "$workflow_saved" "${DEPLOY}/n8n/workflow.json"
 pass 'n8n workflow 同时核对 runtime 原文件 hash、规范化嵌入 hash 与 Code 前缀'
 
+visitor_output_saved="${TEST_ROOT}/visitor-output.saved.js"
+cp -p -- "${DEPLOY}/scripts/visitor-output.js" "$visitor_output_saved"
+printf '\n// synthetic doctor identity drift\n' >> "${DEPLOY}/scripts/visitor-output.js"
+invoke --local
+(( LAST_RC == 1 )) || fail 'visitor-output 原文件偏离 workflow metadata 应退出 1'
+assert_result n8n.workflow FAIL
+cp -p -- "$visitor_output_saved" "${DEPLOY}/scripts/visitor-output.js"
+pass 'n8n workflow 独立核对 visitor-output 原文件身份，不沿用旧 runtime 绿灯'
+
 invoke
 (( LAST_RC == 0 )) || fail "健康 default 自检退出码应为 0，实际 ${LAST_RC}"
 assert_result crisp.api PASS

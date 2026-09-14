@@ -1447,9 +1447,9 @@ const lexicalFile=fs.readFileSync(process.argv[7],"utf8");
 const visitorOutputFile=fs.readFileSync(process.argv[8],"utf8");
 const lexicalSource=lexicalFile.replace(/^module\.exports[^\n]+\n?$/m,"");
 const visitorOutputSource=visitorOutputFile.replace(/^\x27use strict\x27;\n?/m,"")
-  .replace(/^module\.exports[^\n]+\n?$/m,"");
+  .replace(/^module\.exports\s*=\s*\{[\s\S]*?\};\r?\n?/m,"");
 const runtimeSource=runtimeFile.replace(/^const \{\s*searchKnowledgeLexical\s*\} = require\('\''\.\/knowledge-lexical\.js'\''\);\r?\n/m,"")
-  .replace(/^const \{\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\''\.\.\/scripts\/visitor-output\.js'\''\);\r?\n/m,"")
+  .replace(/^const \{\s*LEGACY_GENERIC_NON_ANSWERS,\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\''\.\.\/scripts\/visitor-output\.js'\''\);\r?\n/m,"")
   .replace(/^if \(typeof module[^\n]+\n?$/m,"");
 if (/require\(["'\''](?:\.\/knowledge-lexical\.js|\.\.\/scripts\/visitor-output\.js)["'\'']\)/.test(runtimeSource)) process.exit(1);
 const source=(lexicalSource+"\n"+visitorOutputSource+"\n"+runtimeSource)

@@ -98,5 +98,5 @@ function sanitizeVisitorText(value, purpose = 'safe_error', context = 'text') {
   return visible;
 }
 
-module.exports = { VISITOR_FALLBACKS, visitorFallbackFor, mechanicalFailureAnswer,
-  legacyGenericNonAnswer, sanitizeVisitorText };
+module.exports = { VISITOR_FALLBACKS, LEGACY_GENERIC_NON_ANSWERS, visitorFallbackFor,
+  mechanicalFailureAnswer, legacyGenericNonAnswer, sanitizeVisitorText };

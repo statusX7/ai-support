@@ -2,8 +2,8 @@
 
 // 独立模块供宿主 CLI/测试复用；生成工作流时由 build-workflow.js 内联同一实现。
 const { searchKnowledgeLexical } = require('./knowledge-lexical.js');
-const { visitorFallbackFor, mechanicalFailureAnswer, legacyGenericNonAnswer,
-  sanitizeVisitorText } = require('../scripts/visitor-output.js');
+const { LEGACY_GENERIC_NON_ANSWERS, visitorFallbackFor, mechanicalFailureAnswer,
+  legacyGenericNonAnswer, sanitizeVisitorText } = require('../scripts/visitor-output.js');
 
 // 纯编排函数：调用方负责认证、当前资料/启用映射代次、共享预算、网络和发送前取消。
 // 本函数不检索、不推理、不改配置，不截断已选知识块，也不把来源数量当作答案正确性。
@@ -470,6 +470,11 @@ function createRuntime(env = {}, options = {}) {
     try { return hash(canonical({ type: String(type || ''), content: content ?? null })); }
     catch (_) { return ''; }
   };
+  // v1.2.x 的部分 sent 记录已经删除正文与 plan，只留下冻结摘要。仅对项目历史
+  // 明确生成过的整条 generic 文案计算摘要；不能凭模糊文本或旧 positive 标记
+  // 猜测普通业务固定回复的语义。
+  const legacyGenericOutboundDigests = new Set([...LEGACY_GENERIC_NON_ANSWERS]
+    .map((content) => outboundContentSha256('text', content)));
   const planSemanticIntent = (job, plan) => {
     if (!plan || typeof plan !== 'object') return 'unknown';
     if (job?.control === true || plan.ordinary === false || preservedVisitorPurpose(plan.purpose)) return 'control';
@@ -480,6 +485,10 @@ function createRuntime(env = {}, options = {}) {
   const matchingOutgoingPlan = (key, job, record, fingerprint) => {
     const plan = job?.plan;
     if (!plan || typeof plan !== 'object' || record?.job_id !== job.id) return null;
+    // sent 记录的可见正文已经离开本机；旧版若既未保留正文也未冻结摘要，
+    // 当前可变 plan 不能反推当时实际投递了什么。queued/sending 仍可使用同一
+    // 事务内的 plan，sent 则必须有正文或摘要作为不可变身份绑定。
+    if (record?.status === 'sent' && !record.content_sha256 && !record.body) return null;
     const plannedFingerprint = plan.fingerprint ?? responseFingerprint(key, job, plan.purpose);
     if (String(plannedFingerprint) !== String(fingerprint)) return null;
     const planDigest = outboundContentSha256(plan.type || 'text', plan.content);
@@ -490,7 +499,23 @@ function createRuntime(env = {}, options = {}) {
     }
     return plan;
   };
+  const outgoingNonAnswerEvidence = (key, job, record, fingerprint) => {
+    const plan = matchingOutgoingPlan(key, job, record, fingerprint);
+    if (plan && planSemanticIntent(job, plan) === 'non_answer') return true;
+    const purpose = String(record?.purpose || plan?.purpose || '');
+    if (job?.control === true || preservedVisitorPurpose(purpose)) return false;
+    const content = record?.body?.content;
+    if (typeof content === 'string' && (mechanicalFailureAnswer(content)
+      || legacyGenericNonAnswer(content))) return true;
+    const generated = generatedAnswerPurpose(purpose) || !purpose && job?.control !== true
+      && ['answer', 'non_answer'].includes(record?.semantic_intent);
+    const type = String(record?.message_type || record?.body?.type || plan?.type || '');
+    return generated && type === 'text'
+      && legacyGenericOutboundDigests.has(String(record?.content_sha256 || ''));
+  };
   const outgoingSemanticIntent = (key, job, record, fingerprint) => {
+    // 可核验的正文/plan/hash 是更强证据；旧版错误写入的 answer 不能覆盖它。
+    if (outgoingNonAnswerEvidence(key, job, record, fingerprint)) return 'non_answer';
     if (['answer', 'non_answer', 'control', 'unknown'].includes(record?.semantic_intent)) {
       return record.semantic_intent;
     }
@@ -503,9 +528,10 @@ function createRuntime(env = {}, options = {}) {
     return 'unknown';
   };
   const receiptSemanticStatus = (key, job, record, fingerprint) => {
+    const intent = outgoingSemanticIntent(key, job, record, fingerprint);
+    if (intent === 'non_answer') return 'delivered_non_answer';
     if (['valid_answer', 'delivered_non_answer', 'control_delivered', 'semantic_unknown']
       .includes(record?.semantic_status)) return record.semantic_status;
-    const intent = outgoingSemanticIntent(key, job, record, fingerprint);
     return intent === 'answer' ? 'valid_answer' : intent === 'non_answer' ? 'delivered_non_answer'
       : intent === 'control' ? 'control_delivered' : 'semantic_unknown';
   };
@@ -559,6 +585,31 @@ function createRuntime(env = {}, options = {}) {
             || outboundContentSha256(record.body.type || 'text', record.body.content);
           delete record.body;
         }
+      }
+      const deliveredLegacyNonAnswer = related.some(([fingerprint, record]) => record?.status === 'sent'
+        && responseGeneration(record) === responseGeneration(job)
+        && outgoingDeliveredNonAnswer(key, job, record, fingerprint));
+      if (terminalJob(job) && job.control !== true
+        && job.responsibility_status !== 'intentional_silence' && deliveredLegacyNonAnswer
+        && job.legacy_non_answer_migrated !== true) {
+        // 历史上已经结束并对访客可见的 generic 不能继续算作有效回答，也不能在
+        // 升级时批量重放旧会话。保留原问题（若仍在）、标成需受控恢复的 P0；
+        // 原问题已经被旧版清掉时更不能凭空构造内容或触发 POST。
+        advanceResponseGeneration(job);
+        job.status = 'failed';
+        job.responsibility_status = 'unresolved_failure';
+        job.failure_code = job.data ? 'legacy_non_answer_requires_review'
+          : 'legacy_non_answer_input_unavailable';
+        job.failure_since = Number.isFinite(job.failure_since) ? job.failure_since : clock();
+        job.last_failure_at = clock();
+        job.retry_at = null;
+        job.lease_until = 0;
+        job.recovery_requires_review = true;
+        job.legacy_non_answer_migrated = true;
+        job.legacy_non_answer_migrated_at = clock();
+        delete job.execution_token;
+        delete job.plan;
+        delete job.inference;
       }
       // 升级或崩溃可能留下旧版尚未登记发送的可见机械话术。所有本项目自动
       // 出站都走同一收敛层；未知回执或已发送正文必须先对账，绝不改写历史。
@@ -956,10 +1007,12 @@ function createRuntime(env = {}, options = {}) {
       if (!record.content_sha256 && matchedPlan) {
         record.content_sha256 = outboundContentSha256(matchedPlan.type || 'text', matchedPlan.content);
       }
-      if (!record.semantic_intent) record.semantic_intent = outgoingSemanticIntent(key, job, record, fingerprint);
+      const semanticIntent = outgoingSemanticIntent(key, job, record, fingerprint);
+      if (!record.semantic_intent || semanticIntent === 'non_answer') record.semantic_intent = semanticIntent;
+      const semanticStatus = receiptSemanticStatus(key, job, record, fingerprint);
       if (!['valid_answer', 'delivered_non_answer', 'control_delivered', 'semantic_unknown']
-        .includes(record.semantic_status)) {
-        record.semantic_status = receiptSemanticStatus(key, job, record, fingerprint);
+        .includes(record.semantic_status) || semanticStatus === 'delivered_non_answer') {
+        record.semantic_status = semanticStatus;
       }
       if (!['answer', 'non_answer', 'control'].includes(record.semantic_intent)
         || !record.content_sha256) record.semantic_status = 'semantic_unknown';
@@ -1244,7 +1297,9 @@ function createRuntime(env = {}, options = {}) {
     for (const job of state.jobs || []) settleUncertainDeliveries(state, job);
     settleAgedOrphanedDeliveries(state);
     for (const job of state.jobs || []) {
-      if (job.status === 'failed' && (job.data || job.plan || uncertainDeliveryFor(state, job))) {
+      if (job.status === 'failed' && job.recovery_requires_review === true) {
+        job.responsibility_status = 'unresolved_failure';
+      } else if (job.status === 'failed' && (job.data || job.plan || uncertainDeliveryFor(state, job))) {
         markUnresolved(job, job.failure || job.failure_code || 'legacy_unresolved_failure');
       } else if (job.status === 'failed' && job.responsibility_status !== 'unresolved_failure') {
         job.responsibility_status = 'unresolved_failure';
@@ -2939,7 +2994,15 @@ function createRuntime(env = {}, options = {}) {
     return 'data:' + mime + ';base64,' + buffer.toString('base64');
   };
   const transcript = (messages, job, state) => messages
-    .filter((message) => message && !message.stealth && !message.properties?.stealth && ['user', 'operator'].includes(message.from) && ['text', 'file', 'audio', 'animation'].includes(message.type) && String(message.fingerprint || '') !== String(job.data?.fingerprint || '') && timestamp(message.timestamp) <= job.event_time)
+    .filter((message) => message && !message.stealth && !message.properties?.stealth
+      && ['user', 'operator'].includes(message.from) && ['text', 'file', 'audio', 'animation'].includes(message.type)
+      && String(message.fingerprint || '') !== String(job.data?.fingerprint || '')
+      && timestamp(message.timestamp) <= job.event_time
+      // 只排除已确认属于本项目、且整条就是旧 generic/机械故障的 operator 消息。
+      // 真人即使引用同一句仍保留；也不改写 Crisp 历史或普通 assistant 事实。
+      && !(message.from === 'operator' && automation(message, state) === true
+        && typeof message.content === 'string'
+        && (legacyGenericNonAnswer(message.content) || mechanicalFailureAnswer(message.content))))
     .sort((left, right) => timestamp(left.timestamp) - timestamp(right.timestamp)).slice(-20)
     .map((message) => {
       const image = message.from === 'user' && ['file', 'animation'].includes(message.type)
@@ -3474,17 +3537,21 @@ function createRuntime(env = {}, options = {}) {
     if (!record.content_sha256 && matchedPlan) {
       record.content_sha256 = outboundContentSha256(matchedPlan.type || 'text', matchedPlan.content);
     }
-    if (!record.semantic_intent) record.semantic_intent = outgoingSemanticIntent(key, job, record, fingerprint);
-    let semanticStatus = record.semantic_status;
+    const derivedSemanticIntent = outgoingSemanticIntent(key, job, record, fingerprint);
+    if (!record.semantic_intent || derivedSemanticIntent === 'non_answer') {
+      record.semantic_intent = derivedSemanticIntent;
+    }
+    let semanticStatus = receiptSemanticStatus(key, job, record, fingerprint);
     if (!['valid_answer', 'delivered_non_answer', 'control_delivered', 'semantic_unknown']
-      .includes(semanticStatus)) {
-      semanticStatus = receiptSemanticStatus(key, job, record, fingerprint);
+      .includes(record.semantic_status) || semanticStatus === 'delivered_non_answer') {
       // 旧版已经删除正文且未冻结语义的 sent 记录只能安全识别明确坏答案；
       // 不能使用此刻可变的 job.plan 反推它当时已经投递了有效回答。
       if (alreadySent && !record.content_sha256 && semanticStatus !== 'delivered_non_answer') {
         semanticStatus = 'semantic_unknown';
       }
       record.semantic_status = semanticStatus;
+    } else {
+      semanticStatus = record.semantic_status;
     }
     record.status = 'sent';
     record.sent_at = Number.isFinite(record.sent_at) ? record.sent_at : clock();
@@ -3612,7 +3679,8 @@ function createRuntime(env = {}, options = {}) {
           if (!record.content_sha256 && record.body) {
             record.content_sha256 = outboundContentSha256(record.body.type || 'text', record.body.content);
           }
-          if (!record.semantic_intent) record.semantic_intent = outgoingSemanticIntent(key, stored, record, fingerprint);
+          const semanticIntent = outgoingSemanticIntent(key, stored, record, fingerprint);
+          if (!record.semantic_intent || semanticIntent === 'non_answer') record.semantic_intent = semanticIntent;
           record.semantic_status = receiptSemanticStatus(key, stored, record, fingerprint);
           if (!['answer', 'non_answer', 'control'].includes(record.semantic_intent)
             || !record.content_sha256) record.semantic_status = 'semantic_unknown';
@@ -4648,6 +4716,15 @@ function createRuntime(env = {}, options = {}) {
       || job.plan.fingerprint && String(job.plan.fingerprint) === fingerprint);
     return !related.some(([, record]) => ['unknown', 'sending', 'sent'].includes(record?.status));
   };
+  const terminalLegacyNonAnswerNeedsMigration = (state, job) => {
+    if (!terminalJob(job) || job?.control === true || job?.responsibility_status === 'intentional_silence'
+      || job?.legacy_non_answer_migrated === true) return false;
+    const key = stateKey(state.website_id, state.session_id);
+    return Object.entries(state.outgoing || {}).some(([fingerprint, record]) => record?.status === 'sent'
+      && (record?.job_id === job.id || job.plan?.fingerprint && String(job.plan.fingerprint) === fingerprint)
+      && responseGeneration(record) === responseGeneration(job)
+      && outgoingDeliveredNonAnswer(key, job, record, fingerprint));
+  };
   const scanNeedsTransaction = (state, at) => {
     if (!state || state.schema_version !== 2 || !Array.isArray(state.jobs)
       || !state.offers || typeof state.offers !== 'object' || Array.isArray(state.offers)
@@ -4681,6 +4758,7 @@ function createRuntime(env = {}, options = {}) {
         && job.feedback_retired !== true) return true;
       if (safeErrorNeedsNormalization(state, job)) return true;
       if (visitorOutputNeedsNormalization(state, job)) return true;
+      if (terminalLegacyNonAnswerNeedsMigration(state, job)) return true;
       if (job.status === 'processing' && !(job.lease_until > at)) return true;
       if (job.status === 'received' && !(job.retry_at > at)) return true;
       return ['done', 'cancelled', 'failed'].includes(job.status)

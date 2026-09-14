@@ -13,9 +13,9 @@ const lexicalFile = fs.readFileSync(path.join(__dirname, 'knowledge-lexical.js')
 const visitorOutputFile = fs.readFileSync(path.join(root, 'scripts', 'visitor-output.js'), 'utf8');
 const lexicalSource = lexicalFile.replace(/^module\.exports[^\n]+\n?$/m, '');
 const visitorOutputSource = visitorOutputFile.replace(/^'use strict';\n?/m, '')
-  .replace(/^module\.exports[^\n]+\n?$/m, '');
+  .replace(/^module\.exports\s*=\s*\{[\s\S]*?\};\r?\n?/m, '');
 const runtimeSource = runtimeFile.replace(/^const \{\s*searchKnowledgeLexical\s*\} = require\('\.\/knowledge-lexical\.js'\);\r?\n/m, '')
-  .replace(/^const \{\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\.\.\/scripts\/visitor-output\.js'\);\r?\n/m, '')
+  .replace(/^const \{\s*LEGACY_GENERIC_NON_ANSWERS,\s*visitorFallbackFor,\s*mechanicalFailureAnswer,\s*legacyGenericNonAnswer,\s*sanitizeVisitorText\s*\} = require\('\.\.\/scripts\/visitor-output\.js'\);\r?\n/m, '')
   .replace(/^if \(typeof module[^\n]+\n?$/m, '');
 if (/require\(['"](?:\.\/knowledge-lexical\.js|\.\.\/scripts\/visitor-output\.js)['"]\)/.test(runtimeSource)) {
   throw new Error('运行时内联失败：仍包含宿主模块导入');
