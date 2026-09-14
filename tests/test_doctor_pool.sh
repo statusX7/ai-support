@@ -33,19 +33,33 @@ internal=$(env_get "${DEPLOY}/.env" PROVIDER_ADAPTER_KEY)
 jq --arg key "$internal" '{
   "provider-adapter":[$key,"true","true","host.docker.internal"],
   anythingllm:["http://provider-adapter:8787/v1",$key],
-  n8n:(.n8n[0:10]+["http://provider-adapter:8787/v1",$key,"true"])
+  n8n:(.n8n[0:10]+["http://provider-adapter:8787/v1",$key,"true","true"])
 }' "$RUNTIME_ENV_FILE" > "${RUNTIME_ENV_FILE}.new"
 mv -- "${RUNTIME_ENV_FILE}.new" "$RUNTIME_ENV_FILE"
+write_readback() {
+  local sha
+  sha=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
+  jq --arg sha "$sha" '{schema_version:1,readback_contract_version:1,revision,
+    secrets_generation,pool_sha256:$sha,verified_at:1}' \
+    "${DEPLOY}/config/provider-pool-applied.json" > "${DEPLOY}/config/provider-pool-readback.json"
+  chmod 0640 "${DEPLOY}/config/provider-pool-readback.json"
+  chown 0:1000 "${DEPLOY}/config/provider-pool-readback.json" 2>/dev/null || true
+}
 write_health() {
-  jq --arg state "$1" \
-    '{ok:true,configuration_state:"applied",revision,entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \
+  local sha
+  sha=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
+  jq --arg state "$1" --arg sha "$sha" \
+    '{ok:true,readback_contract_version:1,configuration_state:"applied",revision,
+      secrets_generation,pool_sha256:$sha,
+      entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \
     "${DEPLOY}/config/provider-pool-applied.json" > "${DEPLOY}/tmp/fixture-pool-status.json"
 }
+write_readback
 write_health unknown
 before=$(business_hash)
 invoke --local
 (( LAST_RC == 2 )) || fail '单主未检测应警告，不假绿、不认定接口故障'
-for id in provider.configuration provider.pending provider.rag_transaction provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback; do assert_result "$id" PASS; done
+for id in provider.configuration provider.pending provider.rag_transaction provider.readback provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback runtime.provider_settlements; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
 ! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '主备默认doctor执行付费推理'
@@ -138,6 +152,34 @@ assert_result provider.pool_health SKIP
 write_health healthy
 pass '运行时配置代偏离拒绝旧健康事实'
 
+cp -p -- "${DEPLOY}/config/provider-pool-readback.json" "${TEST_ROOT}/pool-readback.saved"
+rm -- "${DEPLOY}/config/provider-pool-readback.json"
+invoke --local
+assert_result provider.readback FAIL
+assert_result provider.adapter PASS
+(( LAST_RC == 1 )) || fail '缺少运行回读时 runtime 会停止推理，doctor 必须失败'
+cp -p -- "${TEST_ROOT}/pool-readback.saved" "${DEPLOY}/config/provider-pool-readback.json"
+pass '回读文件缺失与 adapter 当前身份分层报告，不用容器健康假绿'
+
+jq '.pool_sha256=("f"*64)' "${TEST_ROOT}/pool-readback.saved" \
+  > "${DEPLOY}/config/provider-pool-readback.json"
+invoke --local
+assert_result provider.readback FAIL
+(( LAST_RC == 1 )) || fail '伪造或旧代回读摘要必须失败'
+cp -p -- "${TEST_ROOT}/pool-readback.saved" "${DEPLOY}/config/provider-pool-readback.json"
+pass '回读精确绑定当前原始池摘要、revision 和秘密代次'
+
+cp -p -- "${DEPLOY}/tmp/fixture-pool-status.json" "${TEST_ROOT}/pool-status.saved"
+jq 'del(.secrets_generation)' "${TEST_ROOT}/pool-status.saved" \
+  > "${DEPLOY}/tmp/fixture-pool-status.json"
+invoke --local
+assert_result provider.readback PASS
+assert_result provider.adapter FAIL
+assert_result provider.pool_health SKIP
+(( LAST_RC == 1 )) || fail 'adapter 缺失完整运行身份不得只比对 revision'
+cp -p -- "${TEST_ROOT}/pool-status.saved" "${DEPLOY}/tmp/fixture-pool-status.json"
+pass 'adapter 运行身份必须回读秘密代次和原始池摘要'
+
 cp -p -- "${DEPLOY}/config/provider-pool.yaml" "${TEST_ROOT}/pool.saved"
 jq '.entries[0].name="尚未应用的名称"' "${TEST_ROOT}/pool.saved" > "${DEPLOY}/config/provider-pool.yaml"
 invoke --local
@@ -163,6 +205,20 @@ assert_result runtime.feedback WARN
 [[ "$before" == "$(business_hash)" ]] || fail '只读doctor退役了旧任务或修改人工状态'
 cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
 pass '旧评价残留只读报告，不清人工状态和普通任务'
+
+jq '.jobs[0].provider_settlement={schema_version:1,state:"deferred",next_action_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.provider_settlements WARN
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了延后的推理结算责任'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"invalid",next_action_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '推理结算身份损坏必须阻止自检假绿'
+cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
+pass '推理结果结算延后与身份损坏分层报告，默认自检不删责任'
 
 mv -- "${DEPLOY}/config/provider-pool-applied.json" "${TEST_ROOT}/pool-applied.saved"
 env_set "${DEPLOY}/.env" PROVIDER_POOL_REQUIRED false

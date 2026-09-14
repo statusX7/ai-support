@@ -11,6 +11,15 @@ const POLICY_BOUNDS = {question_timeout_ms:[1000,180000],call_timeout_ms:[1000,6
   max_attempts:[1,21],cooldown_initial_ms:[1000,300000],cooldown_max_ms:[1000,3600000],pool_cooldown_ms:[100,60000]};
 const forbiddenHeaders = new Set(['authorization','host','connection','content-length','content-type','transfer-encoding','cookie','proxy-authorization','x-crispai-question']);
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+const requestContract = value => value?.request_contract_version === 1
+  && /^[a-f0-9]{64}$/.test(value.request_sha256 || '')
+  && /^[a-f0-9]{64}$/.test(value.plan_context_sha256 || '')
+  ? {request_contract_version:1,request_sha256:value.request_sha256,
+    plan_context_sha256:value.plan_context_sha256} : null;
+const sameRequestContract = (left,right) => Boolean(left && right
+  && left.request_contract_version === right.request_contract_version
+  && left.request_sha256 === right.request_sha256
+  && left.plan_context_sha256 === right.plan_context_sha256);
 
 function cachedResultDisposition(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'invalid';
@@ -122,7 +131,11 @@ function atomic(file, value) {
 
 function loadPool(environment = process.env) {
   const root = environment.PROVIDER_ROOT || '/opt/crisp-ai';
-  const value = readJson(environment.PROVIDER_POOL_PATH || path.join(root,'config/provider-pool-applied.json'),1048576);
+  const poolPath = environment.PROVIDER_POOL_PATH || path.join(root,'config/provider-pool-applied.json');
+  const poolStat = fs.lstatSync(poolPath);
+  if (!poolStat.isFile() || poolStat.isSymbolicLink() || poolStat.size < 1 || poolStat.size > 1048576) throw terminal('invalid_pool','主备池结构无效');
+  const poolRaw = fs.readFileSync(poolPath,'utf8');
+  const value = JSON.parse(poolRaw);
   if (value.schema_version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || !/^[a-f0-9]{32}$/.test(value.secrets_generation || '')
     || !Array.isArray(value.entries) || !value.entries.length || value.entries.length > 21 || new Set(value.entries.map(entry => entry.id)).size !== value.entries.length) throw terminal('invalid_pool','主备池结构无效');
   const secretsRoot = environment.PROVIDER_SECRETS_DIR || path.join(root,'secrets/provider/generations');
@@ -131,7 +144,7 @@ function loadPool(environment = process.env) {
   const entries = value.entries.map(entry => validateEntry(entry,secrets.entries[entry.id]));
   if (entries.filter(entry => entry.role === 'primary').length !== 1 || entries[0].id !== value.primary_id || entries[0].role !== 'primary' || !entries[0].enabled
     || entries.some((entry,index) => entry.order !== index || index > 0 && entry.role !== 'backup')) throw terminal('invalid_pool','主备池排序或主接口无效');
-  return {...value, entries, policy:validatePolicy(value.policy)};
+  return {...value, entries, policy:validatePolicy(value.policy),applied_sha256:hash(poolRaw)};
 }
 
 function retryAfterMilliseconds(value, now = Date.now()) {
@@ -175,182 +188,606 @@ function createRouter(environment, invoke) {
   const root = environment.PROVIDER_ROOT || '/opt/crisp-ai';
   const directory = environment.PROVIDER_STATE_DIR || path.join(root,'data/provider-router');
   const stateFile = path.join(directory,'state.json');
+  const stateLockPath = path.join(directory,'.state.lock');
   const boot = crypto.randomUUID();
   const inflight = new Map();
-  let state;
-  try { state = readJson(stateFile); } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    state = {schema_version:1,health:{},recent:[],pool_until:0};
-  }
-  if (state.schema_version !== 1 || !state.health || !Array.isArray(state.recent)) throw terminal('invalid_state','路由状态无效');
-  const save = () => atomic(stateFile,state);
-  let loadedRevision;
+  const pause = milliseconds => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,milliseconds);
+  const processIdentity = (pid = process.pid) => {
+    try {
+      const value = fs.readFileSync('/proc/' + pid + '/stat','utf8');
+      const end = value.lastIndexOf(') ');
+      if (end < 1) return null;
+      const fields = value.slice(end+2).trim().split(/\s+/);
+      return {pid:Number(value.slice(0,value.indexOf(' '))),started:fields[19]};
+    } catch (_) { return null; }
+  };
+  const selfIdentity = processIdentity();
+  if (!selfIdentity) throw terminal('invalid_state','无法建立路由锁进程身份');
+  const freshState = () => {
+    let value;
+    try { value = readJson(stateFile); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      value = {schema_version:1,state_revision:0,health:{},recent:[],pool_until:0};
+    }
+    if (value.schema_version !== 1 || !value.health || typeof value.health !== 'object'
+      || Array.isArray(value.health) || !Array.isArray(value.recent)
+      || value.state_revision !== undefined && (!Number.isSafeInteger(value.state_revision) || value.state_revision < 0)) {
+      throw terminal('invalid_state','路由状态无效');
+    }
+    value.state_revision = value.state_revision || 0;
+    value.pool_until = Number.isFinite(value.pool_until) ? value.pool_until : 0;
+    return value;
+  };
+  let state = freshState();
+  const lockOwner = lockPath => {
+    try { return readJson(path.join(lockPath,'owner.json'),4096); } catch (_) { return null; }
+  };
+  const ownerStatus = owner => {
+    if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid < 1
+      || typeof owner.started !== 'string' || !owner.started) return 'invalid';
+    const current = processIdentity(owner.pid);
+    if (current) return current.pid === owner.pid && current.started === owner.started ? 'alive' : 'dead';
+    // /proc 的读取若被宿主限制，不能把“未知”当作进程已死后抢锁。
+    return fs.existsSync('/proc/' + owner.pid) ? 'unknown' : 'dead';
+  };
+  const lockOldEnoughToRecover = lockPath => {
+    try { return fs.lstatSync(lockPath).mtimeMs < Date.now()-5000; }
+    catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  };
+  const recoverableLock = lockPath => {
+    const status = ownerStatus(lockOwner(lockPath));
+    return status === 'dead' || status === 'invalid' && lockOldEnoughToRecover(lockPath);
+  };
+  const publishLock = (lockPath,token) => {
+    // 不能用 rename(claimDir, lockPath) 充当 no-replace：POSIX 允许源目录
+    // 替换一个已存在的空目录。释放者删除 owner.json 到 rmdir 之间恰有
+    // 这样一个短窗口，会让旧 owner 误删或覆盖新锁。mkdir 本身才是这里
+    // 所需的原子“仅当不存在时创建”；进程若在 owner 落盘前退出，则由
+    // 既有的无 owner 五秒保守恢复规则处理。
+    try { fs.mkdirSync(lockPath,{mode:0o700}); }
+    catch (error) {
+      if (error.code === 'EEXIST') return false;
+      throw error;
+    }
+    try {
+      atomic(path.join(lockPath,'owner.json'),{schema_version:1,token,boot,
+        pid:selfIdentity?.pid || process.pid,started:selfIdentity?.started || '',acquired_at:Date.now()});
+      const parent = fs.openSync(path.dirname(lockPath),'r');
+      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+      return true;
+    } catch (error) {
+      try { fs.unlinkSync(path.join(lockPath,'owner.json')); } catch (_) {}
+      try { fs.rmdirSync(lockPath); } catch (_) {}
+      throw error;
+    }
+  };
+  const discardLock = lockPath => {
+    let info;
+    try { info = fs.lstatSync(lockPath); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    if (!info.isDirectory() || info.isSymbolicLink()) throw terminal('invalid_state','受管锁路径无效');
+    const quarantine = lockPath + '.stale-' + crypto.randomBytes(8).toString('hex');
+    try { fs.renameSync(lockPath,quarantine); }
+    catch (error) { if (['ENOENT','ENOTEMPTY','EEXIST'].includes(error.code)) return false; throw error; }
+    try { fs.unlinkSync(path.join(quarantine,'owner.json')); } catch (_) {}
+    try { fs.rmdirSync(quarantine); } catch (_) {}
+    return true;
+  };
+  const acquireSyncLock = lockPath => {
+    fs.mkdirSync(path.dirname(lockPath),{recursive:true,mode:0o700});
+    const token = crypto.randomBytes(24).toString('hex');
+    for (let attempt=0;attempt<200;attempt+=1) {
+      try {
+        if (!publishLock(lockPath,token)) throw Object.assign(new Error('lock exists'),{code:'EEXIST'});
+        return {path:lockPath,token};
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (recoverableLock(lockPath)) { discardLock(lockPath); continue; }
+        pause(5);
+      }
+    }
+    throw terminal('state_busy','路由状态正忙，请稍后重试');
+  };
+  const lockCurrent = lock => {
+    const owner = lockOwner(lock.path);
+    return Boolean(owner && owner.token === lock.token && owner.boot === boot);
+  };
+  const releaseSyncLock = lock => {
+    if (!lockCurrent(lock)) return;
+    try { fs.unlinkSync(path.join(lock.path,'owner.json')); } catch (_) {}
+    try { fs.rmdirSync(lock.path); } catch (_) {}
+  };
+  const mutateState = action => {
+    const lock = acquireSyncLock(stateLockPath);
+    try {
+      const current = freshState();
+      const result = action(current);
+      current.state_revision += 1;
+      atomic(stateFile,current);
+      state = current;
+      return result;
+    } finally { releaseSyncLock(lock); }
+  };
+  const refreshState = () => { state = freshState(); return state; };
+  let loadedPoolBinding;
   const currentPool = () => {
     const pool = loadPool(environment);
-    if (loadedRevision !== pool.revision) {
+    const poolBinding = pool.revision + ':' + pool.secrets_generation + ':' + pool.applied_sha256;
+    if (loadedPoolBinding !== poolBinding) {
       const active = new Set(pool.entries.flatMap(entry => [entry.authScope,entry.modelScope,entry.entryScope,entry.visionScope]));
-      for (const key of Object.keys(state.health)) if (!active.has(key)) delete state.health[key];
-      if (loadedRevision !== undefined) state.pool_until = 0;
-      loadedRevision = pool.revision; save();
+      mutateState(current => {
+        for (const key of Object.keys(current.health)) if (!active.has(key)) delete current.health[key];
+        if (loadedPoolBinding !== undefined) current.pool_until = 0;
+      });
+      loadedPoolBinding = poolBinding;
     }
     return pool;
   };
-  const record = value => {
-    state.recent.push(value); state.recent = state.recent.slice(-200); save();
-  };
+  const record = value => mutateState(current => {
+    current.recent.push(value); current.recent = current.recent.slice(-200);
+  });
+  // 健康与近期切换记录是运维证据，不能反向决定一个已经持久化的业务结果
+  // 是否存在。它们写入失败时保留问题缓存作为唯一事实来源。
+  const bestEffortState = action => { try { return action(); } catch (_) { return undefined; } };
   const scopes = (entry, visual = false) => [entry.authScope,entry.modelScope,entry.entryScope,...(visual ? [entry.visionScope] : [])];
-  const allowed = (entry, now, visual = false) => scopes(entry,visual).every(key => {
-    const health = state.health[key];
+  const allowedIn = (current, entry, now, visual = false) => scopes(entry,visual).every(key => {
+    const health = current.health[key];
     return !health || health.until <= now && (!health.lease || health.lease.until <= now);
   });
+  const allowed = (entry, now, visual = false) => allowedIn(refreshState(),entry,now,visual);
   const reserve = (entry, policy, now, visual = false) => {
-    if (!allowed(entry,now,visual)) return false;
-    for (const key of scopes(entry,visual)) {
-      const health = state.health[key];
-      if (health && health.failures > 0 && health.successes < 2) health.lease = {owner:boot,until:now + policy.call_timeout_ms + 1000};
-    }
-    save(); return true;
+    return mutateState(current => {
+      if (!allowedIn(current,entry,now,visual)) return false;
+      for (const key of scopes(entry,visual)) {
+        const health = current.health[key];
+        if (health && health.failures > 0 && health.successes < 2) {
+          health.lease = {owner:boot,until:now + policy.call_timeout_ms + 1000};
+        }
+      }
+      return true;
+    });
   };
-  const release = (entry, visual = false) => {
-    for (const key of scopes(entry,visual)) if (state.health[key]?.lease?.owner === boot) delete state.health[key].lease;
-  };
-  const success = (entry, visual = false) => {
+  const release = (entry, visual = false) => mutateState(current => {
+    for (const key of scopes(entry,visual)) if (current.health[key]?.lease?.owner === boot) delete current.health[key].lease;
+  });
+  const success = (entry, visual = false) => mutateState(current => {
     for (const key of scopes(entry,visual)) {
-      const health = state.health[key] || {failures:0,successes:0,until:0};
+      const health = current.health[key] || {failures:0,successes:0,until:0};
       health.successes = Math.min(2,health.successes+1); health.until = 0; delete health.lease;
       if (health.successes >= 2) { health.failures = 0; health.last_error = ''; }
-      state.health[key] = health;
+      current.health[key] = health;
     }
-    state.pool_until = 0; save();
-  };
-  const fault = (entry, failure, policy, visual = false) => {
-    release(entry,visual);
+    current.pool_until = 0;
+  });
+  const fault = (entry, failure, policy, visual = false) => mutateState(current => {
+    for (const key of scopes(entry,visual)) if (current.health[key]?.lease?.owner === boot) delete current.health[key].lease;
     const key = entry[failure.scope || 'entryScope'];
-    const health = state.health[key] || {failures:0};
+    const health = current.health[key] || {failures:0};
     health.failures += 1; health.successes = 0; health.last_error = failure.kind;
     health.until = Date.now() + cooldownMilliseconds(policy,health.failures,failure.retryAfter);
-    state.health[key] = health; save();
-  };
-  const assertCurrent = (envelope, revision, deadline) => {
-    if (Date.now() >= deadline) throw terminal('question_timeout','本次问题的总处理时间已用尽');
+    current.health[key] = health;
+  });
+  const configurationTuple = (runtimeRevision,poolRevision,secretsGeneration,poolSha256='',materialsSourceSha256='') => ({
+    runtime_revision:runtimeRevision,pool_revision:poolRevision,secrets_generation:secretsGeneration,
+    pool_sha256:poolSha256,materials_source_sha256:materialsSourceSha256,
+  });
+  const sameConfiguration = (left,right) => Boolean(left && right
+    && left.runtime_revision === right.runtime_revision && left.pool_revision === right.pool_revision
+    && left.secrets_generation === right.secrets_generation
+    && String(left.pool_sha256 || '') === String(right.pool_sha256 || '')
+    && String(left.materials_source_sha256 || '') === String(right.materials_source_sha256 || ''));
+  const assertCurrent = (envelope, pool, deadline, options = {}) => {
+    if (options.ignoreDeadline !== true && Date.now() >= deadline) throw terminal('question_timeout','本次问题的总处理时间已用尽');
     const current = loadPool(environment);
-    if (current.revision !== revision) throw terminal('question_cancelled','接口配置已变更，本次问题已取消');
+    if (current.revision !== pool.revision || current.secrets_generation !== pool.secrets_generation) throw terminal('question_cancelled','接口配置已变更，本次问题已取消');
     if (!envelope) return;
-    if (envelope.pool_revision !== revision) throw terminal('question_cancelled','接口配置已变更，本次问题已取消');
-    let runtime;
+    if (envelope.pool_revision !== pool.revision || envelope.secrets_generation !== undefined
+      && envelope.secrets_generation !== pool.secrets_generation) throw terminal('question_cancelled','接口配置已变更，本次问题已取消');
+    let runtime, materialsSourceSha256 = '';
     try {
       const projection = readJson(path.join(root,'config/materials-applied.json'));
       if (projection.state !== 'applied') throw terminal('question_cancelled','客服配置正在应用，本次问题已取消');
       runtime = projection.configuration?.runtime;
+      materialsSourceSha256 = String(projection.source_sha256 || '');
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       runtime = readJson(path.join(root,'config/runtime.yaml'),1048576);
     }
     if (!runtime || runtime.enabled !== true && envelope.scope !== 'admin' || runtime.revision !== envelope.runtime_revision) throw terminal('question_cancelled','客服状态已变更，本次问题已取消');
-    if (envelope.scope === 'admin') return;
+    if (envelope.pool_sha256 !== undefined && envelope.pool_sha256 !== pool.applied_sha256
+      || envelope.materials_source_sha256 !== undefined
+        && envelope.materials_source_sha256 !== materialsSourceSha256) throw terminal('question_cancelled','应用配置身份已变更，本次问题已取消');
+    if (envelope.scope === 'admin') {
+      if (envelope.migration_from) throw terminal('invalid_envelope','管理员问题不能携带配置迁移凭证');
+      return;
+    }
     const session = readJson(path.join(root,'data/runtime/session-' + envelope.session_key + '.json'));
+    const currentConfiguration = configurationTuple(envelope.runtime_revision,envelope.pool_revision,
+      envelope.secrets_generation || pool.secrets_generation,envelope.pool_sha256 || pool.applied_sha256,
+      envelope.materials_source_sha256 || materialsSourceSha256);
+    const currentConfigurationBinding = configurationBinding(currentConfiguration);
+    if (envelope.configuration_binding !== undefined
+      && envelope.configuration_binding !== currentConfigurationBinding) {
+      throw terminal('question_cancelled','应用配置身份已变更，本次问题已取消');
+    }
+    const expectedMigration = envelope.migration_from;
     if (session.schema_version !== 2 || session.mode !== 'ai' || session.generation !== envelope.generation || session.uncertain_events?.length
-      || !Array.isArray(session.jobs) || !session.jobs.some(job => job.id === envelope.question_id
-        && job.generation === envelope.generation && job.revision === envelope.runtime_revision
-        && job.inference?.attempt_generation === envelope.attempt_generation
-        && !['cancelled','failed','done'].includes(job.status))) throw terminal('question_cancelled','会话状态已变更，本次问题已取消');
+      || !Array.isArray(session.jobs) || !session.jobs.some(job => {
+        const inference = job.inference || {};
+        const strictBinding = envelope.secrets_generation !== undefined
+          || envelope.pool_sha256 !== undefined || envelope.materials_source_sha256 !== undefined
+          || envelope.configuration_binding !== undefined;
+        if (job.id !== envelope.question_id || job.generation !== envelope.generation
+          || job.revision !== envelope.runtime_revision || inference.attempt_generation !== envelope.attempt_generation
+          || inference.pool_revision !== envelope.pool_revision
+          || strictBinding && (inference.runtime_revision !== currentConfiguration.runtime_revision
+            || inference.secrets_generation !== currentConfiguration.secrets_generation
+            || inference.pool_sha256 !== currentConfiguration.pool_sha256
+            || inference.materials_source_sha256 !== currentConfiguration.materials_source_sha256
+            || inference.configuration_binding !== currentConfigurationBinding)
+          || !strictBinding && inference.secrets_generation !== undefined
+            && inference.secrets_generation !== currentConfiguration.secrets_generation
+          || ['cancelled','failed','done'].includes(job.status)) return false;
+        if (!expectedMigration) return !job.provider_migration_from;
+        return sameConfiguration(job.provider_migration_from,expectedMigration)
+          && job.provider_migration_from.attempt_generation === expectedMigration.attempt_generation;
+      })) throw terminal('question_cancelled','会话状态已变更，本次问题已取消');
   };
   const questionFile = id => path.join(directory,'questions',id + '.json');
   const readQuestion = id => { try { return readJson(questionFile(id),20000000); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
-  const storage = () => {
+  const questionLockPath = id => path.join(directory,'questions','.locks',id + '.lock');
+  const acquireQuestionLock = async (id,signal,deadline=Date.now()+180000) => {
+    const lockPath = questionLockPath(id), token = crypto.randomBytes(24).toString('hex');
+    fs.mkdirSync(path.dirname(lockPath),{recursive:true,mode:0o700});
+    for (;;) {
+      if (signal?.aborted) throw terminal('question_cancelled','本次问题已取消');
+      if (Date.now() >= deadline) throw terminal('question_timeout','本次问题的总处理时间已用尽');
+      try {
+        if (!publishLock(lockPath,token)) throw Object.assign(new Error('lock exists'),{code:'EEXIST'});
+        const ownerPath = path.join(lockPath,'owner.json');
+        let descriptor;
+        try { descriptor = fs.openSync(ownerPath,'r+'); }
+        catch (error) {
+          const owned = {path:lockPath,token};
+          if (lockCurrent(owned)) {
+            try { fs.unlinkSync(ownerPath); } catch (_) {}
+            try { fs.rmdirSync(lockPath); } catch (_) {}
+          }
+          throw error;
+        }
+        const lock = {path:lockPath,ownerPath,token,descriptor,recordRevision:0};
+        lock.heartbeat = setInterval(() => {
+          try {
+            if (!lockCurrent(lock)) return;
+            const now = new Date(); fs.futimesSync(descriptor,now,now);
+          } catch (_) {}
+        },1000);
+        lock.heartbeat.unref?.();
+        return lock;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (recoverableLock(lockPath)) {
+          if (discardLock(lockPath)) await new Promise(resolve => setTimeout(resolve,25));
+          continue;
+        }
+        await new Promise(resolve => setTimeout(resolve,20));
+      }
+    }
+  };
+  const releaseQuestionLock = lock => {
+    clearInterval(lock?.heartbeat);
+    try { if (lock?.descriptor !== undefined) fs.closeSync(lock.descriptor); } catch (_) {}
+    if (!lock || !lockCurrent(lock)) return;
+    try { fs.unlinkSync(lock.ownerPath); } catch (_) {}
+    try { fs.rmdirSync(lock.path); } catch (_) {}
+  };
+  const storage = (pressure = false, prune = true) => {
     const folder = path.join(directory,'questions');
-    let files; try { files = fs.readdirSync(folder); } catch (error) { if (error.code === 'ENOENT') return {count:0,bytes:0}; throw error; }
-    let count = 0, bytes = 0;
+    let files; try { files = fs.readdirSync(folder); } catch (error) { if (error.code === 'ENOENT') return {count:0,bytes:0,settled:0,unsettled:0,legacy:0}; throw error; }
+    let count = 0, bytes = 0, settled = 0, unsettled = 0, legacy = 0;
     for (const name of files) {
       if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
       const file = path.join(folder,name), info = fs.lstatSync(file);
       if (!info.isFile() || info.isSymbolicLink()) throw terminal('invalid_state','问题缓存文件无效');
-      // 最长问题预算为3分钟；最后写入超过10分钟的记录不可能仍有合法活跃信封。
-      if (info.mtimeMs < Date.now()-600000) { fs.unlinkSync(file); continue; }
+      let value;
+      try { value = readJson(file,20000000); } catch (error) { throw terminal('invalid_state','问题缓存文件无效'); }
+      const activeLock = fs.existsSync(questionLockPath(name.slice(0,-5)));
+      const adminExpired = value.schema_version === 2 && value.scope === 'admin'
+        && !value.settlement && info.mtimeMs < Date.now()-600000;
+      const settledExpired = value.schema_version === 2 && value.settlement
+        && info.mtimeMs < Date.now()-(pressure ? 600000 : 604800000);
+      if (prune && !activeLock && (adminExpired || settledExpired)) { fs.unlinkSync(file); continue; }
       count++; bytes += info.size;
+      if (value.schema_version !== 2) legacy += 1;
+      else if (value.settlement) settled += 1;
+      else unsettled += 1;
     }
-    return {count,bytes};
+    return {count,bytes,settled,unsettled,legacy};
   };
-  const persistQuestion = question => {
-    const target = questionFile(question.id), size = Buffer.byteLength(JSON.stringify(question));
-    const used = storage(); let previous = 0; try { previous = fs.statSync(target).size; } catch (_) {}
+  const persistQuestion = (question,lock) => {
+    if (!lockCurrent(lock)) throw terminal('question_owner_changed','问题处理所有权已变化');
+    const target = questionFile(question.id);
+    let disk = null, previous = 0;
+    try { disk = readQuestion(question.id); previous = fs.statSync(target).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const diskRevision = Number.isSafeInteger(disk?.record_revision) ? disk.record_revision : 0;
+    if (diskRevision !== lock.recordRevision) throw terminal('question_owner_changed','问题处理记录已由新的执行者接管');
+    question.schema_version = 2;
+    question.record_revision = diskRevision + 1;
+    question.updated_at = Date.now();
+    const size = Buffer.byteLength(JSON.stringify(question));
+    if (size > 20000000) throw terminal('question_cache_full','问题处理记录超过安全限制');
+    let used = storage();
+    if ((!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) && used.settled) used = storage(true);
     if (!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) {
-      for (const phase of Object.values(question.stages)) delete phase.result;
-      question.terminal = {code:'question_cache_full',message:'问题处理缓存已达容量上限'};
-      if (previous) atomic(target,question);
-      throw terminal(question.terminal.code,question.terminal.message);
+      question.record_revision = diskRevision;
+      throw terminal('question_cache_full','问题处理缓存已达容量上限');
     }
     atomic(target,question);
+    lock.recordRevision = question.record_revision;
   };
 
-  async function run(body, envelope, signal) {
+  const envelopeConfiguration = (envelope,pool) => configurationTuple(envelope?.runtime_revision ?? 0,
+    envelope?.pool_revision ?? pool.revision,envelope?.secrets_generation || pool.secrets_generation,
+    envelope?.pool_sha256 || pool.applied_sha256,envelope?.materials_source_sha256 || '');
+  const legacyIdentityParts = (envelope,configuration,pool) => envelope
+    ? [envelope.scope || 'conversation',envelope.session_key,envelope.generation,
+      configuration.runtime_revision,configuration.pool_revision] : [pool.revision];
+  const responsibilityBinding = (id,envelope) => hash(JSON.stringify([id,envelope?.scope || 'admin',
+    envelope?.session_key || '',envelope?.generation ?? 0]));
+  const configurationBinding = value => hash(JSON.stringify([value.runtime_revision,value.pool_revision,
+    value.secrets_generation,value.pool_sha256 || '',value.materials_source_sha256 || '']));
+  const executionBinding = (responsibility,configuration,generation) => hash(JSON.stringify([
+    responsibility,configurationBinding(configuration),generation]));
+  const legacyBindings = (envelope,configuration,pool,generation) => {
+    const parts = legacyIdentityParts(envelope,configuration,pool);
+    return {identity:hash(JSON.stringify(parts)),binding:hash(JSON.stringify([...parts,generation]))};
+  };
+  const normalizeQuestion = (question,id,envelope,pool,lock) => {
+    lock.recordRevision = Number.isSafeInteger(question?.record_revision) ? question.record_revision : 0;
+    if (!question) return null;
+    if (question.id !== id || !question.stages || typeof question.stages !== 'object' || Array.isArray(question.stages)
+      || !Number.isSafeInteger(question.attempts) || question.attempts < 0
+      || question.round_attempts !== undefined && (!Number.isSafeInteger(question.round_attempts) || question.round_attempts < 0)) {
+      throw terminal('invalid_state','问题处理预算状态无效');
+    }
+    for (const [stage,phase] of Object.entries(question.stages)) {
+      if (!['vision','answer'].includes(stage) || !phase || typeof phase !== 'object' || Array.isArray(phase)
+        || phase.request_contract !== undefined && !requestContract(phase.request_contract)) {
+        throw terminal('invalid_state','问题阶段请求身份无效');
+      }
+    }
+    const priorGeneration = Number.isSafeInteger(question.attempt_generation) && question.attempt_generation > 0
+      ? question.attempt_generation : 1;
+    let originalConfiguration = question.configuration;
+    if (!originalConfiguration) {
+      const candidates = [envelopeConfiguration(envelope,pool),envelope?.migration_from].filter(Boolean);
+      originalConfiguration = candidates.find(value => {
+        const legacy = legacyBindings(envelope,value,pool,priorGeneration);
+        return question.binding === legacy.binding || question.identity_binding === legacy.identity;
+      });
+      if (!originalConfiguration) throw terminal('question_conflict','旧问题记录无法与当前责任安全绑定');
+    }
+    if (!Number.isSafeInteger(originalConfiguration.runtime_revision)
+      || !Number.isSafeInteger(originalConfiguration.pool_revision)
+      || typeof originalConfiguration.secrets_generation !== 'string'
+      || originalConfiguration.pool_sha256 !== undefined && !/^[a-f0-9]{64}$/.test(originalConfiguration.pool_sha256)
+      || originalConfiguration.materials_source_sha256 !== undefined
+        && originalConfiguration.materials_source_sha256 !== ''
+        && !/^[a-f0-9]{64}$/.test(originalConfiguration.materials_source_sha256)) throw terminal('invalid_state','问题配置代次无效');
+    if (question.migration_origin !== undefined
+      && (!Number.isSafeInteger(question.migration_origin.attempt_generation)
+        || question.migration_origin.attempt_generation < 1
+        || !Number.isSafeInteger(question.migration_origin.runtime_revision)
+        || !Number.isSafeInteger(question.migration_origin.pool_revision)
+        || !/^[a-f0-9]{32}$/.test(question.migration_origin.secrets_generation || '')
+        || !/^[a-f0-9]{64}$/.test(question.migration_origin.pool_sha256 || '')
+        || !/^[a-f0-9]{64}$/.test(question.migration_origin.materials_source_sha256 || ''))) {
+      throw terminal('invalid_state','问题配置迁移根无效');
+    }
+    const responsibility = responsibilityBinding(id,envelope);
+    if (question.responsibility_binding && question.responsibility_binding !== responsibility) throw terminal('question_conflict','问题责任与当前会话不一致');
+    if (question.scope !== undefined && question.scope !== (envelope?.scope || 'admin')
+      || question.session_key !== undefined && question.session_key !== (envelope?.session_key || '')
+      || question.conversation_generation !== undefined
+        && question.conversation_generation !== (envelope?.generation ?? 0)) {
+      throw terminal('question_conflict','问题持久身份与当前会话不一致');
+    }
+    const expectedConfigurationBinding = configurationBinding(originalConfiguration);
+    if (question.configuration_binding !== undefined
+      && question.configuration_binding !== expectedConfigurationBinding) {
+      throw terminal('invalid_state','问题配置绑定已损坏');
+    }
+    question.schema_version = 2;
+    question.scope = question.scope || envelope?.scope || 'admin';
+    question.session_key = question.session_key || envelope?.session_key || '';
+    question.conversation_generation = question.conversation_generation ?? envelope?.generation ?? 0;
+    question.responsibility_binding = responsibility;
+    question.configuration = originalConfiguration;
+    question.configuration_binding = expectedConfigurationBinding;
+    question.execution_binding = question.execution_binding
+      || executionBinding(responsibility,originalConfiguration,priorGeneration);
+    question.attempt_generation = priorGeneration;
+    // v1.2.x 只有累计 attempts。升级时保守视为本轮已消费；明确恢复代才清零。
+    if (question.round_attempts === undefined) question.round_attempts = Math.min(question.attempts,pool.policy.max_attempts);
+    return question;
+  };
+  const setQuestionExecution = (question,envelope,pool,generation) => {
+    const configuration = envelopeConfiguration(envelope,pool);
+    const legacy = legacyBindings(envelope,configuration,pool,generation);
+    question.configuration = configuration;
+    question.configuration_binding = configurationBinding(configuration);
+    question.execution_binding = executionBinding(question.responsibility_binding,configuration,generation);
+    question.binding = legacy.binding;
+    question.identity_binding = legacy.identity;
+    question.revision = pool.revision;
+    question.attempt_generation = generation;
+    question.deadline = Math.min(envelope?.deadline_at || Infinity,Date.now()+pool.policy.question_timeout_ms);
+  };
+  const migrationAllowed = (question,envelope,pool,attemptGeneration) => {
+    const from = envelope?.migration_from;
+    if (!from || envelope.transition_reason !== 'configuration_changed'
+      || !Number.isSafeInteger(from.attempt_generation)
+      || attemptGeneration <= question.attempt_generation) return false;
+    const origin = question.migration_origin;
+    const direct = sameConfiguration(question.configuration,from)
+      && from.attempt_generation === question.attempt_generation;
+    // runtime 保留最早尚未 settle 的配置迁移根。若 router 已经
+    // 把 A 迁到 B，但 B 的 adapter 回程未确认时又应用 C，则
+    // C 信封仍携带 A 根；只有 router 自身持久的同责任迁移根
+    // 能证明这条 A→B→C 继承链，不接受任意旧配置。
+    const inherited = origin && sameConfiguration(origin,from)
+      && origin.attempt_generation === from.attempt_generation;
+    if (!direct && !inherited) return false;
+    const current = envelopeConfiguration(envelope,pool);
+    return !sameConfiguration(question.configuration,current);
+  };
+  const invalidateQuestionResults = (question,reason) => {
+    for (const [stage,phase] of Object.entries(question.stages || {})) {
+      if (phase?.result !== undefined) {
+        question.invalidated_results = [...(question.invalidated_results || []),{
+          stage,sha256:hash(JSON.stringify(phase.result)),disposition:cachedResultDisposition(phase.result),
+          reason,attempt_generation:question.attempt_generation,invalidated_at:Date.now(),
+        }].slice(-8);
+        delete phase.result;
+      }
+      phase.tried = [];
+      delete phase.request_contract;
+      delete phase.owner;
+    }
+  };
+
+  async function run(body,envelope,signal,lock,id) {
     const pool = currentPool();
     if (envelope && Date.now() >= envelope.deadline_at) throw terminal('question_timeout','本次问题的总处理时间已用尽');
-    const id = envelope?.question_id || hash(crypto.randomUUID());
     const stage = envelope?.stage || 'answer';
-    const attemptGeneration = envelope?.attempt_generation || 1;
-    const identityParts = envelope ? [envelope.scope || 'conversation',envelope.session_key,
-      envelope.generation,envelope.runtime_revision,envelope.pool_revision] : [pool.revision];
-    const identityBinding = hash(JSON.stringify(identityParts));
-    const bindingForGeneration = generation => hash(JSON.stringify([...identityParts,generation]));
-    const binding = bindingForGeneration(attemptGeneration);
-    let question = readQuestion(id);
-    if (question && question.binding !== binding) {
-      const priorGeneration = Number.isSafeInteger(question.attempt_generation) ? question.attempt_generation : 1;
-      const nonRetryable = new Set(['invalid_input','safety_refusal']);
-      const sameIdentity = question.identity_binding
-        ? question.identity_binding === identityBinding
-        : question.binding === bindingForGeneration(priorGeneration);
-      const cached = question.stages?.[stage];
-      const cachedDisposition = cachedResultDisposition(cached?.result);
-      const otherCachedDispositions = Object.entries(question.stages || {})
-        .filter(([name,phase]) => name !== stage && phase?.result !== undefined)
-        .map(([,phase]) => cachedResultDisposition(phase.result));
-      const otherCachedResultsSafe = otherCachedDispositions.every(value => value === 'answer');
-      const recoverCachedNonAnswer = sameIdentity && attemptGeneration === priorGeneration + 1
-        && cachedDisposition === 'non_answer' && otherCachedResultsSafe && !question.output_policy_recovery
-        && (!question.terminal || !nonRetryable.has(question.terminal.code));
-      if (recoverCachedNonAnswer) {
-        const invalidatedSha256 = hash(JSON.stringify(cached.result));
-        delete cached.result;
-        delete cached.owner;
-        cached.invalidated_result = {sha256:invalidatedSha256,
-          reason:'current_output_policy_non_answer',attempt_generation:priorGeneration,invalidated_at:Date.now()};
-        question.output_policy_recovery = {stage,from_attempt_generation:priorGeneration,
-          to_attempt_generation:attemptGeneration,result_sha256:invalidatedSha256,invalidated_at:Date.now()};
-        question.binding = binding;
-        question.identity_binding = identityBinding;
-        question.attempt_generation = attemptGeneration;
-        question.deadline = Math.min(envelope?.deadline_at || Infinity,
-          Date.now()+pool.policy.question_timeout_ms);
-        if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
-        persistQuestion(question);
-        record({at:Date.now(),question_id:id,stage,pool_revision:pool.revision,
-          outcome:'cached_non_answer_invalidated',attempt:question.attempts});
-      } else if (sameIdentity && attemptGeneration === priorGeneration + 1
-        && cachedDisposition === 'invalid' && cached?.result === undefined
-        && otherCachedResultsSafe
-        && (!question.terminal || !nonRetryable.has(question.terminal.code))) {
-        question.binding = binding;
-        question.identity_binding = identityBinding;
-        question.attempt_generation = attemptGeneration;
-        question.deadline = Math.min(envelope?.deadline_at || Infinity,
-          Date.now()+pool.policy.question_timeout_ms);
-        for (const phase of Object.values(question.stages || {})) {
-          if (phase?.result !== undefined) continue;
-          phase.tried = [];
-          delete phase.owner;
-        }
-        if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
-        persistQuestion(question);
-      }
-      else throw terminal('question_conflict','问题标识与原处理上下文不一致');
+    const contract = requestContract(envelope);
+    if (envelope?.scope === 'conversation' && !contract) {
+      throw terminal('provider_request_identity_unknown',
+        '会话推理缺少与实际请求及知识上下文绑定的身份');
     }
-    if (!question) question = {id,binding,attempt_generation:attemptGeneration,revision:pool.revision,
-      identity_binding:identityBinding,
-      deadline:Math.min(envelope?.deadline_at || Infinity,Date.now()+pool.policy.question_timeout_ms),attempts:0,stages:{},created_at:Date.now()};
-    const check = () => { if (signal?.aborted) throw terminal('question_cancelled','本次问题已取消'); assertCurrent(envelope,pool.revision,question.deadline); };
-    try { check(); } catch (error) { question.terminal = {code:error.code || 'question_cancelled',message:'本次问题已取消或到期'}; persistQuestion(question); throw error; }
+    const attemptGeneration = envelope?.attempt_generation || 1;
+    if (!Number.isSafeInteger(attemptGeneration) || attemptGeneration < 1) throw terminal('invalid_input','问题恢复代次无效');
+    assertCurrent(envelope,pool,envelope?.deadline_at || Date.now()+pool.policy.question_timeout_ms);
+    let question = normalizeQuestion(readQuestion(id),id,envelope,pool,lock);
+    const currentConfiguration = envelopeConfiguration(envelope,pool);
+    const responsibility = responsibilityBinding(id,envelope);
+    if (question && !sameConfiguration(question.configuration,currentConfiguration)) {
+      if (!migrationAllowed(question,envelope,pool,attemptGeneration)
+        || ['invalid_input','safety_refusal'].includes(question.terminal?.code)) {
+        throw terminal('question_conflict','问题配置与当前应用代次不一致');
+      }
+      const from = {...question.configuration,attempt_generation:question.attempt_generation};
+      if (!question.migration_origin) question.migration_origin = {...from};
+      if (question.settlement) {
+        question.prior_settlements = [...(question.prior_settlements || []),{
+          ...question.settlement,reason:'configuration_changed',invalidated_at:Date.now(),
+        }].slice(-8);
+        delete question.settlement;
+      }
+      invalidateQuestionResults(question,'configuration_changed');
+      setQuestionExecution(question,envelope,pool,attemptGeneration);
+      question.round_attempts = 0;
+      question.configuration_migrations = [...(question.configuration_migrations || []),{
+        from_runtime_revision:from.runtime_revision,from_pool_revision:from.pool_revision,
+        from_secrets_generation:from.secrets_generation,from_attempt_generation:from.attempt_generation,
+        from_pool_sha256:from.pool_sha256 || '',from_materials_source_sha256:from.materials_source_sha256 || '',
+        to_runtime_revision:currentConfiguration.runtime_revision,to_pool_revision:currentConfiguration.pool_revision,
+        to_secrets_generation:currentConfiguration.secrets_generation,to_attempt_generation:attemptGeneration,
+        to_pool_sha256:currentConfiguration.pool_sha256 || '',to_materials_source_sha256:currentConfiguration.materials_source_sha256 || '',
+        migrated_at:Date.now(),
+      }].slice(-8);
+      if (question.terminal) delete question.terminal;
+      persistQuestion(question,lock);
+    }
+    if (question?.settlement) throw terminal('question_settled','该问题已由运行时持久接管');
+    if (question) {
+      const expectedExecution = executionBinding(responsibility,currentConfiguration,attemptGeneration);
+      if (question.execution_binding !== expectedExecution) {
+        const priorGeneration = question.attempt_generation;
+        const nonRetryable = new Set(['invalid_input','safety_refusal']);
+        const sameIdentity = sameConfiguration(question.configuration,currentConfiguration)
+          && question.responsibility_binding === responsibility;
+        const cached = question.stages?.[stage];
+        const cachedDisposition = cachedResultDisposition(cached?.result);
+        const cachedContract = requestContract(cached?.request_contract);
+        const otherCachedDispositions = Object.entries(question.stages || {})
+          .filter(([name,phase]) => name !== stage && phase?.result !== undefined)
+          .map(([,phase]) => cachedResultDisposition(phase.result));
+        const otherCachedResultsSafe = otherCachedDispositions.every(value => value === 'answer');
+        const recoverBoundAnswer = sameIdentity && attemptGeneration === priorGeneration + 1
+          && cachedDisposition === 'answer' && contract && sameRequestContract(cachedContract,contract)
+          && otherCachedResultsSafe && (!question.terminal || !nonRetryable.has(question.terminal.code));
+        const recoverUnboundAnswer = sameIdentity && attemptGeneration === priorGeneration + 1
+          && cachedDisposition === 'answer' && contract && !sameRequestContract(cachedContract,contract)
+          && otherCachedResultsSafe && (!question.terminal || !nonRetryable.has(question.terminal.code));
+        const recoverCachedNonAnswer = sameIdentity && attemptGeneration === priorGeneration + 1
+          && cachedDisposition === 'non_answer' && otherCachedResultsSafe && !question.output_policy_recovery
+          && (!question.terminal || !nonRetryable.has(question.terminal.code));
+        if (recoverBoundAnswer) {
+          setQuestionExecution(question,envelope,pool,attemptGeneration);
+          question.round_attempts = 0;
+          if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+          persistQuestion(question,lock);
+        } else if (recoverUnboundAnswer) {
+          question.invalidated_results = [...(question.invalidated_results || []),{
+            stage,sha256:hash(JSON.stringify(cached.result)),disposition:'answer',
+            reason:'request_identity_changed',attempt_generation:priorGeneration,
+            invalidated_at:Date.now(),
+          }].slice(-8);
+          delete cached.result; delete cached.owner; delete cached.request_contract;
+          cached.tried = [];
+          setQuestionExecution(question,envelope,pool,attemptGeneration);
+          question.round_attempts = 0;
+          if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+          persistQuestion(question,lock);
+        } else if (recoverCachedNonAnswer) {
+          const invalidatedSha256 = hash(JSON.stringify(cached.result));
+          delete cached.result; delete cached.owner;
+          delete cached.request_contract;
+          cached.invalidated_result = {sha256:invalidatedSha256,
+            reason:'current_output_policy_non_answer',attempt_generation:priorGeneration,invalidated_at:Date.now()};
+          question.output_policy_recovery = {stage,from_attempt_generation:priorGeneration,
+            to_attempt_generation:attemptGeneration,result_sha256:invalidatedSha256,invalidated_at:Date.now()};
+          setQuestionExecution(question,envelope,pool,attemptGeneration);
+          if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+          persistQuestion(question,lock);
+          bestEffortState(() => record({at:Date.now(),question_id:id,stage,pool_revision:pool.revision,
+            outcome:'cached_non_answer_invalidated',attempt:question.attempts}));
+        } else if (sameIdentity && attemptGeneration === priorGeneration + 1
+          && cachedDisposition === 'invalid' && cached?.result === undefined
+          && otherCachedResultsSafe && (!question.terminal || !nonRetryable.has(question.terminal.code))) {
+          setQuestionExecution(question,envelope,pool,attemptGeneration);
+          for (const phase of Object.values(question.stages || {})) {
+            if (phase?.result !== undefined) continue;
+            phase.tried = []; delete phase.owner; delete phase.request_contract;
+          }
+          question.round_attempts = 0;
+          if (question.terminal && !nonRetryable.has(question.terminal.code)) delete question.terminal;
+          persistQuestion(question,lock);
+        } else throw terminal('question_conflict','问题标识与原处理上下文不一致');
+      }
+    }
+    if (!question) {
+      question = {id,schema_version:2,record_revision:0,scope:envelope?.scope || 'admin',
+        session_key:envelope?.session_key || '',conversation_generation:envelope?.generation ?? 0,
+        responsibility_binding:responsibility,configuration:currentConfiguration,
+        configuration_binding:configurationBinding(currentConfiguration),
+        execution_binding:executionBinding(responsibility,currentConfiguration,attemptGeneration),
+        attempts:0,round_attempts:0,stages:{},created_at:Date.now()};
+      setQuestionExecution(question,envelope,pool,attemptGeneration);
+    }
+    const check = () => {
+      if (signal?.aborted) throw terminal('question_cancelled','本次问题已取消');
+      if (!lockCurrent(lock)) throw terminal('question_owner_changed','问题处理所有权已变化');
+      assertCurrent(envelope,pool,question.deadline);
+    };
+    try { check(); } catch (error) {
+      if (lockCurrent(lock)) {
+        question.terminal = {code:error.code || 'question_cancelled',message:'本次问题已取消或到期'};
+        persistQuestion(question,lock);
+      }
+      throw error;
+    }
     const existing = question.stages[stage];
     // 旧版或崩溃恢复状态可能只留下另一阶段的结果。即使当前阶段尚未创建
     // result，也必须先封住安全拒绝和畸形缓存，不能因此取得一次新的上游调用权。
@@ -364,17 +801,24 @@ function createRouter(environment, invoke) {
       throw terminal('invalid_response','跨阶段缓存结果未通过当前输出策略');
     }
     if (existing?.result) {
+      if (!contract || !sameRequestContract(requestContract(existing.request_contract),contract)) {
+        throw terminal('provider_request_identity_unknown',
+          '缓存结果缺少与当前请求及知识上下文一致的身份');
+      }
       const disposition = cachedResultDisposition(existing.result);
       if (disposition === 'answer' || disposition === 'safety_refusal') return existing.result;
       throw terminal('invalid_response','缓存结果未通过当前输出策略');
     }
     if (question.terminal) throw terminal(question.terminal.code,question.terminal.message);
     if (existing?.owner && existing.owner !== boot) {
-      question.terminal = {code:'question_interrupted',message:'先前请求未获得确定结果，本次问题已终止'}; persistQuestion(question);
+      question.terminal = {code:'question_interrupted',message:'先前请求未获得确定结果，本次问题已终止'}; persistQuestion(question,lock);
       throw terminal(question.terminal.code,question.terminal.message);
     }
     const phase = question.stages[stage] || {tried:[]};
-    question.stages[stage] = phase; phase.owner = boot; persistQuestion(question);
+    question.stages[stage] = phase;
+    if (contract) phase.request_contract = contract;
+    else delete phase.request_contract;
+    phase.owner = boot; persistQuestion(question,lock);
     const visual = body.messages.some(message => Array.isArray(message.content) && message.content.some(part => part.type === 'image_url'));
     if (envelope && visual && stage !== 'vision') throw terminal('invalid_input','图片必须使用受管视觉阶段');
     // 近似估算而非模型专用 tokenizer；保留消息开销、256 token 余量与每图4096，不裁剪知识或图片。
@@ -382,17 +826,17 @@ function createRouter(environment, invoke) {
     let candidates = 0;
     const attemptFailures = [];
     try {
-      if (state.pool_until > Date.now()) throw terminal('pool_cooling','接口池处于冷却保护状态');
+      if (refreshState().pool_until > Date.now()) throw terminal('pool_cooling','接口池处于冷却保护状态');
       for (const entry of pool.entries) {
         check();
-        if (question.attempts >= pool.policy.max_attempts) throw terminal('question_budget_exhausted','本次问题的调用次数已用尽');
+        if (question.round_attempts >= pool.policy.max_attempts) throw terminal('question_budget_exhausted','本轮问题调用次数已用尽');
         if (!entry.enabled || !entry.capabilities[entry.mode] || visual && !entry.capabilities.vision || phase.tried.includes(entry.id)) continue;
         const requestedOutput = Number(body.max_completion_tokens ?? body.max_tokens ?? body.max_output_tokens) || entry.max_output_tokens;
         const maxOutput = Math.min(entry.max_output_tokens,Math.max(1,requestedOutput));
         if (inputTokens + maxOutput > entry.context_window) continue;
         candidates += 1;
         if (!reserve(entry,pool.policy,Date.now(),visual)) continue;
-        phase.tried.push(entry.id); question.attempts += 1; persistQuestion(question);
+        phase.tried.push(entry.id); question.attempts += 1; question.round_attempts += 1; persistQuestion(question,lock);
         const start = Date.now();
         const controller = new AbortController();
         let cancelError;
@@ -403,23 +847,36 @@ function createRouter(environment, invoke) {
           const result = await invoke(body,{...entry,maxOutput,timeout:Math.min(pool.policy.call_timeout_ms,question.deadline-Date.now()),connectTimeout:pool.policy.connect_timeout_ms},controller.signal);
           check();
           if (cancelError) throw cancelError;
-          success(entry,visual);
           phase.result = result; delete phase.owner;
           if (result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter') question.terminal = {code:'safety_refusal',message:'模型已拒绝该内容，本次问题已终止'};
-          persistQuestion(question);
-          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),outcome:result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter' ? 'refused':'success',attempt:question.attempts,duration_ms:Date.now()-start});
+          try { persistQuestion(question,lock); }
+          catch (error) {
+            delete phase.result;
+            throw error.terminal ? error
+              : terminal('question_persistence_failed','推理结果未能安全持久化');
+          }
+          bestEffortState(() => success(entry,visual));
+          bestEffortState(() => record({at:Date.now(),question_id:id,stage,entry_id:entry.id,
+            pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),
+            outcome:result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter' ? 'refused':'success',
+            attempt:question.attempts,duration_ms:Date.now()-start}));
           return result;
         } catch (error) {
           if (!cancelError) { try { check(); } catch (currentError) { cancelError = currentError; } }
-          if (cancelError || error.terminal || signal?.aborted) { release(entry,visual); save(); throw cancelError || error; }
+          if (cancelError || error.terminal || signal?.aborted) { bestEffortState(() => release(entry,visual)); throw cancelError || error; }
           const failure = error.failure || {kind:error.name === 'AbortError' ? 'upstream_timeout':'connection_failed',fallback:true,scope:'entryScope',status:0};
-          if (!failure.fallback || failure.scope === 'visionScope' && !visual) { release(entry,visual); save(); throw terminal(failure.kind === 'vision_unsupported' ? 'invalid_request' : failure.kind,failure.kind === 'safety_refusal' ? '模型拒绝处理该内容':'模型拒绝本次请求的输入格式'); }
-          fault(entry,failure,pool.policy,visual);
+          if (!failure.fallback || failure.scope === 'visionScope' && !visual) { bestEffortState(() => release(entry,visual)); throw terminal(failure.kind === 'vision_unsupported' ? 'invalid_request' : failure.kind,failure.kind === 'safety_refusal' ? '模型拒绝处理该内容':'模型拒绝本次请求的输入格式'); }
+          bestEffortState(() => fault(entry,failure,pool.policy,visual));
           attemptFailures.push(failure.kind);
-          record({at:Date.now(),question_id:id,stage,entry_id:entry.id,pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,attempt:question.attempts,duration_ms:Date.now()-start});
+          bestEffortState(() => record({at:Date.now(),question_id:id,stage,entry_id:entry.id,
+            pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),
+            outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,
+            attempt:question.attempts,duration_ms:Date.now()-start}));
         } finally { clearInterval(monitor); signal?.removeEventListener('abort',cancel); }
       }
-      if (candidates && !pool.entries.some(entry => entry.enabled && allowed(entry,Date.now()))) { state.pool_until = Date.now() + pool.policy.pool_cooldown_ms; save(); }
+      if (candidates && !pool.entries.some(entry => entry.enabled && allowed(entry,Date.now()))) {
+        mutateState(current => { current.pool_until = Date.now() + pool.policy.pool_cooldown_ms; });
+      }
       const diagnosticKinds = new Set(['authentication_failed','model_unavailable','rate_limited','quota_exhausted',
         'upstream_timeout','upstream_unavailable','connection_failed','protocol_error','invalid_response']);
       const distinctFailures = [...new Set(attemptFailures)];
@@ -432,31 +889,132 @@ function createRouter(environment, invoke) {
       throw terminal(candidates ? 'pool_exhausted':'no_capable_provider',candidates ? '本次问题可用的接口已用尽':'没有满足协议、图片能力或上下文限制的可用接口');
     } catch (error) {
       question.terminal = {code:error.code || 'question_failed',message:error.terminal ? error.message:'本次问题处理已终止'};
-      delete phase.owner; persistQuestion(question);
+      delete phase.owner;
+      if (lockCurrent(lock)) persistQuestion(question,lock);
       if (error.terminal) throw error;
       throw terminal(question.terminal.code,question.terminal.message);
     }
   }
 
   const route = async (body,envelope,signal) => {
-    const id = envelope?.question_id;
+    const id = envelope?.question_id || hash(crypto.randomUUID());
     const previous = id && inflight.get(id);
-    const pending = (async () => { if (previous) { try { await previous; } catch (_) {} } return run(body,envelope,signal); })();
+    const pending = (async () => {
+      if (previous) { try { await previous; } catch (_) {} }
+      const deadline = Math.max(Date.now()+1000,envelope?.deadline_at || Date.now()+180000);
+      const lock = await acquireQuestionLock(id,signal,deadline);
+      try { return await run(body,envelope,signal,lock,id); }
+      finally { releaseQuestionLock(lock); }
+    })();
     if (id) inflight.set(id,pending);
     try { return await pending; } finally { if (id && inflight.get(id) === pending) inflight.delete(id); }
   };
+  const replay = async envelope => {
+    if (!envelope?.question_id) throw terminal('invalid_envelope','受管问题信封缺失或无效');
+    const contract = requestContract(envelope);
+    if (!contract) throw terminal('provider_request_identity_unknown','重放请求缺少原请求身份');
+    const pool = currentPool();
+    assertCurrent(envelope,pool,Date.now()+5000,{ignoreDeadline:true});
+    const lock = await acquireQuestionLock(envelope.question_id,undefined,Date.now()+5000);
+    try {
+      const question = normalizeQuestion(readQuestion(envelope.question_id),envelope.question_id,envelope,pool,lock);
+      if (!question) throw terminal('question_result_absent','没有可重放的已确认推理结果');
+      if (!sameConfiguration(question.configuration,envelopeConfiguration(envelope,pool))
+        && migrationAllowed(question,envelope,pool,envelope.attempt_generation || 1)) {
+        // successor 还未进入正常 route：旧配置缓存不能被当成新代结果。
+        // 返回明确 absent，让 runtime 保留迁移凭证并使用同代正常请求。
+        throw terminal('question_result_absent','当前配置代尚无可重放结果');
+      }
+      const expected = executionBinding(responsibilityBinding(envelope.question_id,envelope),
+        envelopeConfiguration(envelope,pool),envelope.attempt_generation || 1);
+      if (question.execution_binding !== expected) throw terminal('question_conflict','重放请求与原问题代次不一致');
+      if (question.settlement) throw terminal('question_settled','该问题已由运行时持久接管');
+      const phase = question.stages?.[envelope.stage || 'answer'];
+      if (phase?.result !== undefined) {
+        if (!sameRequestContract(requestContract(phase.request_contract),contract)) {
+          throw terminal('provider_request_identity_unknown','缓存结果与原请求或知识上下文身份不一致');
+        }
+        const disposition = cachedResultDisposition(phase.result);
+        if (disposition === 'answer' || disposition === 'safety_refusal') {
+          bestEffortState(() => record({at:Date.now(),question_id:question.id,stage:envelope.stage || 'answer',
+            pool_revision:pool.revision,outcome:'cached_replay',attempt:question.attempts}));
+          return phase.result;
+        }
+        throw terminal('invalid_response','缓存结果未通过当前输出策略');
+      }
+      if (phase?.owner) throw terminal('question_interrupted','先前请求未获得确定结果');
+      // 没有持久正文时，上一次终态只说明该轮没有结果。replay 用统一 absent
+      // 让 runtime 安全开启后续有界恢复，而不是把模糊类别误当缓存正文。
+      if (question.terminal) throw terminal('question_result_absent','原处理轮没有可重放结果');
+      throw terminal('question_result_absent','没有可重放的已确认推理结果');
+    } finally { releaseQuestionLock(lock); }
+  };
+  const settle = async (envelope,value={}) => {
+    if (!envelope?.question_id || value.outcome !== 'plan_persisted'
+      || !/^[a-f0-9]{64}$/.test(value.plan_sha256 || '')
+      || !Number.isSafeInteger(value.response_generation) || value.response_generation < 0) {
+      throw terminal('invalid_input','问题结算内容无效');
+    }
+    const contract = requestContract(envelope);
+    if (!contract) throw terminal('provider_request_identity_unknown','结算请求缺少原请求身份');
+    const pool = currentPool();
+    // settle 只是确认 runtime 已持久接管一份既有结果，不授予新的推理权。
+    // adapter 暂时不可用期间，conversation、总开关或接口配置可能已经换代；
+    // 仍须允许携带原始完整配置/请求绑定的签名回执释放旧缓存。下面逐字核对
+    // question 的责任、执行代和结果摘要，不能复用 route/replay 的“当前状态”门禁。
+    const lock = await acquireQuestionLock(envelope.question_id,undefined,Date.now()+5000);
+    try {
+      const question = normalizeQuestion(readQuestion(envelope.question_id),envelope.question_id,envelope,pool,lock);
+      if (!question) return {ok:true,state:'absent'};
+      const expected = executionBinding(responsibilityBinding(envelope.question_id,envelope),
+        envelopeConfiguration(envelope,pool),envelope.attempt_generation || 1);
+      if (question.execution_binding !== expected) throw terminal('question_conflict','结算请求与原问题代次不一致');
+      if (question.settlement) {
+        if (question.settlement.plan_sha256 !== value.plan_sha256
+          || question.settlement.response_generation !== value.response_generation
+          || !sameRequestContract(question.settlement.request_contract,contract)) {
+          throw terminal('question_conflict','问题已经由不同结果结算');
+        }
+        return {ok:true,state:'settled'};
+      }
+      const phase = question.stages?.[envelope.stage || 'answer'];
+      if (!phase?.result || !sameRequestContract(requestContract(phase.request_contract),contract)) {
+        throw terminal('provider_request_identity_unknown','结算结果与原请求或知识上下文身份不一致');
+      }
+      question.settlement = {outcome:'plan_persisted',plan_sha256:value.plan_sha256,
+        response_generation:value.response_generation,request_contract:contract,settled_at:Date.now()};
+      for (const phase of Object.values(question.stages || {})) {
+        if (phase?.result !== undefined) {
+          phase.result_receipt = {sha256:hash(JSON.stringify(phase.result)),
+            disposition:cachedResultDisposition(phase.result)};
+          delete phase.result;
+        }
+        delete phase.owner;
+      }
+      persistQuestion(question,lock);
+      return {ok:true,state:'settled'};
+    } finally { releaseQuestionLock(lock); }
+  };
   const status = () => {
-    const pool = currentPool(), now = Date.now();
-    return {ok:true,revision:pool.revision,pool_cooldown_until:state.pool_until,entries:pool.entries.map(entry => {
-      const values = scopes(entry).map(key => state.health[key]).filter(Boolean);
+    const pool = currentPool(), now = Date.now(), current = refreshState(), questions = storage(false,false);
+    // 管理面用这一组非敏感身份确认：严格读取了哪一份完整池与秘密代次。
+    // pool_sha256 是公开配置投影的原始文件摘要，不含 Key 或自定义 Header 值。
+    return {ok:true,readback_contract_version:1,revision:pool.revision,
+      secrets_generation:pool.secrets_generation,pool_sha256:pool.applied_sha256,
+      pool_cooldown_until:current.pool_until,questions,entries:pool.entries.map(entry => {
+      const values = scopes(entry).map(key => current.health[key]).filter(Boolean);
       const until = Math.max(0,...values.map(value => value.until || 0));
-      const visionValues = scopes(entry,true).map(key => state.health[key]).filter(Boolean);
+      const visionValues = scopes(entry,true).map(key => current.health[key]).filter(Boolean);
       const visionUntil = Math.max(0,...visionValues.map(value => value.until || 0));
       return {id:entry.id,enabled:entry.enabled,health:!entry.enabled ? 'disabled' : until > now ? 'cooling' : values.some(value => value.lease?.until > now) ? 'half_open' : values.length && values.every(value => value.successes >= 2) ? 'healthy' : 'unknown',cooldown_until:until,last_error:values.find(value => value.last_error)?.last_error || '',
-        vision_health:!entry.enabled || !entry.capabilities.vision ? 'disabled' : visionUntil > now ? 'cooling' : visionValues.some(value => value.lease?.until > now) ? 'half_open' : state.health[entry.visionScope] && visionValues.every(value => value.successes >= 2) ? 'healthy' : 'unknown',vision_cooldown_until:visionUntil,vision_last_error:visionValues.find(value => value.last_error)?.last_error || ''};
+        vision_health:!entry.enabled || !entry.capabilities.vision ? 'disabled' : visionUntil > now ? 'cooling' : visionValues.some(value => value.lease?.until > now) ? 'half_open' : current.health[entry.visionScope] && visionValues.every(value => value.successes >= 2) ? 'healthy' : 'unknown',vision_cooldown_until:visionUntil,vision_last_error:visionValues.find(value => value.last_error)?.last_error || ''};
     })};
   };
-  return {route,status,recent:() => ({ok:true,records:state.recent.slice().reverse()}),loadPool:currentPool,clearHealth:entry => { for (const key of scopes(entry,true)) delete state.health[key]; state.pool_until = 0; save(); }};
+  return {route,replay,settle,status,recent:() => ({ok:true,records:refreshState().recent.slice().reverse()}),
+    loadPool:currentPool,clearHealth:entry => mutateState(current => {
+      for (const key of scopes(entry,true)) delete current.health[key]; current.pool_until = 0;
+    })};
 }
 
-module.exports = {createRouter,loadPool,validateEntry,validatePolicy,normalizeApiBase,parseHeaders,DEFAULT_POLICY,RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};
+module.exports = {createRouter,loadPool,validateEntry,validatePolicy,normalizeApiBase,parseHeaders,DEFAULT_POLICY,
+  RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};

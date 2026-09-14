@@ -7,7 +7,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
-const {signEnvelope,envelopeMarker} = require('../scripts/provider-envelope.js');
+const {signEnvelope,envelopeMarker,requestContract} = require('../scripts/provider-envelope.js');
 const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens,normalizeApiBase} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
@@ -70,7 +70,8 @@ async function fixture(count=1,policy={}) {
   await f.start();
   f.envelope = (stage='answer',extra={}) => ({version:1,scope:'admin',question_id:crypto.randomBytes(32).toString('hex'),runtime_revision:1,pool_revision:read(f.poolFile).revision,deadline_at:Date.now()+90000,stage,...extra});
   f.post = async (body=sample,envelope=f.envelope(),options={}) => {
-    const response=await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json',...(envelope? {'x-crispai-question':signEnvelope(envelope,f.key)}:{})},body:JSON.stringify(body),...options});
+    const bound=envelope?{...envelope,...requestContract(body)}:null;
+    const response=await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json',...(bound? {'x-crispai-question':signEnvelope(bound,f.key)}:{})},body:JSON.stringify(body),...options});
     const text=await response.text();let value;try{value=JSON.parse(text);}catch(_){}return{status:response.status,value,text};
   };
   f.get = async action => (await fetch(f.base+'/internal/provider/'+action,{headers:{authorization:'Bearer '+f.key}})).json();
@@ -660,6 +661,12 @@ async function main() {
       const envelope=f.envelope();const body=copy(sample);body.messages[1].content+='\n'+envelopeMarker(envelope,f.key);
       assert.equal((await f.post(body,null)).status,200);assert.ok(!JSON.stringify(f.calls[0].body).includes('CRISPAI_PROVIDER_CONTEXT'));
       body.messages[1].content+='[[CRISPAI_PROVIDER_CONTEXT_V1:tampered]]';assert.equal((await f.post(body,null)).status,400);assert.equal(f.calls.length,1);
+      const oversizedReceipt={...f.envelope(),plan_context:{outcome:'knowledge_answer',sources:['不得进入签名头的受控上下文']},state:'unknown'};
+      assert.equal((await f.post(sample,oversizedReceipt)).status,400);
+      assert.equal(f.calls.length,1,'信封额外字段必须在调用上游前拒绝');
+      const nullEnvelope=await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,
+        'content-type':'application/json','x-crispai-question':signEnvelope(null,f.key)},body:JSON.stringify(sample)});
+      assert.equal(nullEnvelope.status,400);assert.equal(f.calls.length,1,'非对象信封必须稳定拒绝且不能调用上游');
       for(const field of ['previous_response_id','thread_id','file_ids']) {
         assert.equal((await f.post({...sample,[field]:field==='file_ids'?['provider-specific']:'provider-specific'})).status,400);assert.equal(f.calls.length,1);
       }
@@ -763,6 +770,7 @@ async function main() {
       const stored=read(path.join(questions,generic.question_id+'.json'));
       assert.equal(stored.attempt_generation,2);
       assert.equal(stored.attempts,2,'输出策略恢复不得重置既有调用预算');
+      assert.equal(stored.round_attempts,2,'输出策略恢复不得把本轮调用数清零');
       assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
       assert.equal(stored.output_policy_recovery.to_attempt_generation,2);
       assert.match(stored.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
@@ -839,7 +847,7 @@ async function main() {
       assert.equal(f.calls.length,1,'不同 question/session/runtime/pool 身份不得复用旧缓存恢复权限');
     }finally{await f.close();}
   });
-  await test('旧 generic 单接口及失败备用不重置累计预算，失效凭证跨恢复轮持久保留',async()=>{
+  await test('旧 generic 输出策略恢复不重置本轮预算，后续技术恢复只重置新轮计数',async()=>{
     const genericText='你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。';
     const exercise=async(count,maxAttempts,failBackup)=>{
       const f=await fixture(count,{max_attempts:maxAttempts});try {
@@ -855,14 +863,23 @@ async function main() {
         const second=await f.post(sample,{...envelope,attempt_generation:2,deadline_at:Date.now()+90000});
         assert.equal(second.status,400,second.text);
         let stored=read(file);assert.equal(stored.attempts,Math.min(maxAttempts,count));
+        assert.equal(stored.round_attempts,Math.min(maxAttempts,count),
+          'generic 输出策略恢复必须沿用本轮预算，不得伪装成技术故障取得新轮');
         assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
         assert.match(stored.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
         const callsAfterSecond=f.calls.length;
+        f.behavior=null;
         const third=await f.post(sample,{...envelope,attempt_generation:3,deadline_at:Date.now()+90000});
         stored=read(file);assert.equal(stored.output_policy_recovery.from_attempt_generation,1);
-        assert.equal(stored.attempts,Math.min(maxAttempts,count));
-        assert.equal(f.calls.length,callsAfterSecond,'累计调用上限耗尽后不得借新代次重置预算');
-        assert.equal(third.status,400);assert.equal(third.value.error.code,'question_budget_exhausted');
+        assert.equal(stored.attempts,Math.min(maxAttempts,count)+1,
+          '技术恢复轮必须保留累计审计并只增加实际调用');
+        assert.equal(stored.round_attempts,1,'技术恢复轮只重置单轮计数');
+        assert.equal(f.calls.length,callsAfterSecond+1);
+        assert.equal(third.status,200,third.text);
+        const callsAfterThird=f.calls.length;
+        const fourth=await f.post(sample,{...envelope,attempt_generation:4,deadline_at:Date.now()+90000});
+        assert.equal(fourth.status,400);assert.equal(fourth.value.error.code,'question_conflict');
+        assert.equal(f.calls.length,callsAfterThird,'有效恢复结果不得再借代次重推理');
       }finally{await f.close();}
     };
     await exercise(1,1,false);
@@ -1161,7 +1178,7 @@ async function main() {
           response.end(JSON.stringify(chat(complete)));return true;
         };
         const envelope=f.envelope(),body={...sample,stream:true};
-        const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope(envelope,f.key)},body:JSON.stringify(body)}).then(async response=>{clientHeaders=true;return{status:response.status,type:response.headers.get('content-type'),text:await response.text()};});
+        const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope({...envelope,...requestContract(body)},f.key)},body:JSON.stringify(body)}).then(async response=>{clientHeaders=true;return{status:response.status,type:response.headers.get('content-type'),text:await response.text()};});
         await until(()=>partialSent,'上游未发出半份内容');await sleep(30);assert.equal(clientHeaders,false);release();
         const result=await pending;assert.equal(result.status,200);assert.match(result.type,/text\/event-stream/);assert.ok(!result.text.includes(leaked));
         const events=result.text.split('\n').filter(line=>line.startsWith('data: ')).map(line=>line.slice(6));assert.equal(events.filter(event=>event==='[DONE]').length,1);assert.equal(events.at(-1),'[DONE]');
@@ -1176,7 +1193,7 @@ async function main() {
       let partialSent=false,clientHeaders=false,upstreamClosed=false;
       f.behavior=async(_call,response)=>{response.once('close',()=>{upstreamClosed=true;});response.writeHead(200,{'content-type':'application/json'});response.write('{"choices":[{"message":{"content":"迟到内容');partialSent=true;await gate;response.end('不能出站"}}]}');return true;};
       const envelope=f.envelope(),body={...sample,stream:true},controller=new AbortController();
-      const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope(envelope,f.key)},body:JSON.stringify(body),signal:controller.signal}).then(async response=>{clientHeaders=true;return{status:response.status,text:await response.text()};}).catch(error=>({aborted:error.name==='AbortError'}));
+      const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope({...envelope,...requestContract(body)},f.key)},body:JSON.stringify(body),signal:controller.signal}).then(async response=>{clientHeaders=true;return{status:response.status,text:await response.text()};}).catch(error=>({aborted:error.name==='AbortError'}));
       await until(()=>partialSent,'取消例未收到半份上游');assert.equal(clientHeaders,false);controller.abort();assert.equal((await pending).aborted,true);
       const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
       await until(()=>upstreamClosed&&read(file).terminal?.code==='question_cancelled','客户端取消未持久结束上游');release();await sleep(30);

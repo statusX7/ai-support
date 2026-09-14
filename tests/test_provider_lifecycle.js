@@ -236,9 +236,15 @@ async function main(){
         }finally{kind==='directory'?fs.rmdirSync(marker):fs.unlinkSync(marker);}
       }
     });
-    await test('PL08 本机完整快照包含同代secret/router并保持受限权限',async()=>{
+    await test('PL08 本机完整快照包含同代secret/router、排除瞬时回读且缺回读仍可救援',async()=>{
       await f.ok('logs.sh',['initialize','--profile','new'],f.snapshotEnv);
       write(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'),{synthetic:true,state:'旧路由状态必须成套恢复'});
+      const readbackFile=path.join(f.deploy,'config/provider-pool-readback.json');
+      await f.ok('provider.sh',['verify-applied']);
+      const liveReadback=read(readbackFile),livePool=f.pool();
+      assert.equal(liveReadback.revision,livePool.revision);
+      assert.equal(liveReadback.secrets_generation,livePool.secrets_generation);
+      assert.equal(liveReadback.pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
       const adapter=path.join(f.deploy,'scripts/provider-adapter.js'),held=adapter+'.held';
       fs.renameSync(adapter,held);write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
       try {
@@ -252,12 +258,64 @@ async function main(){
       const payload=path.join(directory,'payload'),pool=read(path.join(payload,'config/provider-pool-applied.json'));
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
+      assert(!fs.existsSync(path.join(payload,'config/provider-pool-readback.json')));
       for(const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
       for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert.equal(fs.statSync(path.join(payload,'data/knowledge-projection.json')).mode&0o777,0o600);
       assert.deepEqual(fs.readFileSync(path.join(payload,'.env')),fs.readFileSync(path.join(f.deploy,'.env')));
       assert.match(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8'),/stop .*provider-adapter/);
+
+      fs.unlinkSync(readbackFile);write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+      const rescue=await f.ok('snapshot.sh',['--quiet','--reason','synthetic-provider-rescue-without-readback'],f.snapshotEnv);
+      assert(!fs.existsSync(readbackFile));
+      const rescueDirectory=path.join(work,'snapshot-rescue-extracted');fs.mkdirSync(rescueDirectory);
+      await checked('tar',['-xzf',path.join(f.deploy,'backups/versions',rescue.stdout.trim(),'snapshot.tar.gz'),'-C',rescueDirectory]);
+      const rescuePayload=path.join(rescueDirectory,'payload'),rescuePool=read(path.join(rescuePayload,'config/provider-pool-applied.json'));
+      assert(!fs.existsSync(path.join(rescuePayload,'config/provider-pool-readback.json')));
+      assert.deepEqual(rescuePool,f.pool());
+      assert.deepEqual(read(path.join(rescuePayload,'secrets/provider/generations',rescuePool.secrets_generation+'.json')).entries,f.secretEntries());
+      assert.deepEqual(fs.readFileSync(path.join(rescuePayload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
+      await f.ok('provider.sh',['verify-applied']);
+      assert.equal(read(readbackFile).pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
+    });
+    await test('PL08A 历史快照中的旧回读在回滚组件启动前失效并由当前adapter重新签发',async()=>{
+      const stage=path.join(work,'stale-readback-snapshot');fs.mkdirSync(stage);
+      await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);
+      const payload=path.join(stage,'payload'),poolFile=path.join(payload,'config/provider-pool-applied.json'),pool=read(poolFile);
+      const archivedReadback=path.join(payload,'config/provider-pool-readback.json');
+      write(archivedReadback,{schema_version:1,readback_contract_version:1,revision:pool.revision,
+        secrets_generation:pool.secrets_generation,pool_sha256:digest(fs.readFileSync(poolFile)),verified_at:1});
+      const id='synthetic-stale-provider-readback',directory=path.join(f.deploy,'backups/versions',id);
+      fs.mkdirSync(directory);const archive=path.join(directory,'snapshot.tar.gz');
+      await checked('tar',['-czf',archive,'-C',stage,'payload']);
+      write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
+
+      const guardBin=path.join(work,'readback-guard-bin'),guardLog=path.join(work,'readback-guard.log');
+      fs.mkdirSync(guardBin);write(guardLog,'');
+      const guardDocker=path.join(guardBin,'docker');
+      fs.writeFileSync(guardDocker,[
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        'if [[ "${MOCK_REQUIRE_READBACK_ABSENT_ON_UP:-0}" == 1 && "${1:-}" == compose && " $* " == *" up "* ]]; then',
+        '  [[ ! -e "${MOCK_READBACK_GUARD_DEPLOY:?}/config/provider-pool-readback.json" && ! -L "${MOCK_READBACK_GUARD_DEPLOY}/config/provider-pool-readback.json" ]] || { printf "%s\\n" "旧回读在组件启动前仍存在" >&2; exit 86; }',
+        '  printf "%s\\n" "checked-before-up" >> "${MOCK_READBACK_GUARD_LOG:?}"',
+        'fi',
+        `exec ${JSON.stringify(path.join(project,'tests/mocks/docker'))} "$@"`,
+        '',
+      ].join('\n'),{mode:0o700});
+      write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+      const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],{
+        ...f.snapshotEnv,PATH:guardBin+':'+f.snapshotEnv.PATH,MOCK_REQUIRE_READBACK_ABSENT_ON_UP:'1',
+        MOCK_READBACK_GUARD_DEPLOY:f.deploy,MOCK_READBACK_GUARD_LOG:guardLog,
+      });
+      assert.equal(result.code,0,result.stdout+result.stderr);
+      assert.match(fs.readFileSync(guardLog,'utf8'),/checked-before-up/);
+      const current=f.pool(),receipt=read(path.join(f.deploy,'config/provider-pool-readback.json'));
+      assert.notEqual(receipt.verified_at,1);assert.equal(receipt.revision,current.revision);
+      assert.equal(receipt.secrets_generation,current.secrets_generation);
+      assert.equal(receipt.pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
+      await f.ok('provider.sh',['readback']);
     });
     await test('PL09 缺秘密代次的自洽快照在停服务前拒绝，不留下混合恢复',async()=>{
       const stage=path.join(work,'broken-snapshot');fs.mkdirSync(stage);await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);

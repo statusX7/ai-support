@@ -50,6 +50,33 @@ printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
 
 DEPLOY="${WORK}/deploy"
 COMMAND="${WORK}/bin/crispai"
+POOL_SOURCE="${DEPLOY}/config/provider-pool.yaml"
+POOL_APPLIED="${DEPLOY}/config/provider-pool-applied.json"
+POOL_READBACK="${DEPLOY}/config/provider-pool-readback.json"
+
+assert_provider_readback_current() {
+  local pool_hash revision secret_generation
+  [[ -f "$POOL_READBACK" && ! -L "$POOL_READBACK" ]] \
+    || fail 'Provider 推理准入回读缺失或不安全'
+  pool_hash=$(digest "$POOL_APPLIED")
+  revision=$(jq -er '.revision | select(type == "number" and floor == .)' "$POOL_APPLIED") \
+    || fail '接口池 revision 无效'
+  secret_generation=$(jq -er '.secrets_generation | select(type == "string" and length > 0)' "$POOL_APPLIED") \
+    || fail '接口池秘密代次无效'
+  jq -e --arg pool_hash "$pool_hash" --argjson revision "$revision" \
+    --arg secret_generation "$secret_generation" '
+      (keys | sort) == ["pool_sha256","readback_contract_version","revision","schema_version","secrets_generation","verified_at"]
+      and .schema_version == 1
+      and .readback_contract_version == 1
+      and .revision == $revision
+      and .secrets_generation == $secret_generation
+      and .pool_sha256 == $pool_hash
+      and (.verified_at | type == "number")
+      and .verified_at > 0
+    ' "$POOL_READBACK" >/dev/null \
+    || fail 'Provider 推理准入回读未绑定当前接口池、秘密代次和完整文件摘要'
+}
+
 env \
   AI_API_BASE_URL=https://provider.invalid \
   AI_API_KEY=synthetic-resume-provider-key \
@@ -74,6 +101,8 @@ if grep -Eq '(^| )(up|stop|restart)( |$)' "$MOCK_DOCKER_LOG"; then
 fi
 [[ -f "${DEPLOY}/config/provider-pool-applied.json" ]] \
   || fail 'staged 部署缺少有效接口池投影'
+[[ ! -e "$POOL_READBACK" && ! -L "$POOL_READBACK" ]] \
+  || fail '首次 --skip-start 在组件启动前错误生成了 Provider 运行回读'
 install -m 0600 -- "${DEPLOY}/.env" "${WORK}/staged.env"
 provider_before=$(digest "${DEPLOY}/config/provider.yaml")
 pool_before=$(digest "${DEPLOY}/config/provider-pool-applied.json")
@@ -115,13 +144,66 @@ done
   || fail 'staged 续装改变了接口池秘密代次'
 [[ "$(sed -n 's/^PROVIDER_ADAPTER_KEY=//p' "${DEPLOY}/.env")" == "$adapter_key_before" ]] \
   || fail 'staged 续装重新生成了内部 Provider 认证'
+assert_provider_readback_current
 printf '通过：staged 部署无须重传十项配置即可继续启动，配置与秘密代次保持。\n'
+
+assert_plain_running_skip_rejected() {
+  local expected_state=$1 log=$2 secret_generation before after status=0
+  local -a protected=(
+    '.env'
+    '.crisp-ai-installation'
+    'config/provider.yaml'
+    'config/provider-pool.yaml'
+    'config/provider-pool-applied.json'
+    'config/provider-pool-readback.json'
+  )
+  secret_generation=$(jq -er '.secrets_generation' "$POOL_APPLIED") \
+    || fail "${expected_state} 保护检查无法读取秘密代次"
+  protected+=("secrets/provider/generations/${secret_generation}.json")
+  before=$(
+    for relative in "${protected[@]}"; do
+      [[ -f "${DEPLOY}/${relative}" && ! -L "${DEPLOY}/${relative}" ]] \
+        || fail "${expected_state} 保护文件缺失或不安全：${relative}"
+      printf '%s\t%s\t%s\n' "$relative" \
+        "$(stat -c '%i:%s:%y:%z:%a' "${DEPLOY}/${relative}")" \
+        "$(digest "${DEPLOY}/${relative}")"
+    done
+  )
+  : > "$MOCK_DOCKER_LOG"
+  "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
+    --non-interactive --skip-start > "$log" 2>&1 || status=$?
+  (( status != 0 )) || fail "${expected_state} 运行中实例错误接受了普通 --skip-start"
+  grep -Fq -- '已运行实例不能使用 --skip-start' "$log" \
+    || fail "${expected_state} 普通 --skip-start 的拒绝原因不明确"
+  [[ ! -s "$MOCK_DOCKER_LOG" ]] \
+    || fail "${expected_state} 普通 --skip-start 在拒绝前调用了 Docker/Caddy"
+  after=$(
+    for relative in "${protected[@]}"; do
+      [[ -f "${DEPLOY}/${relative}" && ! -L "${DEPLOY}/${relative}" ]] \
+        || fail "${expected_state} 拒绝后保护文件缺失或不安全：${relative}"
+      printf '%s\t%s\t%s\n' "$relative" \
+        "$(stat -c '%i:%s:%y:%z:%a' "${DEPLOY}/${relative}")" \
+        "$(digest "${DEPLOY}/${relative}")"
+    done
+  )
+  [[ "$after" == "$before" ]] \
+    || fail "${expected_state} 普通 --skip-start 在拒绝前改写了配置、marker、接口池或回读"
+  grep -Fxq "state=${expected_state}" "${DEPLOY}/.crisp-ai-installation" \
+    || fail "${expected_state} 普通 --skip-start 改变了安装状态"
+  assert_provider_readback_current
+}
+
+assert_plain_running_skip_rejected local-ready "${WORK}/local-ready-plain-skip.log"
+install -m 0600 -- "${DEPLOY}/.crisp-ai-installation" "${WORK}/local-ready.marker"
+sed -i 's/^state=.*/state=ready/' "${DEPLOY}/.crisp-ai-installation"
+assert_plain_running_skip_rejected ready "${WORK}/ready-plain-skip.log"
+install -m 0600 -- "${WORK}/local-ready.marker" "${DEPLOY}/.crisp-ai-installation"
+assert_provider_readback_current
+printf '通过：ready/local-ready 的普通 --skip-start 在任何受管配置或运行态写入前拒绝。\n'
 
 # 重配置必须先完成 Webhook/Caddy 候选检查，再探测或提交 Provider。这里用
 # copy_project_files 会保留、但 configure_webhook_access 会拒绝的可写 Caddyfile
 # 制造失败；若把 Provider 调整到 Webhook 前，这个负例会观察到新接口代次。
-POOL_SOURCE="${DEPLOY}/config/provider-pool.yaml"
-POOL_APPLIED="${DEPLOY}/config/provider-pool-applied.json"
 PROVIDER_PROJECTION="${DEPLOY}/config/provider.yaml"
 PROVIDER_SECRET_DIR="${DEPLOY}/secrets/provider/generations"
 PROVIDER_MANAGEMENT_LOG="${WORK}/provider-management.log"

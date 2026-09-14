@@ -215,6 +215,20 @@ function createAdapter(environment = process.env, fetchFunction) {
       if (isPool && request.method === 'GET' && request.url === '/internal/provider/recent') { sendJson(response,200,getRouter().recent()); return; }
       if (request.method !== 'POST') { sendJson(response,404,{error:{message:'不支持的协议路由'}}); return; }
       const body = JSON.parse(await readLimited(request,MAX_INPUT_BYTES));
+      if (isPool && ['/internal/provider/replay','/internal/provider/settle'].includes(request.url)) {
+        let envelope;
+        try {
+          // replay/settle 的 HTTP 正文不是原始推理请求；其签名信封仍必须携带
+          // 原请求摘要，由 router 与已持久阶段逐字核对。
+          envelope = extractEnvelope(body,request.headers['x-crispai-question'],key,true,false);
+        }
+        catch (_) { throw terminal('invalid_envelope','受管问题信封缺失或无效'); }
+        requireApplied();
+        const result = request.url.endsWith('/replay')
+          ? await getRouter().replay(envelope) : await getRouter().settle(envelope,body);
+        requireApplied();
+        sendJson(response,200,result); return;
+      }
       if (isPool && ['/internal/provider/probe','/internal/provider/models'].includes(request.url)) {
         let candidate = body.provider || {}, secret = {api_key:body.api_key,custom_headers:candidate.custom_headers || {}};
         if (body.entry_id) {

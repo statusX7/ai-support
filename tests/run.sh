@@ -302,6 +302,8 @@ if command -v node >/dev/null 2>&1; then
   node "${SCRIPT_DIR}/test_provider_adapter.js"
   pass "Provider 桥接生产代码协议专项（内部子项单列，不重复计入总数）"
   node "${SCRIPT_DIR}/test_provider_pool.js"
+  node "${SCRIPT_DIR}/test_provider_recovery_contract.js"
+  node "${SCRIPT_DIR}/test_runtime_process_fencing.js"
   node "${SCRIPT_DIR}/test_runtime_provider_pool.js"
   node "${SCRIPT_DIR}/test_runtime_provider_failure_reply.js"
   "${SCRIPT_DIR}/test_provider_menu.sh"
@@ -741,12 +743,46 @@ grep -Fq 'n8n workflow 导入失败' "${TEST_ROOT}/workflow-import-failure.log" 
   || fail "n8n workflow 导入失败没有清晰提示"
 pass "n8n workflow 导入失败路径"
 
-ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+REPEAT_PROTECTED_FILES=(
+  .env
+  .crisp-ai-installation
+  config/provider.yaml
+  config/provider-pool.yaml
+  config/provider-pool-applied.json
+  config/provider-pool-readback.json
+)
+REPEAT_PROTECTED_BEFORE=$(
+  for relative in "${REPEAT_PROTECTED_FILES[@]}"; do
+    [[ -f "${DEPLOY_DIR}/${relative}" && ! -L "${DEPLOY_DIR}/${relative}" ]] \
+      || fail "运行中实例的 --skip-start 保护文件缺失或不安全：${relative}"
+    printf '%s\t%s\t%s\n' "$relative" \
+      "$(stat -c '%i:%s:%y:%z:%a' "${DEPLOY_DIR}/${relative}")" \
+      "$(sha256sum "${DEPLOY_DIR}/${relative}" | awk '{print $1}')"
+  done
+)
+: > "$MOCK_DOCKER_LOG"
+REPEAT_INSTALL_STATUS=0
 "${PROJECT_ROOT}/install.sh" \
-  --deploy-dir "$DEPLOY_DIR" --non-interactive --skip-start > "${TEST_ROOT}/repeat-install.log" 2>&1
-ENV_HASH_AFTER=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
-[[ "$ENV_HASH_BEFORE" == "$ENV_HASH_AFTER" ]] || fail "重复安装改写了现有密钥配置"
-pass "重复安装幂等性"
+  --deploy-dir "$DEPLOY_DIR" --non-interactive --skip-start > "${TEST_ROOT}/repeat-install.log" 2>&1 \
+  || REPEAT_INSTALL_STATUS=$?
+(( REPEAT_INSTALL_STATUS != 0 )) \
+  || fail "运行中实例错误接受了普通 --skip-start"
+grep -Fq -- '已运行实例不能使用 --skip-start' "${TEST_ROOT}/repeat-install.log" \
+  || fail "运行中实例的普通 --skip-start 拒绝原因不明确"
+[[ ! -s "$MOCK_DOCKER_LOG" ]] \
+  || fail "运行中实例拒绝普通 --skip-start 前调用了 Docker/Caddy"
+REPEAT_PROTECTED_AFTER=$(
+  for relative in "${REPEAT_PROTECTED_FILES[@]}"; do
+    [[ -f "${DEPLOY_DIR}/${relative}" && ! -L "${DEPLOY_DIR}/${relative}" ]] \
+      || fail "普通 --skip-start 拒绝后保护文件缺失或不安全：${relative}"
+    printf '%s\t%s\t%s\n' "$relative" \
+      "$(stat -c '%i:%s:%y:%z:%a' "${DEPLOY_DIR}/${relative}")" \
+      "$(sha256sum "${DEPLOY_DIR}/${relative}" | awk '{print $1}')"
+  done
+)
+[[ "$REPEAT_PROTECTED_AFTER" == "$REPEAT_PROTECTED_BEFORE" ]] \
+  || fail "运行中实例拒绝普通 --skip-start 时改写了配置、marker、接口池或回读"
+pass "运行中实例普通 --skip-start 在受管写入前拒绝"
 
 install -m 0600 -- "${DEPLOY_DIR}/.env" "${TEST_ROOT}/before-runtime-provider.env"
 install -m 0600 -- "${DEPLOY_DIR}/config/provider.yaml" "${TEST_ROOT}/before-runtime-provider.yaml"

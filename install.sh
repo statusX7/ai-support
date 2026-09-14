@@ -401,6 +401,13 @@ if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$
   die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
 fi
 
+# 正在运行或待外部接入的实例不能走仅暂存路径。后续接口池迁移会主动
+# 失效旧运行回读；若不启动当前 adapter 重新验证，就会留下 marker 仍为
+# ready/local-ready、实际推理却被准入门禁暂停的假正常状态。
+if (( SKIP_START )) && [[ "$PREVIOUS_STATE" == ready || "$PREVIOUS_STATE" == local-ready ]]; then
+  die '已运行实例不能使用 --skip-start；该模式无法完成当前组件回读。请正常运行同版安装恢复，或使用受管 update.sh 升级'
+fi
+
 # --skip-start 只允许新安装暂存文件或复用完整 staged 配置。已有实例的
 # --reconfigure 会探测并原子应用接口池，受管 HTTPS 还可能协调 Caddy 运行代；
 # 必须由正常安装路径完成，不能在“仅暂存”模式下产生隐式服务变更。
@@ -711,6 +718,8 @@ if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
   refresh_program_file_mounts "$DEPLOY_DIR" || die '安装后的单文件程序挂载未完成刷新；进度已保留'
   wait_for_local_health "$DEPLOY_DIR"
+  python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" verify-applied >/dev/null \
+    || die '运行适配器未完整回读主备接口配置；推理保持暂停，安装进度已保留'
   set_installation_fact "$DEPLOY_DIR" local_services ready
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"

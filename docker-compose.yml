@@ -174,6 +174,7 @@ services:
       PROVIDER_ADAPTER_URL: http://provider-adapter:8787/v1
       PROVIDER_ADAPTER_KEY: ${PROVIDER_ADAPTER_KEY:?内部接口认证尚未初始化}
       PROVIDER_POOL_REQUIRED: "true"
+      PROVIDER_POOL_READBACK_REQUIRED: "true"
     volumes:
       - type: bind
         source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/n8n

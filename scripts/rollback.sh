@@ -473,6 +473,13 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   done
 fi
 
+if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
+  # 快照中的接口池必须由这次恢复后启动的 adapter 重新证明。即使旧格式或
+  # 人工保全包意外含有回读文件，也在任何 n8n 启动前精确失效。
+  python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" invalidate-readback >/dev/null \
+    || die '回滚前无法失效旧的主备推理准入回执；应用保持停止'
+fi
+
 # 只有目标 runtime 已采用 owner.json 所有权协议时才迁移旧空锁。降回旧版本时
 # 必须保留目标版本自己的锁语义；新版本则在 n8n 已停止、维护锁仍持有的窗口中
 # 仅删除精确的 ownerless 空目录。任何不安全或非空形态均保持应用停止并失败。
@@ -541,6 +548,10 @@ docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
 docker_compose "$DEPLOY_DIR" up -d --remove-orphans
 refresh_program_file_mounts "$DEPLOY_DIR" || die '回滚后的单文件程序挂载未完成刷新'
 wait_for_local_health "$DEPLOY_DIR"
+if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
+  python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" verify-applied >/dev/null \
+    || die '回滚后的主备接口配置未通过运行组件完整回读；应用保持保护状态'
+fi
 sync_prompt_to_anythingllm "$DEPLOY_DIR"
 import_and_publish_workflow "$DEPLOY_DIR"
 wait_for_local_health "$DEPLOY_DIR"

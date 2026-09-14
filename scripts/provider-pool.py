@@ -328,6 +328,7 @@ class Manager:
         self.secrets = self.root / "secrets/provider/generations"
         self.env = self.root / ".env"
         self.transaction = self.root / "config/provider-pool-transaction.json"
+        self.readback = self.root / "config/provider-pool-readback.json"
 
     def save_draft(self, value, secret):
         generation = secrets.token_hex(16)
@@ -377,8 +378,29 @@ class Manager:
             item["key_status"] = "待填写" if item.get("draft") else "已保存"
         return result
 
+    def applied_identity(self, value):
+        regular(self.applied)
+        raw = self.applied.read_bytes()
+        try:
+            observed = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise PoolError("invalid_pool", "接口池有效投影无法核对") from None
+        require(observed == value, "revision_conflict", "接口池有效投影在回读期间已变更")
+        return hashlib.sha256(raw).hexdigest()
+
+    def invalidate_readback(self):
+        if not self.readback.exists() and not self.readback.is_symlink():
+            return
+        regular(self.readback, 65536)
+        self.readback.unlink()
+        descriptor = os.open(self.readback.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     @staticmethod
-    def verify_adapter_readback(value, observed, configuration_state="applied"):
+    def verify_adapter_readback(value, observed, pool_sha256, configuration_state="applied"):
         expected_entries = [(item["id"], item["enabled"]) for item in value["entries"]]
         actual = observed.get("entries") if isinstance(observed, dict) else None
         actual_entries = [
@@ -386,11 +408,64 @@ class Manager:
             for item in actual
         ] if isinstance(actual, list) and all(isinstance(item, dict) and type(item.get("enabled")) is bool for item in actual) else None
         require(isinstance(observed, dict) and observed.get("ok") is True
+                and observed.get("readback_contract_version") == 1
                 and observed.get("configuration_state") == configuration_state
                 and type(observed.get("revision")) is int and observed.get("revision") == value["revision"]
+                and observed.get("secrets_generation") == value["secrets_generation"]
+                and observed.get("pool_sha256") == pool_sha256
                 and actual_entries == expected_entries,
                 "readback_failed", "运行适配器未完整读取新接口池")
         return observed
+
+    def publish_readback(self, value, observed, pool_sha256, configuration_state="applied"):
+        self.verify_adapter_readback(value, observed, pool_sha256, configuration_state)
+        require(self.applied_identity(value) == pool_sha256,
+                "revision_conflict", "接口池在组件回读完成前已变更")
+        atomic(self.readback, {
+            "schema_version": 1,
+            "readback_contract_version": 1,
+            "revision": value["revision"],
+            "secrets_generation": value["secrets_generation"],
+            "pool_sha256": pool_sha256,
+            "verified_at": int(time.time() * 1000),
+        })
+
+    def verify_applied(self):
+        require(not self.transaction.exists() and not self.transaction.is_symlink(),
+                "configuration_applying", "接口窗口存在未完成事务，请先恢复该事务")
+        value, _ = self.load()
+        pool_sha256 = self.applied_identity(value)
+        observed = self.adapter("status")
+        self.verify_adapter_readback(value, observed, pool_sha256)
+        lock_path = self.root / "config/provider-pool.lock"
+        require(not lock_path.is_symlink(), "unsafe_file", "接口池锁不安全")
+        with open(lock_path, "a", encoding="utf-8") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.publish_readback(value, observed, pool_sha256)
+        return {"ok": True, "state": "verified", "revision": value["revision"],
+                "entries": len(value["entries"]), "verified_at": int(time.time() * 1000)}
+
+    def readback_status(self):
+        """只验证已发布回读与当前有效投影的精确身份，不访问组件或改写状态。"""
+        require(not self.transaction.exists() and not self.transaction.is_symlink(),
+                "configuration_applying", "接口窗口存在未完成事务，当前运行回读无效")
+        value, _ = self.load()
+        pool_sha256 = self.applied_identity(value)
+        receipt = read(self.readback, 65536)
+        expected = {"schema_version", "readback_contract_version", "revision",
+                    "secrets_generation", "pool_sha256", "verified_at"}
+        require(set(receipt) == expected
+                and receipt.get("schema_version") == 1
+                and receipt.get("readback_contract_version") == 1
+                and receipt.get("revision") == value["revision"]
+                and receipt.get("secrets_generation") == value["secrets_generation"]
+                and receipt.get("pool_sha256") == pool_sha256
+                and type(receipt.get("verified_at")) is int
+                and receipt["verified_at"] > 0,
+                "readback_failed", "接口池运行回读与当前有效配置不一致")
+        return {"ok": True, "state": "verified", "revision": value["revision"],
+                "entries": len(value["entries"]), "verified_at": receipt["verified_at"]}
 
     def compatibility(self, value, secret, internal):
         primary = value["entries"][0]
@@ -425,6 +500,7 @@ class Manager:
         atomic(self.secrets / (restored["secrets_generation"] + ".json"), {"schema_version": 1, "generation": restored["secrets_generation"], "revision": restored["revision"], "entries": restored_secret})
         atomic(self.source, {key: content for key, content in restored.items() if key != "secrets_generation"})
         self.compatibility(restored, restored_secret, internal)
+        self.invalidate_readback()
         atomic(self.applied, restored)
         return restored
 
@@ -484,7 +560,8 @@ class Manager:
             value["revision"] = current + 1
             generation = secrets.token_hex(16)
             value["secrets_generation"] = generation
-            saved = {file: file.read_bytes() if file.exists() else None for file in (self.source, self.applied, self.env, self.root / "config/provider.yaml")}
+            saved = {file: file.read_bytes() if file.exists() else None for file in
+                     (self.source, self.applied, self.env, self.root / "config/provider.yaml", self.readback)}
             if saved[self.applied] is not None:
                 previous = json.loads(saved[self.applied])
                 atomic(self.root / "backups/config-history/provider-pool" / (str(previous["revision"]) + ".json"), previous)
@@ -507,9 +584,11 @@ class Manager:
                 atomic(self.source, source)
                 self.compatibility(value, secret, internal)
                 publishing = True
+                self.invalidate_readback()
                 atomic(self.applied, value)
                 observed, _ = self.load()
                 require(observed == value, "readback_failed", "接口池回读不一致")
+                pool_sha256 = self.applied_identity(value)
             except Exception:
                 if publishing and saved[self.applied] is not None:
                     self.restore_previous(saved, value["revision"], internal)
@@ -530,7 +609,8 @@ class Manager:
                 if transaction:
                     self.apply_rag_window(window)
                 observed = self.adapter("status")
-                self.verify_adapter_readback(value, observed, "applying" if transaction else "applied")
+                self.verify_adapter_readback(value, observed, pool_sha256,
+                                             "applying" if transaction else "applied")
             except Exception as failure:
                 with open(lock_path, "a", encoding="utf-8") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -538,24 +618,34 @@ class Manager:
                     restored = self.restore_previous(saved, value["revision"], internal)
                     if transaction:
                         self.transaction_update(transaction, phase="restoring", revision=restored["revision"], context_window=transaction["previous_context_window"], started_at=int(time.time() * 1000))
-                if transaction:
-                    try:
+                    restored_sha256 = self.applied_identity(restored)
+                try:
+                    if transaction:
                         self.apply_rag_window(transaction["previous_context_window"])
-                        self.verify_adapter_readback(restored, self.adapter("status"), "applying")
-                    except Exception:
+                    restored_observed = self.adapter("status")
+                    self.verify_adapter_readback(restored, restored_observed, restored_sha256,
+                                                 "applying" if transaction else "applied")
+                except Exception:
+                    if transaction:
                         with open(lock_path, "a", encoding="utf-8") as lock:
                             fcntl.flock(lock, fcntl.LOCK_EX)
                             self.transaction_update(transaction, phase="restore_failed")
                         raise PoolError("rag_context_restore_failed", "原接口配置已恢复，但知识窗口尚未确认恢复；推理保持暂停，请执行 recover-rag-context") from None
-                    with open(lock_path, "a", encoding="utf-8") as lock:
-                        fcntl.flock(lock, fcntl.LOCK_EX)
+                    raise PoolError("readback_failed", "原接口配置已恢复，但运行组件尚未确认恢复；推理保持暂停，请执行 verify-applied") from None
+                with open(lock_path, "a", encoding="utf-8") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    self.publish_readback(restored, restored_observed, restored_sha256,
+                                          "applying" if transaction else "applied")
+                    if transaction:
                         self.transaction_clear(transaction)
                 code = failure.code if isinstance(failure, PoolError) else "readback_failed"
                 raise PoolError(code, "组件应用或回读失败；原接口配置已以新代次恢复，旧请求保持取消") from None
-            if transaction:
-                with open(lock_path, "a", encoding="utf-8") as lock:
-                    fcntl.flock(lock, fcntl.LOCK_EX)
-                    require(read(self.applied)["revision"] == value["revision"], "revision_conflict", "接口窗口回读期间配置已变更")
+            with open(lock_path, "a", encoding="utf-8") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                require(read(self.applied)["revision"] == value["revision"], "revision_conflict", "接口窗口回读期间配置已变更")
+                self.publish_readback(value, observed, pool_sha256,
+                                      "applying" if transaction else "applied")
+                if transaction:
                     self.transaction_clear(transaction)
         return dict(self.public(value), rag_context={"context_window": window, "state": "applied" if transaction else "unchanged" if verify else "deferred"})
 
@@ -589,7 +679,9 @@ class Manager:
             self.transaction_update(pending, phase="restoring", revision=restored["revision"], context_window=window, started_at=int(time.time() * 1000), **transaction_owner())
         try:
             self.apply_rag_window(window)
-            self.verify_adapter_readback(restored, self.adapter("status"), "applying")
+            restored_sha256 = self.applied_identity(restored)
+            restored_observed = self.adapter("status")
+            self.verify_adapter_readback(restored, restored_observed, restored_sha256, "applying")
         except Exception:
             with open(lock_path, "a", encoding="utf-8") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -597,6 +689,7 @@ class Manager:
             raise PoolError("rag_context_restore_failed", "窗口恢复尚未完成，推理继续暂停；可稍后再次执行 recover-rag-context") from None
         with open(lock_path, "a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self.publish_readback(restored, restored_observed, restored_sha256, "applying")
             self.transaction_clear(pending)
         return dict(self.public(restored), rag_context={"context_window": window, "state": "applied"})
 
@@ -616,9 +709,13 @@ class Manager:
             # 已迁移的池为权威，不从可能陈旧的 AI_* 再生成或覆盖。
             internal = read_env(self.env).get("PROVIDER_ADAPTER_KEY", "")
             require(internal and internal not in [item["api_key"] for item in secret.values()], "internal_key_missing", "已迁移接口池缺少独立内部认证，请恢复受限环境配置")
+            if defer_runtime:
+                # 更新后的程序必须由正在运行的新 adapter 重新证明完整池和秘密代次。
+                # 在此失效旧回读，n8n 会保留问题并等待安装流程显式 verify-applied。
+                self.invalidate_readback()
             if read_env(self.env).get("PROVIDER_RAG_CONTEXT_WINDOW") != str(rag_context_window(value)):
                 return self.commit(value, secret, value["revision"], verify=not defer_runtime)
-            return dict(self.public(value), rag_context={"context_window": rag_context_window(value), "state": "deferred"}) if defer_runtime else self.public(value)
+            return dict(self.public(value), rag_context={"context_window": rag_context_window(value), "state": "deferred"}) if defer_runtime else self.verify_applied()
         require(not self.source.exists(), "invalid_pool", "已有主备池源但有效投影缺失，请恢复有效投影；不会用旧单接口覆盖")
         values = read_env(self.env)
         provider_file = self.root / "config/provider.yaml"
@@ -740,7 +837,7 @@ class Manager:
         raise last
 
     def main(self, action, arguments, defer_runtime=False):
-        readonly = {"list", "get", "show", "entry", "status", "recent", "models", "probe", "test", "vision-test",
+        readonly = {"list", "get", "show", "entry", "status", "recent", "readback", "models", "probe", "test", "vision-test",
                     "validate-file", "admin-marker", "draft", "draft-entry", "recover-rag-context"}
         if action in readonly or action == "policy" and not arguments:
             return self._main(action, arguments, defer_runtime)
@@ -751,6 +848,16 @@ class Manager:
         require(not defer_runtime or action == "migrate", "invalid_action", "延后组件应用仅用于受管安装迁移")
         if action == "recover-rag-context":
             return self.recover_rag_context()
+        if action == "verify-applied":
+            require(not arguments, "invalid_input", "verify-applied 不接受额外参数")
+            return self.verify_applied()
+        if action == "invalidate-readback":
+            require(not arguments, "invalid_input", "invalidate-readback 不接受额外参数")
+            self.invalidate_readback()
+            return {"ok": True, "state": "invalidated"}
+        if action == "readback":
+            require(not arguments, "invalid_input", "readback 不接受额外参数")
+            return self.readback_status()
         if action == "validate-file":
             checked = source_schema(read(Path(arguments[0])))
             return {"ok": True, "valid": True, "entries": len(checked["entries"]), "primary_id": checked["primary_id"]}

@@ -31,8 +31,8 @@ const sealMaterials = value => {
 };
 const wait = ms => new Promise(resolve=>setTimeout(resolve,ms));
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
-const execute = args => new Promise(resolve=>{
-  const child=spawn('python3',[path.join(project,'scripts/provider-pool.py'),...args]);
+const execute = (args,environment={}) => new Promise(resolve=>{
+  const child=spawn('python3',[path.join(project,'scripts/provider-pool.py'),...args],{env:{...process.env,...environment}});
   let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
   child.on('close',code=>resolve({code,stdout,stderr}));
 });
@@ -111,6 +111,10 @@ async function fixture(label) {
     await new Promise(resolve=>adapter.listen(0,'127.0.0.1',resolve));adapterBase=`http://127.0.0.1:${adapter.address().port}`;
   };
   await startAdapter();
+  const verifiedPool=await execute(['--deploy-dir',root,'verify-applied'],{
+    PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,
+  });
+  assert.equal(verifiedPool.code,0,verifiedPool.stderr+verifiedPool.stdout);
   const postAdapter=async(body,headers={},timeout=10000)=>{
     const response=await fetch(adapterBase+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
     return{status:response.status,body:await response.json()};
@@ -131,7 +135,7 @@ async function fixture(label) {
     }]}));
   });
   await new Promise(resolve=>rag.listen(0,'127.0.0.1',resolve));
-  const env={CRISP_WEBSITE_ID:'11111111-1111-4111-8111-111111111111',CRISP_WEBSITE_HOOK_SECRET:'synthetic-hook-only',CRISP_AUTH_B64:'synthetic-crisp-auth',ANYTHINGLLM_WORKSPACE:'synthetic',ANYTHINGLLM_API_KEY:'synthetic-rag-key',PROVIDER_ADAPTER_KEY:internal,PROVIDER_POOL_REQUIRED:'true',PROVIDER_ADAPTER_URL:adapterBase+'/v1',ANYTHINGLLM_INTERNAL_URL:`http://127.0.0.1:${rag.address().port}`};
+  const env={CRISP_WEBSITE_ID:'11111111-1111-4111-8111-111111111111',CRISP_WEBSITE_HOOK_SECRET:'synthetic-hook-only',CRISP_AUTH_B64:'synthetic-crisp-auth',ANYTHINGLLM_WORKSPACE:'synthetic',ANYTHINGLLM_API_KEY:'synthetic-rag-key',PROVIDER_ADAPTER_KEY:internal,PROVIDER_POOL_REQUIRED:'true',PROVIDER_POOL_READBACK_REQUIRED:'true',PROVIDER_ADAPTER_URL:adapterBase+'/v1',ANYTHINGLLM_INTERNAL_URL:`http://127.0.0.1:${rag.address().port}`};
   const request=async(url,options={})=>{
     const parsed=new URL(url);
     if(parsed.hostname==='storage.crisp.chat')return{status:200,headers:{'content-type':'image/png'},body:png};

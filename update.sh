@@ -202,6 +202,8 @@ if (( SKIP_START == 0 )); then
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
   refresh_program_file_mounts "$DEPLOY_DIR" || die '升级后的单文件程序挂载未完成刷新'
   wait_for_local_health "$DEPLOY_DIR"
+  python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" verify-applied >/dev/null \
+    || die '运行适配器未完整回读主备接口配置；推理保持暂停，升级将按原快照恢复'
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
   bash "${DEPLOY_DIR}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY_DIR" ensure \

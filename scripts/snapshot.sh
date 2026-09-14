@@ -493,6 +493,10 @@ copy_snapshot_tree() {
 
 # 新模块、所有命名知识库及其映射均属于本机恢复范围，不再只备份根目录文档。
 copy_snapshot_tree config
+# 运行回读只证明创建快照时的 adapter 实例，不能跨恢复或跨主机作为
+# 当前运行事实。配置、秘密和持久问题责任进入快照；瞬时准入回执由恢复后
+# 的当前 adapter 重新生成。缺少回读也不得阻止管理员创建救援快照。
+rm -f -- "$STAGING/payload/config/provider-pool-readback.json"
 [[ ! -d "${DEPLOY_DIR}/secrets" ]] || copy_snapshot_tree secrets
 snapshot_release_provider_lock
 

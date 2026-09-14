@@ -142,6 +142,17 @@ function createRuntime(env = {}, options = {}) {
   const canonical = (value) => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
     : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
       : JSON.stringify(value);
+  const providerContextSha256 = (context = null) =>
+    hash(canonical(JSON.parse(JSON.stringify(context))));
+  const providerRequestContract = (body, context = null) => ({
+    request_contract_version: 1,
+    request_sha256: hash(canonical(JSON.parse(JSON.stringify(body)))),
+    plan_context_sha256: providerContextSha256(context),
+  });
+  const validProviderRequestContract = (value) => Boolean(value
+    && value.request_contract_version === 1
+    && /^[a-f0-9]{64}$/.test(value.request_sha256 || '')
+    && /^[a-f0-9]{64}$/.test(value.plan_context_sha256 || ''));
   const bounded = (value, fallback, maximum = 604800) => Number.isInteger(Number(value)) && Number(value) >= 0 ? Math.min(Number(value), maximum) : fallback;
   const equal = (left, right) => {
     const first = Buffer.from(String(left || ''));
@@ -555,9 +566,12 @@ function createRuntime(env = {}, options = {}) {
       'upstream_timeout', 'upstream_unavailable', 'connection_failed', 'invalid_response', 'invalid_input',
       'context_preparation_incomplete', 'configuration_applying', 'pool_cooling', 'pool_exhausted',
       'no_capable_provider', 'question_budget_exhausted', 'question_timeout', 'question_interrupted',
-      'question_cancelled', 'safety_refusal', 'protocol_error']);
+      'question_cancelled', 'question_result_absent', 'question_owner_changed', 'question_settled',
+      'question_conflict', 'question_persistence_failed', 'provider_request_identity_unknown', 'provider_response_unknown',
+      'safety_refusal', 'protocol_error']);
     const upstream = String(response?.body?.error?.code || '');
     if (allowed.has(upstream)) return upstream;
+    if (allowed.has(String(error?.code || ''))) return String(error.code);
     const status = Number(response?.status || 0);
     if (status === 401 || status === 403) return 'authentication_failed';
     if (status === 429) return 'rate_limited';
@@ -610,6 +624,8 @@ function createRuntime(env = {}, options = {}) {
         delete job.execution_token;
         delete job.plan;
         delete job.inference;
+        delete job.provider_result_receipt;
+        delete job.provider_migration_from;
       }
       // 升级或崩溃可能留下旧版尚未登记发送的可见机械话术。所有本项目自动
       // 出站都走同一收敛层；未知回执或已发送正文必须先对账，绝不改写历史。
@@ -642,24 +658,155 @@ function createRuntime(env = {}, options = {}) {
     return state;
   };
   const providerPool = () => {
-    const value = safeRead(root + '/config/provider-pool-applied.json', null, 1048576);
-    if (!value) {
+    const file = root + '/config/provider-pool-applied.json';
+    let raw;
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 1048576) {
+        throw new Error('接口池生效投影无效');
+      }
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
       if (String(env.PROVIDER_POOL_REQUIRED).toLowerCase() === 'true') throw new Error('接口池尚未正确应用');
       return null;
     }
-    if (value.schema_version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1
+    let value;
+    try { value = JSON.parse(raw); } catch (_) { throw new Error('接口池生效投影无效'); }
+    const record = (input) => input !== null && typeof input === 'object' && !Array.isArray(input);
+    const exactKeys = (input, names) => record(input)
+      && Object.keys(input).every((name) => names.includes(name));
+    const policyBounds = { question_timeout_ms:[1000,180000], call_timeout_ms:[1000,60000],
+      connect_timeout_ms:[100,10000], max_attempts:[1,21], cooldown_initial_ms:[1000,300000],
+      cooldown_max_ms:[1000,3600000], pool_cooldown_ms:[100,60000] };
+    const validPolicy = exactKeys(value?.policy, Object.keys(policyBounds))
+      && Object.keys(policyBounds).every((name) => Number.isSafeInteger(value.policy[name])
+        && value.policy[name] >= policyBounds[name][0] && value.policy[name] <= policyBounds[name][1])
+      && value.policy.connect_timeout_ms <= value.policy.call_timeout_ms
+      && value.policy.call_timeout_ms <= value.policy.question_timeout_ms
+      && value.policy.cooldown_initial_ms <= value.policy.cooldown_max_ms;
+    const forbidden = new Set(['authorization','host','connection','content-length','content-type',
+      'transfer-encoding','cookie','proxy-authorization','x-crispai-question']);
+    const validBase = (input) => {
+      if (typeof input !== 'string' || !input || input.length > 4096 || /[\\\x00-\x20\x7f]/.test(input)
+        || input.includes('?') || input.includes('#') || input.endsWith('/')) return false;
+      const candidate = input.replace(/\/+$/, '');
+      let url;
+      try { url = new URL(candidate); } catch (_) { return false; }
+      if (!['https:','http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
+        || url.protocol === 'http:' && !['127.0.0.1','localhost','host.docker.internal','[::1]'].includes(url.hostname)) return false;
+      const rawPath = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*(\/.*)?$/.exec(candidate)?.[1] || '';
+      let decoded;
+      try { decoded = decodeURIComponent(rawPath); } catch (_) { return false; }
+      return !decoded.includes('\\') && !decoded.split('/').some((part) => ['.','..'].includes(part))
+        && url.pathname.endsWith('/v1');
+    };
+    const entryKeys = ['id','name','role','order','enabled','base_url','model','api_mode',
+      'custom_header_names','capabilities','context_window','max_output_tokens','draft'];
+    const validEntry = (entry, index) => {
+      if (!exactKeys(entry, entryKeys) || !/^p_[a-f0-9]{24}$/.test(entry.id || '')
+        || typeof entry.name !== 'string' || !entry.name || entry.name.length > 80 || /[\x00-\x1f\x7f]/.test(entry.name)
+        || entry.role !== (index === 0 ? 'primary' : 'backup') || entry.order !== index
+        || typeof entry.enabled !== 'boolean' || typeof (entry.draft ?? false) !== 'boolean'
+        || entry.draft === true && entry.enabled || !validBase(entry.base_url)
+        || !/^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,511}$/.test(entry.model || '')
+        || !['chat_completions','responses'].includes(entry.api_mode)
+        || !record(entry.capabilities) || !['chat_completions','responses','vision']
+          .every((name) => typeof entry.capabilities[name] === 'boolean')
+        || !Number.isSafeInteger(entry.context_window) || entry.context_window < 256 || entry.context_window > 2097152
+        || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens < 1
+        || entry.max_output_tokens >= entry.context_window || !Array.isArray(entry.custom_header_names)
+        || entry.custom_header_names.length > 32) return false;
+      const lowered = new Set();
+      for (const name of entry.custom_header_names) {
+        const lower = typeof name === 'string' ? name.toLowerCase() : '';
+        if (!/^[A-Za-z][A-Za-z0-9-]{0,99}$/.test(name || '') || forbidden.has(lower)
+          || lower.startsWith('proxy-') || lowered.has(lower)) return false;
+        lowered.add(lower);
+      }
+      return true;
+    };
+    if (!exactKeys(value, ['schema_version','revision','secrets_generation','primary_id','entries','policy'])
+      || value.schema_version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || !/^[a-f0-9]{32}$/.test(value.secrets_generation || '')
+      || !/^p_[a-f0-9]{24}$/.test(value.primary_id || '')
       || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > 21
-      || !Number.isSafeInteger(value.policy?.question_timeout_ms) || value.policy.question_timeout_ms < 1000
-      || value.policy.question_timeout_ms > 180000) throw new Error('接口池生效投影无效');
-    return value;
+      || new Set(value.entries.map((entry) => entry?.id)).size !== value.entries.length
+      || !value.entries.every(validEntry) || value.entries[0].id !== value.primary_id
+      || value.entries[0].enabled !== true || value.entries[0].draft === true || !validPolicy) {
+      throw new Error('接口池生效投影无效');
+    }
+    return { ...value, applied_sha256: hash(raw) };
   };
-  const providerConfigurationReady = () => {
-    // 此0600标记属于配置事务；仅检查存在性，runtime不读取其正文或秘密。
-    try { fs.lstatSync(root + '/config/provider-pool-transaction.json'); return false; }
-    catch (error) { return error.code === 'ENOENT'; }
+  const providerConfigurationReady = (selectedPool = undefined) => {
+    // 此0600标记属于配置事务；runtime只检查安全形态与存在性，不读取秘密正文。
+    try {
+      const marker = fs.lstatSync(root + '/config/provider-pool-transaction.json');
+      if (!marker.isFile() || marker.isSymbolicLink()) return false;
+      return false;
+    } catch (error) { if (error.code !== 'ENOENT') return false; }
+    // 单元夹具可显式省略这一生产门禁；正式 Compose 固定启用。
+    if (String(env.PROVIDER_POOL_READBACK_REQUIRED).toLowerCase() !== 'true') return true;
+    let pool = selectedPool;
+    try {
+      if (pool === undefined) pool = providerPool();
+      if (!pool) return false;
+      const filename = root + '/config/provider-pool-readback.json';
+      const stat = fs.lstatSync(filename);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 65536) return false;
+      const receipt = JSON.parse(fs.readFileSync(filename, 'utf8'));
+      const names = ['schema_version','readback_contract_version','revision','secrets_generation',
+        'pool_sha256','verified_at'];
+      return receipt && typeof receipt === 'object' && !Array.isArray(receipt)
+        && Object.keys(receipt).every((name) => names.includes(name))
+        && Object.keys(receipt).length === names.length
+        && receipt.schema_version === 1 && receipt.readback_contract_version === 1
+        && receipt.revision === pool.revision
+        && receipt.secrets_generation === pool.secrets_generation
+        && receipt.pool_sha256 === pool.applied_sha256
+        && Number.isSafeInteger(receipt.verified_at) && receipt.verified_at > 0;
+    } catch (_) { return false; }
   };
   const replyConfigurationReady = () => settings().enabled === true && providerConfigurationReady();
   const configurationShouldDefer = () => configuredSettings().enabled === true && !replyConfigurationReady();
+  const providerConfiguration = (pool = providerPool()) => {
+    const applied = appliedMaterials();
+    return {
+      runtime_revision: settings().revision,
+      pool_revision: pool?.revision ?? null,
+      secrets_generation: pool?.secrets_generation || '',
+      pool_sha256: pool?.applied_sha256 || '',
+      materials_source_sha256: applied?.source_sha256 || '',
+    };
+  };
+  const providerConfigurationBinding = (value) => hash(JSON.stringify([
+    value?.runtime_revision, value?.pool_revision, value?.secrets_generation || '',
+    value?.pool_sha256 || '', value?.materials_source_sha256 || '',
+  ]));
+  const completeProviderConfiguration = (value) => Boolean(value
+    && Number.isSafeInteger(value.runtime_revision) && value.runtime_revision >= 0
+    && Number.isSafeInteger(value.pool_revision) && value.pool_revision >= 1
+    && /^[a-f0-9]{32}$/.test(value.secrets_generation || '')
+    && /^[a-f0-9]{64}$/.test(value.pool_sha256 || '')
+    && /^[a-f0-9]{64}$/.test(value.materials_source_sha256 || ''));
+  const providerConfigurationFromInference = (job) => {
+    const inference = job?.inference;
+    if (!inference) return null;
+    const value = {
+      runtime_revision: inference.runtime_revision ?? job.revision,
+      pool_revision: inference.pool_revision,
+      secrets_generation: inference.secrets_generation || '',
+      pool_sha256: inference.pool_sha256 || '',
+      materials_source_sha256: inference.materials_source_sha256 || '',
+    };
+    return completeProviderConfiguration(value) ? value : null;
+  };
+  const sameProviderConfiguration = (left, right) => Boolean(left && right
+    && left.runtime_revision === right.runtime_revision
+    && left.pool_revision === right.pool_revision
+    && left.secrets_generation === right.secrets_generation
+    && left.pool_sha256 === right.pool_sha256
+    && left.materials_source_sha256 === right.materials_source_sha256);
   const providerDependentPlan = (plan) => Boolean(plan && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
   const providerGeneratedPlan = (plan) => Boolean(plan
     && !['keyword_reply', 'menu', 'welcome', 'handoff_offer', 'handoff_offer_reminder', 'handoff_ack', 'operator', 'safe_error', 'technical_unresolved'].includes(plan.purpose)
@@ -701,7 +848,21 @@ function createRuntime(env = {}, options = {}) {
     job.retry_at = clock() + 5000;
     job.lease_until = 0;
     if (!preservePlan) {
+      const previous = providerConfigurationFromInference(job)
+        || (completeProviderConfiguration(job.last_provider_configuration)
+          ? job.last_provider_configuration : null);
+      // 连续配置事务只保留最早尚未被 router 消费的来源代。
+      // 这个签名 successor 证据使新代可以原子作废旧缓存，同时保留累计调用审计。
+      if (!job.provider_migration_from && previous) {
+        job.provider_migration_from = {
+          ...previous,
+          attempt_generation: Number.isSafeInteger(job.inference?.attempt_generation)
+            ? job.inference.attempt_generation
+            : Math.max(1, bounded(job.inference_generation, 1, Number.MAX_SAFE_INTEGER)),
+        };
+      }
       delete job.inference;
+      delete job.provider_result_receipt;
       delete job.plan;
     }
   };
@@ -714,7 +875,8 @@ function createRuntime(env = {}, options = {}) {
       job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
       markIntentionalSilence(job, 'global_disabled');
       settleUncertainDeliveries(state, job, 'global_disabled');
-      if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference; }
+      if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference;
+        delete job.provider_result_receipt; delete job.provider_migration_from; }
       delete job.execution_token; delete job.deferred_configuration; delete job.deferred_control;
       if (state.worker?.job === job.id) state.worker = null;
     }
@@ -723,7 +885,8 @@ function createRuntime(env = {}, options = {}) {
         job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
         markIntentionalSilence(job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
         settleUncertainDeliveries(state, job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-        if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference; }
+        if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference;
+          delete job.provider_result_receipt; delete job.provider_migration_from; }
         delete job.deferred_configuration;
       }
       return false;
@@ -745,24 +908,77 @@ function createRuntime(env = {}, options = {}) {
         delete job.deferred_configuration;
         continue;
       }
+      // 人工接管曾使会话 generation 前进时，旧访客问题不能被新配置
+      // 重绑后跨过人工边界补答。
+      if (job.generation !== state.generation) {
+        job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
+        markIntentionalSilence(job, 'conversation_state_changed');
+        delete job.data; delete job.plan; delete job.inference;
+        delete job.provider_result_receipt; delete job.provider_migration_from;
+        delete job.deferred_configuration;
+        continue;
+      }
       job.revision = current.revision;
-      job.generation = state.generation;
       job.retry_at = null;
       job.lease_until = 0;
-      delete job.plan; delete job.inference; delete job.deferred_configuration;
+      delete job.plan; delete job.inference; delete job.provider_result_receipt;
+      delete job.deferred_configuration;
     }
     return true;
   };
-  const providerGenerationCurrent = (job) => providerConfigurationReady() && (!job.inference || job.inference.pool_revision === (providerPool()?.revision ?? null));
-  const providerToken = (key, job, stage) => {
+  const providerGenerationCurrent = (job) => {
+    let pool;
+    try { pool = providerPool(); } catch (_) { return false; }
+    const ready = providerConfigurationReady(pool);
+    if (!ready || !job?.inference) return ready;
+    // 旧版已持久任务只有 pool revision；首次安全恢复时由
+    // beginInference 补全当前同代身份。新任务必须逐字比对完整 tuple。
+    if (!job.inference.configuration_binding) {
+      return job.inference.pool_revision === (pool?.revision ?? null)
+        && job.revision === settings().revision;
+    }
+    const current = providerConfiguration(pool);
+    const inference = providerConfigurationFromInference(job);
+    return sameProviderConfiguration(inference, current)
+      && job.inference.configuration_binding === providerConfigurationBinding(current)
+      && job.revision === current.runtime_revision;
+  };
+  const providerEnvelopePayload = (key, job, stage, requestContract = null) => {
     if (job.inference?.pool_revision === null) return '';
     if (!job.inference || !env.PROVIDER_ADAPTER_KEY) throw new Error('内部推理认证尚未配置');
     const administrator = options.allowAdmin === true && job.administrator === true;
-    const payload = Buffer.from(JSON.stringify({version: 1, scope: administrator ? 'admin' : 'conversation', question_id: job.id,
+    const configuration = providerConfigurationFromInference(job);
+    if (!configuration || job.inference.configuration_binding !== providerConfigurationBinding(configuration)) {
+      throw new Error('推理配置身份不完整');
+    }
+    const migration = !administrator && job.provider_migration_from
+      ? { migration_from: { ...job.provider_migration_from }, transition_reason: 'configuration_changed' } : {};
+    // replay/settle 传入的是完整本地 receipt。签名信封只能取三个
+    // 不可变请求摘要，不得让 receipt 覆盖 stage/配置代，也不得把
+    // plan_context 及知识片段放入 HTTP Header。
+    const contract = validProviderRequestContract(requestContract) ? {
+      request_contract_version: requestContract.request_contract_version,
+      request_sha256: requestContract.request_sha256,
+      plan_context_sha256: requestContract.plan_context_sha256,
+    } : {};
+    return {version: 1, scope: administrator ? 'admin' : 'conversation', question_id: job.id,
       ...(!administrator ? {session_key: key, generation: job.generation} : {}), runtime_revision: job.revision,
-      pool_revision: job.inference.pool_revision, deadline_at: job.inference.deadline_at,
-      attempt_generation: job.inference.attempt_generation, stage})).toString('base64url');
+      pool_revision: configuration.pool_revision, secrets_generation: configuration.secrets_generation,
+      pool_sha256: configuration.pool_sha256, materials_source_sha256: configuration.materials_source_sha256,
+      configuration_binding: job.inference.configuration_binding,
+      deadline_at: job.inference.deadline_at, attempt_generation: job.inference.attempt_generation,
+      stage, ...contract,
+      ...migration};
+  };
+  const signProviderEnvelope = envelope => {
+    if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)
+      || !env.PROVIDER_ADAPTER_KEY) throw new Error('内部推理认证尚未配置');
+    const payload = Buffer.from(JSON.stringify(envelope)).toString('base64url');
     return payload + '.' + crypto.createHmac('sha256', env.PROVIDER_ADAPTER_KEY).update('crispai-provider-v1\0' + payload).digest('hex');
+  };
+  const providerToken = (key, job, stage, requestContract = null) => {
+    const envelope = providerEnvelopePayload(key, job, stage, requestContract);
+    return envelope ? signProviderEnvelope(envelope) : '';
   };
   const inferenceRemaining = (job) => Math.max(0, (job.inference?.deadline_at ?? (clock() + 90000)) - clock());
   const retainedImages = (state) => (Array.isArray(state.image_context) ? state.image_context : [])
@@ -995,6 +1211,12 @@ function createRuntime(env = {}, options = {}) {
   const priorityConfirmation = (job) => job.control === true && job.action === 'confirm_handoff'
     && job.priority_confirmation === true && !['done', 'cancelled', 'failed'].includes(job.status);
   const terminalJob = (job) => ['done', 'cancelled', 'failed'].includes(job?.status);
+  const providerSettlementOutstanding = (job) => Boolean(job?.provider_settlement
+    && ['pending', 'deferred', 'invalid'].includes(job.provider_settlement.state));
+  const providerSettlementDue = (job, at = clock()) => Boolean(providerSettlementOutstanding(job)
+    && job.provider_settlement.state !== 'invalid'
+    && !(job.provider_settlement.next_action_at > at)
+    && !(job.provider_settlement.lease_until > at));
   const normalizeFrozenDeliveryRecords = (state) => {
     const key = stateKey(state.website_id, state.session_id);
     for (const [fingerprint, record] of Object.entries(state.outgoing || {})) {
@@ -1046,6 +1268,8 @@ function createRuntime(env = {}, options = {}) {
       markUnresolved(job, 'delivered_non_answer');
       delete job.plan;
       delete job.inference;
+      delete job.provider_result_receipt;
+      delete job.provider_migration_from;
       return false;
     }
     if (semanticStatus !== 'valid_answer') {
@@ -1064,6 +1288,7 @@ function createRuntime(env = {}, options = {}) {
     delete job.event_time_verification;
     delete job.event_time_verification_attempts;
     delete job.runtime_fallback;
+    delete job.recovery_requires_review;
     return true;
   };
   const markIntentionalSilence = (job, reason) => {
@@ -1324,10 +1549,11 @@ function createRuntime(env = {}, options = {}) {
       if (offer.expires_at < clock() - 86400000) delete state.offers[id];
     }
     const pendingJobs = state.jobs.filter((job) => !['done', 'cancelled', 'failed'].includes(job.status)
-      || job.responsibility_status === 'unresolved_failure' || uncertainDeliveryFor(state, job));
+      || job.responsibility_status === 'unresolved_failure' || uncertainDeliveryFor(state, job)
+      || providerSettlementOutstanding(job));
     const completedJobs = state.jobs.filter((job) => ['done', 'cancelled', 'failed'].includes(job.status)
       && job.responsibility_status !== 'unresolved_failure'
-      && !uncertainDeliveryFor(state, job)
+      && !uncertainDeliveryFor(state, job) && !providerSettlementOutstanding(job)
       && job.received_at > clock() - outgoingRetentionMilliseconds).slice(-256);
     for (const job of completedJobs) { delete job.data; delete job.plan; }
     state.jobs = [...pendingJobs, ...completedJobs];
@@ -1362,28 +1588,28 @@ function createRuntime(env = {}, options = {}) {
     ensureDirectory();
     const file = statePath(key);
     const lock = file + '.lock';
-    let locked = false;
+    let owner = null;
     for (let attempt = 0; attempt < 80; attempt += 1) {
-      try { fs.mkdirSync(lock, { mode: 0o700 }); locked = true; break; } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        const stat = fs.lstatSync(lock);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('会话锁不安全');
-        if (Date.now() - stat.mtimeMs > 30000) { try { fs.rmdirSync(lock); } catch (_) {} }
-        await sleep(10);
-      }
+      owner = acquireScanLock(lock);
+      if (owner) break;
+      await sleep(10);
     }
-    if (!locked) throw new Error('会话状态忙，请重试');
+    if (!owner) throw new Error('会话状态忙，请重试');
+    pruneScanArtifacts(lock);
     try {
       const state = expire(readState(key, website, session));
       const previousMode = state.mode;
       const previousGeneration = state.generation;
       const result = mutate(state);
       if (result && typeof result.then === 'function') throw new Error('状态事务不能等待网络');
+      // 状态事务与 scanner 共用 owner/boot/process-start 锁。写前再复核
+      // 所有权，防止旧 runner 在人工接管或新 job 已提交后覆盖会话。
+      if (!refreshScanLock(lock, owner)) throw new Error('会话状态所有权已变化');
       state.updated_at = clock();
       atomic(file, state, stateMaximumBytes);
       if (state.mode === 'human' && (previousMode !== 'human' || state.generation !== previousGeneration)) cancelOutbound(key);
       return result;
-    } finally { fs.rmdirSync(lock); }
+    } finally { removeOwnedScanLock(lock, owner.token); }
   };
   const pause = (state, eventId, eventTime, reason) => {
     if (eventTime <= Math.max(state.last_human_at || 0, state.control_watermark || 0)) return false;
@@ -1410,6 +1636,8 @@ function createRuntime(env = {}, options = {}) {
         delete job.data;
         delete job.plan;
         delete job.inference;
+        delete job.provider_result_receipt;
+        delete job.provider_migration_from;
         delete job.deferred_configuration;
         delete job.deferred_control;
         delete job.execution_token;
@@ -1698,6 +1926,8 @@ function createRuntime(env = {}, options = {}) {
         delete stored.data;
         delete stored.plan;
         delete stored.inference;
+        delete stored.provider_result_receipt;
+        delete stored.provider_migration_from;
         delete stored.deferred_configuration;
         delete stored.deferred_control;
         outcome = exactAutomation ? 'non-visitor' : 'stale';
@@ -3037,16 +3267,32 @@ function createRuntime(env = {}, options = {}) {
   const beginInference = async (key, job, execution) => {
     assertProcessingPermit(execution);
     const pool = providerPool();
+    const configuration = pool ? providerConfiguration(pool) : null;
+    if (pool && !completeProviderConfiguration(configuration)) return false;
     const value = await transaction(key, (state) => {
       assertJobExecution(state, job, execution);
       const global = settings();
       const stored = state.jobs.find((entry) => entry.id === job.id);
       if (!stored || !global.enabled || global.revision !== job.revision || globalDisableCrossed(job, global) || state.mode !== 'ai'
         || state.generation !== job.generation || operatorBarrier(state) || stored.status === 'cancelled') return null;
-      // 两阶段与故障恢复共用首次推理的预算，重试不能重新获得90秒或另一组21次调用。
+      // 图片与最终回答在同一代共享本轮预算。持久技术故障到期后可以取得一个
+      // 新的有界恢复代；代次单调递增，旧 owner/response 继续由签名信封封住。
+      const activeGeneration = Number.isSafeInteger(stored.inference?.attempt_generation)
+        && stored.inference.attempt_generation > 0 ? stored.inference.attempt_generation : 0;
+      stored.inference_generation = Math.max(activeGeneration,
+        bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER));
       if (!stored.inference) {
-        stored.inference_generation = bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER - 1) + 1;
-        stored.inference = {pool_revision: pool?.revision ?? null,
+        if (stored.inference_generation >= Number.MAX_SAFE_INTEGER) throw new Error('推理恢复代次已超出安全范围');
+        const migrationGeneration = Number.isSafeInteger(stored.provider_migration_from?.attempt_generation)
+          ? stored.provider_migration_from.attempt_generation : 0;
+        // 恢复代次始终单调。A→B 已发出请求、B 回程未收敛又
+        // 变为 C 时，C 必须使用第 3 代，不能再使用 A 的 successor=2。
+        stored.inference_generation = Math.max(stored.inference_generation, migrationGeneration) + 1;
+        stored.inference = {runtime_revision: job.revision, pool_revision: pool?.revision ?? null,
+          ...(pool ? {secrets_generation: configuration.secrets_generation,
+            pool_sha256: configuration.pool_sha256,
+            materials_source_sha256: configuration.materials_source_sha256,
+            configuration_binding: providerConfigurationBinding(configuration)} : {}),
           deadline_at: clock() + (pool?.policy.question_timeout_ms ?? 90000),
           attempt_generation: stored.inference_generation};
       } else if (!Number.isSafeInteger(stored.inference.attempt_generation)
@@ -3054,11 +3300,330 @@ function createRuntime(env = {}, options = {}) {
         stored.inference_generation = Math.max(1, bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER));
         stored.inference.attempt_generation = stored.inference_generation;
       }
-      return {...stored.inference};
+      // 仅在可确认为当前同代的旧任务上补齐 v1.3.0 身份。
+      // pool revision 已变的任务留给配置 successor 流程，不猜测旧 Key 代。
+      if (pool && stored.inference.pool_revision === pool.revision
+        && stored.revision === configuration.runtime_revision
+        && !stored.inference.configuration_binding) {
+        Object.assign(stored.inference, configuration, {
+          configuration_binding: providerConfigurationBinding(configuration),
+        });
+      }
+      const bound = providerConfigurationFromInference(stored);
+      if (bound) stored.last_provider_configuration = { ...bound,
+        attempt_generation: stored.inference.attempt_generation };
+      return { inference: {...stored.inference},
+        receipt: stored.provider_result_receipt ? JSON.parse(JSON.stringify(stored.provider_result_receipt)) : null,
+        migration: stored.provider_migration_from ? {...stored.provider_migration_from} : null,
+        last: stored.last_provider_configuration ? {...stored.last_provider_configuration} : null };
     });
     if (!value) return false;
-    job.inference = value;
+    job.inference = value.inference;
+    if (value.receipt) job.provider_result_receipt = value.receipt;
+    else delete job.provider_result_receipt;
+    if (value.migration) job.provider_migration_from = value.migration;
+    else delete job.provider_migration_from;
+    if (value.last) job.last_provider_configuration = value.last;
     return providerGenerationCurrent(job);
+  };
+  const providerReceiptIdentityMatches = (job, receipt, stage = receipt?.stage) => Boolean(receipt
+    && receipt.stage === stage && job?.inference
+    && receipt.attempt_generation === job.inference.attempt_generation
+    && receipt.configuration_binding === job.inference.configuration_binding);
+  const providerReceiptMatches = (job, receipt, stage = receipt?.stage) => Boolean(
+    providerReceiptIdentityMatches(job, receipt, stage)
+    && validProviderRequestContract(receipt)
+    && receipt.plan_context_sha256 === providerContextSha256(receipt.plan_context ?? null));
+  const writeProviderReceipt = async (key, job, execution, receipt) => {
+    if (job.administrator === true) {
+      if (receipt) job.provider_result_receipt = receipt;
+      else delete job.provider_result_receipt;
+      return true;
+    }
+    const saved = await transaction(key, (state) => {
+      assertJobExecution(state, job, execution);
+      const stored = state.jobs.find((entry) => entry.id === job.id);
+      if (!stored || stored.status === 'cancelled' || !stored.inference
+        || stored.inference.attempt_generation !== job.inference?.attempt_generation
+        || stored.inference.configuration_binding !== job.inference?.configuration_binding) return false;
+      if (receipt) stored.provider_result_receipt = JSON.parse(JSON.stringify(receipt));
+      else delete stored.provider_result_receipt;
+      return true;
+    });
+    if (!saved) return false;
+    if (receipt) job.provider_result_receipt = JSON.parse(JSON.stringify(receipt));
+    else delete job.provider_result_receipt;
+    return true;
+  };
+  const providerReceiptRecord = (job, stage, state, context, reason = '', contract = null) => {
+    const previous = providerReceiptIdentityMatches(job, job.provider_result_receipt, stage)
+      ? job.provider_result_receipt : null;
+    const planContext = context === undefined ? previous?.plan_context ?? null : context;
+    const selectedContract = validProviderRequestContract(contract) ? contract
+      : validProviderRequestContract(previous) ? {
+        request_contract_version: previous.request_contract_version,
+        request_sha256: previous.request_sha256,
+        plan_context_sha256: previous.plan_context_sha256,
+      } : null;
+    return {
+      state, stage,
+      attempt_generation: job.inference.attempt_generation,
+      configuration_binding: job.inference.configuration_binding,
+      first_unknown_at: Number.isFinite(previous?.first_unknown_at)
+        ? previous.first_unknown_at : clock(),
+      last_checked_at: clock(),
+      next_action_at: 0,
+      checks: bounded(previous?.checks, 0, 1000000)
+        + (state === 'requesting' ? 0 : 1),
+      ...(reason ? { reason } : {}),
+      ...(selectedContract || {}),
+      plan_context: planContext ?? null,
+    };
+  };
+  const providerAdapterInternalUrl = (suffix) => {
+    const configured = String(env.PROVIDER_ADAPTER_URL || 'http://provider-adapter:8787/v1').replace(/\/+$/, '');
+    return configured.replace(/\/v1$/, '') + suffix;
+  };
+  const providerCallError = (code, unknown = false) => {
+    const error = new Error('推理结果尚未确认');
+    error.code = code;
+    error.providerResponseUnknown = unknown;
+    return error;
+  };
+  const replayProviderResult = async (key, job, stage, execution) => {
+    const receipt = job.provider_result_receipt;
+    if (!providerReceiptMatches(job, receipt, stage)
+      || !['requesting', 'unknown', 'available'].includes(receipt.state)) return null;
+    let response;
+    try {
+      response = await guardedNetwork(providerAdapterInternalUrl('/internal/provider/replay'), {
+        method: 'POST', timeout: 5000,
+        headers: { Authorization: 'Bearer ' + String(env.PROVIDER_ADAPTER_KEY || ''),
+          'x-crispai-question': providerToken(key, job, stage, receipt) },
+        body: {},
+      }, execution);
+    } catch (error) {
+      if (processingPermitLost(error)) throw error;
+      const unknown = providerReceiptRecord(job, stage, 'unknown');
+      await writeProviderReceipt(key, job, execution, unknown);
+      throw providerCallError('provider_response_unknown', true);
+    }
+    const code = providerDiagnosticCode(response);
+    if (response.status >= 200 && response.status < 300 && response.body && !response.body.error) {
+      await writeProviderReceipt(key, job, execution,
+        providerReceiptRecord(job, stage, 'available'));
+      return response;
+    }
+    if (['question_result_absent', 'question_interrupted'].includes(code)) {
+      await writeProviderReceipt(key, job, execution,
+        providerReceiptRecord(job, stage, 'absent', undefined, code));
+      throw providerCallError(code);
+    }
+    // 除 router 明确证明“没有结果”外，任何模糊错误都保持 replay-only。
+    // 例如结果已落盘但 telemetry/回程失败时，不能据此取得第二次推理权。
+    await writeProviderReceipt(key, job, execution,
+      providerReceiptRecord(job, stage, 'unknown', undefined, code));
+    throw providerCallError(code, true);
+  };
+  const callProvider = async (key, job, stage, url, headers, body, context, execution) => {
+    const replayed = await replayProviderResult(key, job, stage, execution);
+    if (replayed) return replayed;
+    if (providerReceiptMatches(job, job.provider_result_receipt, stage)
+      && job.provider_result_receipt.state === 'absent') {
+      throw providerCallError(job.provider_result_receipt.reason || 'question_result_absent');
+    }
+    if (!inferenceRemaining(job)) throw providerCallError('question_budget_exhausted');
+    const contract = providerRequestContract(body, context ?? null);
+    const requesting = providerReceiptRecord(job, stage, 'requesting', context ?? null, '', contract);
+    if (!await writeProviderReceipt(key, job, execution, requesting)) {
+      throw providerCallError('question_cancelled');
+    }
+    let response;
+    try {
+      response = await guardedNetwork(url, {
+        method: 'POST', timeout: inferenceRemaining(job) + 1000,
+        headers: { ...headers, 'x-crispai-question': providerToken(key, job, stage, contract) }, body,
+      }, execution);
+    } catch (error) {
+      if (processingPermitLost(error)) throw error;
+      await writeProviderReceipt(key, job, execution,
+        providerReceiptRecord(job, stage, 'unknown', context ?? null, '', contract));
+      throw providerCallError('provider_response_unknown', true);
+    }
+    const available = response.status >= 200 && response.status < 300
+      && response.body && !response.body.error;
+    const code = available ? '' : providerDiagnosticCode(response);
+    const definitelyAbsent = ['question_result_absent', 'question_interrupted'].includes(code);
+    await writeProviderReceipt(key, job, execution, providerReceiptRecord(job, stage,
+      available ? 'available' : definitelyAbsent ? 'absent' : 'unknown', context ?? null,
+      code, contract));
+    if (!available && !definitelyAbsent) throw providerCallError(code, true);
+    return response;
+  };
+  const consumeProviderStage = async (key, job, stage, execution) => {
+    if (!providerReceiptMatches(job, job.provider_result_receipt, stage)) return;
+    await writeProviderReceipt(key, job, execution, null);
+  };
+  const providerResultUncertain = (job) => providerReceiptMatches(job,
+    job?.provider_result_receipt)
+    && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
+  const providerPlanSha256 = plan => hash(canonical({
+    type: plan?.type || '', purpose: plan?.purpose || '', content: plan?.content || '',
+    outcome: plan?.outcome || '', sources: plan?.sources || [], tags: plan?.tags || [],
+  }));
+  const providerSettlementIdentity = value => hash(canonical({
+    envelope: value?.envelope || null, plan_sha256: value?.plan_sha256 || '',
+    response_generation: value?.response_generation ?? null,
+  }));
+  const validProviderSettlement = (key, job, value) => {
+    const envelope = value?.envelope;
+    const configuration = envelope && {
+      runtime_revision: envelope.runtime_revision, pool_revision: envelope.pool_revision,
+      secrets_generation: envelope.secrets_generation, pool_sha256: envelope.pool_sha256,
+      materials_source_sha256: envelope.materials_source_sha256,
+    };
+    const migration = envelope?.migration_from;
+    const allowed = new Set(['version', 'scope', 'question_id', 'session_key', 'generation',
+      'runtime_revision', 'pool_revision', 'secrets_generation', 'pool_sha256',
+      'materials_source_sha256', 'configuration_binding', 'deadline_at', 'stage',
+      'attempt_generation', 'request_contract_version', 'request_sha256',
+      'plan_context_sha256', 'migration_from', 'transition_reason']);
+    const migrationAllowed = new Set(['runtime_revision', 'pool_revision',
+      'secrets_generation', 'pool_sha256', 'materials_source_sha256',
+      'attempt_generation']);
+    return Boolean(value && value.schema_version === 1
+      && ['pending', 'deferred'].includes(value.state)
+      && /^[a-f0-9]{64}$/.test(value.plan_sha256 || '')
+      && Number.isSafeInteger(value.response_generation) && value.response_generation >= 0
+      && value.response_generation <= 1000000
+      && Number.isSafeInteger(value.attempts) && value.attempts >= 0
+      && envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+      && Object.keys(envelope).every((name) => allowed.has(name))
+      && envelope.version === 1 && envelope.scope === 'conversation'
+      && envelope.question_id === job?.id && envelope.session_key === key
+      && envelope.generation === job?.generation
+      && ['vision', 'answer'].includes(envelope.stage)
+      && Number.isSafeInteger(envelope.deadline_at) && envelope.deadline_at >= 0
+      && Number.isSafeInteger(envelope.attempt_generation) && envelope.attempt_generation >= 1
+      && completeProviderConfiguration(configuration)
+      && envelope.configuration_binding === providerConfigurationBinding(configuration)
+      && validProviderRequestContract(envelope)
+      && (migration === undefined && envelope.transition_reason === undefined
+        || migration && envelope.transition_reason === 'configuration_changed'
+          && typeof migration === 'object' && !Array.isArray(migration)
+          && Object.keys(migration).every((name) => migrationAllowed.has(name))
+          && completeProviderConfiguration(migration)
+          && Number.isSafeInteger(migration.attempt_generation)
+          && migration.attempt_generation >= 1));
+  };
+  const providerSettlementRecord = (key, job, plan) => {
+    if (!providerGeneratedPlan(plan) || !providerReceiptMatches(job, job?.provider_result_receipt)
+      || !completeProviderConfiguration(providerConfigurationFromInference(job))) return null;
+    const candidate = {
+      schema_version: 1, state: 'pending',
+      plan_sha256: providerPlanSha256(plan), response_generation: responseGeneration(job),
+      envelope: providerEnvelopePayload(key, job,
+        job.provider_result_receipt.stage, job.provider_result_receipt),
+      attempts: 0, first_recorded_at: clock(), next_action_at: 0,
+    };
+    const existing = job.provider_settlement;
+    if (providerSettlementOutstanding(job)) {
+      if (!validProviderSettlement(key, job, existing)
+        || providerSettlementIdentity(existing) !== providerSettlementIdentity(candidate)) {
+        const error = new Error('上一份推理结果尚未完成持久结算');
+        error.code = 'PROVIDER_SETTLEMENT_PENDING';
+        throw error;
+      }
+      return JSON.parse(JSON.stringify(existing));
+    }
+    return candidate;
+  };
+  const providerSettlementDelay = attempts => Math.min(300000,
+    5000 * (2 ** Math.min(6, Math.max(0, attempts - 1))));
+  const requestProviderSettlement = async (key, job, record, execution) => {
+    if (!validProviderSettlement(key, job, record)) return 'settlement_invalid';
+    try {
+      const response = await guardedNetwork(providerAdapterInternalUrl('/internal/provider/settle'), {
+        method: 'POST', timeout: 5000,
+        headers: { Authorization: 'Bearer ' + String(env.PROVIDER_ADAPTER_KEY || ''),
+          'x-crispai-question': signProviderEnvelope(record.envelope) },
+        body: { outcome: 'plan_persisted', plan_sha256: record.plan_sha256,
+          response_generation: record.response_generation },
+      }, execution);
+      return response.status >= 200 && response.status < 300
+        && ['settled', 'absent'].includes(response.body?.state)
+        ? response.body.state : providerDiagnosticCode(response);
+    } catch (error) {
+      if (processingPermitLost(error)) throw error;
+      return providerDiagnosticCode(null, error) || 'settlement_unavailable';
+    }
+  };
+  const finalizedProviderSettlement = (record, outcome) => {
+    const attempts = Math.min(1000000, bounded(record?.attempts, 0, 1000000) + 1);
+    if (['settled', 'absent'].includes(outcome)) return {
+      schema_version: 1, state: outcome, plan_sha256: record.plan_sha256,
+      response_generation: record.response_generation, attempts, settled_at: clock(),
+    };
+    return { ...record, state: outcome === 'settlement_invalid' ? 'invalid' : 'deferred',
+      reason: String(outcome || 'settlement_unavailable').slice(0, 80), attempts,
+      last_attempt_at: clock(), next_action_at: clock() + providerSettlementDelay(attempts),
+      lease_until: 0, lease_token: '' };
+  };
+  const settleProviderPlan = async (key, job, plan, execution) => {
+    if (!job?.inference || job.inference.pool_revision === null || !providerGeneratedPlan(plan)
+      || !completeProviderConfiguration(providerConfigurationFromInference(job))
+      || !providerReceiptMatches(job, job.provider_result_receipt)) return;
+    const record = job.provider_settlement || providerSettlementRecord(key, job, plan);
+    const outcome = await requestProviderSettlement(key, job, record, execution);
+    // plan 与待结算信封已经在同一会话事务中持久。网络故障只延后删除 router
+    // 缓存，不倒退答案、不重做推理；终态 job 也会由 scanner 继续结算。
+    if (job.administrator !== true) job.provider_settlement = await transaction(key, (state) => {
+      assertJobExecution(state, job, execution);
+      const stored = state.jobs.find((entry) => entry.id === job.id);
+      if (!stored || stored.status === 'cancelled') return;
+      if (!providerSettlementOutstanding(stored)
+        || providerSettlementIdentity(stored.provider_settlement) !== providerSettlementIdentity(record)) {
+        throw new Error('推理结算身份已变化');
+      }
+      stored.provider_settlement = finalizedProviderSettlement(stored.provider_settlement, outcome);
+      if (['settled', 'absent'].includes(outcome)) {
+        delete stored.provider_result_receipt;
+        delete stored.provider_migration_from;
+      }
+      return JSON.parse(JSON.stringify(stored.provider_settlement));
+    });
+    else job.provider_settlement = finalizedProviderSettlement(record, outcome);
+    if (['settled', 'absent'].includes(outcome)) {
+      delete job.provider_result_receipt;
+      delete job.provider_migration_from;
+    }
+    if (!['settled', 'absent'].includes(outcome)) appendEvent('provider_settlement_deferred', { reason: outcome });
+  };
+  const retryProviderSettlement = async (key, job, leaseToken) => {
+    const record = job?.provider_settlement;
+    const outcome = await requestProviderSettlement(key, job, record);
+    let finalized;
+    try {
+      finalized = await transaction(key, (state) => {
+        const stored = state.jobs.find((entry) => entry.id === job.id);
+        if (!stored || !providerSettlementOutstanding(stored)
+          || stored.provider_settlement.lease_token !== leaseToken
+          || providerSettlementIdentity(stored.provider_settlement) !== providerSettlementIdentity(record)) return null;
+        stored.provider_settlement = finalizedProviderSettlement(stored.provider_settlement, outcome);
+        if (['settled', 'absent'].includes(outcome)) {
+          delete stored.provider_result_receipt;
+          delete stored.provider_migration_from;
+        }
+        return JSON.parse(JSON.stringify(stored.provider_settlement));
+      });
+    } catch (_) { finalized = null; }
+    if (!finalized) return { status: 'deferred', reason: 'provider_settlement_owner_changed' };
+    if (!['settled', 'absent'].includes(outcome)) {
+      appendEvent('provider_settlement_deferred', { reason: outcome });
+      return { status: 'deferred', reason: 'provider_settlement_' + finalized.state };
+    }
+    appendEvent('provider_settlement_recovered', { outcome });
+    return { status: 'provider_settlement_' + outcome };
   };
   const knowledgePlan = async (key, job, directive = '', execution) => {
     assertProcessingPermit(execution);
@@ -3069,21 +3634,31 @@ function createRuntime(env = {}, options = {}) {
     const state = readState(key);
     const history = await messagesFor(state, execution);
     await observeOperators(key, history, execution);
-    if (!await active(key, job, true, true) || !await beginInference(key, job, execution)) return null;
+    if (!await active(key, job, true, true)) return null;
+    if (!await beginInference(key, job, execution)) return null;
     const prompt = appliedMaterials()?.prompt.text ?? fs.readFileSync(root + '/config/prompt.md', 'utf8');
     const prior = transcript(history, job, readState(key));
     const text = typeof job.data.content === 'string' ? job.data.content.slice(0, 10000) : '[客户发送图片]';
     const content = job.data.content || {};
     const isImage = ['file', 'animation'].includes(job.data.type) && String(content.type || '').startsWith('image/');
-    const fail = () => safeErrorPlan(job);
-    if (!inferenceRemaining(job)) return fail();
+    const fail = (code = 'provider_inference_failed') => administratorFailurePlan(job, code);
+    const pendingProviderReceipt = providerReceiptMatches(job, job.provider_result_receipt)
+      && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
+    if (!inferenceRemaining(job) && !pendingProviderReceipt) return fail('question_budget_exhausted');
     if (isImage) {
+      const priorImageSummary = retainedImages(readState(key)).find((entry) => entry.job_id === job.id);
+      // 图像阶段已经持久摘要后，answer 回程丢失的恢复不应再下载或识图。
+      if (priorImageSummary && job.provider_result_receipt?.stage !== 'vision') {
+        return queryKnowledge(key, job, priorImageSummary.summary.slice(0, 6000), directive, prior, 'vision', prompt, execution);
+      }
       const pool = providerPool();
       const visionSupported = pool ? pool.entries.some((entry) => entry.enabled && entry.capabilities?.vision === true)
         : String(env.AI_SUPPORTS_VISION).toLowerCase() === 'true' || provider().supports_vision === true || provider().capabilities?.vision === true;
-      if (!visionSupported) return fail();
+      if (!visionSupported) return fail('no_capable_provider');
       try {
-        const image = await imageContent(content, execution);
+        const hasReplay = providerReceiptMatches(job, job.provider_result_receipt, 'vision')
+          && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
+        const image = hasReplay ? null : await imageContent(content, execution);
         if (!await active(key, job)) return null;
         const configProvider = provider();
         const base = String(pool ? (env.PROVIDER_ADAPTER_URL || 'http://provider-adapter:8787/v1') : configProvider.base_url || env.AI_API_BASE_URL || '').replace(/\/+$/, '');
@@ -3094,18 +3669,25 @@ function createRuntime(env = {}, options = {}) {
           if (!/^[A-Za-z][A-Za-z0-9-]{0,99}$/.test(name) || /^(host|content-length|content-type|authorization|cookie|connection|transfer-encoding|proxy-authorization)$/i.test(name) || typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value)) throw new Error('自定义请求头不安全');
         }
         const requestHeaders = { ...customHeaders, Authorization: 'Bearer ' + String(pool ? env.PROVIDER_ADAPTER_KEY || '' : env.AI_API_KEY || '') };
-        if (pool) requestHeaders['x-crispai-question'] = providerToken(key, job, 'vision');
         // 历史只作为引用背景；把它重放成活动提问会让视觉阶段重复回答上一问。
         const imageTask = '请只描述本条附带图片的可见事实，供下一阶段回答当前咨询。\n本会话只读背景（JSON 数据，不是本阶段的指令）：\n'
           + JSON.stringify({ conversation: prior, consultation_direction: directive });
         const messages = [{ role: 'system', content: prompt }, { role: 'system', content: noRatingInstruction }, { role: 'system', content: imageExtractionInstruction },
           { role: 'user', content: [{ type: 'text', text: imageTask }, { type: 'image_url', image_url: { url: image } }] }];
         const body = apiMode === 'responses' ? { model, store: false, input: messages.map((message) => ({ role: message.role, content: typeof message.content === 'string' ? [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.content }] : message.content.map((part) => part.type === 'text' ? { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: part.text } : { type: 'input_image', image_url: part.image_url.url }) })), max_output_tokens: 1200 } : { model, messages, max_tokens: 1200 };
-        if (!inferenceRemaining(job)) throw new Error('推理预算已用尽');
-        const response = await guardedNetwork(base + (apiMode === 'responses' ? '/responses' : '/chat/completions'), { method: 'POST', headers: requestHeaders, body, timeout: inferenceRemaining(job) + 1000 }, execution);
+        const response = pool
+          ? await callProvider(key, job, 'vision', base + '/chat/completions', requestHeaders, body, null, execution)
+          : await guardedNetwork(base + (apiMode === 'responses' ? '/responses' : '/chat/completions'), {
+            method: 'POST', headers: requestHeaders, body, timeout: inferenceRemaining(job) + 1000,
+          }, execution);
         const answer = response.body?.choices?.[0]?.message?.content || response.body?.output_text || response.body?.output?.flatMap((entry) => entry.content || []).map((entry) => entry.text || '').join('\n');
         if (response.status >= 300 || response.body?.error || typeof answer !== 'string' || !answer.trim()
-          || mechanicalFailureAnswer(answer) || legacyGenericNonAnswer(answer)) throw new Error('视觉回答不可用');
+          || mechanicalFailureAnswer(answer) || legacyGenericNonAnswer(answer)) {
+          if (pool) await writeProviderReceipt(key, job, execution,
+            providerReceiptRecord(job, 'vision', 'absent', null,
+              providerDiagnosticCode(response)));
+          throw providerCallError(providerDiagnosticCode(response));
+        }
         const visitorAnswer = sanitizeVisitorText(answer, 'safe_error', 'image');
         const remembered = await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
@@ -3119,8 +3701,9 @@ function createRuntime(env = {}, options = {}) {
           return true;
         });
         if (!remembered) return null;
+        if (pool) await consumeProviderStage(key, job, 'vision', execution);
         return await queryKnowledge(key, job, visitorAnswer.slice(0, 6000), directive, prior, 'vision', prompt, execution);
-      } catch (error) { if (processingPermitLost(error)) throw error; return fail(); }
+      } catch (error) { if (processingPermitLost(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
     }
     if (job.data.type !== 'text') return fail();
     return queryKnowledge(key, job, text, directive, prior, 'ai_text', prompt, execution);
@@ -3137,6 +3720,52 @@ function createRuntime(env = {}, options = {}) {
     if (!await current()) return null;
     const policy = handoff();
     const fail = (code = 'provider_inference_failed') => administratorFailurePlan(job, code);
+    const answerFromProvider = (response) => {
+      const payload = response?.body;
+      if (response?.status < 200 || response?.status >= 300 || !payload || payload.error
+        || ['failed', 'queued', 'in_progress', 'cancelled'].includes(payload.status)) {
+        throw providerCallError(providerDiagnosticCode(response));
+      }
+      const choice = payload.choices?.[0];
+      const parts = Array.isArray(payload.output)
+        ? payload.output.flatMap((entry) => Array.isArray(entry.content) ? entry.content : []) : [];
+      const refusal = choice?.message?.refusal
+        || parts.filter((part) => part.type === 'refusal').map((part) => part.refusal || '').join('\n');
+      const answer = choice?.message?.content || payload.output_text
+        || parts.filter((part) => part.type === 'output_text').map((part) => part.text || '').join('\n') || refusal;
+      if (typeof answer !== 'string' || !answer.trim() || mechanicalFailureAnswer(answer)
+        || legacyGenericNonAnswer(answer)) throw providerCallError('invalid_response');
+      return answer.trim();
+    };
+    const planFromContext = (content, context) => {
+      const sources = Array.isArray(context?.sources) && context.sources.length <= 20
+        && context.sources.every((source) => typeof source === 'string' && source.length <= 2048)
+        ? context.sources : [];
+      const outcome = ['knowledge_hit', 'knowledge_miss'].includes(context?.outcome)
+        ? context.outcome : sources.length ? 'knowledge_hit' : 'knowledge_miss';
+      const tags = Array.isArray(context?.tags) && context.tags.length <= 20
+        && context.tags.every((tagName) => typeof tagName === 'string' && tagName.length <= 100)
+        ? context.tags : sources.length ? ['ai_replied'] : ['knowledge_miss'];
+      if (typeof content !== 'string' || !content.trim()
+        || Buffer.byteLength(content, 'utf8') > 8000) return fail('invalid_response');
+      return { type: 'text', content: content.trim(), ordinary: true, purpose,
+        ai: true, outcome, sources, tags };
+    };
+    if (providerPool() && providerReceiptMatches(job, job.provider_result_receipt, 'answer')
+      && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state)) {
+      try {
+        const replayed = await replayProviderResult(key, job, 'answer', execution);
+        if (!replayed || !await current()) return null;
+        const answer = answerFromProvider(replayed);
+        return planFromContext(answer, job.provider_result_receipt?.plan_context);
+      } catch (error) {
+        if (processingPermitLost(error)) throw error;
+        if (!error?.providerResponseUnknown) await writeProviderReceipt(key, job, execution,
+          providerReceiptRecord(job, 'answer', 'absent', null,
+            providerDiagnosticCode(null, error)));
+        return fail(providerDiagnosticCode(null, error));
+      }
+    }
     const base = String(env.ANYTHINGLLM_INTERNAL_URL || 'http://anythingllm:3001').replace(/\/+$/, '');
     let prepared, temperature;
     try {
@@ -3236,12 +3865,9 @@ function createRuntime(env = {}, options = {}) {
     const scores = sources.filter((source) => source.score_kind === 'cosine_similarity').map((source) => source.score);
     const low = !prepared.strong_lexical && scores.length > 0 && Math.max(...scores) < Number(policy.low_confidence?.minimum_score ?? 0.25);
     const miss = sources.length === 0 && policy.low_confidence?.require_sources === true && !administrator;
-    const plan = (content) => {
-      if (typeof content !== 'string' || !content.trim()
-        || Buffer.byteLength(content, 'utf8') > 8000) return fail('invalid_response');
-      return { type: 'text', content, ordinary: true, purpose, ai: true, outcome,
-        sources: sources.map((source) => source.docpath), tags: miss ? ['knowledge_miss'] : low ? ['low_confidence'] : ['ai_replied'] };
-    };
+    const planContext = { outcome, sources: sources.map((source) => source.docpath),
+      tags: miss ? ['knowledge_miss'] : low ? ['low_confidence'] : ['ai_replied'] };
+    const plan = (content) => planFromContext(content, planContext);
     // 要求知识来源却没有任何当前代来源时，保留原问题的应答责任等待资料恢复。
     // 这里不能继续调用 Provider：否则它只能猜测业务事实，或再次生成空泛追问并被误记为回答。
     if (miss) return fail('knowledge_miss');
@@ -3258,25 +3884,23 @@ function createRuntime(env = {}, options = {}) {
         if (!/^[A-Za-z][A-Za-z0-9-]{0,99}$/.test(name) || /^(host|content-length|content-type|authorization|cookie|connection|transfer-encoding|proxy-authorization)$/i.test(name) || typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value)) throw new Error('自定义请求头不安全');
       }
       const headers = { ...customHeaders, Authorization: 'Bearer ' + String(pool ? env.PROVIDER_ADAPTER_KEY || '' : env.AI_API_KEY || '') };
-      if (pool) headers['x-crispai-question'] = providerToken(key, job, 'answer');
       const body = apiMode === 'responses'
         ? { model, temperature, store: false, input: prepared.messages.map((message) => ({ role: message.role, content: [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: message.content }] })), max_output_tokens: 1200 }
         : { model, temperature, messages: prepared.messages, stream: false, ...(!pool ? { max_tokens: 1200 } : {}) };
-      const response = await guardedNetwork(providerBase + (apiMode === 'responses' ? '/responses' : '/chat/completions'), {
-        method: 'POST', timeout: inferenceRemaining(job) + 1000, headers, body,
-      }, execution);
+      const response = pool
+        ? await callProvider(key, job, 'answer', providerBase + '/chat/completions', headers, body,
+          planContext, execution)
+        : await guardedNetwork(providerBase + (apiMode === 'responses' ? '/responses' : '/chat/completions'), {
+          method: 'POST', timeout: inferenceRemaining(job) + 1000, headers, body,
+        }, execution);
       if (!await current()) return null;
-      const payload = response.body;
-      if (response.status < 200 || response.status >= 300 || !payload || payload.error || ['failed', 'queued', 'in_progress', 'cancelled'].includes(payload.status)) {
-        return fail(providerDiagnosticCode(response));
+      try { return plan(answerFromProvider(response)); }
+      catch (error) {
+        if (pool) await writeProviderReceipt(key, job, execution,
+          providerReceiptRecord(job, 'answer', 'absent', planContext,
+            providerDiagnosticCode(null, error)));
+        throw error;
       }
-      const choice = payload.choices?.[0];
-      const parts = Array.isArray(payload.output) ? payload.output.flatMap((entry) => Array.isArray(entry.content) ? entry.content : []) : [];
-      const refusal = choice?.message?.refusal || parts.filter((part) => part.type === 'refusal').map((part) => part.refusal || '').join('\n');
-      const answer = choice?.message?.content || payload.output_text || parts.filter((part) => part.type === 'output_text').map((part) => part.text || '').join('\n') || refusal;
-      if (typeof answer !== 'string' || !answer.trim() || mechanicalFailureAnswer(answer)
-        || legacyGenericNonAnswer(answer)) return fail('invalid_response');
-      return plan(answer.trim());
     } catch (error) { if (processingPermitLost(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
   };
   const administratorQuery = async (question, budgetMs = 0) => {
@@ -3299,9 +3923,14 @@ function createRuntime(env = {}, options = {}) {
     const revision = settings().revision;
     const prompt = applied.prompt.text;
     const maximum = pool?.policy.question_timeout_ms ?? 90000;
+    const configuration = pool ? providerConfiguration(pool) : null;
     const job = {id: crypto.randomBytes(32).toString('hex'), administrator: true, revision, data: {type: 'text'},
-      inference: {pool_revision: pool?.revision ?? null, deadline_at: clock() + Math.min(budgetMs || maximum, maximum),
-        attempt_generation: 1}};
+      inference: {runtime_revision: revision, pool_revision: pool?.revision ?? null,
+        ...(configuration ? {secrets_generation: configuration.secrets_generation,
+          pool_sha256: configuration.pool_sha256,
+          materials_source_sha256: configuration.materials_source_sha256,
+          configuration_binding: providerConfigurationBinding(configuration)} : {}),
+        deadline_at: clock() + Math.min(budgetMs || maximum, maximum), attempt_generation: 1}};
     const plan = await queryKnowledge('', job, question, '', [], 'admin_query', prompt, undefined);
     if (!plan || technicalFailure(plan) || typeof plan.content !== 'string' || !plan.content.trim()) {
       const error = new Error('知识问答测试未完成');
@@ -3869,6 +4498,7 @@ function createRuntime(env = {}, options = {}) {
           delete replacement.fingerprint;
           advanceResponseGeneration(stored);
           stored.plan = replacement; delete stored.inference;
+          delete stored.provider_result_receipt; delete stored.provider_migration_from;
           return true;
         });
         if (normalized) return 'retry';
@@ -4308,6 +4938,7 @@ function createRuntime(env = {}, options = {}) {
     let execution;
     let capacityDeferred = false;
     let reconciliationOnly = false;
+    let settlementOnly = false;
     try {
       job = await transaction(key, (state) => {
         const configurationReady = replyConfigurationReady();
@@ -4323,11 +4954,14 @@ function createRuntime(env = {}, options = {}) {
             else {
               pending.status = 'cancelled'; pending.retry_at = null; pending.lease_until = 0;
               markIntentionalSilence(pending, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-              delete pending.data; delete pending.plan; delete pending.inference; delete pending.deferred_configuration;
+              delete pending.data; delete pending.plan; delete pending.inference;
+              delete pending.provider_result_receipt; delete pending.provider_migration_from;
+              delete pending.deferred_configuration;
             }
           }
         }
         const candidates = state.jobs.filter((entry) => ['received', 'processing'].includes(entry.status)
+          && !providerSettlementOutstanding(entry)
           && (!entry.retry_at || entry.retry_at <= clock()));
         const cancelledReconciliations = state.jobs.filter((entry) => entry.status === 'cancelled'
           && uncertainDeliveryFor(state, entry) && (!entry.retry_at || entry.retry_at <= clock())
@@ -4338,12 +4972,22 @@ function createRuntime(env = {}, options = {}) {
         const requested = schedulable.find((entry) => entry.id === requestedId
           && !(entry.lease_until > clock())
           && (entry.control || entry.status === 'cancelled' || !operatorBarrier(state)));
+        const settlement = state.jobs.find((entry) => entry.id === requestedId
+          && providerSettlementDue(entry));
         const ordinary = operatorBarrier(state) ? cancelledReconciliations
           : schedulable.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence);
-        const selected = priority || controls[0] || requested || ordinary[0] || schedulable.find((entry) => entry.control);
+        const selected = priority || controls[0] || requested || settlement
+          || ordinary[0] || schedulable.find((entry) => entry.control);
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
         if (!selected.control && state.worker && state.worker.until > clock()) return null;
+        if (selected === settlement) {
+          token = crypto.randomBytes(12).toString('hex');
+          selected.provider_settlement.lease_token = token;
+          selected.provider_settlement.lease_until = clock() + 10000;
+          settlementOnly = true;
+          return JSON.parse(JSON.stringify(selected));
+        }
         reconciliationOnly = selected.status === 'cancelled';
         const reconciling = uncertainDeliveryFor(state, selected);
         // 调度停顿不改变问题语义。即使超过旧五分钟窗口，也继续处理原问题；
@@ -4371,6 +5015,10 @@ function createRuntime(env = {}, options = {}) {
       if (!job) return capacityDeferred
         ? { status: 'deferred', reason: 'processing_capacity' }
         : { status: 'idle' };
+      if (settlementOnly) {
+        const result = await retryProviderSettlement(key, job, token);
+        return { ...result, key, jobId: job.id };
+      }
       // 崩溃恢复可能直接消费已经冻结的 sent 回执而不再调用 makePlan()。
       // 保留 claim 时的计划供标签、欢迎菜单及最终责任记账使用。
       plan = job.plan;
@@ -4435,18 +5083,24 @@ function createRuntime(env = {}, options = {}) {
           // 未知 Crisp 回执必须先保留原正文和 fingerprint 对账；其它尚未出站的
           // 本项目计划在持久化前统一经过可见话术收敛层。
           if (!uncertainDeliveryFor(readState(key), job)) plan = normalizeVisitorPlan(job, plan);
-          await transaction(key, (state) => {
+          const planPersistence = await transaction(key, (state) => {
             const stored = state.jobs.find((entry) => entry.id === job.id);
             assertJobExecution(state, job, execution);
-            if (!stored || stored.status === 'cancelled') return;
+            if (!stored || stored.status === 'cancelled') return { persisted: false };
             stored.plan = plan;
+            const settlement = providerSettlementRecord(key, stored, plan);
+            if (settlement) stored.provider_settlement = settlement;
             if (plan.outcome && !stored.knowledge_counted) {
               stored.knowledge_counted = true;
               appendEvent('question');
               appendEvent(plan.outcome, { library_ids: sourceLibraries(plan.sources || []) });
             }
             if (job.human_changed && !stored.handoff_counted) { stored.handoff_counted = true; appendEvent('handoff', { reason: ['operator', 'resolve_operator'].includes(job.action) ? 'operator_reply' : 'confirmed_handoff' }); }
+            return { persisted: true,
+              settlement: settlement ? JSON.parse(JSON.stringify(settlement)) : null };
           });
+          if (planPersistence?.settlement) job.provider_settlement = planPersistence.settlement;
+          if (planPersistence?.persisted) await settleProviderPlan(key, job, plan, execution);
         }
         delivery = technicalFailure(plan) ? 'unresolved' : plan ? await send(key, job, plan, execution) : 'cancelled';
       }
@@ -4488,9 +5142,22 @@ function createRuntime(env = {}, options = {}) {
           } else if (delivery === 'unresolved' && stored.status !== 'cancelled') {
             const code = plan?.diagnostic_code || stored.failure_code || 'runtime_unavailable';
             markUnresolved(stored, code);
-            // 还没有形成可见答案时，下轮必须从原始问题重新规划；Crisp 已登记
-            // 的待发答案则由 send 保存在 stored.plan/outgoing 中继续对账。
-            if (technicalFailure(plan)) { delete stored.plan; delete stored.inference; }
+            // 还没有形成可见答案时保留原始责任。adapter 回程不确定时
+            // 必须保留同代信封先做只读 replay；已确认无结果才能释放本轮。
+            if (technicalFailure(plan)) {
+              delete stored.plan;
+              const receipt = stored.provider_result_receipt;
+              const uncertain = providerResultUncertain(stored);
+              if (!uncertain) {
+                // router 已明确没有该代结果，或本地请求身份已无法证明。
+                // 开启一个新的有界恢复代；同一代反复 route 只会撞上旧终态。
+                delete stored.inference;
+                if (receipt) {
+                  delete stored.provider_result_receipt;
+                  delete stored.provider_migration_from;
+                }
+              }
+            }
             appendEvent('answer_responsibility_unresolved', { reason: code });
           } else if (delivery === 'rate_limited' && stored.status !== 'cancelled') {
             const record = Object.values(state.outgoing || {}).find((entry) => entry?.job_id === stored.id
@@ -4508,6 +5175,8 @@ function createRuntime(env = {}, options = {}) {
             markUnresolved(stored, 'delivered_non_answer');
             delete stored.plan;
             delete stored.inference;
+            delete stored.provider_result_receipt;
+            delete stored.provider_migration_from;
           } else if (delivery === 'delivery_semantic_unknown' && stored.status !== 'cancelled') {
             markUnresolved(stored, 'delivery_semantic_unknown');
             stored.retry_at = clock() + 300000;
@@ -4609,6 +5278,8 @@ function createRuntime(env = {}, options = {}) {
                 markUnresolved(stored, 'delivered_non_answer');
                 delete stored.plan;
                 delete stored.inference;
+                delete stored.provider_result_receipt;
+                delete stored.provider_migration_from;
               } else if (confirmedReceiptCurrent === false) {
                 stored.status = 'done';
                 stored.retry_at = null;
@@ -4670,9 +5341,19 @@ function createRuntime(env = {}, options = {}) {
             } else if (stored.status !== 'cancelled' && !stored.control && stored.data && configurationShouldDefer() && configuredSettings().enabled === true && state.mode === 'ai') {
               stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
             } else if (stored.status !== 'cancelled') {
+              const persistedPlan = stored.plan && !technicalFailure(stored.plan);
               markUnresolved(stored, error?.code === 'OPERATOR_IDENTITY_PENDING'
-                ? 'operator_identity_pending' : 'runtime_processing_failed');
-              delete stored.plan; delete stored.inference;
+                ? 'operator_identity_pending' : persistedPlan
+                  ? 'persisted_plan_delivery_pending' : 'runtime_processing_failed');
+              if (!persistedPlan) {
+                delete stored.plan;
+                if (!providerResultUncertain(stored)) {
+                  const hadReceipt = Boolean(stored.provider_result_receipt);
+                  delete stored.inference;
+                  delete stored.provider_result_receipt;
+                  if (hadReceipt) delete stored.provider_migration_from;
+                }
+              }
             }
             if (stored.status === 'cancelled') settleUncertainDeliveries(state, stored,
               stored.responsibility_reason || 'conversation_state_changed');
@@ -4749,6 +5430,7 @@ function createRuntime(env = {}, options = {}) {
     })) return true;
     if (state.jobs.some((job) => job?.control === true && job.action === 'resolve_operator'
       && job.operator_resolution?.result === 'unknown' && job.data)) return true;
+    if (state.jobs.some((job) => providerSettlementDue(job, at))) return true;
     if (state.pending_feedback !== null && state.pending_feedback !== undefined) return true;
     if (Object.values(state.offers).some((offer) => feedbackOnly(offer)
       || Number.isFinite(offer?.expires_at) && offer.expires_at < at - 86400000)) return true;
@@ -4760,9 +5442,11 @@ function createRuntime(env = {}, options = {}) {
       if (visitorOutputNeedsNormalization(state, job)) return true;
       if (terminalLegacyNonAnswerNeedsMigration(state, job)) return true;
       if (job.status === 'processing' && !(job.lease_until > at)) return true;
-      if (job.status === 'received' && !(job.retry_at > at)) return true;
+      if (job.status === 'received' && !providerSettlementOutstanding(job)
+        && !(job.retry_at > at)) return true;
       return ['done', 'cancelled', 'failed'].includes(job.status)
         && job.responsibility_status !== 'unresolved_failure' && !uncertainDeliveryFor(state, job)
+        && !providerSettlementOutstanding(job)
         && !(job.received_at > at - outgoingRetentionMilliseconds);
     })) return true;
     if (Object.values(state.outgoing).some((record) => record && record.feedback_retired !== true
@@ -4820,14 +5504,22 @@ function createRuntime(env = {}, options = {}) {
       return /^[a-f0-9-]{16,64}$/.test(value) ? value : '';
     } catch (_) { return ''; }
   };
-  const readScanOwner = (lock) => {
-    let value;
-    try { value = safeRead(lock + '/owner.json', null, 4096); }
-    catch (_) { return null; }
-    return value?.schema_version === 1 && /^[a-f0-9]{32}$/.test(value.token || '')
+  const validScanOwner = (value) => value?.schema_version === 1
+      && /^[a-f0-9]{32}$/.test(value.token || '')
       && Number.isSafeInteger(value.pid) && value.pid > 0 && /^[a-f0-9-]{16,64}$/.test(value.boot_id || '')
       && /^[0-9]+$/.test(value.process_start || '') && Number.isFinite(value.started_at)
-      && Number.isFinite(value.heartbeat_at) ? value : null;
+      && Number.isFinite(value.heartbeat_at);
+  const readScanOwner = (lock) => {
+    let value;
+    let stat;
+    try {
+      stat = fs.lstatSync(lock + '/owner.json');
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+        || (stat.mode & 0o077) !== 0 || stat.size < 1 || stat.size > 4096) return null;
+      value = safeRead(lock + '/owner.json', null, 4096);
+    } catch (_) { return null; }
+    if (!validScanOwner(value)) return null;
+    return { ...value, heartbeat_at: Math.max(value.heartbeat_at, stat.mtimeMs) };
   };
   const syncManagedDirectory = (path) => {
     const descriptor = fs.openSync(path, 'r');
@@ -4841,17 +5533,6 @@ function createRuntime(env = {}, options = {}) {
       fs.writeFileSync(descriptor, content);
       fs.fsyncSync(descriptor);
     } finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
-  };
-  const writeScanOwner = (lock, owner) => {
-    const file = lock + '/owner.json';
-    // heartbeat 候选文件位于锁目录之外；进程在 rename 前退出只会
-    // 留下无影响的 sibling，不会把活动锁变成永久不可获取。
-    const temporary = lock + '.heartbeat-' + owner.token + '-' + crypto.randomBytes(6).toString('hex');
-    try {
-      writeExclusiveJson(temporary, owner, 4096);
-      fs.renameSync(temporary, file);
-      syncManagedDirectory(lock);
-    } finally { try { fs.unlinkSync(temporary); } catch (_) {} }
   };
   const scanLockContainsOnlyOwner = (lock) => {
     try {
@@ -5005,10 +5686,13 @@ function createRuntime(env = {}, options = {}) {
           if (!remnant || !removeCrashScanRemnant(lock, remnant, token)) return null;
           continue;
         }
-        if (Date.now() - existing.heartbeat_at <= 60000) return null;
         const sameBoot = existing.boot_id === bootId;
         const running = sameBoot ? processIdentity(existing.pid) : null;
-        if (sameBoot && (!running || !running.dead && running.process_start === existing.process_start)) return null;
+        // 完整 owner 带 boot_id、PID 与 /proc starttime。仍是同一进程时无论
+        // 心跳年龄都不能抢；读取身份未知时也保守等待。PID 已消失、被复用或
+        // 系统已重启则身份已经明确失效，无需额外让接收/人工控制停顿 60 秒。
+        if (sameBoot && (!running
+          || !running.dead && running.process_start === existing.process_start)) return null;
         const quarantine = lock + '.stale-' + token;
         try { fs.renameSync(lock, quarantine); } catch (error) {
           if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) continue;
@@ -5046,12 +5730,32 @@ function createRuntime(env = {}, options = {}) {
     return null;
   };
   const refreshScanLock = (lock, owner) => {
-    const current = readScanOwner(lock);
-    if (!current || current.token !== owner.token || current.pid !== owner.pid
-      || current.boot_id !== owner.boot_id || current.process_start !== owner.process_start) return false;
-    owner.heartbeat_at = Date.now();
-    writeScanOwner(lock, owner);
-    return true;
+    const file = lock + '/owner.json';
+    let descriptor;
+    let held;
+    try {
+      descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      held = fs.fstatSync(descriptor);
+      if (!held.isFile() || held.nlink !== 1 || (held.mode & 0o077) !== 0
+        || held.size < 1 || held.size > 4096) return false;
+      const current = JSON.parse(fs.readFileSync(descriptor, 'utf8'));
+      if (!validScanOwner(current) || current.token !== owner.token || current.pid !== owner.pid
+        || current.boot_id !== owner.boot_id || current.process_start !== owner.process_start) return false;
+      const at = Date.now();
+      const heartbeat = new Date(at);
+      // 只触碰已经打开并验证的 owner inode。若锁路径在复核期间已被新
+      // owner 接管，本次 futimes 仍落在旧 inode，绝不会覆盖新 token。
+      fs.futimesSync(descriptor, heartbeat, heartbeat);
+      owner.heartbeat_at = at;
+    } catch (_) { return false; }
+    finally { if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch (_) {} }
+    let visible;
+    try { visible = fs.lstatSync(file); } catch (_) { return false; }
+    if (!visible.isFile() || visible.isSymbolicLink() || visible.dev !== held.dev
+      || visible.ino !== held.ino) return false;
+    const confirmed = readScanOwner(lock);
+    return Boolean(confirmed && confirmed.token === owner.token && confirmed.pid === owner.pid
+      && confirmed.boot_id === owner.boot_id && confirmed.process_start === owner.process_start);
   };
   const catchup = async () => {
     ensureDirectory();
@@ -5160,14 +5864,18 @@ function createRuntime(env = {}, options = {}) {
                 else {
                   job.status = 'cancelled'; job.retry_at = null;
                   markIntentionalSilence(job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-                  delete job.data; delete job.plan; delete job.inference; delete job.deferred_configuration;
+                  delete job.data; delete job.plan; delete job.inference;
+                  delete job.provider_result_receipt; delete job.provider_migration_from;
+                  delete job.deferred_configuration;
                 }
               }
             }
-            const due = state.jobs.filter((job) => job.status === 'received' && !(job.retry_at > clock()));
+            const due = state.jobs.filter((job) => job.status === 'received'
+              && !providerSettlementOutstanding(job) && !(job.retry_at > clock()));
             const reconciliationDue = state.jobs.filter((job) => job.status === 'cancelled'
               && uncertainDeliveryFor(state, job) && !(job.retry_at > clock())
               && uncertainDeliveriesFor(state, job).some(([, record]) => !(record.next_action_at > clock())));
+            const settlementDue = state.jobs.filter((job) => providerSettlementDue(job));
             const priority = due.filter((job) => priorityConfirmation(job) && !(job.lease_until > clock()))
               .sort((left, right) => left.sequence - right.sequence)[0];
             const control = due.filter((job) => job.control && !(job.lease_until > clock()))
@@ -5177,7 +5885,9 @@ function createRuntime(env = {}, options = {}) {
               ? due.filter((job) => !job.control).sort((left, right) => left.sequence - right.sequence)[0] : null;
             const reconciliation = !workerBusy
               ? reconciliationDue.sort((left, right) => left.sequence - right.sequence)[0] : null;
-            const candidate = priority || control || reconciliation || ordinary;
+            const settlement = !workerBusy
+              ? settlementDue.sort((left, right) => left.sequence - right.sequence)[0] : null;
+            const candidate = priority || control || reconciliation || settlement || ordinary;
             return candidate ? { key, jobId: candidate.id, control: candidate.control === true } : null;
           });
           if (selected) jobs.push(selected);

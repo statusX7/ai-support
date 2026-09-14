@@ -1607,6 +1607,19 @@ doctor_provider_pool_files() {
     doctor_add provider.rag_transaction '主备配置应用事务' PASS critical '无未完成的接口池应用事务' filesystem '' "$start"
   fi
   start=$(doctor_now_ms)
+  if doctor_timeout 5 python3 "${DOCTOR_DIR}/provider-pool.py" --deploy-dir "$DOCTOR_DEPLOY_DIR" readback \
+    > "${DOCTOR_TEMP_ROOT}/provider-pool-readback-status.json" 2>/dev/null \
+    && jq -e '.ok == true and .state == "verified" and (.revision | type == "number")
+      and (.entries | type == "number" and . > 0 and . <= 21)
+      and (.verified_at | type == "number" and . > 0)' \
+      "${DOCTOR_TEMP_ROOT}/provider-pool-readback-status.json" >/dev/null 2>&1; then
+    doctor_add provider.readback '主备推理准入回执' PASS critical '准入回执与当前有效投影、秘密代次及原始文件摘要一致；实时组件身份另见 adapter 检查' filesystem '' "$start"
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.readback '主备推理准入回执' filesystem "$start"
+  else
+    doctor_add provider.readback '主备推理准入回执' FAIL critical '当前接口池没有可信的同代准入回执，推理已保持暂停' filesystem '先恢复未完成配置事务，再执行受管 verify-applied；不要手动伪造回读文件' "$start"
+  fi
+  start=$(doctor_now_ms)
   aggregate=$(jq -er '[.entries[] | . as $entry | select(.enabled == true and .draft != true
     and $entry.capabilities[$entry.api_mode] == true) | .context_window] | max' \
     "${DOCTOR_TEMP_ROOT}/provider-pool.json" 2>/dev/null || true)
@@ -1727,7 +1740,7 @@ doctor_pool_adapter_check() {
   hook_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_HOOK_SECRET 2>/dev/null || true)
   plugin_secret=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_PLUGIN_SIGNING_SECRET 2>/dev/null || true)
   if doctor_container_env_binding n8n \
-    'CRISP_WEBSITE_ID,CRISP_API_BASE_URL,CRISP_TOKEN_TIER,CRISP_AUTH_B64,CRISP_HOOK_MODE,CRISP_WEBSITE_HOOK_SECRET,CRISP_PLUGIN_SIGNING_SECRET,WEBHOOK_URL,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,PROVIDER_ADAPTER_URL,PROVIDER_ADAPTER_KEY,PROVIDER_POOL_REQUIRED' \
+    'CRISP_WEBSITE_ID,CRISP_API_BASE_URL,CRISP_TOKEN_TIER,CRISP_AUTH_B64,CRISP_HOOK_MODE,CRISP_WEBSITE_HOOK_SECRET,CRISP_PLUGIN_SIGNING_SECRET,WEBHOOK_URL,ANYTHINGLLM_API_KEY,ANYTHINGLLM_WORKSPACE,PROVIDER_ADAPTER_URL,PROVIDER_ADAPTER_KEY,PROVIDER_POOL_REQUIRED,PROVIDER_POOL_READBACK_REQUIRED' \
     "${DOCTOR_TEMP_ROOT}/n8n-runtime-binding.txt" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_WEBSITE_ID)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_API_BASE_URL 2>/dev/null || printf 'https://api.crisp.chat/v1')" \
@@ -1735,7 +1748,7 @@ doctor_pool_adapter_check() {
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" CRISP_HOOK_MODE)" "${hook_secret:-not-configured}" "${plugin_secret:-not-configured}" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PUBLIC_WEBHOOK_URL)" "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY)" \
     "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE)" http://provider-adapter:8787/v1 \
-    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY)" true; then
+    "$(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_ADAPTER_KEY)" true true; then
     doctor_add n8n.runtime_binding 'n8n AI/Crisp 运行接线' PASS critical '当前 Crisp/AnythingLLM 认证和共享主备推理入口一致' docker '' "$start"
   elif ! doctor_remaining >/dev/null 2>&1; then
     doctor_deadline_add n8n.runtime_binding 'n8n AI/Crisp 运行接线' docker "$start"
@@ -1749,9 +1762,13 @@ doctor_pool_adapter_check() {
       .then(async r=>{const b=await r.json();if(!r.ok||b.ok!==true)throw Error();process.stdout.write(JSON.stringify(b));})
       .catch(()=>{process.exitCode=1;});
   ' < /dev/null > "$output" 2>/dev/null \
-    && jq -e --slurpfile expected "${DOCTOR_TEMP_ROOT}/provider-pool.json" \
-      '.ok == true and .configuration_state == "applied" and .revision == $expected[0].revision and (.entries | type == "array" and length > 0) and
-       ([.entries[]|{id,enabled}]|sort_by(.id)) == ([$expected[0].entries[]|{id,enabled}]|sort_by(.id)) and
+    && jq -e --slurpfile expected "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" \
+      --arg pool_sha "$(sha256sum "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" | awk '{print $1}')" \
+      '.ok == true and .readback_contract_version == 1 and .configuration_state == "applied"
+       and .revision == $expected[0].revision
+       and .secrets_generation == $expected[0].secrets_generation and .pool_sha256 == $pool_sha
+       and (.entries | type == "array" and length > 0) and
+       ([.entries[]|{id,enabled}]) == ([$expected[0].entries[]|{id,enabled}]) and
        all(.entries[]; (.health == "healthy" or .health == "cooling" or .health == "unknown" or .health == "half_open" or (.enabled == false and .health == "disabled")))' "$output" >/dev/null 2>&1; then
     doctor_add provider.adapter '主备 adapter 实际读取' PASS critical 'AnythingLLM 网络通过内部认证读取当前接口池，配置应用代次一致；未调用模型' docker '' "$start"
     count=$(jq '[.entries[]|select(.enabled)]|length' "$output")
@@ -1956,6 +1973,7 @@ doctor_runtime_state_check() {
   local start now sessions invalid legacy human timed permanent active_workers stale_workers pending_jobs file counts deadline_reached=0
   local feedback_pending=0 feedback_count=0
   local responsibility_pending=0 unresolved_jobs=0 intentional_silence=0 unknown_deliveries=0
+  local provider_settlements=0 invalid_settlements=0 settlement_count invalid_settlement_count
   local oldest_unresolved=0 oldest_unknown=0 pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown
   start=$(doctor_now_ms)
   now=$(doctor_now_ms)
@@ -1999,10 +2017,14 @@ doctor_runtime_state_check() {
       ([.jobs[]? | select(.responsibility_status == "intentional_silence")] | length),
       ([.outgoing[]? | select(.status == "unknown" or .status == "sending")] | length),
       ([.jobs[]? | select(.responsibility_status == "unresolved_failure") | (.failure_since // .received_at // 0)] | min // 0),
-      ([.outgoing[]? | select(.status == "unknown" or .status == "sending") | (.created_at // 0)] | min // 0)
+      ([.outgoing[]? | select(.status == "unknown" or .status == "sending") | (.created_at // 0)] | min // 0),
+      ([.jobs[]? | select(.provider_settlement.state == "pending" or
+        .provider_settlement.state == "deferred" or .provider_settlement.state == "invalid")] | length),
+      ([.jobs[]? | select(.provider_settlement.state == "invalid")] | length)
     ] | @tsv' "$file")
     read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count \
-      pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown <<< "$counts"
+      pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown \
+      settlement_count invalid_settlement_count <<< "$counts"
     human=$((human+human_count)); timed=$((timed+timed_count)); permanent=$((permanent+permanent_count))
     active_workers=$((active_workers+active_count)); stale_workers=$((stale_workers+stale_count)); pending_jobs=$((pending_jobs+job_count))
     feedback_pending=$((feedback_pending+feedback_count))
@@ -2010,6 +2032,8 @@ doctor_runtime_state_check() {
     unresolved_jobs=$((unresolved_jobs+unresolved_count))
     intentional_silence=$((intentional_silence+silence_count))
     unknown_deliveries=$((unknown_deliveries+unknown_count))
+    provider_settlements=$((provider_settlements+settlement_count))
+    invalid_settlements=$((invalid_settlements+invalid_settlement_count))
     if (( file_oldest_unresolved > 0 && (oldest_unresolved == 0 || file_oldest_unresolved < oldest_unresolved) )); then oldest_unresolved=$file_oldest_unresolved; fi
     if (( file_oldest_unknown > 0 && (oldest_unknown == 0 || file_oldest_unknown < oldest_unknown) )); then oldest_unknown=$file_oldest_unknown; fi
   done
@@ -2040,6 +2064,22 @@ doctor_runtime_state_check() {
   else
     doctor_add runtime.answer_responsibilities '应答责任' PASS critical \
       "当前无未完成故障或未知发送；明确政策静默 ${intentional_silence}" filesystem '' "$start"
+  fi
+  if (( deadline_reached || invalid > 0 )); then
+    doctor_add runtime.provider_settlements '推理结果持久结算' WARN critical \
+      '会话状态未完整读取，不能断言所有已持久答案均已释放临时推理缓存' filesystem \
+      '先修复会话状态读取；自检不会删除推理结果或客户任务' "$start"
+  elif (( invalid_settlements > 0 )); then
+    doctor_add runtime.provider_settlements '推理结果持久结算' FAIL critical \
+      "发现 ${invalid_settlements} 项结算身份损坏；待结算总数 ${provider_settlements}" filesystem \
+      '检查当前 runtime 与 adapter 身份；不要删除会话任务或问题缓存来消除告警' "$start"
+  elif (( provider_settlements > 0 )); then
+    doctor_add runtime.provider_settlements '推理结果持久结算' WARN warning \
+      "有 ${provider_settlements} 项已持久答案等待 adapter 确认；不会重新推理或重复发送" filesystem \
+      '检查 adapter 与五秒任务扫描；恢复后会用原签名身份继续结算' "$start"
+  else
+    doctor_add runtime.provider_settlements '推理结果持久结算' PASS warning \
+      '当前没有延后的推理结果结算' filesystem '' "$start"
   fi
   if (( deadline_reached || invalid > 0 )); then
     doctor_add runtime.feedback '自动评价邀请' WARN warning '会话扫描未完整完成，未对未检查的旧评价状态作成功判断' filesystem '修复上述会话检查问题后重试；自检不会删除任何任务' "$start"
