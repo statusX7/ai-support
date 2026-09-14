@@ -3,6 +3,7 @@
 // 生产 runtime -> 生产 provider-adapter 子进程 -> 两个受控上游。
 // 本文件验证访客最终出站与进程崩溃恢复，不是真实 Crisp/Provider E2E。
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -21,6 +22,77 @@ const writeJson = (file, value) => {
   fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
 };
 const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const canonical = (value) => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort()
+    .map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const sealMaterials = (value) => {
+  const runtime = structuredClone(value.configuration.runtime);
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  value.source_components = {
+    runtime: digest(canonical(runtime)),
+    handoff: digest(canonical(value.configuration.handoff)),
+    keyword: digest(canonical(value.configuration.keyword)),
+    menu: digest(canonical(value.configuration.menu)),
+    tags: digest(canonical(value.configuration.tags)),
+    feedback: digest(canonical(value.configuration.feedback)),
+    prompt: value.prompt.sha256,
+    knowledge: digest(canonical(value.knowledge)),
+  };
+  value.source_sha256 = digest(canonical(value.source_components));
+  return value;
+};
+const assertReplyReadyMaterials = (root, materials) => {
+  const mapRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-map.json'));
+  const settingsRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-settings.json'));
+  const profileRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-profile.json'));
+  const lexicalRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-lexical.json'));
+  const map = JSON.parse(mapRaw);
+  const settings = JSON.parse(settingsRaw);
+  const profile = JSON.parse(profileRaw);
+  const lexical = JSON.parse(lexicalRaw);
+  assert.equal(materials.schema_version, 2);
+  assert.equal(materials.state, 'applied');
+  assert.equal(materials.configuration.runtime.enabled, true);
+  assert.equal(materials.configuration.runtime.revision, materials.revision);
+  assert.equal(materials.configuration.runtime.applied_revision, materials.revision);
+  assert.equal(materials.prompt.bytes, Buffer.byteLength(materials.prompt.text));
+  assert.equal(materials.prompt.sha256, digest(materials.prompt.text));
+  assert.equal(materials.knowledge.map_sha256, digest(mapRaw));
+  assert.equal(materials.knowledge.settings_sha256, digest(settingsRaw));
+  assert.equal(materials.knowledge.profile_sha256, digest(profileRaw));
+  assert.equal(materials.knowledge.lexical_sha256, digest(lexicalRaw));
+  assert.equal(map.schema_version, 2);
+  assert.equal(materials.knowledge.enabled_document_count, map.documents.length);
+  assert.deepEqual(materials.knowledge.enabled_library_ids,
+    [...new Set(map.documents.map((item) => item.library_id))].sort());
+  assert.equal(settings.schema_version, 1);
+  assert.equal(settings.workspace_slug, 'synthetic');
+  assert.equal(typeof settings.temperature, 'number');
+  assert.equal(profile.state, 'applied');
+  assert.equal(profile.fingerprint, digest(canonical(profile.profile)));
+  assert.equal(lexical.schema_version, 2);
+  assert.equal(lexical.map_sha256, digest(mapRaw));
+  const { payload_sha256: lexicalDigest, ...lexicalPayload } = lexical;
+  assert.equal(lexicalDigest, digest(canonical(lexicalPayload)));
+  const runtime = structuredClone(materials.configuration.runtime);
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  assert.deepEqual(materials.source_components, {
+    runtime: digest(canonical(runtime)),
+    handoff: digest(canonical(materials.configuration.handoff)),
+    keyword: digest(canonical(materials.configuration.keyword)),
+    menu: digest(canonical(materials.configuration.menu)),
+    tags: digest(canonical(materials.configuration.tags)),
+    feedback: digest(canonical(materials.configuration.feedback)),
+    prompt: materials.prompt.sha256,
+    knowledge: digest(canonical(materials.knowledge)),
+  });
+  assert.equal(materials.source_sha256, digest(canonical(materials.source_components)));
+  assert.equal(fs.existsSync(path.join(root, 'data/runtime/knowledge-migration.json')), false);
+};
 const until = async (check, timeout = 5000) => {
   const deadline = Date.now() + timeout;
   let last;
@@ -102,10 +174,38 @@ async function fixture(label, behavior) {
   fs.writeFileSync(path.join(root, 'config/prompt.md'), prompt, { mode: 0o600 });
   writeJson(path.join(root, 'config/runtime.yaml'), { schema_version: 2, enabled: true, revision: 1, applied_revision: 1 });
   const projection = 'kb_1111111111111111_doc_2222222222222222.md';
-  writeJson(path.join(root, 'data/runtime/knowledge-map.json'), { schema_version: 2, revision: 1, documents: [{
+  const mapPath = path.join(root, 'data/runtime/knowledge-map.json');
+  writeJson(mapPath, { schema_version: 2, revision: 1, documents: [{
     library_id: 'kb_1111111111111111', library_name: '受控资料', document_id: 'doc_2222222222222222', projection,
     location: `custom-documents/${projection}-33333333-3333-4333-8333-333333333333.json`,
   }] });
+  const settingsPath = path.join(root, 'data/runtime/knowledge-settings.json');
+  writeJson(settingsPath, { schema_version: 1, workspace_slug: 'synthetic', temperature: 0.25, observed_at: now });
+  const profileValue = { engine: 'native', model: 'synthetic-provider-failure-embedding', chunk_size: 1000,
+    chunk_overlap: 20, passage_prefix: '', query_prefix: '', component_version: 'synthetic' };
+  const profilePath = path.join(root, 'data/runtime/knowledge-profile.json');
+  writeJson(profilePath, { schema_version: 1, state: 'applied', profile: profileValue,
+    fingerprint: digest(canonical(profileValue)), applied_at: now });
+  const mapRaw = fs.readFileSync(mapPath);
+  const lexicalPayload = { schema_version: 2, algorithm: 'crispai-lexical-v2', map_sha256: digest(mapRaw),
+    complete: false, coverage: { source_documents: 1, indexed_documents: 0, omitted_documents: 1,
+      source_bytes: 1, indexed_bytes: 0, omitted_bytes: 1, reasons: ['index_capacity'] }, passages: [] };
+  const lexicalPath = path.join(root, 'data/runtime/knowledge-lexical.json');
+  writeJson(lexicalPath, { ...lexicalPayload, payload_sha256: digest(canonical(lexicalPayload)) });
+  const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']
+    .map((name) => [name, readJson(path.join(root, `config/${name}.yaml`))]));
+  const materials = sealMaterials({ schema_version: 2, state: 'applied', revision: 1, applied_at: now,
+    source_sha256: '', source_components: {}, configuration,
+    prompt: { text: prompt, bytes: Buffer.byteLength(prompt), sha256: digest(prompt) },
+    knowledge: {
+      catalog_revision: 1, catalog_sha256: digest(canonical({ fixture: 'catalog', documents: 1 })),
+      manifest_sha256: digest(canonical({ fixture: 'manifest', projection })), map_sha256: digest(mapRaw),
+      settings_sha256: digest(fs.readFileSync(settingsPath)), profile_sha256: digest(fs.readFileSync(profilePath)),
+      lexical_sha256: digest(fs.readFileSync(lexicalPath)), enabled_library_ids: ['kb_1111111111111111'],
+      library_count: 1, document_count: 1, enabled_document_count: 1,
+    } });
+  writeJson(path.join(root, 'config/materials-applied.json'), materials);
+  assertReplyReadyMaterials(root, materials);
 
   let upstreamBehavior = behavior;
   const upstream = http.createServer(async (request, response) => {
@@ -275,7 +375,8 @@ async function fixture(label, behavior) {
   const deliver = async (body) => {
     const accepted = await receive(body);
     assert.equal(accepted.accepted, true);
-    return accepted.route === 'process' ? runtime.process(accepted.key, accepted.jobId) : accepted;
+    assert.equal(accepted.route, 'process', 'reply-ready fixture 必须直接进入 Provider 处理链');
+    return runtime.process(accepted.key, accepted.jobId);
   };
   const state = (session) => runtime.readState(runtime.stateKey(env.CRISP_WEBSITE_ID, session));
   const close = async () => {
