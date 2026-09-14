@@ -2193,7 +2193,7 @@ function createRuntime(env = {}, options = {}) {
             global_disable_epoch: runtimeDisableEpoch(configuredSettings()), control: true,
             action: 'resolve_operator', responsibility_status: 'unresolved_failure',
             failure_code: 'catchup_message_invalid', catchup_unresolved_id: item.id,
-            lease_until: 0, retry_at: null };
+            lease_until: 0, retry_at: null });
         }
         if (!current.uncertain_events.includes(barrierId)) current.uncertain_events.push(barrierId);
         for (const pending of current.jobs) {
