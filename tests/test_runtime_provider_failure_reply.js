@@ -292,6 +292,8 @@ async function fixture(label, behavior) {
   let retirementTransportFailures = 0;
   let pendingRetirementResponseGate = null;
   let activeRetirementResponseGate = null;
+  const ragVectorClientFailures = [];
+  let activeRagVectorClientFailure = null;
   let upstreamPhase = 'runtime';
   let now = Date.now();
   for (const name of ['config', 'data/runtime', 'data/analytics', 'tmp']) {
@@ -554,6 +556,28 @@ async function fixture(label, behavior) {
     const isRag = parsed.port === String(rag.address()?.port || '');
     let response;
     try {
+      const isVectorSearch = isRag && options.method === 'POST'
+        && parsed.pathname === '/api/v1/workspace/synthetic/vector-search';
+      if (isVectorSearch && ragVectorClientFailures.length) {
+        const injected = ragVectorClientFailures.shift();
+        if (injected.wait) {
+          activeRagVectorClientFailure = injected;
+          injected.arrived();
+          try { await injected.wait; }
+          finally {
+            if (activeRagVectorClientFailure === injected) activeRagVectorClientFailure = null;
+          }
+        }
+        const cause = new Error('受控底层连接已关闭');
+        cause.code = 'UND_ERR_SOCKET';
+        const error = new TypeError('受控向量客户端传输失败', { cause });
+        fetchFailureDetails.set(error, {
+          fetch_phase: 'fetch_pending', local_timeout_fired: false,
+          nested_error_kind: 'socket_closed_or_reset', nested_cause_present: true,
+          aggregate_present: false,
+        });
+        throw error;
+      }
       response = await fetchJson(url, options);
       if (isRag) ragClientResults.push({
         kind: options.method === 'GET' ? 'workspace_read' : 'vector_search',
@@ -708,6 +732,8 @@ async function fixture(label, behavior) {
   const close = async () => {
     pendingRetirementResponseGate?.release();
     activeRetirementResponseGate?.release();
+    activeRagVectorClientFailure?.release?.();
+    for (const pending of ragVectorClientFailures) pending.release?.();
     fs.renameSync = originalRenameSync;
     await stopAdapter();
     for (const server of [rag, upstream]) server.closeAllConnections();
@@ -720,6 +746,29 @@ async function fixture(label, behavior) {
     event, receive, deliver, state,
     get adapterBase() { return adapterBase; },
     setBehavior(value) { upstreamBehavior = value; },
+    queueRagVectorClientFailures(count = 1) {
+      assert.equal(Number.isSafeInteger(count) && count >= 1 && count <= 2, true,
+        '向量客户端故障注入次数只允许1或2');
+      assert.equal(activeRagVectorClientFailure === null
+        && ragVectorClientFailures.length + count <= 2, true,
+        '向量客户端故障队列总数不得超过2');
+      for (let index = 0; index < count; index += 1) ragVectorClientFailures.push({});
+    },
+    holdNextRagVectorClientFailure() {
+      assert.equal(activeRagVectorClientFailure === null
+        && ragVectorClientFailures.length === 0, true,
+        '受控门必须是队列中的下一个向量客户端故障');
+      let arrivedResolve;
+      let releaseResolve;
+      const arrived = new Promise((resolve) => { arrivedResolve = resolve; });
+      const waiting = new Promise((resolve) => { releaseResolve = resolve; });
+      const entry = { wait: waiting, arrived: arrivedResolve, release: releaseResolve };
+      ragVectorClientFailures.push(entry);
+      return { arrived, release: () => entry.release() };
+    },
+    ragVectorClientFailuresPending() {
+      return ragVectorClientFailures.length + Number(activeRagVectorClientFailure !== null);
+    },
     dropNextAdapterResponse() { dropNextAdapterResponse = true; },
     failNextSettlementWriteback() { armSettlementWritebackFailure = true; },
     failNextSettlementRequest() { settlementTransportFailures += 1; },
@@ -815,6 +864,51 @@ const advancePastRetry = (fixture, event, jobId) => {
   const job = pendingJob(fixture, event, jobId);
   assert(job && Number.isFinite(job.retry_at), '未完成责任必须登记下一次恢复时间');
   fixture.advance(Math.max(1, job.retry_at - fixture.now() + 1));
+};
+const deliverThroughHeldVectorFailure = async (fixture, event, control) => {
+  const gate = fixture.holdNextRagVectorClientFailure();
+  const observed = fixture.deliver(event).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  let timer;
+  let waitFailure;
+  let controlFailure;
+  try {
+    const winner = await Promise.race([
+      gate.arrived.then(() => ({ kind: 'arrived' })),
+      observed.then((outcome) => ({ kind: 'operation', outcome })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), 5000);
+      }),
+    ]);
+    if (winner.kind === 'operation') {
+      waitFailure = winner.outcome.ok
+        ? new Error('受控向量故障到达前处理已意外结束')
+        : winner.outcome.error;
+    } else if (winner.kind === 'timeout') {
+      waitFailure = new Error('向量客户端故障未在期限内到达受控门');
+    } else {
+      try { await control(); }
+      catch (error) { controlFailure = error; }
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    gate.release();
+  }
+  let settleTimer;
+  const settled = await Promise.race([
+    observed.then((outcome) => ({ kind: 'settled', outcome })),
+    new Promise((resolve) => {
+      settleTimer = setTimeout(() => resolve({ kind: 'timeout' }), 5000);
+    }),
+  ]);
+  if (settleTimer !== undefined) clearTimeout(settleTimer);
+  if (controlFailure) throw controlFailure;
+  if (waitFailure) throw waitFailure;
+  if (settled.kind === 'timeout') throw new Error('释放向量故障门后处理未在期限内收敛');
+  if (!settled.outcome.ok) throw settled.outcome.error;
+  return settled.outcome.value;
 };
 
 let passed = 0;
@@ -2061,7 +2155,8 @@ async function test(name, action) {
     assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 1);
     assert.equal(f.sent.length, 0);
     assert.equal(f.signedProviderPayloads.filter((entry) =>
-      entry.path === '/internal/provider/retire').length, 2);
+      entry.path === '/internal/provider/retire').length, 1,
+      'direct adapter调用由独立回执证明；签名采集数组只统计runtime发出的退休请求');
   });
 
   await test('旧退休HTTP响应迟到时不能覆盖真人接管后的新purpose与identity', async (f) => {
@@ -2921,6 +3016,132 @@ async function test(name, action) {
     assert.equal((await f.process(first.key, first.jobId)).status, 'idle');
     assert.equal(f.calls.length, 5);
     assert.equal(f.sent.length, 1);
+  });
+
+  await test('向量客户端一次瞬态传输失败由同一问题预算恢复且不放大Provider或Crisp出站', async (f) => {
+    f.queueRagVectorClientFailures(1);
+    const event = f.event('vector-client-retry-once');
+    const result = await f.deliver(event);
+    assert.equal(result.status, 'sent');
+    assert.deepEqual(f.ragClientResults.map((entry) => [entry.kind, entry.outcome,
+      entry.nested_error_kind || '', entry.status || 0]), [
+      ['vector_search', 'error', 'socket_closed_or_reset', 0],
+      ['vector_search', 'response', '', 200],
+    ]);
+    assert.deepEqual(f.ragClientResults[0], {
+      kind: 'vector_search', outcome: 'error', error_kind: 'other_error',
+      fetch_phase: 'fetch_pending', local_timeout_fired: false,
+      nested_error_kind: 'socket_closed_or_reset', nested_cause_present: true,
+      aggregate_present: false, timeout_ms: 7000, execution_aborted: false,
+    }, '故障记录只能保留固定分类和受控数值');
+    const vectorRequests = f.ragServerRequests.filter((entry) => entry.kind === 'vector_search');
+    assert.equal(vectorRequests.length, 1,
+      '客户端前沿失败不得到达服务端，恢复轮只允许一个完整向量请求');
+    assert.equal(vectorRequests[0].body_read, true);
+    assert.equal(vectorRequests[0].response_started, true);
+    assert.equal(vectorRequests[0].finished, true);
+    assert.deepEqual(f.calls.map((call) => call.index), [0]);
+    assert.equal(f.crispPostAttempts.length, 1);
+    assertSingleBusinessReply(f);
+    const stored = pendingJob(f, event, result.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.responsibility_status, 'answered_confirmed');
+    assert.equal(stored.inference_generation, 1);
+    assert.equal(Number(stored.response_generation || 0), 0);
+    const question = f.question(result.jobId);
+    assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts],
+      [1, 1, 1], '向量重试不能计入Provider上游调用审计');
+    assert.equal(f.ragVectorClientFailuresPending(), 0);
+    assert.equal((await f.process(result.key, result.jobId)).status, 'idle');
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.sent.length, 1);
+  });
+
+  await test('向量客户端连续两次传输失败严格封顶并保留同一未回答责任', async (f) => {
+    f.queueRagVectorClientFailures(2);
+    const event = f.event('vector-client-retry-capped');
+    const result = await f.deliver(event);
+    assert.equal(result.status, 'unresolved');
+    assert.equal(f.ragClientResults.length, 2);
+    assert.equal(f.ragClientResults.every((entry) => entry.kind === 'vector_search'
+      && entry.outcome === 'error' && entry.nested_error_kind === 'socket_closed_or_reset'), true);
+    assert.equal(f.ragServerRequests.filter((entry) => entry.kind === 'vector_search').length, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/v1/chat/completions').length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+    const stored = pendingJob(f, event, result.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'retrieval_unavailable');
+    assert.equal(stored.data?.content, event.data.content);
+    assert.equal(stored.inference_generation, 1);
+    assert.equal(stored.inference, undefined);
+    assert.equal(fs.existsSync(f.questionPath(result.jobId)), false);
+    assert.equal(Number.isFinite(stored.retry_at) && stored.retry_at > f.now(), true);
+    assert.equal(f.ragVectorClientFailuresPending(), 0);
+    assert.equal((await f.process(result.key, result.jobId)).status, 'idle');
+    assert.equal(f.ragClientResults.length, 2, '退避未到期不得形成第三次向量请求');
+  });
+
+  await test('向量重试窗口内真人接管后立即停止且不调用Provider或发送正文', async (f) => {
+    const event = f.event('vector-retry-human-cancel');
+    const result = await deliverThroughHeldVectorFailure(f, event,
+      () => f.enterHumanMode(event.data.session_id));
+    assert.equal(result.status, 'cancelled');
+    assert.equal(f.ragClientResults.length, 1);
+    assert.equal(f.ragServerRequests.filter((entry) => entry.kind === 'vector_search').length, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+    const stored = pendingJob(f, event, result.jobId);
+    assert.equal(f.state(event.data.session_id).mode, 'human');
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'human_handoff');
+    assert.equal(f.ragVectorClientFailuresPending(), 0);
+  });
+
+  await test('向量重试窗口内客服总开关关闭后不再请求或出站', async (f) => {
+    const event = f.event('vector-retry-global-off');
+    const result = await deliverThroughHeldVectorFailure(f, event,
+      () => { f.publishRuntime(false); });
+    assert.equal(result.status, 'cancelled');
+    assert.equal(f.ragClientResults.length, 1);
+    assert.equal(f.ragServerRequests.filter((entry) => entry.kind === 'vector_search').length, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+    const stored = pendingJob(f, event, result.jobId);
+    assert.equal(f.state(event.data.session_id).mode, 'ai');
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'global_disabled');
+    assert.equal(f.ragVectorClientFailuresPending(), 0);
+  });
+
+  await test('向量重试前总问题预算耗尽时不取得第二次请求权', async (f) => {
+    const event = f.event('vector-retry-budget-expired');
+    const result = await deliverThroughHeldVectorFailure(f, event, () => {
+      const stored = f.state(event.data.session_id).jobs
+        .find((entry) => entry.data?.fingerprint === event.data.fingerprint);
+      assert.equal(Number.isSafeInteger(stored?.inference?.deadline_at), true,
+        '受控请求必须已持久化本代问题截止时间');
+      f.advance(Math.max(1, stored.inference.deadline_at - f.now() + 1));
+    });
+    assert.equal(result.status, 'unresolved');
+    assert.equal(f.ragClientResults.length, 1);
+    assert.equal(f.ragServerRequests.filter((entry) => entry.kind === 'vector_search').length, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+    const stored = pendingJob(f, event, result.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'question_budget_exhausted');
+    assert.equal(stored.data?.content, event.data.content);
+    assert.equal(f.ragVectorClientFailuresPending(), 0);
   });
 
   writeJson(path.join(base, 'result.json'), { layer: 'UNIT/PROTOCOL', passed, failed: 0, real_external: false });
