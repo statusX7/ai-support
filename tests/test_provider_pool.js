@@ -942,10 +942,15 @@ async function main() {
   await test('人工接管、总开关、池热改取消在途且不记上游故障',async()=>{
     for(const control of ['human','global','pool']) {
       const f=await fixture(2);try {
-        f.behavior=async()=>{await sleep(400);return false;};const sessionKey='a'.repeat(64),envelope=f.envelope('answer',{scope:'conversation',session_key:sessionKey,generation:2});
-        const session={schema_version:2,mode:'ai',generation:2,uncertain_events:[],jobs:[{id:envelope.question_id,generation:2,revision:1,status:'processing'}]};
+        f.behavior=async()=>{await sleep(400);return false;};
+        const website='fixture-control-website',sessionId='fixture-control-'+control;
+        const sessionKey=digest(website+'\0'+sessionId);
+        const envelope=f.envelope('answer',{scope:'conversation',session_key:sessionKey,generation:2});
+        const session={schema_version:2,website_id:website,session_id:sessionId,mode:'ai',generation:2,
+          uncertain_events:[],jobs:[{id:envelope.question_id,generation:2,revision:envelope.runtime_revision,
+            status:'processing',inference:{attempt_generation:1,pool_revision:envelope.pool_revision}}]};
         const sessionFile=path.join(f.directory,'data/runtime/session-'+sessionKey+'.json');json(sessionFile,session);
-        const pending=f.post(sample,envelope);while(!f.calls.length)await sleep(5);
+        const pending=f.post(sample,envelope);await until(()=>f.calls.length===1,'推理未进入合成上游');
         if(control==='human')json(sessionFile,{...session,mode:'human',generation:3});
         if(control==='global')json(path.join(f.directory,'config/runtime.yaml'),{schema_version:2,enabled:false,revision:2});
         if(control==='pool')f.publish(pool=>{pool.entries[1].enabled=false;});
@@ -1033,19 +1038,29 @@ async function main() {
       assert.equal(stored.output_policy_recovery.to_attempt_generation,2);
       assert.match(stored.stages.answer.invalidated_result.sha256,/^[a-f0-9]{64}$/);
       assert.equal(stored.stages.answer.invalidated_result.reason,'current_output_policy_non_answer');
+      const callsBeforeAgain=f.calls.length;
       const again=await f.post(sample,{...generic,attempt_generation:3,deadline_at:Date.now()+90000});
-      assert.equal(again.status,400);assert.equal(again.value.error.code,'question_conflict');
-      assert.equal(f.calls.length,1,'同一责任不得再次借代次递增重置并重推理');
+      assert.equal(again.status,200,again.text);assert.equal(again.value.choices[0].message.content,'验证回答');
+      assert.equal(f.calls.length,callsBeforeAgain,'精确绑定的答案只重绑恢复代，不得再次推理');
+      const rebound=read(path.join(questions,generic.question_id+'.json'));
+      assert.equal(rebound.attempt_generation,3);assert.equal(rebound.round_attempts,0);
 
       const valid=f.envelope('answer',{attempt_generation:1});seed(valid,chat('已有合法业务答案'));
+      const callsBeforeValid=f.calls.length;
       const validRetry=await f.post(sample,{...valid,attempt_generation:2,deadline_at:Date.now()+90000});
-      assert.equal(validRetry.status,400);assert.equal(validRetry.value.error.code,'question_conflict');
+      assert.equal(validRetry.status,200,validRetry.text);assert.equal(validRetry.value.choices[0].message.content,'验证回答');
+      assert.equal(f.calls.length,callsBeforeValid+1);assert.equal(f.calls.at(-1).index,0);
+      const validStored=read(path.join(questions,valid.question_id+'.json'));
+      assert.equal(validStored.attempt_generation,2);assert.equal(validStored.round_attempts,1);
+      assert.equal(validStored.invalidated_results.at(-1).reason,'request_identity_changed');
+      assert.equal(validStored.invalidated_results.at(-1).disposition,'answer');
       const refusal=f.envelope('answer',{attempt_generation:1});
       seed(refusal,{id:'cached-refusal',model:'fixture-model-0',choices:[{message:{role:'assistant',content:null,
         refusal:'无法协助该请求'},finish_reason:'stop'}]});
+      const callsBeforeRefusal=f.calls.length;
       const refusalRetry=await f.post(sample,{...refusal,attempt_generation:2,deadline_at:Date.now()+90000});
       assert.equal(refusalRetry.status,400);assert.equal(refusalRetry.value.error.code,'question_conflict');
-      assert.equal(f.calls.length,1,'合法旧答案与安全拒答都不得触发新供应商调用');
+      assert.equal(f.calls.length,callsBeforeRefusal,'安全拒答不得取得新推理权');
 
       for(const [protectedResult,sameGenerationCode] of [
         [{id:'cross-stage-refusal',choices:[{message:{role:'assistant',content:null,refusal:'无法协助该请求'},finish_reason:'stop'}]},'safety_refusal'],
@@ -1099,10 +1114,20 @@ async function main() {
 
       const wrongIdentity=f.envelope('answer',{attempt_generation:1});
       seed(wrongIdentity,chat('你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'));
-      const conflict=await f.post(sample,{...wrongIdentity,scope:'conversation',session_key:'a'.repeat(64),
-        generation:0,attempt_generation:2,deadline_at:Date.now()+90000});
+      const wrongWebsite='fixture-wrong-website',wrongSessionId='fixture-wrong-session';
+      const wrongSessionKey=digest(wrongWebsite+'\0'+wrongSessionId);
+      const conflictEnvelope={...wrongIdentity,scope:'conversation',session_key:wrongSessionKey,
+        generation:0,attempt_generation:2,deadline_at:Date.now()+90000};
+      json(path.join(f.directory,'data/runtime/session-'+wrongSessionKey+'.json'),{
+        schema_version:2,website_id:wrongWebsite,session_id:wrongSessionId,mode:'ai',generation:0,
+        uncertain_events:[],jobs:[{id:conflictEnvelope.question_id,generation:0,
+          revision:conflictEnvelope.runtime_revision,status:'processing',
+          inference:{attempt_generation:2,pool_revision:conflictEnvelope.pool_revision}}],
+      });
+      const callsBeforeConflict=f.calls.length;
+      const conflict=await f.post(sample,conflictEnvelope);
       assert.equal(conflict.status,400);assert.equal(conflict.value.error.code,'question_conflict');
-      assert.equal(f.calls.length,1,'不同 question/session/runtime/pool 身份不得复用旧缓存恢复权限');
+      assert.equal(f.calls.length,callsBeforeConflict,'不同 question/session/runtime/pool 身份不得复用旧缓存恢复权限');
     }finally{await f.close();}
   });
   await test('旧 generic 输出策略恢复不重置本轮预算，后续技术恢复只重置新轮计数',async()=>{
@@ -1134,10 +1159,14 @@ async function main() {
         assert.equal(stored.round_attempts,1,'技术恢复轮只重置单轮计数');
         assert.equal(f.calls.length,callsAfterSecond+1);
         assert.equal(third.status,200,third.text);
+        const attemptsAfterThird=stored.attempts;
         const callsAfterThird=f.calls.length;
         const fourth=await f.post(sample,{...envelope,attempt_generation:4,deadline_at:Date.now()+90000});
-        assert.equal(fourth.status,400);assert.equal(fourth.value.error.code,'question_conflict');
-        assert.equal(f.calls.length,callsAfterThird,'有效恢复结果不得再借代次重推理');
+        assert.equal(fourth.status,200,fourth.text);assert.equal(fourth.value.choices[0].message.content,'验证回答');
+        assert.equal(f.calls.length,callsAfterThird,'有效绑定答案只重绑，不得再次推理');
+        const fourthStored=read(file);assert.equal(fourthStored.attempt_generation,4);
+        assert.equal(fourthStored.attempts,attemptsAfterThird,'累计实际调用数必须单调且本次不增加');
+        assert.equal(fourthStored.round_attempts,0);
       }finally{await f.close();}
     };
     await exercise(1,1,false);

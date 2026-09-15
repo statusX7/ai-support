@@ -130,7 +130,6 @@ runtime = dict(value["configuration"]["runtime"])
 runtime.pop("revision", None)
 runtime.pop("applied_revision", None)
 knowledge = value["knowledge"]
-identity = {name: knowledge[name + "_sha256"] for name in ("catalog", "manifest", "map", "settings", "profile", "lexical")}
 value["source_components"] = {
     "runtime": digest(runtime),
     "handoff": digest(value["configuration"]["handoff"]),
@@ -139,7 +138,7 @@ value["source_components"] = {
     "tags": digest(value["configuration"]["tags"]),
     "feedback": digest(value["configuration"]["feedback"]),
     "prompt": value["prompt"]["sha256"],
-    "knowledge": digest(identity),
+    "knowledge": digest(knowledge),
 }
 value["source_sha256"] = digest(value["source_components"])
 temporary = target.with_name(target.name + ".reseal")

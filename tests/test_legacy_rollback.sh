@@ -13,16 +13,29 @@ fail() {
   exit 1
 }
 
-for command_name in git tar jq sha256sum realpath; do
+for command_name in tar jq sha256sum realpath python3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "缺少测试命令：${command_name}"
 done
 (( EUID == 0 )) || fail '旧版完整快照回滚测试需要 root，以执行生产回滚入口'
-git -C "$PROJECT_ROOT" rev-parse --verify 'v1.1.0^{commit}' >/dev/null 2>&1 \
-  || fail '缺少真实 v1.1.0 tag，无法构造旧版快照'
+
+LEGACY_SOURCE_ARCHIVE=${CRISPAI_TEST_V110_ARCHIVE:-}
+LEGACY_SOURCE_SHA256=${CRISPAI_TEST_V110_ARCHIVE_SHA256:-}
+if [[ -n "$LEGACY_SOURCE_ARCHIVE" && -z "$LEGACY_SOURCE_SHA256" ]] \
+  || [[ -z "$LEGACY_SOURCE_ARCHIVE" && -n "$LEGACY_SOURCE_SHA256" ]]; then
+  fail 'CRISPAI_TEST_V110_ARCHIVE 与 CRISPAI_TEST_V110_ARCHIVE_SHA256 必须成对提供'
+fi
+if [[ -z "$LEGACY_SOURCE_ARCHIVE" ]]; then
+  command -v git >/dev/null 2>&1 || fail '源码镜像不含 Git 历史时必须提供受控 v1.1.0 归档及 SHA256'
+  git -C "$PROJECT_ROOT" rev-parse --verify 'v1.1.0^{commit}' >/dev/null 2>&1 \
+    || fail '缺少真实 v1.1.0 tag，且未提供受控旧版归档'
+fi
 
 TEST_ROOT=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.legacy-rollback.XXXXXX")
-git -C "$PROJECT_ROOT" check-ignore -q -- "$TEST_ROOT" \
-  || fail '测试工作区未被 Git 忽略，拒绝生成运行资料'
+if command -v git >/dev/null 2>&1 \
+  && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$PROJECT_ROOT" check-ignore -q -- "$TEST_ROOT" \
+    || fail '测试工作区未被 Git 忽略，拒绝生成运行资料'
+fi
 export AI_SUPPORT_TEST_SCOPE="$TEST_ROOT"
 cleanup() {
   if [[ "${AI_SUPPORT_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -44,8 +57,19 @@ MOCK_FORBIDDEN_ARG_FILE="${TEST_ROOT}/forbidden-curl-args.txt"
 STUB_HOST_FIXTURE="${TEST_ROOT}/host-fixture"
 mkdir -p -- "$LEGACY_SOURCE" "${TEST_ROOT}/bin" "${STUB_HOST_FIXTURE}/etc/ssl/certs"
 
-# 由已发布 tag 直接取得旧代程序，不复制当前工作树或手写一个“像旧版”的 fixture。
-git -C "$PROJECT_ROOT" archive --format=tar v1.1.0 | tar -xf - -C "$LEGACY_SOURCE"
+# 优先使用测试编排器提供并绑定 SHA256 的包外 sidecar；源码 checkout 仍可
+# 直接从已发布 tag 生成同一类归档。两条路径都先经过独立安全提取器。
+if [[ -z "$LEGACY_SOURCE_ARCHIVE" ]]; then
+  LEGACY_SOURCE_ARCHIVE="${TEST_ROOT}/v1.1.0-source.tar"
+  git -C "$PROJECT_ROOT" archive --format=tar --output "$LEGACY_SOURCE_ARCHIVE" v1.1.0
+  read -r LEGACY_SOURCE_SHA256 _ < <(sha256sum -- "$LEGACY_SOURCE_ARCHIVE")
+  LEGACY_SOURCE_ID="tag commit $(git -C "$PROJECT_ROOT" rev-parse --short=12 'v1.1.0^{commit}')"
+else
+  LEGACY_SOURCE_ID="archive sha256 ${LEGACY_SOURCE_SHA256:0:12}"
+fi
+python3 "${SCRIPT_DIR}/extract_legacy_source.py" --archive "$LEGACY_SOURCE_ARCHIVE" \
+  --sha256 "$LEGACY_SOURCE_SHA256" --destination "$LEGACY_SOURCE" \
+  || fail '受控 v1.1.0 源码归档校验或提取失败'
 [[ "$(<"${LEGACY_SOURCE}/VERSION")" == v1.1.0 ]] || fail 'v1.1.0 tag 的 VERSION 不匹配'
 [[ ! -e "${LEGACY_SOURCE}/get.sh" && ! -L "${LEGACY_SOURCE}/get.sh" ]] \
   || fail '真实 v1.1.0 tag 不应包含 get.sh'
@@ -230,5 +254,4 @@ grep -Fq 'pg_restore' "$MOCK_DOCKER_LOG" || fail '旧版快照未实际执行数
 grep -Fq -- '--force-recreate anythingllm' "$MOCK_DOCKER_LOG" \
   || fail '旧版快照未实际重建 AnythingLLM bind mount'
 
-LEGACY_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --short=12 'v1.1.0^{commit}')
-printf '通过：[UNIT/CONTRACT] 真实 v1.1.0 快照兼容回滚（tag commit %s）\n' "$LEGACY_COMMIT"
+printf '通过：[UNIT/CONTRACT] 真实 v1.1.0 快照兼容回滚（%s）\n' "$LEGACY_SOURCE_ID"

@@ -95,6 +95,7 @@ tests/test_runtime_provider_pool.js
 tests/test_runtime_provider_failure_reply.js
 tests/test_runtime_missing_reply_p0.js
 tests/test_provider_lifecycle.js
+tests/extract_legacy_source.py
 tests/test_outgoing_identity.js
 tests/owned_outgoing.py
 tests/test_provider_log_redaction.py

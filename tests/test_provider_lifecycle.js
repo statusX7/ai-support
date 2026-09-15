@@ -363,8 +363,21 @@ async function main(){
       }
     });
     await test('PL10 真实v1.1.0快照恢复旧程序配置，主备秘密与router受限成套保留',async()=>{
-      const legacy=path.join(work,'legacy-v110'),sourceArchive=path.join(work,'legacy-source.tar');fs.mkdirSync(legacy);
-      await checked('git',['-C',project,'archive','--format=tar','--output',sourceArchive,'v1.1.0']);await checked('tar',['-xf',sourceArchive,'-C',legacy]);
+      const legacy=path.join(work,'legacy-v110');fs.mkdirSync(legacy);
+      let sourceArchive=process.env.CRISPAI_TEST_V110_ARCHIVE||'';
+      let sourceSha256=process.env.CRISPAI_TEST_V110_ARCHIVE_SHA256||'';
+      assert.equal(Boolean(sourceArchive),Boolean(sourceSha256),
+        'CRISPAI_TEST_V110_ARCHIVE 与 CRISPAI_TEST_V110_ARCHIVE_SHA256 必须成对提供');
+      if(!sourceArchive){
+        sourceArchive=path.join(work,'legacy-source.tar');
+        const tag=await command('git',['-C',project,'rev-parse','--verify','v1.1.0^{commit}']);
+        assert.equal(tag.code,0,'源码镜像不含 Git 历史时必须由测试编排器提供受控 v1.1.0 归档及 SHA256');
+        await checked('git',['-C',project,'archive','--format=tar','--output',sourceArchive,'v1.1.0']);
+        fs.chmodSync(sourceArchive,0o600);
+        sourceSha256=digest(fs.readFileSync(sourceArchive));
+      }
+      await checked('python3',[path.join(project,'tests/extract_legacy_source.py'),'--archive',sourceArchive,
+        '--sha256',sourceSha256,'--destination',legacy]);
       assert.equal(fs.readFileSync(path.join(legacy,'VERSION'),'utf8').trim(),'v1.1.0');
       for(const directory of ['knowledge','tmp','data/runtime','data/postgres','data/n8n','data/anythingllm','backups/versions'])fs.mkdirSync(path.join(legacy,directory),{recursive:true});
       for(const name of ['keyword','handoff','menu','tags','feedback','provider','runtime'])if(fs.existsSync(path.join(legacy,`config/${name}.yaml.example`)))fs.copyFileSync(path.join(legacy,`config/${name}.yaml.example`),path.join(legacy,`config/${name}.yaml`));

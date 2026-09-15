@@ -30,6 +30,11 @@ const sealMaterials = value => {
   value.source_sha256 = digest(canonical(value.source_components)); return value;
 };
 const wait = ms => new Promise(resolve=>setTimeout(resolve,ms));
+const until = async (check,message,timeout=5000) => {
+  const deadline=Date.now()+timeout;
+  while(Date.now()<deadline){if(check())return;await wait(5);}
+  assert.ok(check(),message);
+};
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const execute = (args,environment={}) => new Promise(resolve=>{
   const child=spawn('python3',[path.join(project,'scripts/provider-pool.py'),...args],{env:{...process.env,...environment}});
@@ -217,7 +222,14 @@ async function fixture(label) {
   f.receive=async body=>{if(body.event==='message:send'||body.data.from==='operator'){const items=histories.get(body.data.session_id)||[];items.push(body.data);histories.set(body.data.session_id,items);}return runtime.receive({body,query:{key:env.CRISP_WEBSITE_HOOK_SECRET}});};
   f.deliver=async body=>{const accepted=await f.receive(body);assert.equal(accepted.accepted,true);return accepted.route==='process'?runtime.process(accepted.key,accepted.jobId):accepted;};
   f.state=session=>runtime.readState(runtime.stateKey(env.CRISP_WEBSITE_ID,session.replace(/^session_pool_/,'session_pool-')));
-  f.publish=change=>{pool=read(poolPath);change(pool);pool.revision++;secrets.revision=pool.revision;write(secretPath,secrets);write(poolPath,pool);};
+  f.publish=async change=>{
+    pool=read(poolPath);change(pool);pool.revision++;secrets.revision=pool.revision;
+    write(secretPath,secrets);write(poolPath,pool);
+    const verified=await execute(['--deploy-dir',root,'verify-applied'],{
+      PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,
+    });
+    assert.equal(verified.code,0,verified.stderr+verified.stdout);
+  };
   f.close=async()=>{for(const server of [rag,adapter,upstream])server.closeAllConnections();await Promise.all([rag,adapter,upstream].map(server=>new Promise(resolve=>server.close(resolve))));};
   return f;
 }
@@ -282,7 +294,7 @@ async function recoverOnce(f,event,result){
     assert.equal(f.calls.filter(call=>call.visual).length,1,'恢复不得重新识图');
   });
   await test('视觉与RAG回答共享三次上限，耗尽后保留责任并在恢复后仅答一次',async f=>{
-    f.publish(pool=>{pool.policy.max_attempts=3;});f.failed=new Set([0]);f.failAnswer=true;
+    await f.publish(pool=>{pool.policy.max_attempts=3;});f.failed=new Set([0]);f.failAnswer=true;
     const event=f.event('session_pool_image1',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
     const result=await f.deliver(event);assert.equal(f.calls.length,3);assert.equal(f.calls.filter(x=>x.visual).length,2);assert.equal(f.sent.length,0);assert.equal(f.state(event.data.session_id).mode,'ai');
     assert(f.tasks[0].query.includes('蓝色保存按钮'));assertUnresolved(f,event,result);
@@ -291,7 +303,7 @@ async function recoverOnce(f,event,result){
   });
   await test('主备等待时真人优先暂停A，B独立回复，不续尝试不发送迟到A答案',async f=>{
     f.slow=true;f.delay=1000;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
-    while(!f.calls.length)await wait(5);
+    await until(()=>f.calls.length===1,'慢推理未进入合成上游');
     const human=f.event('session_pool_humanA','真人公开处理进度',{from:'operator',automated:false});human.event='message:received';
     const started=Date.now();await f.deliver(human);assert(Date.now()-started<300);assert.equal(f.state('session_pool_humanA').mode,'human');
     const cancelled=await pending;assert(Date.now()-started<400);assert.equal(cancelled.status,'cancelled');
@@ -313,7 +325,8 @@ async function recoverOnce(f,event,result){
     assert.equal(f.adapterInternalRequests.filter(path=>path==='/internal/provider/retire').length,1);
   });
   await test('总关与池配置变更取消整条推理；不误发一次错误提示',async f=>{
-    f.slow=true;f.delay=1000;const pending=f.deliver(f.event('session_pool_global','慢问题'));while(!f.calls.length)await wait(5);
+    f.slow=true;f.delay=1000;const pending=f.deliver(f.event('session_pool_global','慢问题'));
+    await until(()=>f.calls.length===1,'总关场景的慢推理未进入合成上游');
     const disabledAt=Date.now();f.publishRuntime(false);const cancelled=await pending;
     assert(Date.now()-disabledAt<400);assert.equal(cancelled.status,'cancelled');assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
     let stored=f.state('session_pool_global').jobs.find(item=>item.id===cancelled.jobId);
@@ -322,10 +335,12 @@ async function recoverOnce(f,event,result){
     stored=f.state('session_pool_global').jobs.find(item=>item.id===cancelled.jobId);
     assert.equal(stored.provider_retirement?.state,'retired');assert.equal(stored.inference,undefined);
     f.publishRuntime(true);
-    const changed=f.deliver(f.event('session_pool_changed','另一个慢问题'));while(f.calls.length<2)await wait(5);f.publish(pool=>{pool.entries[1].enabled=false;});await changed;assert.equal(f.sent.length,0);assert.equal(f.calls.length,2);
+    const changed=f.deliver(f.event('session_pool_changed','另一个慢问题'));
+    await until(()=>f.calls.length===2,'池换代场景的慢推理未进入合成上游');
+    await f.publish(pool=>{pool.entries[1].enabled=false;});await changed;assert.equal(f.sent.length,0);assert.equal(f.calls.length,2);
   });
   await test('A19 视觉后重启adapter仍共享真实总期限和累计次数，重放缓存不再次识图',async f=>{
-    f.publish(pool=>{Object.assign(pool.policy,{question_timeout_ms:3000,call_timeout_ms:2500,connect_timeout_ms:100,max_attempts:4});});
+    await f.publish(pool=>{Object.assign(pool.policy,{question_timeout_ms:3000,call_timeout_ms:2500,connect_timeout_ms:100,max_attempts:4});});
     let answerClosed=false,answerClosedAt,beforeRestart,afterRestart,replay,answerEnvelope,visionCallsBefore,resolveAnswerClosed;
     const answerClosedEvent=new Promise(resolve=>{resolveAnswerClosed=resolve;});
     f.behavior=async(call,response)=>{
