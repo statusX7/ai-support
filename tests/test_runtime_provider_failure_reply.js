@@ -1635,7 +1635,7 @@ async function test(name, action) {
   await test('v1.2.1直接/source_frozen/successor_bound旧缓存遇人工时均只做签名清理', async (f) => {
     const variants = ['direct', 'source_frozen', 'successor_bound'];
     for (const [index, variant] of variants.entries()) {
-      const event = f.event(`legacy-retirement-${variant}`);
+      const event = f.event(`legacy-retirement-${variant.replace(/_/g, '-')}`);
       const accepted = await f.receive(event);
       assert.equal(accepted.accepted, true);
       const deadline = f.now() + 7000 + index;
