@@ -144,24 +144,120 @@ const reservePort = async () => {
   await new Promise((resolve) => server.close(resolve));
   return port;
 };
+const fetchFailureDetails = new WeakMap();
+const classifyNestedFetchFailure = (error) => {
+  const codeKinds = new Map([
+    ['UND_ERR_SOCKET', 'socket_closed_or_reset'], ['ECONNRESET', 'socket_closed_or_reset'],
+    ['EPIPE', 'socket_closed_or_reset'], ['UND_ERR_CONNECT_TIMEOUT', 'connect_timeout'],
+    ['ETIMEDOUT', 'connect_timeout'], ['UND_ERR_HEADERS_TIMEOUT', 'response_timeout'],
+    ['UND_ERR_BODY_TIMEOUT', 'response_timeout'], ['UND_ERR_ABORTED', 'request_aborted'],
+    ['ABORT_ERR', 'request_aborted'], ['ECONNREFUSED', 'connection_refused'],
+    ['ENETUNREACH', 'network_unreachable'], ['EHOSTUNREACH', 'network_unreachable'],
+    ['UND_ERR_DESTROYED', 'client_state_invalid'], ['ERR_INVALID_STATE', 'client_state_invalid'],
+    ['ERR_INVALID_ARG_TYPE', 'client_state_invalid'], ['EAI_AGAIN', 'dns_temporary'],
+    ['ENOTFOUND', 'dns_not_found'], ['CERT_HAS_EXPIRED', 'tls_error'],
+    ['DEPTH_ZERO_SELF_SIGNED_CERT', 'tls_error'], ['SELF_SIGNED_CERT_IN_CHAIN', 'tls_error'],
+    ['UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'tls_error'], ['ERR_TLS_CERT_ALTNAME_INVALID', 'tls_error'],
+  ]);
+  let nestedCausePresent = false;
+  let aggregatePresent = false;
+  let aggregateMembersAdded = 0;
+  const pending = [];
+  const addNested = (value, depth) => {
+    if (depth > 2 || value === null || !['object', 'function'].includes(typeof value)) return;
+    pending.push({ value, depth });
+  };
+  const addAggregate = (owner, depth) => {
+    if (aggregateMembersAdded >= 4) return;
+    try {
+      const values = owner.errors;
+      if (!Array.isArray(values)) return;
+      aggregatePresent = true;
+      const limit = Math.min(values.length, 4 - aggregateMembersAdded);
+      for (let index = 0; index < limit; index += 1) {
+        aggregateMembersAdded += 1;
+        try { addNested(values[index], depth); } catch (_) {}
+      }
+    } catch (_) {}
+  };
+  try {
+    if (error !== null && ['object', 'function'].includes(typeof error)) {
+      const cause = error.cause;
+      if (cause !== undefined && cause !== null) {
+        nestedCausePresent = true;
+        addNested(cause, 1);
+      }
+      addAggregate(error, 1);
+    }
+    let visited = 0;
+    while (pending.length && visited < 12) {
+      const { value, depth } = pending.shift();
+      visited += 1;
+      let code = '';
+      let name = '';
+      try {
+        code = typeof value.code === 'string' ? value.code : '';
+        name = typeof value.name === 'string' ? value.name : '';
+      } catch (_) {}
+      if (codeKinds.has(code)) return {
+        nested_error_kind: codeKinds.get(code), nested_cause_present: nestedCausePresent,
+        aggregate_present: aggregatePresent,
+      };
+      if (name === 'AbortError') return {
+        nested_error_kind: 'request_aborted', nested_cause_present: nestedCausePresent,
+        aggregate_present: aggregatePresent,
+      };
+      if (depth < 2) {
+        try {
+          const cause = value.cause;
+          if (cause !== undefined && cause !== null) {
+            nestedCausePresent = true;
+            addNested(cause, depth + 1);
+          }
+          addAggregate(value, depth + 1);
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  return { nested_error_kind: 'unclassified', nested_cause_present: nestedCausePresent,
+    aggregate_present: aggregatePresent };
+};
 const fetchJson = async (url, options = {}) => {
+  let fetchPhase = 'signal_setup';
+  let localTimeoutFired = false;
   const controller = new AbortController();
   const abort = () => controller.abort();
   options.signal?.addEventListener('abort', abort, { once: true });
   if (options.signal?.aborted) controller.abort();
-  const timer = setTimeout(abort, options.timeout || 10000);
+  const timer = setTimeout(() => { localTimeoutFired = true; abort(); }, options.timeout || 10000);
   try {
+    fetchPhase = 'body_serialization';
+    const requestBody = options.body === undefined ? undefined : JSON.stringify(options.body);
+    fetchPhase = 'fetch_pending';
     const response = await fetch(url, {
       method: options.method || 'GET',
       headers: { ...(options.body === undefined ? {} : { 'content-type': 'application/json' }), ...(options.headers || {}) },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: requestBody,
       signal: controller.signal,
       redirect: 'error',
     });
+    fetchPhase = 'response_received';
     const text = await response.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch (_) {}
-    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body };
+    fetchPhase = 'body_read';
+    let responseBody = null;
+    try { responseBody = JSON.parse(text); } catch (_) {}
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: responseBody };
+  } catch (error) {
+    if (error !== null && ['object', 'function'].includes(typeof error)) {
+      try {
+        fetchFailureDetails.set(error, {
+          fetch_phase: fetchPhase,
+          local_timeout_fired: localTimeoutFired,
+          ...classifyNestedFetchFailure(error),
+        });
+      } catch (_) {}
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', abort);
@@ -468,6 +564,8 @@ async function fixture(label, behavior) {
     } catch (error) {
       if (isRag) {
         const executionAborted = options.signal?.aborted === true;
+        const details = error !== null && ['object', 'function'].includes(typeof error)
+          ? fetchFailureDetails.get(error) : null;
         const transportCodes = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT']);
         const errorKind = executionAborted ? 'execution_aborted'
           : error?.name === 'AbortError' ? 'request_aborted'
@@ -475,6 +573,16 @@ async function fixture(label, behavior) {
         ragClientResults.push({
           kind: options.method === 'GET' ? 'workspace_read' : 'vector_search',
           outcome: 'error', error_kind: errorKind,
+          fetch_phase: ['signal_setup', 'body_serialization', 'fetch_pending',
+            'response_received', 'body_read'].includes(details?.fetch_phase)
+            ? details.fetch_phase : 'unclassified',
+          local_timeout_fired: details?.local_timeout_fired === true,
+          nested_error_kind: ['socket_closed_or_reset', 'connect_timeout', 'response_timeout',
+            'request_aborted', 'connection_refused', 'network_unreachable', 'client_state_invalid',
+            'dns_temporary', 'dns_not_found', 'tls_error'].includes(details?.nested_error_kind)
+            ? details.nested_error_kind : 'unclassified',
+          nested_cause_present: details?.nested_cause_present === true,
+          aggregate_present: details?.aggregate_present === true,
           timeout_ms: Number.isFinite(options.timeout) ? options.timeout : null,
           execution_aborted: executionAborted,
         });
