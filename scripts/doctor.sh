@@ -1971,9 +1971,16 @@ doctor_adapter_check() {
 
 doctor_runtime_state_check() {
   local start now sessions invalid legacy human timed permanent active_workers stale_workers pending_jobs file counts deadline_reached=0
+  local state_key state_website state_session expected_state_key
   local feedback_pending=0 feedback_count=0
   local responsibility_pending=0 unresolved_jobs=0 intentional_silence=0 unknown_deliveries=0
   local provider_settlements=0 invalid_settlements=0 settlement_count invalid_settlement_count
+  local provider_retirements=0 invalid_retirements=0 retirement_count invalid_retirement_count
+  local provider_receipts=0 invalid_provider_receipts=0 legacy_provider_inferences=0
+  local receipt_count invalid_receipt_count legacy_inference_count context_hash_invalid stored_hash encoded_context actual_hash
+  local legacy_binding_invalid encoded_legacy_configuration
+  local settlement_identity_invalid encoded_plan settlement_generation job_generation encoded_configuration
+  local retirement_identity_invalid stored_identity encoded_retirement
   local oldest_unresolved=0 oldest_unknown=0 pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown
   start=$(doctor_now_ms)
   now=$(doctor_now_ms)
@@ -1983,6 +1990,8 @@ doctor_runtime_state_check() {
     if ! doctor_remaining >/dev/null; then deadline_reached=1; break; fi
     [[ -f "$file" && ! -L "$file" ]] || { ((invalid += 1)); continue; }
     if ! jq -e '.schema_version == 2 and (.mode == "ai" or .mode == "human") and
+      (.website_id | type == "string" and length > 0) and
+      (.session_id | type == "string" and length > 0) and
       (.generation | type == "number") and (.jobs | type == "array") and (.offers | type == "object")' "$file" >/dev/null 2>&1; then
       if jq -e '((.version | type) == "number" or (.version | type) == "string") and
         (.aiEnabled | type == "boolean") and (.aiResumeAt | type == "number" and . >= 0) and
@@ -1997,17 +2006,302 @@ doctor_runtime_state_check() {
       fi
       continue
     fi
+    state_key=${file##*/session-}; state_key=${state_key%.json}
+    IFS=$'\t' read -r state_website state_session < <(jq -r '[.website_id,.session_id] | @tsv' "$file")
+    expected_state_key=$(printf '%s\0%s' "$state_website" "$state_session" | sha256sum | awk '{print $1}')
+    if [[ "$state_key" != "$expected_state_key" ]]; then
+      ((invalid += 1))
+      continue
+    fi
     ((sessions += 1))
-    counts=$(jq -r --argjson now "$now" '
+    counts=$(jq -r --argjson now "$now" --arg state_key "$state_key" '
       def nonnegative_safe_integer:
         type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
       def provider_settlement_finished:
-        type == "object" and .schema_version == 1 and
+        type == "object" and
+        (keys | sort) == ["attempts","plan_sha256","response_generation","schema_version","settled_at","state"] and
+        .schema_version == 1 and
         (.state == "settled" or .state == "absent") and
         ((.plan_sha256 // "") | test("^[a-f0-9]{64}$")) and
         (.response_generation | nonnegative_safe_integer) and
         (.attempts | nonnegative_safe_integer) and .attempts >= 1 and
         (.settled_at | nonnegative_safe_integer);
+      def provider_retirement_finished:
+        type == "object" and
+        (keys | sort) == ["attempts","identity_sha256","purpose","retired_at","schema_version","state"] and
+        .schema_version == 1 and (.state == "retired" or .state == "absent") and
+        (.purpose == "conversation_cancelled" or .purpose == "global_disabled" or
+          .purpose == "input_retired" or .purpose == "non_answer_retired") and
+        ((.identity_sha256 // "") | test("^[a-f0-9]{64}$")) and
+        (.attempts | nonnegative_safe_integer) and .attempts >= 1 and
+        (.retired_at | nonnegative_safe_integer);
+      def provider_retirement_purpose_authorized($purpose):
+        . as $job |
+        if $purpose == "conversation_cancelled" then
+          $job.status == "cancelled" and $job.responsibility_status == "intentional_silence" and
+          ($job.responsibility_reason == "human_reply" or
+            $job.responsibility_reason == "human_handoff" or
+            $job.responsibility_reason == "conversation_state_changed")
+        elif $purpose == "global_disabled" then
+          $job.status == "cancelled" and $job.responsibility_status == "intentional_silence" and
+          $job.responsibility_reason == "global_disabled"
+        elif $purpose == "input_retired" then
+          ($job.status == "done" or $job.status == "cancelled" or $job.status == "failed") and
+          ($job.responsibility_status == "intentional_silence" or
+            $job.responsibility_status == "control_handled") and
+          ($job.responsibility_reason == "non_visitor_message" or
+            $job.responsibility_reason == "before_catchup_bootstrap" or
+            $job.responsibility_reason == "before_control_watermark")
+        else $purpose == "non_answer_retired" and
+          ($job.status == "received" or $job.status == "failed") and
+          $job.responsibility_status == "unresolved_failure" end;
+      def provider_retirement_finished_for:
+        . as $job |
+        ($job.provider_retirement | provider_retirement_finished) and
+        ($job | provider_retirement_purpose_authorized($job.provider_retirement.purpose)) and
+        ($job | has("provider_retirement_failure_code") | not) and
+        ($job | has("inference") | not) and
+        ($job | has("provider_result_receipt") | not) and
+        ($job | has("provider_migration_from") | not) and
+        ($job | has("legacy_v121_pending_origin") | not) and
+        ($job | has("provider_settlement") | not);
+      def positive_safe_integer:
+        type == "number" and . >= 1 and . <= 9007199254740991 and floor == .;
+      def provider_configuration_valid:
+        type == "object" and
+        (.runtime_revision | nonnegative_safe_integer) and
+        (.pool_revision | positive_safe_integer) and
+        ((.secrets_generation // "") | test("^[a-f0-9]{32}$")) and
+        ((.pool_sha256 // "") | test("^[a-f0-9]{64}$")) and
+        ((.materials_source_sha256 // "") | test("^[a-f0-9]{64}$"));
+      def legacy_v121_inference:
+        type == "object" and (keys | sort) == ["deadline_at","pool_revision"] and
+        (.pool_revision | positive_safe_integer) and
+        (.deadline_at | nonnegative_safe_integer);
+      def legacy_v121_origin:
+        type == "object" and (keys | sort) == ["deadline_at","pool_revision","runtime_revision"] and
+        (.runtime_revision | nonnegative_safe_integer) and
+        (.pool_revision | positive_safe_integer) and
+        (.deadline_at | nonnegative_safe_integer);
+      def legacy_v121_source_frozen_valid:
+        . as $job |
+        ($job.legacy_v121_pending_origin | type) == "object" and
+        ($job.legacy_v121_pending_origin | keys | sort) == ["phase","schema_version","source"] and
+        $job.legacy_v121_pending_origin.schema_version == 1 and
+        $job.legacy_v121_pending_origin.phase == "source_frozen" and
+        ($job.legacy_v121_pending_origin.source | legacy_v121_origin) and
+        ($job.provider_result_receipt == null) and ($job.provider_settlement == null) and
+        ($job.plan == null) and
+        ($job.inference | legacy_v121_inference) and
+        $job.legacy_v121_pending_origin.source.runtime_revision == $job.revision and
+        $job.legacy_v121_pending_origin.source.pool_revision == $job.inference.pool_revision and
+        $job.legacy_v121_pending_origin.source.deadline_at == $job.inference.deadline_at;
+      def legacy_v121_successor_bound_valid:
+        . as $job |
+        ($job.legacy_v121_pending_origin | type) == "object" and
+        ($job.legacy_v121_pending_origin | keys | sort) ==
+          ["phase","schema_version","source","target","target_configuration_binding"] and
+        $job.legacy_v121_pending_origin.schema_version == 1 and
+        $job.legacy_v121_pending_origin.phase == "successor_bound" and
+        ($job.legacy_v121_pending_origin.source | legacy_v121_origin) and
+        ($job.legacy_v121_pending_origin.target | provider_configuration_valid) and
+        ($job.legacy_v121_pending_origin.target | keys | sort) ==
+          ["materials_source_sha256","pool_revision","pool_sha256","runtime_revision","secrets_generation"] and
+        (($job.legacy_v121_pending_origin.target_configuration_binding // "") |
+          test("^[a-f0-9]{64}$")) and
+        $job.legacy_v121_pending_origin.target.runtime_revision == $job.revision and
+        ($job | has("inference") | not) and
+        ($job.provider_result_receipt == null) and ($job.provider_settlement == null) and
+        ($job.plan == null);
+      def legacy_v121_pending_valid:
+        (. | legacy_v121_source_frozen_valid) or
+        (. | legacy_v121_successor_bound_valid);
+      def provider_receipt_valid:
+        . as $job |
+        ($job.inference) as $inference |
+        ($job.provider_result_receipt) as $receipt |
+        if ($inference | type) != "object" or ($receipt | type) != "object" then false
+        else
+          $inference.provider_receipt_protocol_version == 1 and
+          ($inference.attempt_generation | positive_safe_integer) and
+          (if $inference.legacy_v121_origin == null then true
+           else ($inference.legacy_v121_origin | legacy_v121_origin) and
+             $inference.attempt_generation == 2 end) and
+          (($inference.configuration_binding // "") | test("^[a-f0-9]{64}$")) and
+          ($receipt.state == "requesting" or $receipt.state == "unknown" or
+            $receipt.state == "available" or $receipt.state == "absent") and
+          ($receipt.stage == "vision" or $receipt.stage == "answer") and
+          ($receipt.attempt_generation | positive_safe_integer) and
+          $receipt.attempt_generation == $inference.attempt_generation and
+          (($receipt.configuration_binding // "") | test("^[a-f0-9]{64}$")) and
+          $receipt.configuration_binding == $inference.configuration_binding and
+          $receipt.request_contract_version == 1 and
+          (($receipt.request_sha256 // "") | test("^[a-f0-9]{64}$")) and
+          (($receipt.plan_context_sha256 // "") | test("^[a-f0-9]{64}$"))
+        end;
+      def provider_settlement_outstanding_valid:
+        . as $job |
+        ($job.provider_settlement) as $settlement |
+        ($settlement.envelope) as $envelope |
+        ($job.inference) as $inference |
+        ($job.provider_result_receipt) as $receipt |
+        if ($settlement | type) != "object" or ($envelope | type) != "object"
+          or ($inference | type) != "object" or ($receipt | type) != "object" then false
+        else
+          $settlement.schema_version == 1 and
+          ($settlement.state == "pending" or $settlement.state == "deferred") and
+          (($settlement.plan_sha256 // "") | test("^[a-f0-9]{64}$")) and
+          ($settlement.response_generation | nonnegative_safe_integer) and
+          ($settlement.attempts | nonnegative_safe_integer) and
+          (($envelope | keys) - ["version","scope","question_id","session_key","generation",
+            "runtime_revision","pool_revision","secrets_generation","pool_sha256",
+            "materials_source_sha256","configuration_binding","deadline_at","stage",
+            "attempt_generation","request_contract_version","request_sha256",
+            "plan_context_sha256","migration_from","transition_reason",
+            "legacy_v121_origin"] | length) == 0 and
+          $envelope.version == 1 and $envelope.scope == "conversation" and
+          $envelope.question_id == $job.id and
+          $envelope.session_key == $state_key and
+          $envelope.generation == $job.generation and $envelope.stage == "answer" and
+          ($envelope.deadline_at | nonnegative_safe_integer) and
+          ($envelope.attempt_generation | positive_safe_integer) and
+          ({runtime_revision:$envelope.runtime_revision,pool_revision:$envelope.pool_revision,
+            secrets_generation:$envelope.secrets_generation,pool_sha256:$envelope.pool_sha256,
+            materials_source_sha256:$envelope.materials_source_sha256} | provider_configuration_valid) and
+          (($envelope.configuration_binding // "") | test("^[a-f0-9]{64}$")) and
+          $envelope.request_contract_version == 1 and
+          (($envelope.request_sha256 // "") | test("^[a-f0-9]{64}$")) and
+          (($envelope.plan_context_sha256 // "") | test("^[a-f0-9]{64}$")) and
+          ($job | provider_receipt_valid) and $receipt.stage == "answer" and
+          $envelope.runtime_revision == ($inference.runtime_revision // $job.revision) and
+          $envelope.pool_revision == $inference.pool_revision and
+          $envelope.secrets_generation == $inference.secrets_generation and
+          $envelope.pool_sha256 == $inference.pool_sha256 and
+          $envelope.materials_source_sha256 == $inference.materials_source_sha256 and
+          $envelope.attempt_generation == $inference.attempt_generation and
+          $envelope.configuration_binding == $inference.configuration_binding and
+          $envelope.deadline_at == $inference.deadline_at and
+          $envelope.request_contract_version == $receipt.request_contract_version and
+          $envelope.request_sha256 == $receipt.request_sha256 and
+          $envelope.plan_context_sha256 == $receipt.plan_context_sha256 and
+          (($envelope.legacy_v121_origin // null) == ($inference.legacy_v121_origin // null)) and
+          (if $envelope.migration_from == null then $envelope.transition_reason == null
+           else $envelope.transition_reason == "configuration_changed" and
+             ($envelope.migration_from | provider_configuration_valid) and
+             ($envelope.migration_from.attempt_generation | positive_safe_integer) and
+             ((($envelope.migration_from | keys) - ["runtime_revision","pool_revision",
+               "secrets_generation","pool_sha256","materials_source_sha256",
+               "attempt_generation"] | length) == 0) end) and
+          (if $envelope.legacy_v121_origin == null then true
+           else ($envelope.legacy_v121_origin | legacy_v121_origin) and
+             $envelope.attempt_generation == 2 and $envelope.migration_from == null end)
+        end;
+      def provider_retirement_outstanding_valid:
+        . as $job |
+        ($job.provider_retirement) as $retirement |
+        ($retirement.envelope) as $envelope |
+        ($job.inference) as $inference |
+        ($job.provider_result_receipt) as $receipt |
+        if ($retirement | type) != "object" or ($envelope | type) != "object" then false
+        else
+          (($retirement | keys) - ["schema_version","state","purpose","envelope",
+            "identity_sha256","attempts","first_recorded_at","next_action_at","reason",
+            "last_attempt_at","lease_until","lease_token"] | length) == 0 and
+          (["schema_version","state","purpose","envelope","identity_sha256","attempts",
+            "first_recorded_at","next_action_at"] - ($retirement | keys) | length) == 0 and
+          $retirement.schema_version == 1 and
+          ($retirement.state == "pending" or $retirement.state == "deferred") and
+          ($retirement.purpose == "conversation_cancelled" or
+            $retirement.purpose == "global_disabled" or
+            $retirement.purpose == "input_retired" or
+            $retirement.purpose == "non_answer_retired") and
+          (($retirement.identity_sha256 // "") | test("^[a-f0-9]{64}$")) and
+          ($retirement.attempts | nonnegative_safe_integer) and
+          ($retirement.first_recorded_at | nonnegative_safe_integer) and
+          ($retirement.next_action_at | nonnegative_safe_integer) and
+          (if ($retirement | has("reason")) then
+             (($retirement.reason | type) == "string" and ($retirement.reason | length) <= 80)
+           else true end) and
+          (if ($retirement | has("last_attempt_at")) then
+             ($retirement.last_attempt_at | nonnegative_safe_integer)
+           else true end) and
+          (($retirement | has("lease_until")) == ($retirement | has("lease_token"))) and
+          (if ($retirement | has("lease_until")) then
+             ($retirement.lease_until | nonnegative_safe_integer) and
+             ($retirement.lease_token | type) == "string" and
+             ($retirement.lease_token | test("^(|[a-f0-9]{24})$"))
+           else true end) and
+          ($job | has("provider_settlement") | not) and $job.control != true and
+          $envelope.version == 1 and $envelope.scope == "conversation" and
+          $envelope.question_id == $job.id and
+          $envelope.session_key == $state_key and
+          $envelope.generation == $job.generation and
+          ($envelope.deadline_at | nonnegative_safe_integer) and
+          ($envelope.attempt_generation | positive_safe_integer) and
+          ($job | provider_retirement_purpose_authorized($retirement.purpose)) and
+          (if $envelope.legacy_v121_cleanup == true then
+             ($envelope | keys | sort) == ["attempt_generation","deadline_at","generation",
+               "legacy_v121_cleanup","pool_revision","question_id","runtime_revision",
+               "scope","session_key","stage","version"] and
+             $envelope.stage == "answer" and $envelope.attempt_generation == 1 and
+             ($envelope.runtime_revision | nonnegative_safe_integer) and
+             ($envelope.pool_revision | positive_safe_integer) and
+             ($job | has("plan") | not) and
+             ($job | has("provider_result_receipt") | not) and
+             ($job | has("provider_migration_from") | not) and
+             (if ($job | has("legacy_v121_pending_origin")) then
+                ($job | legacy_v121_pending_valid) and
+                $envelope.runtime_revision == $job.legacy_v121_pending_origin.source.runtime_revision and
+                $envelope.pool_revision == $job.legacy_v121_pending_origin.source.pool_revision and
+                $envelope.deadline_at == $job.legacy_v121_pending_origin.source.deadline_at
+              else ($job.inference | legacy_v121_inference) and
+                $envelope.runtime_revision == $job.revision and
+                $envelope.pool_revision == $job.inference.pool_revision and
+                $envelope.deadline_at == $job.inference.deadline_at end)
+           else
+             ($envelope | has("legacy_v121_cleanup") | not) and
+             ($inference | type) == "object" and ($receipt | type) == "object" and
+             (($envelope | keys) - ["version","scope","question_id","session_key","generation",
+               "runtime_revision","pool_revision","secrets_generation","pool_sha256",
+               "materials_source_sha256","configuration_binding","deadline_at","stage",
+               "attempt_generation","request_contract_version","request_sha256",
+               "plan_context_sha256","migration_from","transition_reason",
+               "legacy_v121_origin"] | length) == 0 and
+             ($envelope.stage == "vision" or $envelope.stage == "answer") and
+             ({runtime_revision:$envelope.runtime_revision,pool_revision:$envelope.pool_revision,
+               secrets_generation:$envelope.secrets_generation,pool_sha256:$envelope.pool_sha256,
+               materials_source_sha256:$envelope.materials_source_sha256} | provider_configuration_valid) and
+             (($envelope.configuration_binding // "") | test("^[a-f0-9]{64}$")) and
+             $envelope.request_contract_version == 1 and
+             (($envelope.request_sha256 // "") | test("^[a-f0-9]{64}$")) and
+             (($envelope.plan_context_sha256 // "") | test("^[a-f0-9]{64}$")) and
+             ($job | provider_receipt_valid) and
+             ($receipt.state == "requesting" or $receipt.state == "unknown" or
+               $receipt.state == "available") and $envelope.stage == $receipt.stage and
+             $envelope.runtime_revision == ($inference.runtime_revision // $job.revision) and
+             $envelope.pool_revision == $inference.pool_revision and
+             $envelope.secrets_generation == $inference.secrets_generation and
+             $envelope.pool_sha256 == $inference.pool_sha256 and
+             $envelope.materials_source_sha256 == $inference.materials_source_sha256 and
+             $envelope.attempt_generation == $inference.attempt_generation and
+             $envelope.configuration_binding == $inference.configuration_binding and
+             $envelope.deadline_at == $inference.deadline_at and
+             $envelope.request_contract_version == $receipt.request_contract_version and
+             $envelope.request_sha256 == $receipt.request_sha256 and
+             $envelope.plan_context_sha256 == $receipt.plan_context_sha256 and
+             (($envelope.legacy_v121_origin // null) == ($inference.legacy_v121_origin // null)) and
+             (if $envelope.migration_from == null then $envelope.transition_reason == null
+              else $envelope.transition_reason == "configuration_changed" and
+                ($envelope.migration_from | provider_configuration_valid) and
+                ($envelope.migration_from.attempt_generation | positive_safe_integer) and
+                ((($envelope.migration_from | keys) - ["runtime_revision","pool_revision",
+                  "secrets_generation","pool_sha256","materials_source_sha256",
+                  "attempt_generation"] | length) == 0) end) and
+             (if $envelope.legacy_v121_origin == null then true
+              else ($envelope.legacy_v121_origin | legacy_v121_origin) and
+                $envelope.attempt_generation == 2 and $envelope.migration_from == null end)
+           end)
+        end;
       [
       (if .mode == "human" then 1 else 0 end),
       (if .mode == "human" and .resume_at != null then 1 else 0 end),
@@ -2034,12 +2328,41 @@ doctor_runtime_state_check() {
       ([.jobs[]? | select(.provider_settlement != null) |
         .provider_settlement as $settlement |
         select(if ($settlement | type) != "object" then true
-          elif ($settlement.state == "pending" or $settlement.state == "deferred") then false
-          else (($settlement | provider_settlement_finished) | not) end)] | length)
+          elif ($settlement.state == "pending" or $settlement.state == "deferred") then
+            ((provider_settlement_outstanding_valid) | not)
+          else (($settlement | provider_settlement_finished) | not) end)] | length),
+      ([.jobs[]? | select(has("provider_retirement")) |
+        select((provider_retirement_finished_for) | not)] | length),
+      ([.jobs[]? | select(has("provider_retirement") or
+          has("provider_retirement_failure_code")) |
+        .provider_retirement as $retirement |
+        select((has("provider_retirement_failure_code") and
+            ((provider_retirement_finished_for) | not)) or
+          if ($retirement | type) != "object" then true
+          elif ($retirement.state == "pending" or $retirement.state == "deferred") then
+            ((provider_retirement_outstanding_valid) | not)
+          else ((provider_retirement_finished_for) | not) end)] | length),
+      ([.jobs[]? | select(.provider_result_receipt != null)] | length),
+      ([.jobs[]? | select(.provider_result_receipt != null) |
+        select((provider_receipt_valid) | not)] | length) +
+      ([.jobs[]? | select(has("legacy_v121_pending_origin")) |
+        select((legacy_v121_pending_valid) | not)] | length) +
+      ([.jobs[]? | select(.inference != null and .provider_result_receipt == null) |
+        select((.inference | type) != "object" or
+          ((.inference | has("provider_receipt_protocol_version")) and
+            .inference.provider_receipt_protocol_version != 1) or
+          ((.inference | has("provider_receipt_protocol_version") | not) and
+            ((.inference | legacy_v121_inference) | not)))] | length),
+      ([.jobs[]? | select(.provider_result_receipt == null) |
+        select((.inference | legacy_v121_inference) or legacy_v121_pending_valid) |
+        select(.status == "received" or .status == "processing" or
+          .responsibility_status == "unresolved_failure")] | length)
     ] | @tsv' "$file")
     read -r human_count timed_count permanent_count active_count stale_count job_count feedback_count \
       pending_count unresolved_count silence_count unknown_count file_oldest_unresolved file_oldest_unknown \
-      settlement_count invalid_settlement_count <<< "$counts"
+      settlement_count invalid_settlement_count retirement_count invalid_retirement_count \
+      receipt_count invalid_receipt_count \
+      legacy_inference_count <<< "$counts"
     human=$((human+human_count)); timed=$((timed+timed_count)); permanent=$((permanent+permanent_count))
     active_workers=$((active_workers+active_count)); stale_workers=$((stale_workers+stale_count)); pending_jobs=$((pending_jobs+job_count))
     feedback_pending=$((feedback_pending+feedback_count))
@@ -2049,6 +2372,110 @@ doctor_runtime_state_check() {
     unknown_deliveries=$((unknown_deliveries+unknown_count))
     provider_settlements=$((provider_settlements+settlement_count))
     invalid_settlements=$((invalid_settlements+invalid_settlement_count))
+    provider_retirements=$((provider_retirements+retirement_count))
+    invalid_retirements=$((invalid_retirements+invalid_retirement_count))
+    provider_receipts=$((provider_receipts+receipt_count))
+    invalid_provider_receipts=$((invalid_provider_receipts+invalid_receipt_count))
+    legacy_provider_inferences=$((legacy_provider_inferences+legacy_inference_count))
+    context_hash_invalid=0
+    while IFS=$'\t' read -r stored_hash encoded_context; do
+      [[ -n "$stored_hash" && -n "$encoded_context" ]] || continue
+      actual_hash=$(printf '%s' "$encoded_context" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+      [[ "$actual_hash" == "$stored_hash" ]] || ((context_hash_invalid += 1))
+    done < <(jq -r '
+      def canonical_value:
+        if type == "object" then to_entries | sort_by(.key) |
+          map({key:.key,value:(.value | canonical_value)}) | from_entries
+        elif type == "array" then map(canonical_value)
+        else . end;
+      .jobs[]? | select(.provider_result_receipt != null) |
+      [(.provider_result_receipt.plan_context_sha256 // ""),
+       ((if (.provider_result_receipt | has("plan_context"))
+         then .provider_result_receipt.plan_context else null end |
+         canonical_value | tojson | @base64))] | @tsv' "$file" 2>/dev/null)
+    invalid_provider_receipts=$((invalid_provider_receipts+context_hash_invalid))
+    legacy_binding_invalid=0
+    while IFS=$'\t' read -r stored_hash encoded_legacy_configuration; do
+      [[ -n "$stored_hash" && -n "$encoded_legacy_configuration" ]] || continue
+      actual_hash=$(printf '%s' "$encoded_legacy_configuration" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+      [[ "$actual_hash" == "$stored_hash" ]] || ((legacy_binding_invalid += 1))
+    done < <(jq -r '
+      .jobs[]? | select(.legacy_v121_pending_origin.phase == "successor_bound") |
+      .legacy_v121_pending_origin as $marker |
+      [($marker.target_configuration_binding // ""),
+       ([$marker.target.runtime_revision,$marker.target.pool_revision,
+         $marker.target.secrets_generation,$marker.target.pool_sha256,
+         $marker.target.materials_source_sha256] | tojson | @base64)] | @tsv' \
+      "$file" 2>/dev/null)
+    invalid_provider_receipts=$((invalid_provider_receipts+legacy_binding_invalid))
+    settlement_identity_invalid=0
+    while IFS=$'\t' read -r stored_hash encoded_plan settlement_generation job_generation; do
+      [[ -n "$stored_hash" && -n "$encoded_plan" ]] || continue
+      actual_hash=$(printf '%s' "$encoded_plan" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+      if [[ "$actual_hash" != "$stored_hash" || "$settlement_generation" != "$job_generation" ]]; then
+        ((settlement_identity_invalid += 1))
+      fi
+    done < <(jq -r '
+      def canonical_value:
+        if type == "object" then to_entries | sort_by(.key) |
+          map({key:.key,value:(.value | canonical_value)}) | from_entries
+        elif type == "array" then map(canonical_value)
+        else . end;
+      def response_generation:
+        if (.response_generation | type) == "number" and .response_generation >= 0 and
+          .response_generation <= 1000000 and (.response_generation | floor) == .response_generation
+        then .response_generation else 0 end;
+      .jobs[]? | select(.provider_settlement != null and (.plan | type) == "object") |
+      [(.provider_settlement.plan_sha256 // ""),
+       ({type:(.plan.type // ""),purpose:(.plan.purpose // ""),content:(.plan.content // ""),
+         outcome:(.plan.outcome // ""),sources:(.plan.sources // []),tags:(.plan.tags // [])} |
+         canonical_value | tojson | @base64),
+       ((.provider_settlement.response_generation // "") | tostring),
+       ((response_generation) | tostring)] | @tsv' "$file" 2>/dev/null)
+    while IFS=$'\t' read -r stored_hash encoded_configuration; do
+      [[ -n "$stored_hash" && -n "$encoded_configuration" ]] || continue
+      actual_hash=$(printf '%s' "$encoded_configuration" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+      [[ "$actual_hash" == "$stored_hash" ]] || ((settlement_identity_invalid += 1))
+    done < <(jq -r '
+      .jobs[]? | select(.provider_settlement.state == "pending" or
+        .provider_settlement.state == "deferred") |
+      .provider_settlement.envelope as $envelope |
+      [($envelope.configuration_binding // ""),
+       ([$envelope.runtime_revision,$envelope.pool_revision,$envelope.secrets_generation,
+         $envelope.pool_sha256,$envelope.materials_source_sha256] | tojson | @base64)] | @tsv' \
+      "$file" 2>/dev/null)
+    invalid_settlements=$((invalid_settlements+settlement_identity_invalid))
+    retirement_identity_invalid=0
+    while IFS=$'\t' read -r stored_identity encoded_retirement identity_kind stored_hash encoded_configuration; do
+      [[ -n "$stored_identity" && -n "$encoded_retirement" && -n "$identity_kind" ]] || continue
+      actual_hash=$(printf '%s' "$encoded_retirement" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+      [[ "$actual_hash" == "$stored_identity" ]] || ((retirement_identity_invalid += 1))
+      if [[ "$identity_kind" == current ]]; then
+        if [[ -z "$stored_hash" || -z "$encoded_configuration" ]]; then
+          ((retirement_identity_invalid += 1))
+        else
+          actual_hash=$(printf '%s' "$encoded_configuration" | base64 -d 2>/dev/null | sha256sum | awk '{print $1}')
+          [[ "$actual_hash" == "$stored_hash" ]] || ((retirement_identity_invalid += 1))
+        fi
+      fi
+    done < <(jq -r '
+      def canonical_value:
+        if type == "object" then to_entries | sort_by(.key) |
+          map({key:.key,value:(.value | canonical_value)}) | from_entries
+        elif type == "array" then map(canonical_value)
+        else . end;
+      .jobs[]? | select(.provider_retirement.state == "pending" or
+        .provider_retirement.state == "deferred") |
+      .provider_retirement as $retirement | $retirement.envelope as $envelope |
+      [($retirement.identity_sha256 // ""),
+       ({envelope:$envelope,purpose:($retirement.purpose // "")} |
+         canonical_value | tojson | @base64),
+       (if $envelope.legacy_v121_cleanup == true then "legacy_v121" else "current" end),
+       ($envelope.configuration_binding // "-"),
+       ([$envelope.runtime_revision,$envelope.pool_revision,$envelope.secrets_generation,
+         $envelope.pool_sha256,$envelope.materials_source_sha256] | tojson | @base64)] | @tsv' \
+      "$file" 2>/dev/null)
+    invalid_retirements=$((invalid_retirements+retirement_identity_invalid))
     if (( file_oldest_unresolved > 0 && (oldest_unresolved == 0 || file_oldest_unresolved < oldest_unresolved) )); then oldest_unresolved=$file_oldest_unresolved; fi
     if (( file_oldest_unknown > 0 && (oldest_unknown == 0 || file_oldest_unknown < oldest_unknown) )); then oldest_unknown=$file_oldest_unknown; fi
   done
@@ -2081,6 +2508,26 @@ doctor_runtime_state_check() {
       "当前无未完成故障或未知发送；明确政策静默 ${intentional_silence}" filesystem '' "$start"
   fi
   if (( deadline_reached || invalid > 0 )); then
+    doctor_add runtime.provider_receipts '推理请求回执' WARN critical \
+      '会话状态未完整读取，不能断言所有推理请求身份均可安全恢复' filesystem \
+      '先修复会话状态读取；自检不会清除推理信封或重新调用模型' "$start"
+  elif (( invalid_provider_receipts > 0 )); then
+    doctor_add runtime.provider_receipts '推理请求回执' FAIL critical \
+      "发现 ${invalid_provider_receipts} 项推理回执身份损坏；当前回执总数 ${provider_receipts}" filesystem \
+      '保留原问题和推理信封，检查受限状态备份与当前 runtime；不要删除回执来强制重试' "$start"
+  elif (( legacy_provider_inferences > 0 )); then
+    doctor_add runtime.provider_receipts '推理请求回执' WARN critical \
+      "发现 ${legacy_provider_inferences} 项旧版未跟踪推理信封；将由当前独占任务保留原问题并迁移" filesystem \
+      '保持任务扫描运行；迁移前不会把旧信封冒充已确认结果' "$start"
+  elif (( provider_receipts > 0 )); then
+    doctor_add runtime.provider_receipts '推理请求回执' WARN warning \
+      "有 ${provider_receipts} 项当前代推理回执等待重放或收敛；不会并行重新推理" filesystem \
+      '检查 adapter 与五秒任务扫描；持续未收敛时查看应答责任故障原因' "$start"
+  else
+    doctor_add runtime.provider_receipts '推理请求回执' PASS warning \
+      '当前没有等待收敛或身份损坏的推理请求回执' filesystem '' "$start"
+  fi
+  if (( deadline_reached || invalid > 0 )); then
     doctor_add runtime.provider_settlements '推理结果持久结算' WARN critical \
       '会话状态未完整读取，不能断言所有已持久答案均已释放临时推理缓存' filesystem \
       '先修复会话状态读取；自检不会删除推理结果或客户任务' "$start"
@@ -2095,6 +2542,22 @@ doctor_runtime_state_check() {
   else
     doctor_add runtime.provider_settlements '推理结果持久结算' PASS warning \
       '当前没有延后的推理结果结算' filesystem '' "$start"
+  fi
+  if (( deadline_reached || invalid > 0 )); then
+    doctor_add runtime.provider_retirements 'Provider 推理缓存清理' WARN critical \
+      '会话状态未完整读取，不能断言不可见推理缓存均已安全释放' filesystem \
+      '先修复会话状态读取；自检不会删除推理缓存或客户任务' "$start"
+  elif (( invalid_retirements > 0 )); then
+    doctor_add runtime.provider_retirements 'Provider 推理缓存清理' FAIL critical \
+      "发现 ${invalid_retirements} 项清理身份或授权损坏；待清理总数 ${provider_retirements}" filesystem \
+      '保留人工/总开关状态与原签名身份，检查当前 runtime 和 adapter；不要手工删除问题缓存' "$start"
+  elif (( provider_retirements > 0 )); then
+    doctor_add runtime.provider_retirements 'Provider 推理缓存清理' WARN warning \
+      "有 ${provider_retirements} 项推理缓存等待 adapter 安全释放；清理事务本身不会调用上游或向访客发送，未解决问题将在清理后按原责任恢复" filesystem \
+      '检查 adapter 与五秒任务扫描；人工或总关任务保持静默，其余未解决责任继续正常恢复' "$start"
+  else
+    doctor_add runtime.provider_retirements 'Provider 推理缓存清理' PASS warning \
+      '当前没有延后的 Provider 推理缓存清理事务' filesystem '' "$start"
   fi
   if (( deadline_reached || invalid > 0 )); then
     doctor_add runtime.feedback '自动评价邀请' WARN warning '会话扫描未完整完成，未对未检查的旧评价状态作成功判断' filesystem '修复上述会话检查问题后重试；自检不会删除任何任务' "$start"

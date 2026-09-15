@@ -568,7 +568,7 @@ function createRuntime(env = {}, options = {}) {
       'no_capable_provider', 'question_budget_exhausted', 'question_timeout', 'question_interrupted',
       'question_cancelled', 'question_result_absent', 'question_result_rejected', 'question_owner_changed', 'question_settled',
       'question_conflict', 'question_persistence_failed', 'provider_request_identity_unknown', 'provider_response_unknown',
-      'safety_refusal', 'protocol_error']);
+      'provider_receipt_identity_unresolved', 'safety_refusal', 'protocol_error']);
     const upstream = String(response?.body?.error?.code || '');
     if (allowed.has(upstream)) return upstream;
     if (allowed.has(String(error?.code || ''))) return String(error.code);
@@ -622,10 +622,7 @@ function createRuntime(env = {}, options = {}) {
         job.legacy_non_answer_migrated = true;
         job.legacy_non_answer_migrated_at = clock();
         delete job.execution_token;
-        delete job.plan;
-        delete job.inference;
-        delete job.provider_result_receipt;
-        delete job.provider_migration_from;
+        retireProviderAttempt(key, job, 'non_answer_retired');
       }
       // 升级或崩溃可能留下旧版尚未登记发送的可见机械话术。所有本项目自动
       // 出站都走同一收敛层；未知回执或已发送正文必须先对账，绝不改写历史。
@@ -789,6 +786,76 @@ function createRuntime(env = {}, options = {}) {
     && /^[a-f0-9]{32}$/.test(value.secrets_generation || '')
     && /^[a-f0-9]{64}$/.test(value.pool_sha256 || '')
     && /^[a-f0-9]{64}$/.test(value.materials_source_sha256 || ''));
+  const legacyV121Inference = (value) => Boolean(value
+    && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 2
+    && Object.prototype.hasOwnProperty.call(value, 'pool_revision')
+    && Object.prototype.hasOwnProperty.call(value, 'deadline_at')
+    && Number.isSafeInteger(value.pool_revision) && value.pool_revision >= 1
+    && Number.isSafeInteger(value.deadline_at) && value.deadline_at >= 0);
+  const legacyV121Origin = (value) => Boolean(value
+    && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 3
+    && Object.prototype.hasOwnProperty.call(value, 'runtime_revision')
+    && Object.prototype.hasOwnProperty.call(value, 'pool_revision')
+    && Object.prototype.hasOwnProperty.call(value, 'deadline_at')
+    && Number.isSafeInteger(value.runtime_revision) && value.runtime_revision >= 0
+    && Number.isSafeInteger(value.pool_revision) && value.pool_revision >= 1
+    && Number.isSafeInteger(value.deadline_at) && value.deadline_at >= 0);
+  const hasLegacyV121PendingOrigin = (job) => Boolean(job
+    && Object.prototype.hasOwnProperty.call(job, 'legacy_v121_pending_origin'));
+  const legacyV121SourceFrozen = (value) => Boolean(value
+    && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 3
+    && value.schema_version === 1 && value.phase === 'source_frozen'
+    && legacyV121Origin(value.source));
+  const legacyV121SuccessorBound = (value) => Boolean(value
+    && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 5
+    && value.schema_version === 1 && value.phase === 'successor_bound'
+    && legacyV121Origin(value.source)
+    && completeProviderConfiguration(value.target)
+    && value.target_configuration_binding === providerConfigurationBinding(value.target));
+  const legacyV121SourceMarker = (job) => ({schema_version: 1, phase: 'source_frozen',
+    source: {runtime_revision: job.revision, pool_revision: job.inference.pool_revision,
+      deadline_at: job.inference.deadline_at}});
+  const legacyV121SuccessorMarker = (source, target) => ({schema_version: 1,
+    phase: 'successor_bound', source: {...source}, target: {...target},
+    target_configuration_binding: providerConfigurationBinding(target)});
+  const legacyV121PendingOriginMatches = (job, expectedTarget = null) => {
+    const marker = job?.legacy_v121_pending_origin;
+    if (job?.provider_result_receipt || job?.provider_settlement || job?.plan) return false;
+    if (legacyV121SourceFrozen(marker)) {
+      return legacyV121Inference(job.inference)
+        && marker.source.runtime_revision === job.revision
+        && marker.source.pool_revision === job.inference.pool_revision
+        && marker.source.deadline_at === job.inference.deadline_at;
+    }
+    if (!legacyV121SuccessorBound(marker) || job.inference !== undefined
+      || marker.target.runtime_revision !== job.revision) return false;
+    return expectedTarget === null || sameProviderConfiguration(marker.target, expectedTarget)
+      && marker.target_configuration_binding === providerConfigurationBinding(expectedTarget);
+  };
+  const legacyV121RetirementSource = (job) => {
+    if (hasLegacyV121PendingOrigin(job) && legacyV121PendingOriginMatches(job)) {
+      return { ...job.legacy_v121_pending_origin.source };
+    }
+    if (legacyV121Inference(job?.inference) && !job.provider_result_receipt
+      && !job.provider_settlement) {
+      return { runtime_revision: job.revision, pool_revision: job.inference.pool_revision,
+        deadline_at: job.inference.deadline_at };
+    }
+    return null;
+  };
+  const legacyV121RetirementEnvelope = (key, job) => {
+    const source = legacyV121RetirementSource(job);
+    if (!source) return null;
+    return { version: 1, scope: 'conversation', question_id: job.id,
+      session_key: key, generation: job.generation,
+      runtime_revision: source.runtime_revision, pool_revision: source.pool_revision,
+      deadline_at: source.deadline_at, stage: 'answer', attempt_generation: 1,
+      legacy_v121_cleanup: true };
+  };
   const providerConfigurationFromInference = (job) => {
     const inference = job?.inference;
     if (!inference) return null;
@@ -807,14 +874,61 @@ function createRuntime(env = {}, options = {}) {
     && left.secrets_generation === right.secrets_generation
     && left.pool_sha256 === right.pool_sha256
     && left.materials_source_sha256 === right.materials_source_sha256);
-  const providerDependentPlan = (plan) => Boolean(plan && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
+  const providerDependentPlan = (plan) => Boolean(plan
+    && signedKnowledgeAnswerState(plan) !== true
+    && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
   const providerGeneratedPlan = (plan) => Boolean(plan
+    && signedKnowledgeAnswerState(plan) !== true
     && !['keyword_reply', 'menu', 'welcome', 'handoff_offer', 'handoff_offer_reminder', 'handoff_ack', 'operator', 'safe_error', 'technical_unresolved'].includes(plan.purpose)
     && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
   const uncertainDeliveriesFor = (state, job) => Object.entries(state.outgoing || {}).filter(([fingerprint, record]) =>
     ['unknown', 'sending'].includes(record.status) && (record.job_id === job.id
       || !record.job_id && job.plan?.fingerprint && String(job.plan.fingerprint) === fingerprint));
   const uncertainDeliveryFor = (state, job) => uncertainDeliveriesFor(state, job).length > 0;
+  // Provider 已生成且 runtime 已原子持久化的正文，之后只剩 Crisp 投递责任。
+  // 配置换代不得删除正文再调用 Provider；结构损坏也必须 fail closed。
+  function frozenDeliveryOnlyDisposition(key, state, job) {
+    const plan = job?.plan;
+    if (!providerGeneratedPlan(plan)) return 'none';
+    const settlement = job.provider_settlement;
+    const planSha256 = providerPlanSha256(plan);
+    const generation = responseGeneration(job);
+    const persisted = providerSettlementFinished(settlement)
+      ? settlement.plan_sha256 === planSha256 && settlement.response_generation === generation
+      : providerSettlementOutstanding(job) && validProviderSettlement(key, job, settlement)
+        && settlement.envelope.stage === 'answer'
+        && settlement.plan_sha256 === planSha256 && settlement.response_generation === generation;
+    if (!persisted) return 'invalid';
+    const records = Object.entries(state?.outgoing || {}).filter(([, record]) => record?.job_id === job.id
+      && ['sending', 'unknown', 'rate_limited', 'rejected'].includes(record.status));
+    if (!records.length) return 'ready';
+    if (records.length !== 1) return 'invalid';
+    const [fingerprint, record] = records[0];
+    const deferredDelivery = ['rate_limited', 'rejected'].includes(record.status);
+    const deferredStateValid = !deferredDelivery || record.resend_forbidden !== true
+      && record.recovery_deferred === true
+      && Number.isSafeInteger(record.next_action_at)
+      && record.next_action_at >= 0 && record.next_action_at <= Number.MAX_SAFE_INTEGER
+      && Number.isSafeInteger(record.attempts) && record.attempts >= 1
+      && record.attempts <= 1000000
+      && (record.status === 'rate_limited'
+        ? record.failure === 'crisp_rate_limited'
+        : /^crisp_http_(400|401|403|404|405|410|413|415|422)$/.test(record.failure || ''));
+    const matched = matchingOutgoingPlan(key, job, record, fingerprint);
+    const expectedType = String(plan.type || 'text');
+    const expectedIntent = planSemanticIntent(job, plan);
+    const expectedDigest = outboundContentSha256(expectedType, plan.content);
+    return deferredStateValid && matched && record.generation === job.generation
+      && responseGeneration(record) === generation
+      && String(record.purpose || '') === String(plan.purpose || '')
+      && String(record.message_type || record.body?.type || '') === expectedType
+      && record.semantic_intent === expectedIntent
+      && record.content_sha256 === expectedDigest
+      && record.body && outboundContentSha256(record.body.type || 'text', record.body.content) === expectedDigest
+      ? 'ready' : 'invalid';
+  }
+  const pendingDeliveryFor = (key, state, job) => uncertainDeliveryFor(state, job)
+    || frozenDeliveryOnlyDisposition(key, state, job) !== 'none';
   const uncertainDeliveryRetryAt = (state, job, fallback = clock() + 5000) => {
     const records = uncertainDeliveriesFor(state, job);
     if (!records.length || records.some(([, record]) => !(record.next_action_at > clock()))) return fallback;
@@ -843,7 +957,42 @@ function createRuntime(env = {}, options = {}) {
     state_change_reason: String(record.receipt_state_change_reason || ''), evidence_count: 1 };
   };
   const frozenDeliverySemanticFor = (state, job) => frozenDeliveryReceiptFor(state, job).semantic_status;
+  const migratableLegacyV121Inference = (job) => Boolean(legacyV121Inference(job?.inference)
+    && !job.provider_result_receipt && !job.provider_settlement && !job.plan
+    && (!hasLegacyV121PendingOrigin(job)
+      || legacyV121SourceFrozen(job.legacy_v121_pending_origin)
+        && legacyV121PendingOriginMatches(job)));
+  const migratableLegacyV121PendingOrigin = (job) => Boolean(
+    hasLegacyV121PendingOrigin(job) && legacyV121PendingOriginMatches(job));
   const deferForConfiguration = (job, preservePlan = false) => {
+    if (providerRetirementOutstanding(job)) {
+      job.deferred_configuration = true;
+      job.retry_at = clock() + 5000;
+      job.lease_until = 0;
+      return false;
+    }
+    if (!preservePlan && migratableLegacyV121PendingOrigin(job)) {
+      job.deferred_configuration = true;
+      job.retry_at = clock() + 5000;
+      job.lease_until = 0;
+      return false;
+    }
+    if (!preservePlan && job?.inference) {
+      if (migratableLegacyV121Inference(job) || migratableLegacyV121PendingOrigin(job)) {
+        if (!hasLegacyV121PendingOrigin(job)) {
+          job.legacy_v121_pending_origin = legacyV121SourceMarker(job);
+        }
+        job.deferred_configuration = true;
+        job.retry_at = clock() + 5000;
+        job.lease_until = 0;
+        return false;
+      }
+      if (providerResultDisposition(job) === 'invalid_identity') {
+        markUnresolved(job, 'provider_receipt_identity_unresolved');
+        job.retry_at = clock() + 300000;
+        return false;
+      }
+    }
     job.deferred_configuration = true;
     job.retry_at = clock() + 5000;
     job.lease_until = 0;
@@ -868,25 +1017,34 @@ function createRuntime(env = {}, options = {}) {
   };
   const releaseConfigurationDeferrals = (state) => {
     const configured = configuredSettings();
+    const key = stateKey(state.website_id, state.session_id);
     // 一次成功应用的全局停用会递增单调代次。即使管理员在任务 retry_at
     // 到期前重新启用，跨过该停用边界的普通问题也不得被新配置重新绑定后补发。
-    for (const job of state.jobs.filter((entry) => !terminalJob(entry)
+    for (const job of state.jobs.filter((entry) => policyCancellationPending(state, entry)
       && globalDisableCrossed(entry, configured))) {
       job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
       markIntentionalSilence(job, 'global_disabled');
       settleUncertainDeliveries(state, job, 'global_disabled');
-      if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference;
-        delete job.provider_result_receipt; delete job.provider_migration_from; }
+      if (!uncertainDeliveryFor(state, job)) {
+        delete job.data;
+        retireProviderAttempt(key, job, 'global_disabled');
+      }
       delete job.execution_token; delete job.deferred_configuration; delete job.deferred_control;
       if (state.worker?.job === job.id) state.worker = null;
     }
     if (configured.enabled !== true || state.mode !== 'ai') {
-      for (const job of state.jobs.filter((entry) => entry.deferred_configuration === true && entry.status === 'received')) {
+      // 修复旧版在 failed/unresolved 上遗留的活动 Provider/投递责任。业务政策
+      // 已经禁止回答时，不论它是否恰好带 deferred_configuration，都必须原子
+      // 取消；历史已投递且没有活动恢复身份的质量记录仍保留供诊断。
+      for (const job of state.jobs.filter((entry) => policyCancellationPending(state, entry))) {
         job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
         markIntentionalSilence(job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
         settleUncertainDeliveries(state, job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-        if (!uncertainDeliveryFor(state, job)) { delete job.data; delete job.plan; delete job.inference;
-          delete job.provider_result_receipt; delete job.provider_migration_from; }
+        if (!uncertainDeliveryFor(state, job)) {
+          delete job.data;
+          retireProviderAttempt(key, job, state.mode !== 'ai'
+            ? 'conversation_cancelled' : 'global_disabled');
+        }
         delete job.deferred_configuration;
       }
       return false;
@@ -898,14 +1056,47 @@ function createRuntime(env = {}, options = {}) {
       return false;
     }
     const current = settings();
+    const currentProvider = providerConfiguration();
     for (const job of state.jobs.filter((entry) => entry.deferred_configuration === true && entry.status === 'received')) {
-      // 已经向 Crisp 交出过字节但未取得确定回执时，必须先沿用旧 plan/fingerprint
-      // 对账。若此处先改 revision 或重新规划，规则变化可能生成另一 fingerprint，
-      // 从而让同一访客问题出现两条回复。
-      if (uncertainDeliveryFor(state, job)) {
+      if (providerRetirementOutstanding(job)) {
+        job.retry_at = clock() + 5000;
+        job.lease_until = 0;
+        continue;
+      }
+      if (migratableLegacyV121Inference(job) || migratableLegacyV121PendingOrigin(job)) {
+        const source = hasLegacyV121PendingOrigin(job)
+          ? job.legacy_v121_pending_origin.source
+          : legacyV121SourceMarker(job).source;
+        // 先把公开 v1.2.1 的来源代冻结，再切换到当前配置 revision。旧 inference
+        // 随后由持有独占 execution 的 beginInference 消费为带签名来源的 attempt 2；
+        // 不能用新 revision 回填旧来源，也不能在维护窗口中丢掉原问题。
+        job.revision = current.revision;
+        delete job.inference;
+        job.legacy_v121_pending_origin = legacyV121SuccessorMarker(source, currentProvider);
         job.retry_at = null;
         job.lease_until = 0;
         delete job.deferred_configuration;
+        continue;
+      }
+      if ((job.inference || hasLegacyV121PendingOrigin(job))
+        && providerResultDisposition(job) === 'invalid_identity') {
+        markUnresolved(job, 'provider_receipt_identity_unresolved');
+        job.retry_at = clock() + 300000;
+        continue;
+      }
+      // 已经向 Crisp 交出过字节但未取得确定回执时，必须先沿用旧 plan/fingerprint
+      // 对账。若此处先改 revision 或重新规划，规则变化可能生成另一 fingerprint，
+      // 从而让同一访客问题出现两条回复。
+      const frozen = frozenDeliveryOnlyDisposition(key, state, job);
+      if (uncertainDeliveryFor(state, job) || frozen === 'ready') {
+        job.retry_at = null;
+        job.lease_until = 0;
+        delete job.deferred_configuration;
+        continue;
+      }
+      if (frozen === 'invalid') {
+        markUnresolved(job, 'delivery_identity_unresolved');
+        job.retry_at = clock() + 300000;
         continue;
       }
       // 人工接管曾使会话 generation 前进时，旧访客问题不能被新配置
@@ -913,8 +1104,8 @@ function createRuntime(env = {}, options = {}) {
       if (job.generation !== state.generation) {
         job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
         markIntentionalSilence(job, 'conversation_state_changed');
-        delete job.data; delete job.plan; delete job.inference;
-        delete job.provider_result_receipt; delete job.provider_migration_from;
+        delete job.data;
+        retireProviderAttempt(key, job, 'conversation_cancelled');
         delete job.deferred_configuration;
         continue;
       }
@@ -922,6 +1113,7 @@ function createRuntime(env = {}, options = {}) {
       job.retry_at = null;
       job.lease_until = 0;
       delete job.plan; delete job.inference; delete job.provider_result_receipt;
+      delete job.legacy_v121_pending_origin;
       delete job.deferred_configuration;
     }
     return true;
@@ -931,9 +1123,9 @@ function createRuntime(env = {}, options = {}) {
     try { pool = providerPool(); } catch (_) { return false; }
     const ready = providerConfigurationReady(pool);
     if (!ready || !job?.inference) return ready;
-    // 旧版已持久任务只有 pool revision；首次安全恢复时由
-    // beginInference 补全当前同代身份。新任务必须逐字比对完整 tuple。
-    if (!job.inference.configuration_binding) {
+    // 只认公开 v1.2.1 的两个字段旧形态。其它缺少 receipt 协议的对象不能
+    // 被补全成当前配置，也不能在配置换代时被当成安全的新请求。
+    if (legacyV121Inference(job.inference)) {
       return job.inference.pool_revision === (pool?.revision ?? null)
         && job.revision === settings().revision;
     }
@@ -961,13 +1153,15 @@ function createRuntime(env = {}, options = {}) {
       request_sha256: requestContract.request_sha256,
       plan_context_sha256: requestContract.plan_context_sha256,
     } : {};
+    const legacy = !administrator && legacyV121Origin(job.inference.legacy_v121_origin)
+      ? { legacy_v121_origin: { ...job.inference.legacy_v121_origin } } : {};
     return {version: 1, scope: administrator ? 'admin' : 'conversation', question_id: job.id,
       ...(!administrator ? {session_key: key, generation: job.generation} : {}), runtime_revision: job.revision,
       pool_revision: configuration.pool_revision, secrets_generation: configuration.secrets_generation,
       pool_sha256: configuration.pool_sha256, materials_source_sha256: configuration.materials_source_sha256,
       configuration_binding: job.inference.configuration_binding,
       deadline_at: job.inference.deadline_at, attempt_generation: job.inference.attempt_generation,
-      stage, ...contract,
+      stage, ...contract, ...legacy,
       ...migration};
   };
   const signProviderEnvelope = envelope => {
@@ -1099,6 +1293,15 @@ function createRuntime(env = {}, options = {}) {
     return error;
   };
   const processingPermitLost = (error) => error?.code === 'PROCESSING_PERMIT_LOST';
+  const processingCancelledError = (reason = 'conversation_state_changed') => {
+    const error = new Error('会话状态已变化，本次后台处理已取消');
+    error.name = 'AbortError';
+    error.code = 'PROCESSING_CANCELLED';
+    error.reason = reason;
+    return error;
+  };
+  const processingCancelled = (error) => error?.code === 'PROCESSING_CANCELLED';
+  const processingInterrupted = (error) => processingPermitLost(error) || processingCancelled(error);
   const combinedAbortSignal = (...values) => {
     const signals = values.filter((signal) => signal && typeof signal.addEventListener === 'function');
     if (!signals.length) return { signal: undefined, cleanup() {} };
@@ -1117,32 +1320,37 @@ function createRuntime(env = {}, options = {}) {
   // 网络发送不占用会话状态锁。逐会话登记尚未完成的普通出站，使真人接管
   // 在状态提交后可以立即中止仍挂起的 HTTP 请求；控制通知不受此机制影响。
   const outboundRequests = new Map();
-  const outboundCancellationReason = (key, job, providerRequired = true, ordinary = true) => {
+  const processingRequests = new Map();
+  const outboundCancellationReason = (key, job, providerRequired = true, ordinary = true,
+    configurationFrozen = false) => {
     try {
       const state = readState(key);
       if (state.generation !== job.generation || (ordinary && state.mode !== 'ai') || operatorBarrier(state)) return 'conversation_state_changed';
       const global = settings();
       if (ordinary && globalDisableCrossed(job, global)) return 'global_disabled';
       if (configuredSettings().enabled !== true) return 'global_disabled';
-      if (!global.enabled || global.revision !== job.revision || providerRequired && !providerGenerationCurrent(job)) return 'configuration_changed';
+      if (!configurationFrozen && (!global.enabled || global.revision !== job.revision
+        || providerRequired && !providerGenerationCurrent(job))) return 'configuration_changed';
       return '';
     } catch (_) { return 'configuration_changed'; }
   };
   const receiptApplicability = (state, job, plan) => {
     const ordinary = plan?.ordinary !== false;
     const providerRequired = providerDependentPlan(plan);
+    const key = stateKey(state.website_id, state.session_id);
+    const configurationFrozen = frozenDeliveryOnlyDisposition(key, state, job) === 'ready';
     if (state.generation !== job.generation || ordinary && state.mode !== 'ai'
       || operatorBarrier(state)) return { current: false, reason: 'conversation_state_changed' };
     const global = settings();
     if (ordinary && globalDisableCrossed(job, global)
       || configuredSettings().enabled !== true) return { current: false, reason: 'global_disabled' };
-    if (!global.enabled || global.revision !== job.revision
-      || providerRequired && !providerGenerationCurrent(job)) {
+    if (!configurationFrozen && (!global.enabled || global.revision !== job.revision
+      || providerRequired && !providerGenerationCurrent(job))) {
       return { current: false, reason: 'configuration_changed' };
     }
     return { current: true, reason: '' };
   };
-  const beginOutbound = (key, job, providerRequired = true) => {
+  const beginOutbound = (key, job, providerRequired = true, configurationFrozen = false) => {
     const entry = { token: crypto.randomBytes(16).toString('hex'), controller: createAbortController(), cancellation_reason: '' };
     const entries = outboundRequests.get(key) || new Set();
     entries.add(entry);
@@ -1151,7 +1359,8 @@ function createRuntime(env = {}, options = {}) {
     // 快速路径，持久 generation/mode 才是跨实例权威 fence。
     entry.timer = setInterval(() => {
       if (entry.controller.signal.aborted) return;
-      entry.cancellation_reason = outboundCancellationReason(key, job, providerRequired);
+      entry.cancellation_reason = outboundCancellationReason(key, job, providerRequired, true,
+        configurationFrozen);
       if (entry.cancellation_reason) entry.controller.abort();
     }, 100);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
@@ -1169,6 +1378,49 @@ function createRuntime(env = {}, options = {}) {
     for (const entry of outboundRequests.get(key) || []) {
       if (!entry.controller.signal.aborted) { entry.cancellation_reason = 'conversation_state_changed'; entry.controller.abort(); }
     }
+  };
+  const processingCancellationReason = (key, job, token) => {
+    try {
+      const state = readState(key);
+      const stored = state.jobs.find((entry) => entry?.id === job?.id);
+      if (state.generation !== job.generation || state.mode !== 'ai' || operatorBarrier(state)
+        || stored?.status === 'cancelled') return 'conversation_state_changed';
+      const global = configuredSettings();
+      if (globalDisableCrossed(job, global) || global.enabled !== true) return 'global_disabled';
+      if (!stored || stored.status !== 'processing' || stored.execution_token !== token) {
+        return 'execution_superseded';
+      }
+      return '';
+    } catch (_) { return 'execution_superseded'; }
+  };
+  const abortProcessingEntry = (entry, reason) => {
+    if (!entry || entry.controller.signal.aborted || !reason) return;
+    entry.cancellation_reason = reason;
+    entry.controller.abort(reason === 'execution_superseded'
+      ? processingPermitLostError(reason) : processingCancelledError(reason));
+  };
+  const beginProcessingCancellation = (key, job, token) => {
+    const entry = { token, controller: createAbortController(), cancellation_reason: '' };
+    const entries = processingRequests.get(key) || new Set();
+    entries.add(entry);
+    processingRequests.set(key, entries);
+    const inspect = () => abortProcessingEntry(entry,
+      processingCancellationReason(key, job, token));
+    entry.timer = setInterval(inspect, 100);
+    if (typeof entry.timer.unref === 'function') entry.timer.unref();
+    inspect();
+    return entry;
+  };
+  const finishProcessingCancellation = (key, entry) => {
+    if (!entry) return;
+    clearInterval(entry.timer);
+    const entries = processingRequests.get(key);
+    if (!entries) return;
+    entries.delete(entry);
+    if (!entries.size) processingRequests.delete(key);
+  };
+  const cancelProcessing = (key, reason = 'conversation_state_changed') => {
+    for (const entry of processingRequests.get(key) || []) abortProcessingEntry(entry, reason);
   };
   const statePath = (key) => {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('会话标识无效');
@@ -1211,8 +1463,31 @@ function createRuntime(env = {}, options = {}) {
   const priorityConfirmation = (job) => job.control === true && job.action === 'confirm_handoff'
     && job.priority_confirmation === true && !['done', 'cancelled', 'failed'].includes(job.status);
   const terminalJob = (job) => ['done', 'cancelled', 'failed'].includes(job?.status);
+  const providerRetirementPurposeAuthorized = (job, purpose) => {
+    if (purpose === 'conversation_cancelled') {
+      return job?.status === 'cancelled' && job.responsibility_status === 'intentional_silence'
+        && ['human_reply', 'human_handoff', 'conversation_state_changed']
+          .includes(job.responsibility_reason);
+    }
+    if (purpose === 'global_disabled') {
+      return job?.status === 'cancelled' && job.responsibility_status === 'intentional_silence'
+        && job.responsibility_reason === 'global_disabled';
+    }
+    if (purpose === 'input_retired') {
+      return terminalJob(job)
+        && ['intentional_silence', 'control_handled'].includes(job.responsibility_status)
+        && ['non_visitor_message', 'before_catchup_bootstrap', 'before_control_watermark']
+          .includes(job.responsibility_reason);
+    }
+    return purpose === 'non_answer_retired'
+      && ['received', 'failed'].includes(job?.status)
+      && job.responsibility_status === 'unresolved_failure';
+  };
   const providerSettlementFinished = (record) => Boolean(record
     && typeof record === 'object' && !Array.isArray(record)
+    && Object.keys(record).length === 6
+    && ['schema_version', 'state', 'plan_sha256', 'response_generation',
+      'attempts', 'settled_at'].every((name) => Object.prototype.hasOwnProperty.call(record, name))
     && record.schema_version === 1 && ['settled', 'absent'].includes(record.state)
     && /^[a-f0-9]{64}$/.test(record.plan_sha256 || '')
     && Number.isSafeInteger(record.response_generation) && record.response_generation >= 0
@@ -1222,10 +1497,136 @@ function createRuntime(env = {}, options = {}) {
   // 也不能因字段拼写或半次写入被当成“没有待结算”而清理答案缓存。
   const providerSettlementOutstanding = (job) => Boolean(job?.provider_settlement
     && !providerSettlementFinished(job.provider_settlement));
+  const providerRetirementFinished = (record) => Boolean(record
+    && typeof record === 'object' && !Array.isArray(record)
+    && Object.keys(record).length === 6
+    && ['schema_version', 'state', 'purpose', 'attempts', 'retired_at', 'identity_sha256']
+      .every((name) => Object.prototype.hasOwnProperty.call(record, name))
+    && record.schema_version === 1 && ['retired', 'absent'].includes(record.state)
+    && ['conversation_cancelled', 'global_disabled', 'input_retired', 'non_answer_retired']
+      .includes(record.purpose)
+    && Number.isSafeInteger(record.attempts) && record.attempts >= 1
+    && Number.isSafeInteger(record.retired_at) && record.retired_at >= 0
+    && /^[a-f0-9]{64}$/.test(record.identity_sha256 || ''));
+  const providerRetirementCleanupComplete = (job) => Boolean(
+    providerRetirementFinished(job?.provider_retirement)
+    && job.provider_retirement_failure_code === undefined
+    && job.inference === undefined && job.provider_result_receipt === undefined
+    && job.provider_migration_from === undefined && job.legacy_v121_pending_origin === undefined
+    && job.provider_settlement === undefined);
+  const providerRetirementFinishedFor = (job) => Boolean(providerRetirementCleanupComplete(job)
+    && providerRetirementPurposeAuthorized(job, job.provider_retirement.purpose));
+  const providerRetirementOutstanding = (job) => Boolean(job?.provider_retirement
+    && !providerRetirementFinishedFor(job));
+  const providerAttemptOutstandingForPolicy = (job) => Boolean(job
+    && (job.inference !== undefined || job.provider_result_receipt !== undefined
+      || job.provider_migration_from !== undefined || hasLegacyV121PendingOrigin(job)
+      || providerSettlementOutstanding(job) || providerRetirementOutstanding(job)));
+  const recoverableDeliveryOutstandingForPolicy = (state, job) => Boolean(job
+    && (job.delivery_receipt_unknown
+      || Object.values(state?.outgoing || {}).some((record) => record?.job_id === job.id
+        && ['sending', 'unknown', 'rate_limited', 'rejected'].includes(record.status))));
+  // failed/done 只是旧执行轮的终态，不代表访客责任已经终结。只要该责任仍为
+  // unresolved 且持有 Provider/投递恢复身份，真人接管或总关就必须覆盖它；
+  // 已经发送的历史 P0 若没有任何活动恢复身份则继续留给诊断，不能顺手洗成静默。
+  const policyCancellationPending = (state, job) => Boolean(job && !job.control
+    && (!terminalJob(job) || ['done', 'failed'].includes(job.status)
+      && job.responsibility_status === 'unresolved_failure'
+      && (providerAttemptOutstandingForPolicy(job)
+        || recoverableDeliveryOutstandingForPolicy(state, job))));
+  const clearProviderAttemptIdentity = (job) => {
+    delete job.inference;
+    delete job.provider_result_receipt;
+    delete job.provider_migration_from;
+    delete job.legacy_v121_pending_origin;
+  };
+  const retireProviderAttempt = (key, job, purpose = 'conversation_cancelled') => {
+    // 政策取消或旧坏答案恢复必须立即删除可见计划；router 清理则是独立的
+    // cleanup-only 责任。它不授予 route/replay/推理或 Crisp POST 权限。
+    if (purpose === 'non_answer_retired'
+      && !(['received', 'failed'].includes(job?.status)
+        && job?.responsibility_status === 'unresolved_failure')) {
+      // 旧 generic 计划尚未投递就被收敛时，先持久“问题仍未解决”，
+      // 再授权 router 删除该精确 Provider 结果。不能只删缓存却留下
+      // pending/processing 的假成功语义。
+      markUnresolved(job, job?.failure_code || job?.plan?.diagnostic_code
+        || 'visitor_output_rejected');
+    }
+    delete job.plan;
+    // router 已明确返回 retired/absent 且本地已清除全部推理身份时，远端
+    // cleanup 已经完成。若随后真人接管或总关改变业务 purpose，只需丢弃旧
+    // 完成摘要；不能为一个已不存在的缓存伪造“身份损坏”并永久卡住责任。
+    if (providerRetirementCleanupComplete(job)) {
+      delete job.provider_retirement;
+      delete job.provider_retirement_failure_code;
+      return;
+    }
+    if (providerSettlementOutstanding(job)) return;
+    if (providerRetirementOutstanding(job)) {
+      // 退休等待期间可能发生更强的业务终态，例如旧 non-answer 尚待清理时
+      // 真人已接管。旧 purpose 此时不再获授权；必须以同一精确推理身份原子
+      // 重绑新 purpose。旧在途响应会因 identity 不同而失去写回权，新请求
+      // 对已经删除的 router 记录则以 absent 幂等完成。
+      if (job.provider_retirement?.purpose === purpose
+        && validProviderRetirement(key, job, job.provider_retirement)) return;
+      try {
+        const replacement = providerRetirementRecord(key, job, purpose);
+        if (replacement) {
+          job.provider_retirement = replacement;
+          delete job.provider_retirement_failure_code;
+          return;
+        }
+      } catch (_) { /* 精确身份或新业务授权损坏时 fail closed。 */ }
+      job.provider_retirement_failure_code = 'provider_retirement_identity_unresolved';
+      return;
+    }
+    // 公开 v1.2.1 的两字段 inference 以及 source_frozen/successor_bound
+    // 都没有 receipt-before-network 请求契约，但仍持有可逐字反查的旧缓存
+    // 身份。必须先建立签名 cleanup-only 事务；不能让通用
+    // invalid_identity 分支把它永久留成不可恢复的孤儿。
+    if (legacyV121RetirementSource(job)) {
+      try {
+        const record = providerRetirementRecord(key, job, purpose);
+        if (record) {
+          job.provider_retirement = record;
+          delete job.provider_retirement_failure_code;
+          return;
+        }
+      } catch (_) { /* 精确旧身份或业务授权损坏时 fail closed。 */ }
+      job.provider_retirement_failure_code = 'provider_retirement_identity_unresolved';
+      return;
+    }
+    const disposition = providerResultDisposition(job);
+    if (disposition === 'uncertain') {
+      try {
+        const record = providerRetirementRecord(key, job, purpose);
+        if (record) {
+          job.provider_retirement = record;
+          delete job.provider_retirement_failure_code;
+          return;
+        }
+      } catch (_) { /* 控制事务必须落盘；损坏身份留给 doctor，不阻断人工。 */ }
+      job.provider_retirement_failure_code = 'provider_retirement_identity_unresolved';
+      return;
+    }
+    if (disposition === 'invalid_identity') {
+      job.provider_retirement_failure_code = 'provider_retirement_identity_unresolved';
+      return;
+    }
+    // receipt-before-network 保证：没有合法 receipt 时当前协议尚未创建 router
+    // question。公开 v1.2.1 遗留问题若仍可能存在，会在上面的 legacy
+    // cleanup-only 事务中保留身份直至 router 明确返回 retired/absent。
+    clearProviderAttemptIdentity(job);
+    delete job.provider_retirement_failure_code;
+  };
   const providerSettlementDue = (job, at = clock()) => Boolean(providerSettlementOutstanding(job)
     && ['pending', 'deferred'].includes(job.provider_settlement.state)
     && !(job.provider_settlement.next_action_at > at)
     && !(job.provider_settlement.lease_until > at));
+  const providerRetirementDue = (job, at = clock()) => Boolean(providerRetirementOutstanding(job)
+    && ['pending', 'deferred'].includes(job.provider_retirement.state)
+    && !(job.provider_retirement.next_action_at > at)
+    && !(job.provider_retirement.lease_until > at));
   const normalizeFrozenDeliveryRecords = (state) => {
     const key = stateKey(state.website_id, state.session_id);
     for (const [fingerprint, record] of Object.entries(state.outgoing || {})) {
@@ -1252,7 +1653,8 @@ function createRuntime(env = {}, options = {}) {
   };
   const recoveryDelay = (job, code = '') => {
     const rounds = Math.min(8, bounded(job?.failure_rounds, 0, 1000000));
-    const minimum = ['authentication_failed', 'model_unavailable', 'invalid_input', 'configuration_invalid'].includes(code)
+    const minimum = ['authentication_failed', 'model_unavailable', 'invalid_input', 'configuration_invalid',
+      'provider_receipt_identity_unresolved'].includes(code)
       ? 300000 : ['rate_limited', 'quota_exhausted', 'pool_cooling'].includes(code) ? 60000 : 5000;
     return Math.min(300000, Math.max(minimum, 5000 * (2 ** rounds)));
   };
@@ -1270,15 +1672,12 @@ function createRuntime(env = {}, options = {}) {
     delete job.deferred_configuration;
     delete job.runtime_fallback;
   };
-  const markAnsweredConfirmed = (job, plan, semanticStatus) => {
+  const markAnsweredConfirmed = (key, job, plan, semanticStatus) => {
     if (!job || job.control) return;
     if (semanticStatus === 'delivered_non_answer') {
       advanceResponseGeneration(job);
       markUnresolved(job, 'delivered_non_answer');
-      delete job.plan;
-      delete job.inference;
-      delete job.provider_result_receipt;
-      delete job.provider_migration_from;
+      retireProviderAttempt(key, job, 'non_answer_retired');
       return false;
     }
     if (semanticStatus !== 'valid_answer') {
@@ -1322,10 +1721,10 @@ function createRuntime(env = {}, options = {}) {
     if (!job || job.status !== 'cancelled') return;
     for (const record of Object.values(state.outgoing || {})) {
       if (!record || record.job_id !== job.id
-        || !['unknown', 'sending', 'rate_limited'].includes(record.status)) continue;
-      if (record.status === 'rate_limited') {
-        // 420/429 是明确未接收，不需要按未知回执查询；人工接管或总关后
-        // 仍保留同一 fingerprint 的禁止重发栅栏，防止到期任务重新出站。
+        || !['unknown', 'sending', 'rate_limited', 'rejected'].includes(record.status)) continue;
+      if (['rate_limited', 'rejected'].includes(record.status)) {
+        // 420/429 及明确 HTTP 拒绝都证明本次正文未被接收，不需要按未知
+        // 回执查询；人工接管或总关后只保留禁止重发的最小审计。
         record.status = 'cancelled';
         record.resend_forbidden = true;
         record.recovery_deferred = false;
@@ -1559,10 +1958,11 @@ function createRuntime(env = {}, options = {}) {
     }
     const pendingJobs = state.jobs.filter((job) => !['done', 'cancelled', 'failed'].includes(job.status)
       || job.responsibility_status === 'unresolved_failure' || uncertainDeliveryFor(state, job)
-      || providerSettlementOutstanding(job));
+      || providerSettlementOutstanding(job) || providerRetirementOutstanding(job));
     const completedJobs = state.jobs.filter((job) => ['done', 'cancelled', 'failed'].includes(job.status)
       && job.responsibility_status !== 'unresolved_failure'
       && !uncertainDeliveryFor(state, job) && !providerSettlementOutstanding(job)
+      && !providerRetirementOutstanding(job)
       && job.received_at > clock() - outgoingRetentionMilliseconds).slice(-256);
     for (const job of completedJobs) { delete job.data; delete job.plan; }
     state.jobs = [...pendingJobs, ...completedJobs];
@@ -1616,7 +2016,11 @@ function createRuntime(env = {}, options = {}) {
       if (!refreshScanLock(lock, owner)) throw new Error('会话状态所有权已变化');
       state.updated_at = clock();
       atomic(file, state, stateMaximumBytes);
-      if (state.mode === 'human' && (previousMode !== 'human' || state.generation !== previousGeneration)) cancelOutbound(key);
+      if (state.generation !== previousGeneration
+        || state.mode === 'human' && previousMode !== 'human') {
+        cancelOutbound(key);
+        cancelProcessing(key, 'conversation_state_changed');
+      }
       return result;
     } finally { removeOwnedScanLock(lock, owner.token); }
   };
@@ -1634,19 +2038,17 @@ function createRuntime(env = {}, options = {}) {
     state.resume_at = seconds === 0 ? null : eventTime + seconds * 1000;
     state.pending_feedback = null;
     state.offers = {};
+    const key = stateKey(state.website_id, state.session_id);
     const cancelled = new Set();
     for (const job of state.jobs) {
-      if (!job.control && !['done', 'failed'].includes(job.status)) {
+      if (policyCancellationPending(state, job)) {
         job.status = 'cancelled';
         markIntentionalSilence(job, reason === 'operator_reply' ? 'human_reply' : 'human_handoff');
         // 真人接管是容量压力下也必须落盘的控制状态。被取消的普通任务不会
         // 再恢复或补答，立即释放其正文和推理计划，避免旧版接近 2 MiB 的
         // 合法状态因本次控制事件新增少量元数据而拒绝提交。
         delete job.data;
-        delete job.plan;
-        delete job.inference;
-        delete job.provider_result_receipt;
-        delete job.provider_migration_from;
+        retireProviderAttempt(key, job, 'conversation_cancelled');
         delete job.deferred_configuration;
         delete job.deferred_control;
         delete job.execution_token;
@@ -1820,7 +2222,7 @@ function createRuntime(env = {}, options = {}) {
       const resolved = automation(original, state);
       if (resolved !== null) return resolved ? 'not-human' : 'human';
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       const pending = new Error('人工消息归属暂未确认');
       pending.code = 'OPERATOR_IDENTITY_PENDING';
       pending.cause_code = Number.isInteger(error?.crispStatus) ? 'crisp_http_' + error.crispStatus : 'crisp_unavailable';
@@ -1842,7 +2244,7 @@ function createRuntime(env = {}, options = {}) {
     try {
       response = await crisp(readState(key), '/message/' + encodeURIComponent(fingerprint), 'GET', undefined, { execution });
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       const reason = [420, 429].includes(error?.crispStatus) ? 'rate_limited'
         : [401, 403].includes(error?.crispStatus) ? 'authorization_failed'
           : error?.crispStatus === 404 ? 'message_unavailable'
@@ -1933,10 +2335,7 @@ function createRuntime(env = {}, options = {}) {
           }
         }
         delete stored.data;
-        delete stored.plan;
-        delete stored.inference;
-        delete stored.provider_result_receipt;
-        delete stored.provider_migration_from;
+        retireProviderAttempt(key, stored, 'input_retired');
         delete stored.deferred_configuration;
         delete stored.deferred_control;
         outcome = exactAutomation ? 'non-visitor' : 'stale';
@@ -3266,12 +3665,14 @@ function createRuntime(env = {}, options = {}) {
       });
     }
   };
-  const active = async (key, job, ordinary = true, providerRequired = true) => transaction(key, (state) => {
+  const active = async (key, job, ordinary = true, providerRequired = true,
+    configurationFrozen = false) => transaction(key, (state) => {
     const global = settings();
-    return global.enabled && global.revision === job.revision && state.generation === job.generation
+    return (configurationFrozen ? configuredSettings().enabled === true : global.enabled)
+      && (configurationFrozen || global.revision === job.revision) && state.generation === job.generation
       && (!ordinary || !globalDisableCrossed(job, global))
       && (!ordinary || state.mode === 'ai') && !operatorBarrier(state)
-      && (!providerRequired || providerGenerationCurrent(job));
+      && (!providerRequired || configurationFrozen || providerGenerationCurrent(job));
   });
   const beginInference = async (key, job, execution) => {
     assertProcessingPermit(execution);
@@ -3284,6 +3685,47 @@ function createRuntime(env = {}, options = {}) {
       const stored = state.jobs.find((entry) => entry.id === job.id);
       if (!stored || !global.enabled || global.revision !== job.revision || globalDisableCrossed(job, global) || state.mode !== 'ai'
         || state.generation !== job.generation || operatorBarrier(state) || stored.status === 'cancelled') return null;
+      if (providerRetirementOutstanding(stored)) return null;
+      if (providerRetirementFinishedFor(stored)) {
+        delete stored.provider_retirement;
+        delete stored.provider_retirement_failure_code;
+      }
+      if (hasLegacyV121PendingOrigin(stored)
+        && (!legacyV121SuccessorBound(stored.legacy_v121_pending_origin)
+          || !legacyV121PendingOriginMatches(stored, configuration))) {
+        return { inference: stored.inference === undefined
+          ? undefined : JSON.parse(JSON.stringify(stored.inference)),
+        receipt: stored.provider_result_receipt ? JSON.parse(JSON.stringify(stored.provider_result_receipt)) : null,
+        migration: stored.provider_migration_from ? {...stored.provider_migration_from} : null,
+        last: stored.last_provider_configuration ? {...stored.last_provider_configuration} : null,
+        legacyPendingPresent: true,
+        legacyPending: stored.legacy_v121_pending_origin === undefined ? undefined
+          : JSON.parse(JSON.stringify(stored.legacy_v121_pending_origin)),
+        invalidLegacyPending: true };
+      }
+      // v1.2.x 没有 receipt-before-network 协议字段。它留下的无 plan、无回执
+      // inference 无法按新签名安全重放；在取得当前独占 execution 后，只迁移
+      // 这一类明确旧形态并保留原问题。带有任何回执或畸形版本字段的状态
+      // 一律留给下面的三态校验，不能当作“没有结果”清除。
+      let legacyOrigin = null;
+      if (legacyV121SuccessorBound(stored.legacy_v121_pending_origin)
+        && legacyV121PendingOriginMatches(stored, configuration)) {
+        legacyOrigin = { ...stored.legacy_v121_pending_origin.source };
+        stored.inference_generation = Math.max(1,
+          bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER));
+        stored.legacy_provider_inference_migrated_at = clock();
+        delete stored.inference;
+        delete stored.legacy_v121_pending_origin;
+      } else if (legacyV121Inference(stored.inference) && !stored.provider_result_receipt
+        && !stored.provider_settlement && !stored.plan && !hasLegacyV121PendingOrigin(stored)) {
+        legacyOrigin = { runtime_revision: stored.revision,
+          pool_revision: stored.inference.pool_revision,
+          deadline_at: stored.inference.deadline_at };
+        stored.inference_generation = Math.max(1,
+          bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER));
+        stored.legacy_provider_inference_migrated_at = clock();
+        delete stored.inference;
+      }
       // 图片与最终回答在同一代共享本轮预算。持久技术故障到期后可以取得一个
       // 新的有界恢复代；代次单调递增，旧 owner/response 继续由签名信封封住。
       const activeGeneration = Number.isSafeInteger(stored.inference?.attempt_generation)
@@ -3303,36 +3745,37 @@ function createRuntime(env = {}, options = {}) {
             materials_source_sha256: configuration.materials_source_sha256,
             configuration_binding: providerConfigurationBinding(configuration)} : {}),
           deadline_at: clock() + (pool?.policy.question_timeout_ms ?? 90000),
-          attempt_generation: stored.inference_generation};
-      } else if (!Number.isSafeInteger(stored.inference.attempt_generation)
-        || stored.inference.attempt_generation < 1) {
-        stored.inference_generation = Math.max(1, bounded(stored.inference_generation, 0, Number.MAX_SAFE_INTEGER));
-        stored.inference.attempt_generation = stored.inference_generation;
-      }
-      // 仅在可确认为当前同代的旧任务上补齐 v1.3.0 身份。
-      // pool revision 已变的任务留给配置 successor 流程，不猜测旧 Key 代。
-      if (pool && stored.inference.pool_revision === pool.revision
-        && stored.revision === configuration.runtime_revision
-        && !stored.inference.configuration_binding) {
-        Object.assign(stored.inference, configuration, {
-          configuration_binding: providerConfigurationBinding(configuration),
-        });
+          attempt_generation: stored.inference_generation,
+          ...(legacyOrigin !== null
+            ? {legacy_v121_origin: legacyOrigin} : {}),
+          provider_receipt_protocol_version: 1};
       }
       const bound = providerConfigurationFromInference(stored);
       if (bound) stored.last_provider_configuration = { ...bound,
         attempt_generation: stored.inference.attempt_generation };
-      return { inference: {...stored.inference},
+      return { inference: stored.inference === undefined
+        ? undefined : JSON.parse(JSON.stringify(stored.inference)),
         receipt: stored.provider_result_receipt ? JSON.parse(JSON.stringify(stored.provider_result_receipt)) : null,
         migration: stored.provider_migration_from ? {...stored.provider_migration_from} : null,
-        last: stored.last_provider_configuration ? {...stored.last_provider_configuration} : null };
+        last: stored.last_provider_configuration ? {...stored.last_provider_configuration} : null,
+        legacyPendingPresent: hasLegacyV121PendingOrigin(stored),
+        legacyPending: stored.legacy_v121_pending_origin === undefined ? undefined
+          : JSON.parse(JSON.stringify(stored.legacy_v121_pending_origin)) };
     });
     if (!value) return false;
-    job.inference = value.inference;
+    if (value.inference === undefined) delete job.inference;
+    else job.inference = value.inference;
     if (value.receipt) job.provider_result_receipt = value.receipt;
     else delete job.provider_result_receipt;
     if (value.migration) job.provider_migration_from = value.migration;
     else delete job.provider_migration_from;
     if (value.last) job.last_provider_configuration = value.last;
+    if (value.legacyPendingPresent) job.legacy_v121_pending_origin = value.legacyPending;
+    else delete job.legacy_v121_pending_origin;
+    // 畸形/未知旧协议必须继续到统一 disposition，产生可见 unresolved，
+    // 不能在 active() 处被误归为普通配置维护并删除原责任。
+    if (value.invalidLegacyPending
+      || job.inference?.provider_receipt_protocol_version !== 1) return true;
     return providerGenerationCurrent(job);
   };
   const providerReceiptIdentityMatches = (job, receipt, stage = receipt?.stage) => Boolean(receipt
@@ -3340,9 +3783,24 @@ function createRuntime(env = {}, options = {}) {
     && receipt.attempt_generation === job.inference.attempt_generation
     && receipt.configuration_binding === job.inference.configuration_binding);
   const providerReceiptMatches = (job, receipt, stage = receipt?.stage) => Boolean(
-    providerReceiptIdentityMatches(job, receipt, stage)
+    job?.inference?.provider_receipt_protocol_version === 1
+    && providerReceiptIdentityMatches(job, receipt, stage)
     && validProviderRequestContract(receipt)
     && receipt.plan_context_sha256 === providerContextSha256(receipt.plan_context ?? null));
+  const providerResultDisposition = (job, expectedStage = null) => {
+    if (hasLegacyV121PendingOrigin(job)) {
+      return legacyV121PendingOriginMatches(job) ? 'uncertain' : 'invalid_identity';
+    }
+    if (!job?.inference) return 'definitely_absent';
+    const receipt = job.provider_result_receipt;
+    if (!receipt) return job.inference.provider_receipt_protocol_version === 1
+      ? 'definitely_absent' : 'invalid_identity';
+    if (expectedStage !== null && receipt.stage !== expectedStage) return 'invalid_identity';
+    if (!providerReceiptMatches(job, receipt, expectedStage || receipt.stage)) return 'invalid_identity';
+    if (['requesting', 'unknown', 'available'].includes(receipt.state)) return 'uncertain';
+    if (receipt.state === 'absent') return 'definitely_absent';
+    return 'invalid_identity';
+  };
   const writeProviderReceipt = async (key, job, execution, receipt) => {
     if (job.administrator === true) {
       if (receipt) job.provider_result_receipt = receipt;
@@ -3412,7 +3870,7 @@ function createRuntime(env = {}, options = {}) {
         body: {},
       }, execution);
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       const unknown = providerReceiptRecord(job, stage, 'unknown');
       await writeProviderReceipt(key, job, execution, unknown);
       throw providerCallError('provider_response_unknown', true);
@@ -3435,6 +3893,9 @@ function createRuntime(env = {}, options = {}) {
     throw providerCallError(code, true);
   };
   const callProvider = async (key, job, stage, url, headers, body, context, execution) => {
+    if (providerResultDisposition(job, stage) === 'invalid_identity') {
+      throw providerCallError('provider_receipt_identity_unresolved', true);
+    }
     const replayed = await replayProviderResult(key, job, stage, execution);
     if (replayed) return replayed;
     if (providerReceiptMatches(job, job.provider_result_receipt, stage)
@@ -3454,7 +3915,7 @@ function createRuntime(env = {}, options = {}) {
         headers: { ...headers, 'x-crispai-question': providerToken(key, job, stage, contract) }, body,
       }, execution);
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       await writeProviderReceipt(key, job, execution,
         providerReceiptRecord(job, stage, 'unknown', context ?? null, '', contract));
       throw providerCallError('provider_response_unknown', true);
@@ -3470,12 +3931,9 @@ function createRuntime(env = {}, options = {}) {
     return response;
   };
   const consumeProviderStage = async (key, job, stage, execution) => {
-    if (!providerReceiptMatches(job, job.provider_result_receipt, stage)) return;
-    await writeProviderReceipt(key, job, execution, null);
+    if (!providerReceiptMatches(job, job.provider_result_receipt, stage)) return false;
+    return await writeProviderReceipt(key, job, execution, null);
   };
-  const providerResultUncertain = (job) => providerReceiptMatches(job,
-    job?.provider_result_receipt)
-    && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
   const providerPlanSha256 = plan => hash(canonical({
     type: plan?.type || '', purpose: plan?.purpose || '', content: plan?.content || '',
     outcome: plan?.outcome || '', sources: plan?.sources || [], tags: plan?.tags || [],
@@ -3496,10 +3954,13 @@ function createRuntime(env = {}, options = {}) {
       'runtime_revision', 'pool_revision', 'secrets_generation', 'pool_sha256',
       'materials_source_sha256', 'configuration_binding', 'deadline_at', 'stage',
       'attempt_generation', 'request_contract_version', 'request_sha256',
-      'plan_context_sha256', 'migration_from', 'transition_reason']);
+      'plan_context_sha256', 'migration_from', 'transition_reason',
+      'legacy_v121_origin']);
     const migrationAllowed = new Set(['runtime_revision', 'pool_revision',
       'secrets_generation', 'pool_sha256', 'materials_source_sha256',
       'attempt_generation']);
+    const inferenceConfiguration = providerConfigurationFromInference(job);
+    const receipt = job?.provider_result_receipt;
     return Boolean(value && value.schema_version === 1
       && ['pending', 'deferred'].includes(value.state)
       && /^[a-f0-9]{64}$/.test(value.plan_sha256 || '')
@@ -3511,12 +3972,27 @@ function createRuntime(env = {}, options = {}) {
       && envelope.version === 1 && envelope.scope === 'conversation'
       && envelope.question_id === job?.id && envelope.session_key === key
       && envelope.generation === job?.generation
-      && ['vision', 'answer'].includes(envelope.stage)
+      && envelope.stage === 'answer'
       && Number.isSafeInteger(envelope.deadline_at) && envelope.deadline_at >= 0
       && Number.isSafeInteger(envelope.attempt_generation) && envelope.attempt_generation >= 1
+      && (envelope.legacy_v121_origin === undefined
+        || legacyV121Origin(envelope.legacy_v121_origin)
+          && envelope.attempt_generation === 2
+          && migration === undefined)
       && completeProviderConfiguration(configuration)
       && envelope.configuration_binding === providerConfigurationBinding(configuration)
+      && completeProviderConfiguration(inferenceConfiguration)
+      && sameProviderConfiguration(configuration, inferenceConfiguration)
+      && envelope.deadline_at === job.inference.deadline_at
+      && envelope.attempt_generation === job.inference.attempt_generation
+      && envelope.configuration_binding === job.inference.configuration_binding
       && validProviderRequestContract(envelope)
+      && providerReceiptMatches(job, receipt, 'answer')
+      && envelope.request_contract_version === receipt.request_contract_version
+      && envelope.request_sha256 === receipt.request_sha256
+      && envelope.plan_context_sha256 === receipt.plan_context_sha256
+      && canonical(envelope.legacy_v121_origin ?? null)
+        === canonical(job.inference.legacy_v121_origin ?? null)
       && (migration === undefined && envelope.transition_reason === undefined
         || migration && envelope.transition_reason === 'configuration_changed'
           && typeof migration === 'object' && !Array.isArray(migration)
@@ -3525,14 +4001,134 @@ function createRuntime(env = {}, options = {}) {
           && Number.isSafeInteger(migration.attempt_generation)
           && migration.attempt_generation >= 1));
   };
+  const providerRetirementPurposes = new Set(['conversation_cancelled', 'global_disabled',
+    'input_retired', 'non_answer_retired']);
+  const providerRetirementAuthorized = providerRetirementPurposeAuthorized;
+  const providerRetirementIdentity = value => hash(canonical({
+    envelope: value?.envelope || null, purpose: value?.purpose || '',
+  }));
+  const validProviderRetirement = (key, job, value) => {
+    const envelope = value?.envelope;
+    const configuration = envelope && {
+      runtime_revision: envelope.runtime_revision, pool_revision: envelope.pool_revision,
+      secrets_generation: envelope.secrets_generation, pool_sha256: envelope.pool_sha256,
+      materials_source_sha256: envelope.materials_source_sha256,
+    };
+    const migration = envelope?.migration_from;
+    const allowedRecord = new Set(['schema_version', 'state', 'purpose', 'envelope',
+      'identity_sha256', 'attempts', 'first_recorded_at', 'next_action_at', 'reason',
+      'last_attempt_at', 'lease_until', 'lease_token']);
+    const requiredRecord = ['schema_version', 'state', 'purpose', 'envelope',
+      'identity_sha256', 'attempts', 'first_recorded_at', 'next_action_at'];
+    const allowedEnvelope = new Set(['version', 'scope', 'question_id', 'session_key',
+      'generation', 'runtime_revision', 'pool_revision', 'secrets_generation', 'pool_sha256',
+      'materials_source_sha256', 'configuration_binding', 'deadline_at', 'stage',
+      'attempt_generation', 'request_contract_version', 'request_sha256',
+      'plan_context_sha256', 'migration_from', 'transition_reason', 'legacy_v121_origin',
+      'legacy_v121_cleanup']);
+    const migrationAllowed = new Set(['runtime_revision', 'pool_revision',
+      'secrets_generation', 'pool_sha256', 'materials_source_sha256', 'attempt_generation']);
+    const inferenceConfiguration = providerConfigurationFromInference(job);
+    const receipt = job?.provider_result_receipt;
+    const leasePresent = value && (value.lease_until !== undefined || value.lease_token !== undefined);
+    const recordValid = Boolean(value && typeof value === 'object' && !Array.isArray(value)
+      && Object.keys(value).every((name) => allowedRecord.has(name))
+      && requiredRecord.every((name) => Object.prototype.hasOwnProperty.call(value, name))
+      && value.schema_version === 1 && ['pending', 'deferred'].includes(value.state)
+      && providerRetirementPurposes.has(value.purpose)
+      && providerRetirementAuthorized(job, value.purpose)
+      && /^[a-f0-9]{64}$/.test(value.identity_sha256 || '')
+      && value.identity_sha256 === providerRetirementIdentity(value)
+      && Number.isSafeInteger(value.attempts) && value.attempts >= 0
+      && Number.isSafeInteger(value.first_recorded_at) && value.first_recorded_at >= 0
+      && Number.isSafeInteger(value.next_action_at) && value.next_action_at >= 0
+      && (value.reason === undefined || typeof value.reason === 'string' && value.reason.length <= 80)
+      && (value.last_attempt_at === undefined
+        || Number.isSafeInteger(value.last_attempt_at) && value.last_attempt_at >= 0)
+      && (!leasePresent || Number.isSafeInteger(value.lease_until) && value.lease_until >= 0
+        && typeof value.lease_token === 'string'
+        && (value.lease_token === '' || /^[a-f0-9]{24}$/.test(value.lease_token)))
+      && !job?.provider_settlement && job?.control !== true
+      && envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+      && Object.keys(envelope).every((name) => allowedEnvelope.has(name))
+      && envelope.version === 1 && envelope.scope === 'conversation'
+      && envelope.question_id === job?.id && envelope.session_key === key
+      && envelope.generation === job?.generation
+      && ['vision', 'answer'].includes(envelope.stage)
+      && Number.isSafeInteger(envelope.deadline_at) && envelope.deadline_at >= 0
+      && Number.isSafeInteger(envelope.attempt_generation) && envelope.attempt_generation >= 1);
+    if (!recordValid) return false;
+    if (envelope.legacy_v121_cleanup === true) {
+      const source = legacyV121RetirementSource(job);
+      return Boolean(source && job.plan === undefined && job.provider_result_receipt === undefined
+        && job.provider_settlement === undefined && job.provider_migration_from === undefined
+        && Object.keys(envelope).sort().join(',') === [
+          'attempt_generation','deadline_at','generation','legacy_v121_cleanup','pool_revision',
+          'question_id','runtime_revision','scope','session_key','stage','version',
+        ].sort().join(',')
+        && envelope.stage === 'answer' && envelope.attempt_generation === 1
+        && envelope.runtime_revision === source.runtime_revision
+        && envelope.pool_revision === source.pool_revision
+        && envelope.deadline_at === source.deadline_at);
+    }
+    return Boolean(envelope.legacy_v121_cleanup === undefined
+      && (envelope.legacy_v121_origin === undefined
+        || legacyV121Origin(envelope.legacy_v121_origin)
+          && envelope.attempt_generation === 2 && migration === undefined)
+      && completeProviderConfiguration(configuration)
+      && envelope.configuration_binding === providerConfigurationBinding(configuration)
+      && completeProviderConfiguration(inferenceConfiguration)
+      && sameProviderConfiguration(configuration, inferenceConfiguration)
+      && envelope.deadline_at === job.inference.deadline_at
+      && envelope.attempt_generation === job.inference.attempt_generation
+      && envelope.configuration_binding === job.inference.configuration_binding
+      && validProviderRequestContract(envelope)
+      && providerReceiptMatches(job, receipt, envelope.stage)
+      && ['requesting', 'unknown', 'available'].includes(receipt.state)
+      && envelope.request_contract_version === receipt.request_contract_version
+      && envelope.request_sha256 === receipt.request_sha256
+      && envelope.plan_context_sha256 === receipt.plan_context_sha256
+      && canonical(envelope.legacy_v121_origin ?? null)
+        === canonical(job.inference.legacy_v121_origin ?? null)
+      && (migration === undefined && envelope.transition_reason === undefined
+        || migration && envelope.transition_reason === 'configuration_changed'
+          && typeof migration === 'object' && !Array.isArray(migration)
+          && Object.keys(migration).every((name) => migrationAllowed.has(name))
+          && completeProviderConfiguration(migration)
+          && Number.isSafeInteger(migration.attempt_generation)
+          && migration.attempt_generation >= 1));
+  };
+  const providerRetirementRecord = (key, job, purpose) => {
+    if (!providerRetirementPurposes.has(purpose)
+      || !providerRetirementAuthorized(job, purpose)) return null;
+    const legacyEnvelope = legacyV121RetirementEnvelope(key, job);
+    if (legacyEnvelope) {
+      const candidate = {
+        schema_version: 1, state: 'pending', purpose, envelope: legacyEnvelope,
+        identity_sha256: '', attempts: 0, first_recorded_at: clock(), next_action_at: 0,
+      };
+      candidate.identity_sha256 = providerRetirementIdentity(candidate);
+      return validProviderRetirement(key, job, candidate) ? candidate : null;
+    }
+    if (!providerReceiptMatches(job, job?.provider_result_receipt)
+      || !['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state)
+      || !completeProviderConfiguration(providerConfigurationFromInference(job))) return null;
+    const candidate = {
+      schema_version: 1, state: 'pending', purpose,
+      envelope: providerEnvelopePayload(key, job, job.provider_result_receipt.stage,
+        job.provider_result_receipt),
+      identity_sha256: '', attempts: 0, first_recorded_at: clock(), next_action_at: 0,
+    };
+    candidate.identity_sha256 = providerRetirementIdentity(candidate);
+    return candidate;
+  };
   const providerSettlementRecord = (key, job, plan) => {
-    if (!providerGeneratedPlan(plan) || !providerReceiptMatches(job, job?.provider_result_receipt)
+    if (!providerGeneratedPlan(plan) || !providerReceiptMatches(job, job?.provider_result_receipt, 'answer')
       || !completeProviderConfiguration(providerConfigurationFromInference(job))) return null;
     const candidate = {
       schema_version: 1, state: 'pending',
       plan_sha256: providerPlanSha256(plan), response_generation: responseGeneration(job),
-      envelope: providerEnvelopePayload(key, job,
-        job.provider_result_receipt.stage, job.provider_result_receipt),
+      envelope: providerEnvelopePayload(key, job, 'answer', job.provider_result_receipt),
       attempts: 0, first_recorded_at: clock(), next_action_at: 0,
     };
     const existing = job.provider_settlement;
@@ -3549,6 +4145,79 @@ function createRuntime(env = {}, options = {}) {
   };
   const providerSettlementDelay = attempts => Math.min(300000,
     5000 * (2 ** Math.min(6, Math.max(0, attempts - 1))));
+  const requestProviderRetirement = async (key, job, record) => {
+    if (!validProviderRetirement(key, job, record)) return 'retirement_invalid';
+    try {
+      const response = await guardedNetwork(providerAdapterInternalUrl('/internal/provider/retire'), {
+        method: 'POST', timeout: 5000,
+        headers: { Authorization: 'Bearer ' + String(env.PROVIDER_ADAPTER_KEY || ''),
+          'x-crispai-question': signProviderEnvelope(record.envelope) },
+        body: { outcome: 'responsibility_retired', purpose: record.purpose },
+      });
+      if (response.status >= 200 && response.status < 300
+        && ['retired', 'absent'].includes(response.body?.state)
+      ) return response.body.state;
+      const upstreamCode = String(response?.body?.error?.code || '');
+      if (['question_conflict', 'provider_request_identity_unknown', 'invalid_input',
+        'invalid_envelope', 'invalid_state'].includes(upstreamCode)) return 'retirement_invalid';
+      const code = providerDiagnosticCode(response);
+      return ['question_conflict', 'provider_request_identity_unknown', 'invalid_input',
+        'invalid_envelope', 'invalid_state'].includes(code) ? 'retirement_invalid' : code;
+    } catch (error) {
+      return providerDiagnosticCode(null, error) || 'retirement_unavailable';
+    }
+  };
+  const finalizedProviderRetirement = (record, outcome) => {
+    const attempts = Math.min(1000000, bounded(record?.attempts, 0, 1000000) + 1);
+    if (['retired', 'absent'].includes(outcome)) return {
+      schema_version: 1, state: outcome, purpose: record.purpose, attempts,
+      retired_at: clock(), identity_sha256: record.identity_sha256,
+    };
+    return { ...record, state: outcome === 'retirement_invalid' ? 'invalid' : 'deferred',
+      reason: String(outcome || 'retirement_unavailable').slice(0, 80), attempts,
+      last_attempt_at: clock(), next_action_at: clock() + providerSettlementDelay(attempts),
+      lease_until: 0, lease_token: '' };
+  };
+  const retryProviderRetirement = async (key, job, leaseToken) => {
+    const record = job?.provider_retirement;
+    const outcome = await requestProviderRetirement(key, job, record);
+    let finalized;
+    try {
+      finalized = await transaction(key, (state) => {
+        const stored = state.jobs.find((entry) => entry.id === job.id);
+        if (!stored || !providerRetirementOutstanding(stored)
+          || stored.provider_retirement.lease_token !== leaseToken
+          || stored.provider_retirement.identity_sha256 !== record?.identity_sha256
+          || providerRetirementIdentity(stored.provider_retirement) !== record?.identity_sha256) return null;
+        stored.provider_retirement = finalizedProviderRetirement(stored.provider_retirement, outcome);
+        if (['retired', 'absent'].includes(outcome)) {
+          clearProviderAttemptIdentity(stored);
+          delete stored.provider_retirement_failure_code;
+        }
+        return JSON.parse(JSON.stringify(stored.provider_retirement));
+      });
+    } catch (_) { finalized = null; }
+    if (!finalized) return { status: 'deferred', reason: 'provider_retirement_owner_changed' };
+    if (outcome === 'retirement_invalid') {
+      await transaction(key, (state) => {
+        const stored = state.jobs.find((entry) => entry.id === job.id);
+        if (!stored || stored.provider_retirement?.state !== 'invalid') return;
+        stored.provider_retirement_failure_code = 'provider_retirement_identity_unresolved';
+        if (!(stored.status === 'cancelled'
+          && stored.responsibility_status === 'intentional_silence')) {
+          markUnresolved(stored, 'provider_retirement_identity_unresolved');
+        }
+      });
+      appendEvent('provider_retirement_deferred', { reason: outcome });
+      return { status: 'unresolved', reason: 'provider_retirement_identity_unresolved' };
+    }
+    if (!['retired', 'absent'].includes(outcome)) {
+      appendEvent('provider_retirement_deferred', { reason: outcome });
+      return { status: 'deferred', reason: 'provider_retirement_' + finalized.state };
+    }
+    appendEvent('provider_retirement_recovered', { outcome });
+    return { status: 'provider_retirement_' + outcome };
+  };
   const requestProviderSettlement = async (key, job, record, execution) => {
     if (!validProviderSettlement(key, job, record)) return 'settlement_invalid';
     try {
@@ -3563,7 +4232,7 @@ function createRuntime(env = {}, options = {}) {
         && ['settled', 'absent'].includes(response.body?.state)
         ? response.body.state : providerDiagnosticCode(response);
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       return providerDiagnosticCode(null, error) || 'settlement_unavailable';
     }
   };
@@ -3581,7 +4250,7 @@ function createRuntime(env = {}, options = {}) {
   const settleProviderPlan = async (key, job, plan, execution) => {
     if (!job?.inference || job.inference.pool_revision === null || !providerGeneratedPlan(plan)
       || !completeProviderConfiguration(providerConfigurationFromInference(job))
-      || !providerReceiptMatches(job, job.provider_result_receipt)) return;
+      || !providerReceiptMatches(job, job.provider_result_receipt, 'answer')) return;
     const record = job.provider_settlement || providerSettlementRecord(key, job, plan);
     const outcome = await requestProviderSettlement(key, job, record, execution);
     // plan 与待结算信封已经在同一会话事务中持久。网络故障只延后删除 router
@@ -3596,15 +4265,15 @@ function createRuntime(env = {}, options = {}) {
       }
       stored.provider_settlement = finalizedProviderSettlement(stored.provider_settlement, outcome);
       if (['settled', 'absent'].includes(outcome)) {
-        delete stored.provider_result_receipt;
-        delete stored.provider_migration_from;
+        clearProviderAttemptIdentity(stored);
+        delete stored.provider_settlement_failure_code;
       }
       return JSON.parse(JSON.stringify(stored.provider_settlement));
     });
     else job.provider_settlement = finalizedProviderSettlement(record, outcome);
     if (['settled', 'absent'].includes(outcome)) {
-      delete job.provider_result_receipt;
-      delete job.provider_migration_from;
+      clearProviderAttemptIdentity(job);
+      delete job.provider_settlement_failure_code;
     }
     if (!['settled', 'absent'].includes(outcome)) appendEvent('provider_settlement_deferred', { reason: outcome });
   };
@@ -3620,13 +4289,27 @@ function createRuntime(env = {}, options = {}) {
           || providerSettlementIdentity(stored.provider_settlement) !== providerSettlementIdentity(record)) return null;
         stored.provider_settlement = finalizedProviderSettlement(stored.provider_settlement, outcome);
         if (['settled', 'absent'].includes(outcome)) {
-          delete stored.provider_result_receipt;
-          delete stored.provider_migration_from;
+          clearProviderAttemptIdentity(stored);
+          delete stored.provider_settlement_failure_code;
         }
         return JSON.parse(JSON.stringify(stored.provider_settlement));
       });
     } catch (_) { finalized = null; }
     if (!finalized) return { status: 'deferred', reason: 'provider_settlement_owner_changed' };
+    if (outcome === 'settlement_invalid') {
+      await transaction(key, (state) => {
+        const stored = state.jobs.find((entry) => entry.id === job.id);
+        if (stored && stored.provider_settlement?.state === 'invalid') {
+          stored.provider_settlement_failure_code = 'provider_settlement_identity_unresolved';
+          if (!(stored.status === 'cancelled'
+            && stored.responsibility_status === 'intentional_silence')) {
+            markUnresolved(stored, 'provider_settlement_identity_unresolved');
+          }
+        }
+      });
+      appendEvent('provider_settlement_deferred', { reason: outcome });
+      return { status: 'unresolved', reason: 'provider_settlement_identity_unresolved' };
+    }
     if (!['settled', 'absent'].includes(outcome)) {
       appendEvent('provider_settlement_deferred', { reason: outcome });
       return { status: 'deferred', reason: 'provider_settlement_' + finalized.state };
@@ -3639,11 +4322,13 @@ function createRuntime(env = {}, options = {}) {
     // Provider 配置事务只应阻止真正依赖上游的计划。先做代次栅栏，再读取
     // Crisp 历史或开始检索，避免维护窗口中的普通问题产生任何外部调用；
     // 固定回复、人工确认和菜单等本地动作仍可使用当前已应用投影及时完成。
-    if (!await active(key, job, true, true)) return null;
+    const unresolvedLegacyInference = hasLegacyV121PendingOrigin(job)
+      || job?.inference && job.inference.provider_receipt_protocol_version !== 1;
+    if (!await active(key, job, true, !unresolvedLegacyInference)) return null;
     const state = readState(key);
     const history = await messagesFor(state, execution);
     await observeOperators(key, history, execution);
-    if (!await active(key, job, true, true)) return null;
+    if (!await active(key, job, true, !unresolvedLegacyInference)) return null;
     if (!await beginInference(key, job, execution)) return null;
     const prompt = appliedMaterials()?.prompt.text ?? fs.readFileSync(root + '/config/prompt.md', 'utf8');
     const prior = transcript(history, job, readState(key));
@@ -3651,6 +4336,9 @@ function createRuntime(env = {}, options = {}) {
     const content = job.data.content || {};
     const isImage = ['file', 'animation'].includes(job.data.type) && String(content.type || '').startsWith('image/');
     const fail = (code = 'provider_inference_failed') => administratorFailurePlan(job, code);
+    if (providerResultDisposition(job) === 'invalid_identity') {
+      return fail('provider_receipt_identity_unresolved');
+    }
     const pendingProviderReceipt = providerReceiptMatches(job, job.provider_result_receipt)
       && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
     if (!inferenceRemaining(job) && !pendingProviderReceipt) return fail('question_budget_exhausted');
@@ -3710,9 +4398,11 @@ function createRuntime(env = {}, options = {}) {
           return true;
         });
         if (!remembered) return null;
-        if (pool) await consumeProviderStage(key, job, 'vision', execution);
+        if (pool && !await consumeProviderStage(key, job, 'vision', execution)) {
+          return fail('provider_receipt_identity_unresolved');
+        }
         return await queryKnowledge(key, job, visitorAnswer.slice(0, 6000), directive, prior, 'vision', prompt, execution);
-      } catch (error) { if (processingPermitLost(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
+      } catch (error) { if (processingInterrupted(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
     }
     if (job.data.type !== 'text') return fail();
     return queryKnowledge(key, job, text, directive, prior, 'ai_text', prompt, execution);
@@ -3768,9 +4458,9 @@ function createRuntime(env = {}, options = {}) {
         const answer = answerFromProvider(replayed);
         return planFromContext(answer, job.provider_result_receipt?.plan_context);
       } catch (error) {
-        if (processingPermitLost(error)) throw error;
+        if (processingInterrupted(error)) throw error;
         if (!error?.providerResponseUnknown) await writeProviderReceipt(key, job, execution,
-          providerReceiptRecord(job, 'answer', 'absent', null,
+          providerReceiptRecord(job, 'answer', 'absent', undefined,
             providerDiagnosticCode(null, error)));
         return fail(providerDiagnosticCode(null, error));
       }
@@ -3834,7 +4524,7 @@ function createRuntime(env = {}, options = {}) {
             guardrails: '', response, enabledMap: knowledgeMap.value, maxResults: 20 });
           vectorResults = response.body.results;
         } catch (error) {
-          if (processingPermitLost(error)) throw error;
+          if (processingInterrupted(error)) throw error;
           vectorFailure = ['retrieval_error', 'retrieval_invalid', 'source_unmapped', 'source_ambiguous', 'context_invalid'].includes(error?.code)
             ? error.code : 'retrieval_unavailable';
         }
@@ -3863,7 +4553,7 @@ function createRuntime(env = {}, options = {}) {
         response: { status: 200, body: { results: merged } }, enabledMap: knowledgeMap.value, maxResults: 20 });
       prepared.strong_lexical = strongLexical;
     } catch (error) {
-      if (processingPermitLost(error)) throw error;
+      if (processingInterrupted(error)) throw error;
       const reason = ['retrieval_error', 'retrieval_invalid', 'source_unmapped', 'source_ambiguous', 'context_invalid',
         'knowledge_conflict', 'exact_answer_invalid'].includes(error?.code) ? error.code : 'retrieval_unavailable';
       if (!administrator) appendEvent('retrieval_failed', { reason });
@@ -3910,7 +4600,7 @@ function createRuntime(env = {}, options = {}) {
             providerDiagnosticCode(null, error)));
         throw error;
       }
-    } catch (error) { if (processingPermitLost(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
+    } catch (error) { if (processingInterrupted(error)) throw error; return fail(providerDiagnosticCode(null, error)); }
   };
   const administratorQuery = async (question, budgetMs = 0) => {
     // 仅本机受控 CLI 显式启用；Webhook 的 runtime 从不启用此选项，也不创建客户任务。
@@ -3939,7 +4629,8 @@ function createRuntime(env = {}, options = {}) {
           pool_sha256: configuration.pool_sha256,
           materials_source_sha256: configuration.materials_source_sha256,
           configuration_binding: providerConfigurationBinding(configuration)} : {}),
-        deadline_at: clock() + Math.min(budgetMs || maximum, maximum), attempt_generation: 1}};
+        deadline_at: clock() + Math.min(budgetMs || maximum, maximum), attempt_generation: 1,
+        provider_receipt_protocol_version: 1}};
     const plan = await queryKnowledge('', job, question, '', [], 'admin_query', prompt, undefined);
     if (!plan || technicalFailure(plan) || typeof plan.content !== 'string' || !plan.content.trim()) {
       const error = new Error('知识问答测试未完成');
@@ -4080,7 +4771,7 @@ function createRuntime(env = {}, options = {}) {
       if (!Array.isArray(metadata.data?.segments)) throw new Error('标签读取失败');
       const existing = metadata.data.segments.map(String);
       await crisp(state, '/meta', 'PATCH', { segments: [...new Set([...existing, ...additions])] }, { execution });
-    } catch (error) { if (processingPermitLost(error)) throw error; appendEvent('tag_failed'); }
+    } catch (error) { if (processingInterrupted(error)) throw error; appendEvent('tag_failed'); }
   };
   const rememberSent = async (key, job, plan, fingerprint, attemptToken = '', confirmedBody) => transaction(key, (state) => {
     let record = state.outgoing[String(fingerprint)];
@@ -4244,7 +4935,7 @@ function createRuntime(env = {}, options = {}) {
     if (!dueRecords.length) return 'retry';
     let history;
     try { history = await messagesFor(snapshot, execution); }
-    catch (error) { if (processingPermitLost(error)) throw error; return 'retry'; }
+    catch (error) { if (processingInterrupted(error)) throw error; return 'retry'; }
     await observeOperators(key, history, execution);
     const delivered = new Map();
     const absent = new Set();
@@ -4261,7 +4952,7 @@ function createRuntime(env = {}, options = {}) {
         if (receiptMessageMatches(snapshot, record, fingerprint, exact.data)) delivered.set(fingerprint, exact.data);
         else pending.add(fingerprint);
       } catch (error) {
-        if (processingPermitLost(error)) throw error;
+        if (processingInterrupted(error)) throw error;
         // 列表请求成功后，只有精确端点 404 才是一条阴性证据。其它协议、认证、
         // 限流或网络结果继续保持当前 fingerprint 的 unknown，不能被另一条命中吞掉。
         if (error?.crispStatus === 404) absent.add(fingerprint);
@@ -4381,6 +5072,10 @@ function createRuntime(env = {}, options = {}) {
     if (plan?.purpose === 'safe_error') plan = safeErrorPlan(job, plan);
     if (!plan?.content) return 'none';
     const state = readState(key);
+    const frozenDisposition = frozenDeliveryOnlyDisposition(key, state, job);
+    if (frozenDisposition === 'invalid') return 'delivery_identity_unresolved';
+    const configurationFrozen = frozenDisposition === 'ready';
+    const providerRequired = providerDependentPlan(plan) && !configurationFrozen;
     let fingerprint = plan.fingerprint || responseFingerprint(key, job, plan.purpose);
     let outgoing = state.outgoing[String(fingerprint)];
     const retired = job.feedback_retired || outgoing?.feedback_retired || feedbackOnly(job) || feedbackOnly(plan);
@@ -4389,9 +5084,26 @@ function createRuntime(env = {}, options = {}) {
         outgoing.attempt_token || ''), retired);
     }
     if (outgoing?.status === 'cancelled') return 'cancelled';
-    if (outgoing?.status === 'rejected' && outgoing.next_action_at > clock()) return 'failed';
+    if (outgoing?.status === 'rejected') {
+      const reason = outboundCancellationReason(key, job, providerRequired,
+        plan.ordinary !== false, configurationFrozen);
+      if (reason) {
+        await transaction(key, (current) => {
+          assertJobExecution(current, job, execution);
+          const record = current.outgoing[String(fingerprint)];
+          if (!record || record.status !== 'rejected') return;
+          record.status = 'cancelled'; record.resend_forbidden = true;
+          record.recovery_deferred = false; record.cancelled_at = clock();
+          record.cancellation_reason = reason; record.next_action_at = null;
+          delete record.body;
+        });
+        return 'cancelled';
+      }
+      if (outgoing.resend_forbidden || outgoing.next_action_at > clock()) return 'rejected';
+    }
     if (outgoing?.status === 'rate_limited') {
-      const reason = outboundCancellationReason(key, job, providerDependentPlan(plan), plan.ordinary !== false);
+      const reason = outboundCancellationReason(key, job, providerRequired,
+        plan.ordinary !== false, configurationFrozen);
       if (reason) {
         await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
@@ -4416,7 +5128,7 @@ function createRuntime(env = {}, options = {}) {
       if (outgoing.next_action_at > clock()) return 'retry';
       let history;
       try { history = await messagesFor(state, execution); }
-      catch (error) { if (processingPermitLost(error)) throw error; return 'retry'; }
+      catch (error) { if (processingInterrupted(error)) throw error; return 'retry'; }
       if (plan.ordinary !== false) await observeOperators(key, history, execution);
       const historyReceipt = history.find((message) => receiptMessageMatches(state, outgoing, fingerprint, message));
       if (historyReceipt) {
@@ -4430,7 +5142,7 @@ function createRuntime(env = {}, options = {}) {
       let exact;
       try { exact = await crisp(state, '/message/' + encodeURIComponent(fingerprint), 'GET', undefined, { execution }); }
       catch (error) {
-        if (processingPermitLost(error)) throw error;
+        if (processingInterrupted(error)) throw error;
         // 列表请求已成功后，精确端点的 404 是“当前未找到”的正常协议结果；
         // 它仍只算一次阴性，必须与下一次至少间隔五秒。其它失败不能算阴性。
         if (error?.crispStatus !== 404) return 'retry';
@@ -4463,7 +5175,8 @@ function createRuntime(env = {}, options = {}) {
         return record.reconcile_misses || 0;
       });
       if (misses < 2) return 'retry';
-      const cancellationReason = outboundCancellationReason(key, job, providerDependentPlan(plan), plan.ordinary !== false);
+      const cancellationReason = outboundCancellationReason(key, job, providerRequired,
+        plan.ordinary !== false, configurationFrozen);
       if (cancellationReason === 'configuration_changed') {
         await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
@@ -4506,8 +5219,8 @@ function createRuntime(env = {}, options = {}) {
           const replacement = normalizeVisitorPlan(stored, stored.plan);
           delete replacement.fingerprint;
           advanceResponseGeneration(stored);
-          stored.plan = replacement; delete stored.inference;
-          delete stored.provider_result_receipt; delete stored.provider_migration_from;
+          retireProviderAttempt(key, stored, 'non_answer_retired');
+          stored.plan = replacement;
           return true;
         });
         if (normalized) return 'retry';
@@ -4534,24 +5247,26 @@ function createRuntime(env = {}, options = {}) {
     if (plan.fingerprint !== undefined && plan.fingerprint !== null) fingerprint = plan.fingerprint;
     else if (!outgoing) fingerprint = responseFingerprint(key, job, plan.purpose);
     outgoing = state.outgoing[String(fingerprint)];
-    const providerRequired = providerDependentPlan(plan);
-    if (retired || !await active(key, job, plan.ordinary !== false, providerRequired)) return 'cancelled';
+    if (retired || !await active(key, job, plan.ordinary !== false, providerRequired,
+      configurationFrozen)) return 'cancelled';
     if (plan.ordinary !== false) {
       let history;
       try { history = await messagesFor(readState(key), execution); } catch (error) {
-        if (processingPermitLost(error)) throw error;
+        if (processingInterrupted(error)) throw error;
         appendEvent('delivery_failed', { reason: 'pre_send_check_failed' });
         return 'retry';
       }
       await observeOperators(key, history, execution);
       const unresolved = history.filter(publicOperator).some((message) => timestamp(message.timestamp) > job.event_time && automation(message, readState(key)) === null);
-      if (unresolved || !await active(key, job, true, providerRequired)) return 'cancelled';
+      if (unresolved || !await active(key, job, true, providerRequired,
+        configurationFrozen)) return 'cancelled';
     }
     // 使用官方可选昵称，不请求自动消息徽标；自回流识别在POST前持久登记，
     // 不伪造真人账号，也不依赖昵称或可见标签判断是否为本项目出站。
     const body = { type: plan.type || 'text', from: 'operator', origin: 'chat', content: plan.content, fingerprint, user: { type: 'website', nickname: '在线客服' } };
     if (body.type === 'picker') body.content = { ...body.content, required: false };
-    const outbound = plan.ordinary !== false ? beginOutbound(key, job, providerRequired) : null;
+    const outbound = plan.ordinary !== false
+      ? beginOutbound(key, job, providerRequired, configurationFrozen) : null;
     const attemptToken = outbound?.token || crypto.randomBytes(16).toString('hex');
     let postMayHaveStarted = false;
     try {
@@ -4559,9 +5274,11 @@ function createRuntime(env = {}, options = {}) {
       const registered = await transaction(key, (current) => {
         assertJobExecution(current, job, execution);
         const global = settings();
-        if (!global.enabled || global.revision !== job.revision || globalDisableCrossed(job, global)
+        if ((configurationFrozen ? configuredSettings().enabled !== true
+          : !global.enabled || global.revision !== job.revision) || globalDisableCrossed(job, global)
           || current.generation !== job.generation || operatorBarrier(current)
-          || plan.ordinary !== false && current.mode !== 'ai' || providerRequired && !providerGenerationCurrent(job)) return false;
+          || plan.ordinary !== false && current.mode !== 'ai'
+          || !configurationFrozen && providerRequired && !providerGenerationCurrent(job)) return false;
         registerOwnedMessage(current, fingerprint);
         const previous = current.outgoing[String(fingerprint)];
         const contentSha256 = outboundContentSha256(body.type, body.content);
@@ -4578,7 +5295,8 @@ function createRuntime(env = {}, options = {}) {
         }
         current.outgoing[String(fingerprint)] = {
           status: 'sending', body, created_at: previous?.created_at || clock(),
-          attempts: (previous?.attempts || 0) + 1, job_id: job.id,
+          attempts: Math.min(1000000,
+            bounded(previous?.attempts, 0, 1000000) + 1), job_id: job.id,
           generation: current.generation, response_generation: responseGeneration(job),
           purpose: String(plan.purpose || ''), message_type: body.type,
           semantic_intent: semanticIntent,
@@ -4587,7 +5305,8 @@ function createRuntime(env = {}, options = {}) {
         return true;
       });
       if (!registered || outbound?.controller.signal.aborted) {
-        const reason = outbound?.cancellation_reason || outboundCancellationReason(key, job, providerRequired, plan.ordinary !== false);
+        const reason = outbound?.cancellation_reason || outboundCancellationReason(key, job,
+          providerRequired, plan.ordinary !== false, configurationFrozen);
         if (registered) await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
@@ -4600,8 +5319,10 @@ function createRuntime(env = {}, options = {}) {
       }
       // 登记出站后再次核对，再把字节交给 HTTP 层；之后的真人事件通过 signal
       // 中止仍挂起的请求。远端若已收到字节，最终回执仍会如实标记。
-      if (plan.ordinary !== false && !await active(key, job, true, providerRequired)) {
-        const reason = outboundCancellationReason(key, job, providerRequired, true);
+      if (plan.ordinary !== false && !await active(key, job, true, providerRequired,
+        configurationFrozen)) {
+        const reason = outboundCancellationReason(key, job, providerRequired, true,
+          configurationFrozen);
         await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
@@ -4636,7 +5357,7 @@ function createRuntime(env = {}, options = {}) {
         });
         return configurationChanged ? 'deferred' : 'cancelled';
       }
-      if (processingPermitLost(error)) {
+      if (processingInterrupted(error)) {
         // POST 之前失去许可可以删除本次登记；一旦可能已交出字节，
         // 必须保留原 fingerprint 作 unknown 对账，绝不重新推理或换一份答案。
         await transaction(key, (current) => {
@@ -4657,7 +5378,8 @@ function createRuntime(env = {}, options = {}) {
       const retryDelay = rateLimited ? Math.max(60000,
         Math.min(604800000, Number(error.retryAfterMilliseconds || 0))) : 0;
       const retryAt = rateLimited ? clock() + retryDelay : null;
-      // 其它明确的请求/权限拒绝不是“发送结果未知”，不再对同一坏正文重试或反复调用模型。
+      // 其它明确的请求/权限拒绝不是“发送结果未知”。保留同一正文按有界退避
+      // 继续恢复，绝不重新调用模型；人工接管或总关才永久取消这项责任。
       const rejected = [400, 401, 403, 404, 405, 410, 413, 415, 422].includes(error.crispStatus);
       await transaction(key, (current) => {
         const record = current.outgoing[String(fingerprint)];
@@ -4673,7 +5395,12 @@ function createRuntime(env = {}, options = {}) {
         } else if (rejected) {
           record.failure = 'crisp_http_' + error.crispStatus;
           record.recovery_deferred = true;
-          record.next_action_at = clock() + 300000;
+          // 明确 HTTP 拒绝证明本次正文未被 Crisp 接收，因此每轮只发一次、
+          // 按封顶退避保留同一正文即可；三次只是 unknown 防重预算，不能在这里
+          // 变成永久丢失应答责任。人工接管或总关才设置永久禁止重发。
+          delete record.resend_forbidden;
+          record.next_action_at = clock() + Math.min(21600000,
+            300000 * (2 ** Math.min(7, Math.max(0, record.attempts - 1))));
         }
       });
       if (rateLimited) {
@@ -4682,7 +5409,7 @@ function createRuntime(env = {}, options = {}) {
       }
       if (rejected) {
         appendEvent('delivery_failed', { reason: 'crisp_http_' + error.crispStatus });
-        return 'failed';
+        return 'rejected';
       }
       return 'retry';
     } finally { finishOutbound(key, outbound); }
@@ -4919,6 +5646,11 @@ function createRuntime(env = {}, options = {}) {
   };
   const assertProcessingPermit = (execution) => {
     if (!execution) return true;
+    if (execution.signal?.aborted) {
+      const reason = execution.signal.reason;
+      if (processingInterrupted(reason)) throw reason;
+      throw processingPermitLostError('execution_aborted');
+    }
     const permit = execution.permit;
     if (!permit || permit.lost || permit.controller?.signal?.aborted
       || !refreshOrdinaryProcessingPermit(permit)) {
@@ -4944,10 +5676,13 @@ function createRuntime(env = {}, options = {}) {
     let plan;
     let delivery;
     let processingPermit;
+    let processingCancellation;
+    let processingSignals;
     let execution;
     let capacityDeferred = false;
     let reconciliationOnly = false;
     let settlementOnly = false;
+    let retirementOnly = false;
     try {
       job = await transaction(key, (state) => {
         const configurationReady = replyConfigurationReady();
@@ -4955,7 +5690,7 @@ function createRuntime(env = {}, options = {}) {
         if (!configurationReady) {
           const configured = configuredSettings();
           for (const pending of state.jobs.filter((entry) => entry.status === 'received' && !entry.control)) {
-            if (uncertainDeliveryFor(state, pending)) continue;
+            if (pendingDeliveryFor(key, state, pending)) continue;
             const waitsForProvider = pending.deferred_configuration === true
               || pending.plan && providerDependentPlan(pending.plan);
             if (!waitsForProvider) continue;
@@ -4963,14 +5698,17 @@ function createRuntime(env = {}, options = {}) {
             else {
               pending.status = 'cancelled'; pending.retry_at = null; pending.lease_until = 0;
               markIntentionalSilence(pending, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-              delete pending.data; delete pending.plan; delete pending.inference;
-              delete pending.provider_result_receipt; delete pending.provider_migration_from;
+              delete pending.data;
+              retireProviderAttempt(key, pending, state.mode !== 'ai'
+                ? 'conversation_cancelled' : 'global_disabled');
               delete pending.deferred_configuration;
             }
           }
         }
         const candidates = state.jobs.filter((entry) => ['received', 'processing'].includes(entry.status)
-          && !providerSettlementOutstanding(entry)
+          && !providerRetirementOutstanding(entry)
+          && (!providerSettlementOutstanding(entry)
+            || frozenDeliveryOnlyDisposition(key, state, entry) === 'ready')
           && (!entry.retry_at || entry.retry_at <= clock()));
         const cancelledReconciliations = state.jobs.filter((entry) => entry.status === 'cancelled'
           && uncertainDeliveryFor(state, entry) && (!entry.retry_at || entry.retry_at <= clock())
@@ -4982,13 +5720,23 @@ function createRuntime(env = {}, options = {}) {
           && !(entry.lease_until > clock())
           && (entry.control || entry.status === 'cancelled' || !operatorBarrier(state)));
         const settlement = state.jobs.find((entry) => entry.id === requestedId
-          && providerSettlementDue(entry));
+          && providerSettlementDue(entry)
+          && frozenDeliveryOnlyDisposition(key, state, entry) !== 'ready');
+        const retirement = state.jobs.find((entry) => entry.id === requestedId
+          && providerRetirementDue(entry));
         const ordinary = operatorBarrier(state) ? cancelledReconciliations
           : schedulable.filter((entry) => !entry.control).sort((left, right) => left.sequence - right.sequence);
-        const selected = priority || controls[0] || requested || settlement
+        const selected = priority || controls[0] || requested || retirement || settlement
           || ordinary[0] || schedulable.find((entry) => entry.control);
         if (!selected) return null;
         if (selected.control && selected.lease_until > clock()) return null;
+        if (selected === retirement) {
+          token = crypto.randomBytes(12).toString('hex');
+          selected.provider_retirement.lease_token = token;
+          selected.provider_retirement.lease_until = clock() + 10000;
+          retirementOnly = true;
+          return JSON.parse(JSON.stringify(selected));
+        }
         if (!selected.control && state.worker && state.worker.until > clock()) return null;
         if (selected === settlement) {
           token = crypto.randomBytes(12).toString('hex');
@@ -5024,6 +5772,10 @@ function createRuntime(env = {}, options = {}) {
       if (!job) return capacityDeferred
         ? { status: 'deferred', reason: 'processing_capacity' }
         : { status: 'idle' };
+      if (retirementOnly) {
+        const result = await retryProviderRetirement(key, job, token);
+        return { ...result, key, jobId: job.id };
+      }
       if (settlementOnly) {
         const result = await retryProviderSettlement(key, job, token);
         return { ...result, key, jobId: job.id };
@@ -5031,7 +5783,11 @@ function createRuntime(env = {}, options = {}) {
       // 崩溃恢复可能直接消费已经冻结的 sent 回执而不再调用 makePlan()。
       // 保留 claim 时的计划供标签、欢迎菜单及最终责任记账使用。
       plan = job.plan;
-      execution = { token, permit: processingPermit, signal: processingPermit.controller.signal, job };
+      processingCancellation = !job.control && !reconciliationOnly
+        ? beginProcessingCancellation(key, job, token) : null;
+      processingSignals = combinedAbortSignal(processingPermit.controller.signal,
+        processingCancellation?.controller.signal);
+      execution = { token, permit: processingPermit, signal: processingSignals.signal, job };
       startOrdinaryProcessingPermitHeartbeat(processingPermit);
       assertProcessingPermit(execution);
       const eventTimeResolution = !reconciliationOnly
@@ -5119,6 +5875,7 @@ function createRuntime(env = {}, options = {}) {
           const global = settings();
           if (configuredSettings().enabled === true && !globalDisableCrossed(job, global)
             && current.mode === 'ai' && !operatorBarrier(current)
+            && frozenDeliveryOnlyDisposition(key, current, job) !== 'ready'
             && (!global.enabled || global.revision !== job.revision || !providerGenerationCurrent(job))) delivery = 'deferred';
         } catch (_) { delivery = 'deferred'; }
       }
@@ -5127,8 +5884,9 @@ function createRuntime(env = {}, options = {}) {
         catch (error) {
           // 答案已有确定回执，或控制状态已持久提交时，标签只是可选后处理。
           // 许可丢失不得把已发送答案倒退为可重发状态。
-          if (!processingPermitLost(error)) throw error;
-          appendEvent('tag_failed', { reason: 'processing_permit_lost' });
+          if (!processingInterrupted(error)) throw error;
+          appendEvent('tag_failed', { reason: processingCancelled(error)
+            ? 'processing_cancelled' : 'processing_permit_lost' });
         }
       }
       if (!(delivery === 'sent' || delivery === 'dispatched_after_cancel'
@@ -5156,15 +5914,18 @@ function createRuntime(env = {}, options = {}) {
             if (technicalFailure(plan)) {
               delete stored.plan;
               const receipt = stored.provider_result_receipt;
-              const uncertain = providerResultUncertain(stored);
-              if (!uncertain) {
-                // router 已明确没有该代结果，或本地请求身份已无法证明。
-                // 开启一个新的有界恢复代；同一代反复 route 只会撞上旧终态。
+              const disposition = providerResultDisposition(stored);
+              if (disposition === 'definitely_absent') {
+                // 只有 receipt-before-network 协议证明尚未请求，或 router 已用
+                // 当前完整身份明确返回 absent，才可开启新的有界恢复代。
                 delete stored.inference;
                 if (receipt) {
                   delete stored.provider_result_receipt;
                   delete stored.provider_migration_from;
                 }
+              } else if (disposition === 'invalid_identity') {
+                stored.failure_code = 'provider_receipt_identity_unresolved';
+                stored.retry_at = clock() + 300000;
               }
             }
             appendEvent('answer_responsibility_unresolved', { reason: code });
@@ -5179,18 +5940,28 @@ function createRuntime(env = {}, options = {}) {
             stored.retry_at = Number.isFinite(record?.next_action_at)
               ? record.next_action_at : clock() + 60000;
             appendEvent('answer_responsibility_unresolved', { reason: 'crisp_rate_limited' });
+          } else if (delivery === 'rejected' && stored.status !== 'cancelled') {
+            const record = Object.values(state.outgoing || {}).find((entry) => entry?.job_id === stored.id
+              && entry.status === 'rejected');
+            const code = /^crisp_http_(400|401|403|404|405|410|413|415|422)$/.test(record?.failure || '')
+              ? record.failure : 'crisp_delivery_rejected';
+            markUnresolved(stored, code);
+            stored.retry_at = Number.isSafeInteger(record?.next_action_at)
+              ? record.next_action_at : clock() + 300000;
+            appendEvent('answer_responsibility_unresolved', { reason: code });
           } else if (delivery === 'delivered_non_answer' && stored.status !== 'cancelled') {
             advanceResponseGeneration(stored);
             markUnresolved(stored, 'delivered_non_answer');
-            delete stored.plan;
-            delete stored.inference;
-            delete stored.provider_result_receipt;
-            delete stored.provider_migration_from;
+            retireProviderAttempt(key, stored, 'non_answer_retired');
           } else if (delivery === 'delivery_semantic_unknown' && stored.status !== 'cancelled') {
             markUnresolved(stored, 'delivery_semantic_unknown');
             stored.retry_at = clock() + 300000;
+          } else if (delivery === 'delivery_identity_unresolved' && stored.status !== 'cancelled') {
+            markUnresolved(stored, 'delivery_identity_unresolved');
+            stored.retry_at = clock() + 300000;
           } else if (delivery === 'deferred' && stored.status !== 'cancelled' && configuredSettings().enabled === true && state.mode === 'ai') {
-            stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
+            stored.status = 'received'; deferForConfiguration(stored,
+              pendingDeliveryFor(key, state, stored));
           } else if (delivery === 'dispatched_after_cancel') {
             // Crisp 已确认收到，但确认前人工/总开关/配置代次已经变化。该字节
             // 不能撤回，也绝不能作为正常回答或 intentional silence 记账；保留
@@ -5227,7 +5998,7 @@ function createRuntime(env = {}, options = {}) {
             if (stored.control || frozenDeliverySemanticFor(state, stored) === 'control_delivered') {
               markControlHandled(stored, stored.action || plan?.purpose || 'control');
             }
-            else markAnsweredConfirmed(stored, plan, frozenDeliverySemanticFor(state, stored));
+            else markAnsweredConfirmed(key, stored, plan, frozenDeliverySemanticFor(state, stored));
           } else if (stored.status === 'done' && stored.responsibility_status === 'pending') {
             if (stored.control) markControlHandled(stored, stored.action || plan?.purpose || 'control');
             else markUnresolved(stored, 'delivery_confirmation_missing');
@@ -5250,6 +6021,38 @@ function createRuntime(env = {}, options = {}) {
       }
       return { status: delivery, key, jobId: job.id };
     } catch (error) {
+      if (processingCancelled(error)) {
+        const reason = error.reason === 'global_disabled'
+          ? 'global_disabled' : 'conversation_state_changed';
+        if (job) {
+          try { await transaction(key, (state) => {
+            const stored = state.jobs.find((entry) => entry.id === job.id);
+            if (!stored) return;
+            // 另一 Code 执行实例可能已经持久提交真人接管并删除 execution_token。
+            // 若当前 token 仍在，说明本实例通过 100ms 状态探针先看到了总关；
+            // 这里补齐同一权威取消事务。两种路径都不得恢复为 received。
+            if (stored.execution_token === token) {
+              stored.status = 'cancelled';
+              stored.retry_at = null;
+              stored.lease_until = 0;
+              markIntentionalSilence(stored, reason === 'global_disabled'
+                ? 'global_disabled' : state.mode === 'human' ? 'human_handoff'
+                  : 'conversation_state_changed');
+              delete stored.data;
+              retireProviderAttempt(key, stored, reason === 'global_disabled'
+                ? 'global_disabled' : 'conversation_cancelled');
+              delete stored.deferred_configuration;
+              delete stored.deferred_control;
+              delete stored.execution_token;
+              settleUncertainDeliveries(state, stored, reason);
+            }
+            if (state.worker?.token === token) state.worker = null;
+          }); } catch (_) {}
+        }
+        appendEvent('processing_cancelled', { reason,
+          kind: job?.control ? 'control' : 'ordinary' });
+        return { status: 'cancelled', reason, key, jobId: job?.id || '' };
+      }
       if (processingPermitLost(error)) {
         let confirmedSent = ['sent', 'dispatched_after_cancel', 'delivered_non_answer',
           'delivery_semantic_unknown'].includes(delivery);
@@ -5285,10 +6088,7 @@ function createRuntime(env = {}, options = {}) {
                   && confirmedStateChangeReason !== 'configuration_changed')) {
                 advanceResponseGeneration(stored);
                 markUnresolved(stored, 'delivered_non_answer');
-                delete stored.plan;
-                delete stored.inference;
-                delete stored.provider_result_receipt;
-                delete stored.provider_migration_from;
+                retireProviderAttempt(key, stored, 'non_answer_retired');
               } else if (confirmedReceiptCurrent === false) {
                 stored.status = 'done';
                 stored.retry_at = null;
@@ -5306,7 +6106,7 @@ function createRuntime(env = {}, options = {}) {
               } else if (confirmedSemantic === 'valid_answer') {
                 stored.status = 'done';
                 stored.retry_at = null;
-                markAnsweredConfirmed(stored, plan, 'valid_answer');
+                markAnsweredConfirmed(key, stored, plan, 'valid_answer');
               } else {
                 markUnresolved(stored, 'delivery_semantic_unknown');
                 stored.retry_at = clock() + 300000;
@@ -5348,7 +6148,8 @@ function createRuntime(env = {}, options = {}) {
               stored.responsibility_status = 'unresolved_failure';
               stored.failure_code = 'operator_identity_pending';
             } else if (stored.status !== 'cancelled' && !stored.control && stored.data && configurationShouldDefer() && configuredSettings().enabled === true && state.mode === 'ai') {
-              stored.status = 'received'; deferForConfiguration(stored, uncertainDeliveryFor(state, stored));
+              stored.status = 'received'; deferForConfiguration(stored,
+                pendingDeliveryFor(key, state, stored));
             } else if (stored.status !== 'cancelled') {
               const persistedPlan = stored.plan && !technicalFailure(stored.plan);
               markUnresolved(stored, error?.code === 'OPERATOR_IDENTITY_PENDING'
@@ -5356,11 +6157,15 @@ function createRuntime(env = {}, options = {}) {
                   ? 'persisted_plan_delivery_pending' : 'runtime_processing_failed');
               if (!persistedPlan) {
                 delete stored.plan;
-                if (!providerResultUncertain(stored)) {
+                const disposition = providerResultDisposition(stored);
+                if (disposition === 'definitely_absent') {
                   const hadReceipt = Boolean(stored.provider_result_receipt);
                   delete stored.inference;
                   delete stored.provider_result_receipt;
                   if (hadReceipt) delete stored.provider_migration_from;
+                } else if (disposition === 'invalid_identity') {
+                  stored.failure_code = 'provider_receipt_identity_unresolved';
+                  stored.retry_at = clock() + 300000;
                 }
               }
             }
@@ -5374,7 +6179,11 @@ function createRuntime(env = {}, options = {}) {
       appendEvent('runtime_failed', { reason: failureSummary(error) });
       return { status: 'deferred', reason: error?.code === 'OPERATOR_IDENTITY_PENDING'
         ? 'operator_identity_pending' : 'answer_responsibility_unresolved' };
-    } finally { releaseOrdinaryProcessingPermit(processingPermit); }
+    } finally {
+      processingSignals?.cleanup();
+      finishProcessingCancellation(key, processingCancellation);
+      releaseOrdinaryProcessingPermit(processingPermit);
+    }
   };
   const list = async () => {
     ensureDirectory();
@@ -5439,7 +6248,8 @@ function createRuntime(env = {}, options = {}) {
     })) return true;
     if (state.jobs.some((job) => job?.control === true && job.action === 'resolve_operator'
       && job.operator_resolution?.result === 'unknown' && job.data)) return true;
-    if (state.jobs.some((job) => providerSettlementDue(job, at))) return true;
+    if (state.jobs.some((job) => providerSettlementDue(job, at)
+      || providerRetirementDue(job, at))) return true;
     if (state.pending_feedback !== null && state.pending_feedback !== undefined) return true;
     if (Object.values(state.offers).some((offer) => feedbackOnly(offer)
       || Number.isFinite(offer?.expires_at) && offer.expires_at < at - 86400000)) return true;
@@ -5452,10 +6262,11 @@ function createRuntime(env = {}, options = {}) {
       if (terminalLegacyNonAnswerNeedsMigration(state, job)) return true;
       if (job.status === 'processing' && !(job.lease_until > at)) return true;
       if (job.status === 'received' && !providerSettlementOutstanding(job)
+        && !providerRetirementOutstanding(job)
         && !(job.retry_at > at)) return true;
       return ['done', 'cancelled', 'failed'].includes(job.status)
         && job.responsibility_status !== 'unresolved_failure' && !uncertainDeliveryFor(state, job)
-        && !providerSettlementOutstanding(job)
+        && !providerSettlementOutstanding(job) && !providerRetirementOutstanding(job)
         && !(job.received_at > at - outgoingRetentionMilliseconds);
     })) return true;
     if (Object.values(state.outgoing).some((record) => record && record.feedback_retired !== true
@@ -5867,24 +6678,31 @@ function createRuntime(env = {}, options = {}) {
               }
               const waitsForProvider = job.deferred_configuration === true
                 || job.plan && providerDependentPlan(job.plan);
-              if (job.status === 'received' && !job.control && !configurationReady && !uncertainDeliveryFor(state, job)
+              if (job.status === 'received' && !job.control && !configurationReady
+                && !pendingDeliveryFor(key, state, job)
                 && waitsForProvider) {
                 if (shouldDefer && state.mode === 'ai') deferForConfiguration(job);
                 else {
                   job.status = 'cancelled'; job.retry_at = null;
                   markIntentionalSilence(job, state.mode !== 'ai' ? 'human_handoff' : 'global_disabled');
-                  delete job.data; delete job.plan; delete job.inference;
-                  delete job.provider_result_receipt; delete job.provider_migration_from;
+                  delete job.data;
+                  retireProviderAttempt(key, job, state.mode !== 'ai'
+                    ? 'conversation_cancelled' : 'global_disabled');
                   delete job.deferred_configuration;
                 }
               }
             }
             const due = state.jobs.filter((job) => job.status === 'received'
-              && !providerSettlementOutstanding(job) && !(job.retry_at > clock()));
+              && !providerRetirementOutstanding(job)
+              && (!providerSettlementOutstanding(job)
+                || frozenDeliveryOnlyDisposition(key, state, job) === 'ready')
+              && !(job.retry_at > clock()));
             const reconciliationDue = state.jobs.filter((job) => job.status === 'cancelled'
               && uncertainDeliveryFor(state, job) && !(job.retry_at > clock())
               && uncertainDeliveriesFor(state, job).some(([, record]) => !(record.next_action_at > clock())));
-            const settlementDue = state.jobs.filter((job) => providerSettlementDue(job));
+            const settlementDue = state.jobs.filter((job) => providerSettlementDue(job)
+              && frozenDeliveryOnlyDisposition(key, state, job) !== 'ready');
+            const retirementDue = state.jobs.filter((job) => providerRetirementDue(job));
             const priority = due.filter((job) => priorityConfirmation(job) && !(job.lease_until > clock()))
               .sort((left, right) => left.sequence - right.sequence)[0];
             const control = due.filter((job) => job.control && !(job.lease_until > clock()))
@@ -5896,7 +6714,10 @@ function createRuntime(env = {}, options = {}) {
               ? reconciliationDue.sort((left, right) => left.sequence - right.sequence)[0] : null;
             const settlement = !workerBusy
               ? settlementDue.sort((left, right) => left.sequence - right.sequence)[0] : null;
-            const candidate = priority || control || reconciliation || settlement || ordinary;
+            // cleanup-only 不占普通推理许可；即使同会话旧 worker 尚在退出，也可
+            // 通过 question 独占锁安全退休已取消代，避免容量长期泄漏。
+            const retirement = retirementDue.sort((left, right) => left.sequence - right.sequence)[0];
+            const candidate = priority || control || retirement || reconciliation || settlement || ordinary;
             return candidate ? { key, jobId: candidate.id, control: candidate.control === true } : null;
           });
           if (selected) jobs.push(selected);
@@ -5960,6 +6781,11 @@ function createRuntime(env = {}, options = {}) {
     state.mode = 'ai'; state.generation += 1; state.resume_at = null; state.pause_reason = ''; state.control_watermark = clock(); state.offers = {}; state.pending_feedback = null;
     for (const job of state.jobs) if (!job.control && ['received', 'processing'].includes(job.status)) {
       job.status = 'cancelled';
+      job.retry_at = null;
+      job.lease_until = 0;
+      markIntentionalSilence(job, 'conversation_state_changed');
+      delete job.data;
+      retireProviderAttempt(key, job, 'conversation_cancelled');
       delete job.execution_token;
       settleUncertainDeliveries(state, job, 'conversation_state_changed');
     }

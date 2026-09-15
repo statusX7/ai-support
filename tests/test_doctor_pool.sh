@@ -59,7 +59,7 @@ write_health unknown
 before=$(business_hash)
 invoke --local
 (( LAST_RC == 2 )) || fail '单主未检测应警告，不假绿、不认定接口故障'
-for id in provider.configuration provider.pending provider.rag_transaction provider.readback provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback runtime.provider_settlements; do assert_result "$id" PASS; done
+for id in provider.configuration provider.pending provider.rag_transaction provider.readback provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback runtime.provider_receipts runtime.provider_settlements runtime.provider_retirements; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
 ! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '主备默认doctor执行付费推理'
@@ -206,12 +206,187 @@ assert_result runtime.feedback WARN
 cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
 pass '旧评价残留只读报告，不清人工状态和普通任务'
 
-jq '.jobs[0].provider_settlement={schema_version:1,state:"deferred",next_action_at:0}' \
+NULL_CONTEXT_SHA=$(printf '%s' null | sha256sum | awk '{print $1}')
+jq --arg context_sha "$NULL_CONTEXT_SHA" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" |
+    .jobs[0].inference={attempt_generation:1,provider_receipt_protocol_version:1,
+      configuration_binding:("a"*64)} |
+    .jobs[0].provider_result_receipt={state:"unknown",stage:"answer",attempt_generation:1,
+      configuration_binding:("a"*64),request_contract_version:1,request_sha256:("b"*64),
+      plan_context_sha256:$context_sha,plan_context:null}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.provider_receipts WARN
+(( LAST_RC == 2 )) || fail '当前同代推理回执等待收敛必须警告而不是假绿'
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了等待重放的推理回执'
+
+jq --arg context_sha "$NULL_CONTEXT_SHA" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" |
+    .jobs[0].inference={attempt_generation:1,provider_receipt_protocol_version:1,
+      configuration_binding:("a"*64)} |
+    .jobs[0].provider_result_receipt={state:"unknown",stage:"answer",attempt_generation:1,
+      configuration_binding:("a"*64),request_contract_version:1,request_sha256:("b"*64),
+      plan_context_sha256:$context_sha,plan_context:{tampered:true}}' \
   "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail '回执知识上下文正文与摘要不一致必须阻止自检假绿'
+
+jq --arg context_sha "$NULL_CONTEXT_SHA" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" |
+    .jobs[0].inference={attempt_generation:1,provider_receipt_protocol_version:1,
+      configuration_binding:("a"*64)} |
+    .jobs[0].provider_result_receipt={state:"unknown",stage:"answer",attempt_generation:2,
+      configuration_binding:("a"*64),request_contract_version:1,request_sha256:("b"*64),
+      plan_context_sha256:$context_sha,plan_context:null}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail '错代推理回执必须阻止自检假绿'
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor删除了错代推理回执或原任务'
+
+jq '.jobs[0].status="received" | .jobs[0].responsibility_status="pending" |
+    .jobs[0].inference={attempt_generation:1,provider_receipt_protocol_version:2,
+      configuration_binding:("a"*64)} | del(.jobs[0].provider_result_receipt)' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail '未知回执协议版本不能被当成明确无结果'
+
+POOL_REVISION=$(jq -r '.revision' "${DEPLOY}/config/provider-pool-applied.json")
+LEGACY_RUNTIME_REVISION=$(jq -r '.jobs[0].revision' "${TEST_ROOT}/session.saved")
+LEGACY_SECRETS_GENERATION=$(jq -r '.secrets_generation' "${DEPLOY}/config/provider-pool-applied.json")
+LEGACY_POOL_SHA=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
+LEGACY_MATERIALS_SHA=$(jq -r '.source_sha256' "${DEPLOY}/config/materials-applied.json")
+LEGACY_TARGET_JSON=$(jq -cn --argjson runtime "$LEGACY_RUNTIME_REVISION" \
+  --argjson pool "$POOL_REVISION" --arg secrets "$LEGACY_SECRETS_GENERATION" \
+  --arg pool_sha "$LEGACY_POOL_SHA" --arg materials_sha "$LEGACY_MATERIALS_SHA" \
+  '[$runtime,$pool,$secrets,$pool_sha,$materials_sha]')
+LEGACY_TARGET_BINDING=$(printf '%s' "$LEGACY_TARGET_JSON" | sha256sum | awk '{print $1}')
+jq --argjson pool_revision "$POOL_REVISION" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" |
+    .jobs[0].inference={pool_revision:$pool_revision,deadline_at:1} |
+    del(.jobs[0].provider_result_receipt)' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts WARN
+(( LAST_RC == 2 )) || fail 'v1.2.x旧推理信封应等待独占任务迁移而不是假绿或删除'
+
+jq --argjson pool_revision "$POOL_REVISION" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" | .jobs[0].deferred_configuration=true |
+    .jobs[0].inference={pool_revision:$pool_revision,deadline_at:1} |
+    .jobs[0].legacy_v121_pending_origin={schema_version:1,phase:"source_frozen",
+      source:{runtime_revision:.jobs[0].revision,pool_revision:$pool_revision,deadline_at:1}} |
+    del(.jobs[0].provider_result_receipt,.jobs[0].plan)' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts WARN
+(( LAST_RC == 2 )) || fail '配置换代中已冻结的v1.2.1来源应显示等待迁移而不是假绿'
+
+jq '.jobs[0].legacy_v121_pending_origin.source.deadline_at=2' "$SESSION_FILE" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail 'v1.2.1临时来源与旧推理期限不符必须阻止自检假绿'
+
+jq '.jobs[0].legacy_v121_pending_origin.source.deadline_at=1 |
+    .jobs[0].provider_settlement={schema_version:1,state:"deferred"}' \
+  "$SESSION_FILE" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail '混有未知结算的v1.2.1临时来源不得冒充可安全迁移状态'
+
+jq --argjson pool_revision "$POOL_REVISION" --arg secrets "$LEGACY_SECRETS_GENERATION" \
+  --arg pool_sha "$LEGACY_POOL_SHA" --arg materials_sha "$LEGACY_MATERIALS_SHA" \
+  --arg binding "$LEGACY_TARGET_BINDING" '.jobs[0].status="received" |
+    .jobs[0].responsibility_status="pending" | .jobs[0].deferred_configuration=true |
+    .jobs[0].legacy_v121_pending_origin={schema_version:1,phase:"successor_bound",
+      source:{runtime_revision:.jobs[0].revision,pool_revision:$pool_revision,deadline_at:1},
+      target:{runtime_revision:.jobs[0].revision,pool_revision:$pool_revision,
+        secrets_generation:$secrets,pool_sha256:$pool_sha,materials_source_sha256:$materials_sha},
+      target_configuration_binding:$binding} |
+    del(.jobs[0].inference,.jobs[0].provider_result_receipt,.jobs[0].provider_settlement,.jobs[0].plan)' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.provider_receipts WARN
+(( LAST_RC == 2 )) || fail '已绑定完整目标代的v1.2.1来源应等待独占任务消费而不是假绿'
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor消费或改写了v1.2.1 successor标记'
+
+jq '.jobs[0].legacy_v121_pending_origin.target_configuration_binding=("f"*64)' \
+  "$SESSION_FILE" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts FAIL
+(( LAST_RC == 1 )) || fail '格式正确但内容错配的v1.2.1目标绑定必须阻止自检假绿'
+
+for malformed in \
+  '"corrupt"' \
+  '[]' \
+  '{}' \
+  '{"pool_revision":1}' \
+  '{"pool_revision":1,"deadline_at":1,"extra":true}' \
+  '{"attempt_generation":1,"configuration_binding":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+do
+  jq --argjson inference "$malformed" '.jobs[0].status="received" |
+      .jobs[0].responsibility_status="pending" |
+      .jobs[0].inference=$inference | del(.jobs[0].provider_result_receipt)' \
+    "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+  invoke --local
+  assert_result runtime.provider_receipts FAIL
+  (( LAST_RC == 1 )) || fail '畸形旧推理信封不能冒充可迁移的v1.2.1状态'
+done
+cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_receipts PASS
+pass '推理回执同代、错代、上下文篡改、未知协议、畸形状态与精确旧版迁移分层可见且默认只读'
+
+RUNTIME_REVISION=$(jq -r '.revision' "${DEPLOY}/config/materials-applied.json")
+SECRETS_GENERATION=$(jq -r '.secrets_generation' "${DEPLOY}/config/provider-pool-applied.json")
+POOL_SHA=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
+MATERIALS_SHA=$(jq -r '.source_sha256' "${DEPLOY}/config/materials-applied.json")
+STATE_KEY=${SESSION_FILE##*/session-}; STATE_KEY=${STATE_KEY%.json}
+CONFIGURATION_JSON=$(jq -cn --argjson runtime "$RUNTIME_REVISION" --argjson pool "$POOL_REVISION" \
+  --arg secrets "$SECRETS_GENERATION" --arg pool_sha "$POOL_SHA" --arg materials_sha "$MATERIALS_SHA" \
+  '[$runtime,$pool,$secrets,$pool_sha,$materials_sha]')
+CONFIGURATION_BINDING=$(printf '%s' "$CONFIGURATION_JSON" | sha256sum | awk '{print $1}')
+PLAN_CANONICAL=$(jq -Scn '{content:"受控已持久答案",outcome:"knowledge_hit",purpose:"ai_text",
+  sources:[],tags:["ai_replied"],type:"text"}')
+PLAN_SHA=$(printf '%s' "$PLAN_CANONICAL" | sha256sum | awk '{print $1}')
+jq --argjson runtime_revision "$RUNTIME_REVISION" --argjson pool_revision "$POOL_REVISION" \
+  --arg secrets_generation "$SECRETS_GENERATION" --arg pool_sha "$POOL_SHA" \
+  --arg materials_sha "$MATERIALS_SHA" --arg binding "$CONFIGURATION_BINDING" \
+  --arg session_key "$STATE_KEY" --arg plan_sha "$PLAN_SHA" --arg context_sha "$NULL_CONTEXT_SHA" '
+    .jobs[0]={id:("c"*64),status:"received",responsibility_status:"pending",generation:.generation,
+      revision:$runtime_revision,response_generation:0,
+      plan:{type:"text",purpose:"ai_text",content:"受控已持久答案",outcome:"knowledge_hit",
+        sources:[],tags:["ai_replied"],ai:true,ordinary:true},
+      inference:{runtime_revision:$runtime_revision,pool_revision:$pool_revision,
+        secrets_generation:$secrets_generation,pool_sha256:$pool_sha,
+        materials_source_sha256:$materials_sha,configuration_binding:$binding,
+        deadline_at:9999999999999,attempt_generation:1,provider_receipt_protocol_version:1},
+      provider_result_receipt:{state:"available",stage:"answer",attempt_generation:1,
+        configuration_binding:$binding,request_contract_version:1,request_sha256:("b"*64),
+        plan_context_sha256:$context_sha,plan_context:null},
+      provider_settlement:{schema_version:1,state:"deferred",plan_sha256:$plan_sha,
+        response_generation:0,attempts:1,first_recorded_at:1,next_action_at:9999999999999,
+        envelope:{version:1,scope:"conversation",question_id:("c"*64),session_key:$session_key,
+          generation:.generation,runtime_revision:$runtime_revision,pool_revision:$pool_revision,
+          secrets_generation:$secrets_generation,pool_sha256:$pool_sha,
+          materials_source_sha256:$materials_sha,configuration_binding:$binding,
+          deadline_at:9999999999999,stage:"answer",attempt_generation:1,
+          request_contract_version:1,request_sha256:("b"*64),plan_context_sha256:$context_sha}}}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/provider-settlement.valid"
 before=$(business_hash)
 invoke --local
 assert_result runtime.provider_settlements WARN
 [[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了延后的推理结算责任'
+jq '.jobs[0].provider_settlement={schema_version:1,state:"deferred",next_action_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '缺少签名身份的延后结算不能被当成正常等待'
 jq '.jobs[0].provider_settlement={schema_version:1,state:"invalid",next_action_at:0}' \
   "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
 invoke --local
@@ -246,8 +421,178 @@ jq '.jobs[0].provider_settlement={schema_version:1,state:"settled",plan_sha256:(
   "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
 invoke --local
 assert_result runtime.provider_settlements PASS
+jq '.jobs[0].provider_settlement.extra="unknown"' "$SESSION_FILE" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '带未知字段的伪结算完成状态必须阻止自检假绿'
+jq '.jobs[0].status="received" | .jobs[0].responsibility_status="pending" |
+    .jobs[0].response_generation=0 |
+    .jobs[0].plan={type:"text",purpose:"ai_text",content:"受控已持久答案",
+      outcome:"knowledge_hit",sources:[],tags:["ai_replied"],ai:true,ordinary:true} |
+    .jobs[0].provider_settlement={schema_version:1,state:"settled",plan_sha256:("a"*64),
+      response_generation:0,attempts:1,settled_at:0}' \
+  "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_settlements FAIL
+(( LAST_RC == 1 )) || fail '完成结算摘要与仍待投递计划不匹配必须阻止自检假绿'
 cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
-pass '推理结果结算延后与身份损坏分层报告，默认自检不删责任'
+pass '推理结果结算、请求回执、计划摘要和配置身份分层报告，默认自检不删责任'
+
+RETIREMENT_ENVELOPE=$(jq -c '.jobs[0].provider_settlement.envelope' \
+  "${TEST_ROOT}/provider-settlement.valid")
+RETIREMENT_CANONICAL=$(jq -Scn --argjson envelope "$RETIREMENT_ENVELOPE" \
+  '{envelope:$envelope,purpose:"conversation_cancelled"}')
+RETIREMENT_SHA=$(printf '%s' "$RETIREMENT_CANONICAL" | sha256sum | awk '{print $1}')
+jq --argjson envelope "$RETIREMENT_ENVELOPE" --arg identity "$RETIREMENT_SHA" '
+    .jobs[0].status="cancelled" |
+    .jobs[0].responsibility_status="intentional_silence" |
+    .jobs[0].responsibility_reason="human_reply" |
+    del(.jobs[0].plan,.jobs[0].provider_settlement) |
+    .jobs[0].provider_retirement={schema_version:1,state:"deferred",
+      purpose:"conversation_cancelled",envelope:$envelope,identity_sha256:$identity,
+      attempts:1,first_recorded_at:1,last_attempt_at:1,next_action_at:9999999999999,
+      reason:"retirement_unavailable",lease_until:0,lease_token:""}' \
+  "${TEST_ROOT}/provider-settlement.valid" > "$SESSION_FILE"
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/provider-retirement.valid"
+before=$(business_hash)
+invoke --local
+assert_result runtime.provider_retirements WARN
+(( LAST_RC == 2 )) || fail '已取消结果的签名退休等待收敛时必须警告'
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了退休身份、人工状态或推理回执'
+
+MISMATCH_RETIREMENT_ENVELOPE=$(jq -c '.jobs[0].provider_retirement.envelope |
+  .session_key=("d"*64)' "${TEST_ROOT}/provider-retirement.valid")
+MISMATCH_RETIREMENT_CANONICAL=$(jq -Scn --argjson envelope "$MISMATCH_RETIREMENT_ENVELOPE" \
+  '{envelope:$envelope,purpose:"conversation_cancelled"}')
+MISMATCH_RETIREMENT_SHA=$(printf '%s' "$MISMATCH_RETIREMENT_CANONICAL" | sha256sum | awk '{print $1}')
+jq --argjson envelope "$MISMATCH_RETIREMENT_ENVELOPE" --arg identity "$MISMATCH_RETIREMENT_SHA" \
+  '.jobs[0].provider_retirement.envelope=$envelope |
+   .jobs[0].provider_retirement.identity_sha256=$identity' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '退休信封session_key与实际会话文件不一致必须失败'
+
+jq 'del(.jobs[0].provider_retirement.lease_token)' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '退休租约只存在截止时间而缺token必须失败'
+
+jq '.jobs[0].provider_retirement.lease_until="0"' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '退休租约字段类型错误必须失败'
+
+jq '.jobs[0].provider_retirement.identity_sha256=("f"*64)' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '格式正确但摘要错配的退休身份必须阻止自检假绿'
+
+jq '.jobs[0].responsibility_reason="unrelated"' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '未获人工取消授权的退休记录必须阻止自检假绿'
+
+SESSION_GENERATION=$(jq -r '.generation' "${TEST_ROOT}/session.saved")
+LEGACY_CLEANUP_DEADLINE=9999999999998
+LEGACY_CLEANUP_ENVELOPE=$(jq -cn --arg session_key "$STATE_KEY" \
+  --argjson generation "$SESSION_GENERATION" --argjson runtime_revision "$RUNTIME_REVISION" \
+  --argjson pool_revision "$POOL_REVISION" --argjson deadline "$LEGACY_CLEANUP_DEADLINE" \
+  '{version:1,scope:"conversation",question_id:("e"*64),session_key:$session_key,
+    generation:$generation,runtime_revision:$runtime_revision,pool_revision:$pool_revision,
+    deadline_at:$deadline,stage:"answer",attempt_generation:1,legacy_v121_cleanup:true}')
+LEGACY_CLEANUP_CANONICAL=$(jq -Scn --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" \
+  '{envelope:$envelope,purpose:"conversation_cancelled"}')
+LEGACY_CLEANUP_SHA=$(printf '%s' "$LEGACY_CLEANUP_CANONICAL" | sha256sum | awk '{print $1}')
+jq --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" --arg identity "$LEGACY_CLEANUP_SHA" \
+  --argjson runtime_revision "$RUNTIME_REVISION" --argjson pool_revision "$POOL_REVISION" \
+  --argjson deadline "$LEGACY_CLEANUP_DEADLINE" '
+    .jobs[0]={id:("e"*64),status:"cancelled",responsibility_status:"intentional_silence",
+      responsibility_reason:"human_reply",generation:.generation,revision:$runtime_revision,
+      inference:{pool_revision:$pool_revision,deadline_at:$deadline},
+      legacy_v121_pending_origin:{schema_version:1,phase:"source_frozen",
+        source:{runtime_revision:$runtime_revision,pool_revision:$pool_revision,deadline_at:$deadline}},
+      provider_retirement:{schema_version:1,state:"pending",purpose:"conversation_cancelled",
+        envelope:$envelope,identity_sha256:$identity,attempts:0,first_recorded_at:1,
+        next_action_at:0}}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements WARN
+(( LAST_RC == 2 )) || fail 'source_frozen旧缓存的签名cleanup等待必须是可诊断警告'
+
+jq --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" --arg identity "$LEGACY_CLEANUP_SHA" \
+  --argjson runtime_revision "$RUNTIME_REVISION" --argjson pool_revision "$POOL_REVISION" \
+  --argjson deadline "$LEGACY_CLEANUP_DEADLINE" --arg secrets "$SECRETS_GENERATION" \
+  --arg pool_sha "$POOL_SHA" --arg materials_sha "$MATERIALS_SHA" \
+  --arg target_binding "$CONFIGURATION_BINDING" '
+    .jobs[0]={id:("e"*64),status:"cancelled",responsibility_status:"intentional_silence",
+      responsibility_reason:"human_reply",generation:.generation,revision:$runtime_revision,
+      legacy_v121_pending_origin:{schema_version:1,phase:"successor_bound",
+        source:{runtime_revision:$runtime_revision,pool_revision:$pool_revision,deadline_at:$deadline},
+        target:{runtime_revision:$runtime_revision,pool_revision:$pool_revision,
+          secrets_generation:$secrets,pool_sha256:$pool_sha,materials_source_sha256:$materials_sha},
+        target_configuration_binding:$target_binding},
+      provider_retirement:{schema_version:1,state:"pending",purpose:"conversation_cancelled",
+        envelope:$envelope,identity_sha256:$identity,attempts:0,first_recorded_at:1,
+        next_action_at:0}}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements WARN
+(( LAST_RC == 2 )) || fail 'successor_bound旧缓存的签名cleanup等待必须是可诊断警告'
+
+jq '.jobs[0].provider_retirement={schema_version:1,state:"retired",
+      purpose:"conversation_cancelled",attempts:1,retired_at:1,identity_sha256:("a"*64)} |
+    del(.jobs[0].inference,.jobs[0].provider_result_receipt,.jobs[0].provider_settlement,
+      .jobs[0].provider_migration_from,.jobs[0].legacy_v121_pending_origin)' \
+  "${TEST_ROOT}/provider-retirement.valid" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements PASS
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/provider-retirement.finished"
+
+jq '.jobs[0].provider_retirement.purpose="global_disabled"' \
+  "${TEST_ROOT}/provider-retirement.finished" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '完成摘要的purpose与当前业务静默原因不符必须失败'
+
+jq '.jobs[0].provider_retirement_failure_code="provider_retirement_identity_unresolved"' \
+  "${TEST_ROOT}/provider-retirement.finished" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '孤立的退休失败码不能被完成摘要掩盖'
+
+jq 'del(.jobs[0].provider_retirement) |
+    .jobs[0].provider_retirement_failure_code="provider_retirement_identity_unresolved"' \
+  "${TEST_ROOT}/provider-retirement.finished" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '只有失败码而没有退休记录时必须明确失败'
+
+jq '.jobs[0].legacy_v121_pending_origin={schema_version:1,phase:"source_frozen",
+      source:{runtime_revision:.jobs[0].revision,pool_revision:1,deadline_at:1}}' \
+  "${TEST_ROOT}/provider-retirement.finished" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '完成摘要仍携带旧版迁移来源必须失败'
+
+jq '.jobs[0].inference={pool_revision:1}' \
+  "${TEST_ROOT}/provider-retirement.finished" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '伪退休完成状态仍携带推理身份时必须阻止自检假绿'
+
+jq 'del(.jobs[0].inference) | .jobs[0].provider_retirement.extra=true' \
+  "${TEST_ROOT}/provider-retirement.finished" > "${SESSION_FILE}.bad"
+mv -- "${SESSION_FILE}.bad" "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '带未知字段的伪退休完成状态必须阻止自检假绿'
+cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
+pass '人工/总关后的签名退休、授权、摘要、完成联合状态与只读边界可诊断'
 
 mv -- "${DEPLOY}/config/provider-pool-applied.json" "${TEST_ROOT}/pool-applied.saved"
 env_set "${DEPLOY}/.env" PROVIDER_POOL_REQUIRED false

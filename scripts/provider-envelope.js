@@ -58,13 +58,14 @@ function verifyEnvelope(token, key) {
   const allowed = new Set(['version', 'scope', 'question_id', 'runtime_revision', 'pool_revision',
     'secrets_generation', 'pool_sha256', 'materials_source_sha256', 'configuration_binding',
     'deadline_at', 'stage', 'attempt_generation', 'request_contract_version', 'request_sha256',
-    'plan_context_sha256']);
+    'plan_context_sha256', 'legacy_v121_cleanup']);
   if (scope === 'conversation') for (const name of ['session_key', 'generation',
-    'migration_from', 'transition_reason']) allowed.add(name);
+    'migration_from', 'transition_reason', 'legacy_v121_origin']) allowed.add(name);
   if (Object.keys(value).some(name => !allowed.has(name))) throw new Error('问题信封字段无效');
   const attemptGeneration = value.attempt_generation === undefined ? 1 : value.attempt_generation;
   const migration = value.migration_from;
-  validRequestContract(value);
+  const contract = validRequestContract(value);
+  const legacyV121Cleanup = value.legacy_v121_cleanup === true;
   const validConfiguration = configuration => configuration && typeof configuration === 'object'
     && !Array.isArray(configuration) && Number.isSafeInteger(configuration.runtime_revision)
     && configuration.runtime_revision >= 0 && Number.isSafeInteger(configuration.pool_revision)
@@ -88,7 +89,27 @@ function verifyEnvelope(token, key) {
       || !Number.isSafeInteger(migration.attempt_generation) || migration.attempt_generation < 1
       || Object.keys(migration).some(name => !['runtime_revision','pool_revision','secrets_generation','pool_sha256','materials_source_sha256','attempt_generation'].includes(name)))
     || value.transition_reason !== undefined && (value.transition_reason !== 'configuration_changed'
-      || migration === undefined)) throw new Error('问题信封字段无效');
+      || migration === undefined)
+    || value.legacy_v121_cleanup !== undefined && value.legacy_v121_cleanup !== true
+    || legacyV121Cleanup && (scope !== 'conversation' || value.stage !== 'answer'
+      || attemptGeneration !== 1 || contract !== null || migration !== undefined
+      || value.legacy_v121_origin !== undefined
+      || Object.keys(value).sort().join(',') !== [
+        'attempt_generation','deadline_at','generation','legacy_v121_cleanup','pool_revision',
+        'question_id','runtime_revision','scope','session_key','stage','version',
+      ].sort().join(',') || value.pool_revision < 1)
+    || value.legacy_v121_origin !== undefined
+      && (scope !== 'conversation' || !value.legacy_v121_origin
+        || typeof value.legacy_v121_origin !== 'object'
+        || Array.isArray(value.legacy_v121_origin)
+        || Object.keys(value.legacy_v121_origin).sort().join(',') !== 'deadline_at,pool_revision,runtime_revision'
+        || !Number.isSafeInteger(value.legacy_v121_origin.runtime_revision)
+        || value.legacy_v121_origin.runtime_revision < 0
+        || !Number.isSafeInteger(value.legacy_v121_origin.pool_revision)
+        || value.legacy_v121_origin.pool_revision < 1
+        || !Number.isSafeInteger(value.legacy_v121_origin.deadline_at)
+        || value.legacy_v121_origin.deadline_at < 0 || attemptGeneration !== 2
+        || migration !== undefined)) throw new Error('问题信封字段无效');
   value.attempt_generation = attemptGeneration;
   return value;
 }

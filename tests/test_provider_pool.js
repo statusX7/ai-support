@@ -7,11 +7,15 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
-const {signEnvelope,envelopeMarker,requestContract} = require('../scripts/provider-envelope.js');
+const {signEnvelope,envelopeMarker,verifyEnvelope,requestContract} = require('../scripts/provider-envelope.js');
 const {DEFAULT_POLICY,retryAfterMilliseconds,cooldownMilliseconds,classifyFailure,estimateTextTokens,normalizeApiBase} = require('../scripts/provider-router.js');
 const root = path.resolve(__dirname,'..');
 const sleep = delay => new Promise(resolve => setTimeout(resolve,delay));
 const digest = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort()
+    .map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
 async function until(condition,message,timeout=3000) {
   const end=Date.now()+timeout;
   while(!condition()&&Date.now()<end)await sleep(5);
@@ -80,6 +84,16 @@ async function fixture(count=1,policy={}) {
       'content-type':'application/json','x-crispai-question':signEnvelope(bound,f.key)},body:'{}'});
     const text=await response.text();let value;try{value=JSON.parse(text);}catch(_){}return{status:response.status,value,text};
   };
+  f.retire = async (envelope,purpose='conversation_cancelled',body=sample) => {
+    // v1.2.1 的旧问题缓存没有 request contract；cleanup-only 信封必须保持
+    // 精确最小字段，不能由测试夹具替它补造一份不存在的请求身份。
+    const bound=envelope?.legacy_v121_cleanup===true
+      ? {...envelope}:{...envelope,...requestContract(body)};
+    const response=await fetch(f.base+'/internal/provider/retire',{method:'POST',headers:{authorization:'Bearer '+f.key,
+      'content-type':'application/json','x-crispai-question':signEnvelope(bound,f.key)},
+      body:JSON.stringify({outcome:'responsibility_retired',purpose})});
+    const text=await response.text();let value;try{value=JSON.parse(text);}catch(_){}return{status:response.status,value,text};
+  };
   f.get = async action => (await fetch(f.base+'/internal/provider/'+action,{headers:{authorization:'Bearer '+f.key}})).json();
   f.cli = (args,environment={}) => command(['--deploy-dir',directory,...args],{PROVIDER_ADAPTER_MANAGEMENT_URL:f.base,...environment});
   f.file = value => { const file=path.join(directory,'candidate-'+crypto.randomBytes(4).toString('hex')+'.json');json(file,value);return file; };
@@ -124,6 +138,46 @@ function testCooldownJitter() {
     assert.equal(cooldownMilliseconds(DEFAULT_POLICY,1,retry,0),retry);assert.equal(cooldownMilliseconds(DEFAULT_POLICY,99,retry,1),retry);
   }
   process.stdout.write('通过 UNIT：冷却0～5%正向抖动的首次、指数递增、近上限、上限、取整及长Retry-After确定性边界（1组，不计入HTTP协议组数）\n');
+}
+
+function testLegacyEnvelopeBoundary() {
+  const key='synthetic-legacy-envelope-key';
+  const configuration={runtime_revision:1,pool_revision:2,secrets_generation:'a'.repeat(32),
+    pool_sha256:'b'.repeat(64),materials_source_sha256:'c'.repeat(64)};
+  const configurationBinding=digest(JSON.stringify([configuration.runtime_revision,
+    configuration.pool_revision,configuration.secrets_generation,configuration.pool_sha256,
+    configuration.materials_source_sha256]));
+  const base={version:1,scope:'conversation',question_id:'d'.repeat(64),session_key:'e'.repeat(64),
+    generation:0,...configuration,configuration_binding:configurationBinding,
+    deadline_at:Date.now()+90000,stage:'answer',attempt_generation:2,
+    legacy_v121_origin:{runtime_revision:1,pool_revision:2,deadline_at:Date.now()+1000},
+    ...requestContract(sample)};
+  assert.deepEqual(verifyEnvelope(signEnvelope(base,key),key).legacy_v121_origin,
+    base.legacy_v121_origin);
+  for(const invalid of [
+    {...base,attempt_generation:1},
+    {...base,scope:'admin'},
+    {...base,legacy_v121_origin:{...base.legacy_v121_origin,deadline_at:-1}},
+    {...base,legacy_v121_origin:{...base.legacy_v121_origin,extra:true}},
+    {...base,migration_from:{...configuration,attempt_generation:1},
+      transition_reason:'configuration_changed'},
+  ]) assert.throws(()=>verifyEnvelope(signEnvelope(invalid,key),key));
+  const cleanup={version:1,scope:'conversation',question_id:'1'.repeat(64),
+    session_key:'2'.repeat(64),generation:3,runtime_revision:4,pool_revision:5,
+    deadline_at:Date.now()+2000,stage:'answer',attempt_generation:1,
+    legacy_v121_cleanup:true};
+  assert.equal(verifyEnvelope(signEnvelope(cleanup,key),key).legacy_v121_cleanup,true);
+  for(const invalid of [
+    {...cleanup,...requestContract(sample)},
+    {...cleanup,scope:'admin'},
+    {...cleanup,stage:'vision'},
+    {...cleanup,attempt_generation:2},
+    {...cleanup,legacy_v121_cleanup:false},
+    {...cleanup,legacy_v121_origin:{runtime_revision:4,pool_revision:5,
+      deadline_at:cleanup.deadline_at}},
+  ]) assert.throws(()=>verifyEnvelope(signEnvelope(invalid,key),key));
+  process.stdout.write('通过 UNIT：仅精确conversation第二恢复代可携带v1.2.1来源，管理员/首代/负值/多字段/配置迁移组合均拒绝（1组，不计入HTTP协议组数）\n');
+  process.stdout.write('通过 UNIT：v1.2.1 cleanup-only 信封只接受精确最小字段，不能获得请求契约、视觉阶段或迁移权限（1组，不计入HTTP协议组数）\n');
 }
 
 async function testRagContextTransactions() {
@@ -494,6 +548,7 @@ async function testManagementErrorClassification() {
 
 async function main() {
   testCooldownJitter();
+  testLegacyEnvelopeBoundary();
   await testMaintenanceTransactions();
   await testRagContextTransactions();
   await testManagementErrorClassification();
@@ -505,6 +560,192 @@ async function main() {
       const visible=JSON.stringify((await f.cli(['list'])).value);assert.ok(!visible.includes('fixture-key-0'));assert.ok(!visible.includes('"x-fixture":"value"'));
       assert.equal((await f.post(sample,null)).status,400);assert.equal(f.calls.length,0);
       assert.equal((await fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer fixture-key-0'},body:JSON.stringify(sample)})).status,401);
+    }finally{await f.close();}
+  });
+  await test('高频healthz只核对配置且不全量反查问题会话，显式status仍提供完整诊断',async()=>{
+    const f=await fixture();const originalReadFileSync=fs.readFileSync;try {
+      const questions=path.join(f.directory,'data/provider-router/questions');
+      fs.mkdirSync(questions,{recursive:true,mode:0o700});
+      for(let index=0;index<8;index+=1) {
+        const id=(index+1).toString(16).repeat(64).slice(0,64);
+        const sessionKey=(index+9).toString(16).repeat(64).slice(0,64);
+        json(path.join(questions,id+'.json'),{schema_version:2,id,scope:'conversation',
+          session_key:sessionKey,conversation_generation:0,
+          responsibility_binding:digest(JSON.stringify([id,'conversation',sessionKey,0])),
+          attempts:0,stages:{},record_revision:1});
+      }
+      let sessionReads=0;
+      fs.readFileSync=function(file,...args) {
+        if(String(file).startsWith(path.join(f.directory,'data/runtime/session-'))) sessionReads+=1;
+        return originalReadFileSync.call(fs,file,...args);
+      };
+      const health=await fetch(f.base+'/healthz');
+      assert.equal(health.status,200);
+      assert.equal((await health.json()).revision,read(f.poolFile).revision);
+      assert.equal(sessionReads,0,'容器健康轮询不得按缓存问题数量同步读取会话');
+      const status=await f.get('status');
+      assert.equal(status.questions.count,8);
+      assert.equal(sessionReads,8,'只有显式管理状态才执行逐问题责任核对');
+    }finally{fs.readFileSync=originalReadFileSync;await f.close();}
+  });
+  await test('容量压力最多反查64个会话且绝不把失败未解决责任当作可回收缓存',async()=>{
+    const f=await fixture();const originalReadFileSync=fs.readFileSync;try {
+      const questions=path.join(f.directory,'data/provider-router/questions');
+      fs.mkdirSync(questions,{recursive:true,mode:0o700});
+      const protectedFiles=[];
+      let reclaimableFile='';
+      for(let index=0;index<1024;index+=1) {
+        const id=digest('pressure-question-'+index);
+        const website='fixture-pressure-website';
+        const sessionId='fixture-pressure-session-'+index;
+        const sessionKey=digest(website+'\0'+sessionId);
+        const file=path.join(questions,id+'.json');
+        json(file,{schema_version:2,id,scope:'conversation',session_key:sessionKey,
+          conversation_generation:0,
+          responsibility_binding:digest(JSON.stringify([id,'conversation',sessionKey,0])),
+          attempts:0,stages:{},record_revision:1,
+          ...(index===2?{settlement:{outcome:'plan_persisted'}}:{}),
+          ...(index===3?{settlement:{outcome:'plan_persisted',plan_sha256:'a'.repeat(64),
+            response_generation:0,request_contract:{request_contract_version:1,
+              request_sha256:'b'.repeat(64),plan_context_sha256:'c'.repeat(64)},
+            settled_at:Date.now()-700000}}:{})});
+        // 让前64项稳定成为压力扫描候选，并证明即使会话文件明确存在，
+        // failed + unresolved（包括一条损坏退休记录）和丢失 job
+        // 的未知责任都不能被“终态”启发式误删。
+        if(index<=64) {
+          json(path.join(f.directory,'data/runtime','session-'+sessionKey+'.json'),{
+            schema_version:2,website_id:website,session_id:sessionId,mode:'ai',generation:0,
+            jobs:index===1?[]:[index<64
+              ? {id,generation:0,status:'failed',responsibility_status:'unresolved_failure',
+                responsibility_reason:'provider_retirement_identity_unresolved',
+                provider_retirement_failure_code:'provider_retirement_identity_unresolved',
+                ...(index===0?{provider_retirement:{schema_version:1,state:'invalid',
+                  purpose:'conversation_cancelled',identity_sha256:'0'.repeat(64)}}:{})}
+              : {id,generation:0,status:'done',responsibility_status:'answered_confirmed'}]});
+          // index=2 的畸形 truthy settlement 已超过正常结算保留阈值；
+          // 它仍是未知责任，不能借年龄或容量压力被当成合法结算删除。
+          const age=[2,3].includes(index) ? Date.now()-700000
+            : index<64 ? Date.now()-180000-index : Date.now()-100000;
+          fs.utimesSync(file,new Date(age),new Date(age));
+        }
+        if(index<64) protectedFiles.push(file);
+        if(index===64) reclaimableFile=file;
+      }
+      let sessionReads=0;
+      fs.readFileSync=function(file,...args) {
+        if(String(file).startsWith(path.join(f.directory,'data/runtime/session-'))) sessionReads+=1;
+        return originalReadFileSync.call(fs,file,...args);
+      };
+      const result=await f.post();
+      assert.equal(result.status,400,result.text);
+      assert.equal(result.value.error.code,'question_cache_full');
+      assert.ok(sessionReads>0&&sessionReads<=64,`压力扫描反查了${sessionReads}个会话`);
+      assert.equal(f.calls.length,0,'容量拒绝必须发生在任何上游调用之前');
+      assert.equal(protectedFiles.every(file=>fs.existsSync(file)),true,
+        '失败未解决责任不能为了释放容量被删除');
+      assert.equal(fs.existsSync(reclaimableFile),true,
+        '首批64项之外的可回收责任不应被越界扫描');
+      assert.equal(fs.readdirSync(questions).filter(name=>/^[a-f0-9]{64}\.json$/.test(name)).length,1024);
+      await f.restart();
+      const recovered=await f.post();
+      assert.equal(recovered.status,200,recovered.text);
+      assert.equal(fs.existsSync(reclaimableFile),false,
+        '适配器重启后的下一次压力扫描必须从持久游标续做并回收后续安全终态');
+      assert.equal(protectedFiles.every(file=>fs.existsSync(file)),true);
+      assert.ok(sessionReads<=128,`两次压力扫描反查了${sessionReads}个会话`);
+      assert.equal(f.calls.length,1,'只有释放容量后的第二个问题可以调用上游');
+    }finally{fs.readFileSync=originalReadFileSync;await f.close();}
+  });
+  await test('签名退休只清理已由运行时持久取消的精确问题，重复请求幂等且不产生新推理',async()=>{
+    const f=await fixture();try {
+      const questionId='7'.repeat(64),website='11111111-1111-4111-8111-111111111111',
+        sessionId='session_fixture_retirement',sessionKey=digest(website+'\0'+sessionId),
+        current=read(f.poolFile);
+      const envelope={version:1,scope:'conversation',question_id:questionId,
+        session_key:sessionKey,generation:0,runtime_revision:1,pool_revision:current.revision,
+        deadline_at:Date.now()+90000,stage:'answer',attempt_generation:1};
+      const bound={...envelope,...requestContract(sample)};
+      const sessionFile=path.join(f.directory,'data/runtime','session-'+sessionKey+'.json');
+      const state={schema_version:2,website_id:website,
+        session_id:sessionId,mode:'ai',generation:0,uncertain_events:[],
+        jobs:[{id:questionId,generation:0,revision:1,status:'processing',
+          responsibility_status:'pending',inference:{pool_revision:current.revision,
+            attempt_generation:1}}]};
+      json(sessionFile,state);
+      const answer=await f.post(sample,envelope);assert.equal(answer.status,200,answer.text);
+      assert.equal(f.calls.length,1);
+      const questionFile=path.join(f.directory,'data/provider-router/questions',questionId+'.json');
+      assert.equal(fs.existsSync(questionFile),true);
+
+      const unauthorized=await f.retire(envelope);assert.equal(unauthorized.status,400);
+      assert.equal(unauthorized.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true,'仅有旧签名不得删除仍在处理的问题');
+
+      state.mode='human';state.generation=1;
+      const job=state.jobs[0];job.status='cancelled';job.responsibility_status='intentional_silence';
+      job.responsibility_reason='human_reply';
+      job.provider_retirement={schema_version:1,state:'pending',purpose:'conversation_cancelled',
+        envelope:bound,identity_sha256:digest(canonical({envelope:bound,purpose:'conversation_cancelled'})),
+        attempts:0,first_recorded_at:Date.now(),next_action_at:0};
+      json(sessionFile,state);
+      const wrongPurpose=await f.retire(envelope,'global_disabled');
+      assert.equal(wrongPurpose.status,400);assert.equal(wrongPurpose.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true,'错误退休原因不得删除精确问题');
+
+      const retired=await f.retire(envelope);assert.equal(retired.status,200,retired.text);
+      assert.deepEqual(retired.value,{ok:true,state:'retired'});assert.equal(fs.existsSync(questionFile),false);
+      const repeated=await f.retire(envelope);assert.equal(repeated.status,200,repeated.text);
+      assert.deepEqual(repeated.value,{ok:true,state:'absent'});
+      assert.equal(f.calls.length,1,'退休和幂等确认均不得重新调用上游');
+    }finally{await f.close();}
+  });
+  await test('v1.2.1旧缓存仅能由会话反向授权的签名cleanup事务精确删除',async()=>{
+    const f=await fixture();try {
+      const current=read(f.poolFile),questionId='6'.repeat(64),
+        website='fixture-legacy-retirement-website',sessionId='fixture-legacy-retirement-session',
+        sessionKey=digest(website+'\0'+sessionId),deadline=Date.now()+90000;
+      const envelope={version:1,scope:'conversation',question_id:questionId,
+        session_key:sessionKey,generation:0,runtime_revision:1,pool_revision:current.revision,
+        deadline_at:deadline,stage:'answer',attempt_generation:1,legacy_v121_cleanup:true};
+      const questionFile=path.join(f.directory,'data/provider-router/questions',questionId+'.json');
+      fs.mkdirSync(path.dirname(questionFile),{recursive:true,mode:0o700});
+      json(questionFile,{id:questionId,
+        binding:digest(JSON.stringify(['conversation',sessionKey,0,1,current.revision,deadline])),
+        revision:current.revision,deadline,attempts:1,
+        stages:{answer:{tried:[current.primary_id],result:chat('已生成但因人工接管不得出站的旧结果')}},
+        created_at:Date.now()});
+      const sessionFile=path.join(f.directory,'data/runtime','session-'+sessionKey+'.json');
+      const state={schema_version:2,website_id:website,session_id:sessionId,mode:'ai',
+        generation:0,uncertain_events:[],jobs:[{id:questionId,generation:0,revision:1,
+          status:'processing',responsibility_status:'pending',
+          inference:{pool_revision:current.revision,deadline_at:deadline}}]};
+      json(sessionFile,state);
+
+      const unauthorized=await f.retire(envelope);
+      assert.equal(unauthorized.status,400);assert.equal(unauthorized.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true);
+      const routeAttempt=await f.post(sample,envelope);
+      assert.equal(routeAttempt.status,400,'cleanup-only 信封不能取得推理权限');
+      const replayAttempt=await f.replay(envelope);
+      assert.equal(replayAttempt.status,400,'cleanup-only 信封不能取得重放权限');
+      assert.equal(f.calls.length,0);
+
+      state.mode='human';state.generation=1;
+      const job=state.jobs[0];job.status='cancelled';
+      job.responsibility_status='intentional_silence';job.responsibility_reason='human_reply';
+      job.provider_retirement={schema_version:1,state:'pending',purpose:'conversation_cancelled',
+        envelope,identity_sha256:digest(canonical({envelope,purpose:'conversation_cancelled'})),
+        attempts:0,first_recorded_at:Date.now(),next_action_at:0};
+      json(sessionFile,state);
+      const wrongPurpose=await f.retire(envelope,'global_disabled');
+      assert.equal(wrongPurpose.status,400);assert.equal(wrongPurpose.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true);
+      const retired=await f.retire(envelope);
+      assert.equal(retired.status,200,retired.text);assert.deepEqual(retired.value,{ok:true,state:'retired'});
+      assert.equal(fs.existsSync(questionFile),false);
+      const repeated=await f.retire(envelope);
+      assert.equal(repeated.status,200,repeated.text);assert.deepEqual(repeated.value,{ok:true,state:'absent'});
+      assert.equal(f.calls.length,0,'旧缓存清理和幂等确认均不得调用任何上游');
     }finally{await f.close();}
   });
   await test('RAG system须完整保留有效Prompt，截断/用户段替代零推理且显式短probe不受影响',async()=>{

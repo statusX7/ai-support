@@ -9,8 +9,13 @@ const DEFAULT_POLICY = Object.freeze({question_timeout_ms:90000, call_timeout_ms
   max_attempts:21, cooldown_initial_ms:60000, cooldown_max_ms:300000, pool_cooldown_ms:3000});
 const POLICY_BOUNDS = {question_timeout_ms:[1000,180000],call_timeout_ms:[1000,60000],connect_timeout_ms:[100,10000],
   max_attempts:[1,21],cooldown_initial_ms:[1000,300000],cooldown_max_ms:[1000,3600000],pool_cooldown_ms:[100,60000]};
+const MAX_PRESSURE_RETIREMENT_CHECKS = 64;
 const forbiddenHeaders = new Set(['authorization','host','connection','content-length','content-type','transfer-encoding','cookie','proxy-authorization','x-crispai-question']);
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort()
+    .map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
 const requestContract = value => value?.request_contract_version === 1
   && /^[a-f0-9]{64}$/.test(value.request_sha256 || '')
   && /^[a-f0-9]{64}$/.test(value.plan_context_sha256 || '')
@@ -20,6 +25,24 @@ const sameRequestContract = (left,right) => Boolean(left && right
   && left.request_contract_version === right.request_contract_version
   && left.request_sha256 === right.request_sha256
   && left.plan_context_sha256 === right.plan_context_sha256);
+const validQuestionSettlement = (value,question) => Boolean(value
+  && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).sort().join(',') === [
+    'outcome','plan_sha256','request_contract','response_generation','settled_at',
+  ].sort().join(',')
+  && value.outcome === 'plan_persisted'
+  && /^[a-f0-9]{64}$/.test(value.plan_sha256 || '')
+  && Number.isSafeInteger(value.response_generation) && value.response_generation >= 0
+  && Number.isSafeInteger(value.settled_at) && value.settled_at >= 0
+  && value.request_contract && typeof value.request_contract === 'object'
+  && !Array.isArray(value.request_contract)
+  && Object.keys(value.request_contract).sort().join(',') === [
+    'plan_context_sha256','request_contract_version','request_sha256',
+  ].sort().join(',')
+  && requestContract(value.request_contract)
+  && question?.stages?.answer
+  && sameRequestContract(requestContract(question.stages.answer.request_contract),
+    requestContract(value.request_contract)));
 
 function cachedResultDisposition(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'invalid';
@@ -216,6 +239,8 @@ function createRouter(environment, invoke) {
     }
     value.state_revision = value.state_revision || 0;
     value.pool_until = Number.isFinite(value.pool_until) ? value.pool_until : 0;
+    value.retirement_cursor = /^[a-f0-9]{64}\.json$/.test(value.retirement_cursor || '')
+      ? value.retirement_cursor : '';
     return value;
   };
   let state = freshState();
@@ -436,6 +461,108 @@ function createRouter(environment, invoke) {
   const questionFile = id => path.join(directory,'questions',id + '.json');
   const readQuestion = id => { try { return readJson(questionFile(id),20000000); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
   const questionLockPath = id => path.join(directory,'questions','.locks',id + '.lock');
+  const authorizedSession = sessionKey => {
+    let session;
+    try { session = readJson(path.join(root,'data/runtime/session-' + sessionKey + '.json'),2097152); }
+    catch (_) { return null; }
+    if (session?.schema_version !== 2 || typeof session.website_id !== 'string'
+      || !session.website_id || typeof session.session_id !== 'string' || !session.session_id
+      || hash(session.website_id + '\0' + session.session_id) !== sessionKey
+      || !Number.isSafeInteger(session.generation) || session.generation < 0
+      || !Array.isArray(session.jobs)) return null;
+    return session;
+  };
+  const safelyTerminalResponsibility = job => {
+    if (!job || Object.prototype.hasOwnProperty.call(job,'provider_retirement')
+      || Object.prototype.hasOwnProperty.call(job,'provider_retirement_failure_code')
+      || Object.prototype.hasOwnProperty.call(job,'provider_settlement')
+      || Object.prototype.hasOwnProperty.call(job,'provider_result_receipt')) return false;
+    if (job.status === 'done') {
+      return !job.failure_code
+        && ['answered_confirmed','clarification_confirmed','control_handled']
+          .includes(job.responsibility_status);
+    }
+    return job.status === 'cancelled' && job.responsibility_status === 'intentional_silence'
+      && ['human_reply','human_handoff','conversation_state_changed','global_disabled']
+        .includes(job.responsibility_reason);
+  };
+  const responsibilityRetired = question => {
+    if (question?.schema_version !== 2 || question.scope !== 'conversation'
+      || !/^[a-f0-9]{64}$/.test(question.id || '')
+      || !/^[a-f0-9]{64}$/.test(question.session_key || '')
+      || !Number.isSafeInteger(question.conversation_generation)
+      || question.conversation_generation < 0
+      || question.responsibility_binding !== hash(JSON.stringify([
+        question.id,'conversation',question.session_key,question.conversation_generation,
+      ]))) return false;
+    const session = authorizedSession(question.session_key);
+    if (!session) return false;
+    const job = session.jobs.find(value => value?.id === question.id);
+    // 会话代次已推进不能证明某个缺失 job 已经安全终结。
+    // job 可能因旧版容量截断或损坏而消失；此时应保留 Provider
+    // 结果并报警，绝不能为释放压力把未知责任当成已回答。
+    if (!job) return false;
+    return job.generation === question.conversation_generation
+      && safelyTerminalResponsibility(job);
+  };
+  const retirementAuthorized = (question,envelope,purpose) => {
+    if (question?.scope !== 'conversation') return false;
+    const session = authorizedSession(question.session_key);
+    const job = session?.jobs.find(value => value?.id === question.id
+      && value.generation === question.conversation_generation);
+    const record = job?.provider_retirement;
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || record.schema_version !== 1 || !['pending','deferred'].includes(record.state)
+      || record.purpose !== purpose || !record.envelope
+      || canonical(record.envelope) !== canonical(envelope)
+      || record.identity_sha256 !== hash(canonical({envelope:record.envelope,purpose}))) return false;
+    if (purpose === 'conversation_cancelled') {
+      return job.status === 'cancelled' && job.responsibility_status === 'intentional_silence'
+        && ['human_reply','human_handoff','conversation_state_changed']
+          .includes(job.responsibility_reason);
+    }
+    if (purpose === 'global_disabled') {
+      return job.status === 'cancelled' && job.responsibility_status === 'intentional_silence'
+        && job.responsibility_reason === 'global_disabled';
+    }
+    if (purpose === 'input_retired') {
+      return ['done','cancelled','failed'].includes(job.status)
+        && ['intentional_silence','control_handled'].includes(job.responsibility_status)
+        && ['non_visitor_message','before_catchup_bootstrap','before_control_watermark']
+          .includes(job.responsibility_reason);
+    }
+    return purpose === 'non_answer_retired'
+      && ['received','failed'].includes(job.status)
+      && job.responsibility_status === 'unresolved_failure';
+  };
+  const legacyV121CleanupEnvelope = envelope => Boolean(envelope
+    && envelope.version === 1 && envelope.legacy_v121_cleanup === true
+    && envelope.scope === 'conversation'
+    && /^[a-f0-9]{64}$/.test(envelope.question_id || '')
+    && /^[a-f0-9]{64}$/.test(envelope.session_key || '')
+    && Number.isSafeInteger(envelope.generation) && envelope.generation >= 0
+    && Number.isSafeInteger(envelope.runtime_revision) && envelope.runtime_revision >= 0
+    && Number.isSafeInteger(envelope.pool_revision) && envelope.pool_revision >= 1
+    && Number.isSafeInteger(envelope.deadline_at) && envelope.deadline_at >= 0
+    && envelope.stage === 'answer' && envelope.attempt_generation === 1
+    && Object.keys(envelope).sort().join(',') === [
+      'attempt_generation','deadline_at','generation','legacy_v121_cleanup','pool_revision',
+      'question_id','runtime_revision','scope','session_key','stage','version',
+    ].sort().join(','));
+  const legacyV121RetirementAuthorized = (envelope,purpose) => {
+    if (!legacyV121CleanupEnvelope(envelope)) return false;
+    const session = authorizedSession(envelope.session_key);
+    const job = session?.jobs.find(value => value?.id === envelope.question_id
+      && value.generation === envelope.generation);
+    const record = job?.provider_retirement;
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || record.schema_version !== 1 || !['pending','deferred'].includes(record.state)
+      || record.purpose !== purpose || !record.envelope
+      || canonical(record.envelope) !== canonical(envelope)
+      || record.identity_sha256 !== hash(canonical({envelope:record.envelope,purpose}))) return false;
+    return retirementAuthorized({scope:'conversation',session_key:envelope.session_key,
+      id:envelope.question_id,conversation_generation:envelope.generation},envelope,purpose);
+  };
   const acquireQuestionLock = async (id,signal,deadline=Date.now()+180000) => {
     const lockPath = questionLockPath(id), token = crypto.randomBytes(24).toString('hex');
     fs.mkdirSync(path.dirname(lockPath),{recursive:true,mode:0o700});
@@ -483,26 +610,69 @@ function createRouter(environment, invoke) {
   };
   const storage = (pressure = false, prune = true) => {
     const folder = path.join(directory,'questions');
-    let files; try { files = fs.readdirSync(folder); } catch (error) { if (error.code === 'ENOENT') return {count:0,bytes:0,settled:0,unsettled:0,legacy:0}; throw error; }
-    let count = 0, bytes = 0, settled = 0, unsettled = 0, legacy = 0;
+    let files; try { files = fs.readdirSync(folder); } catch (error) { if (error.code === 'ENOENT') return {count:0,bytes:0,settled:0,unsettled:0,retired:0,legacy:0}; throw error; }
+    const records = [];
     for (const name of files) {
       if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
       const file = path.join(folder,name), info = fs.lstatSync(file);
       if (!info.isFile() || info.isSymbolicLink()) throw terminal('invalid_state','问题缓存文件无效');
       let value;
       try { value = readJson(file,20000000); } catch (error) { throw terminal('invalid_state','问题缓存文件无效'); }
+      records.push({name,file,info,value});
+    }
+    if (pressure) records.sort((left,right) => left.info.mtimeMs-right.info.mtimeMs
+      || left.name.localeCompare(right.name));
+    let count = 0, bytes = 0, settled = 0, unsettled = 0, retired = 0, legacy = 0;
+    let retirementNames = null;
+    if (pressure) {
+      const candidates = records.filter(record => record.value.schema_version === 2);
+      if (candidates.length) {
+        const cursor = refreshState().retirement_cursor;
+        const found = candidates.findIndex(record => record.name === cursor);
+        const start = found < 0 || found + 1 >= candidates.length ? 0 : found + 1;
+        const selected = [];
+        for (let offset=0;offset<Math.min(MAX_PRESSURE_RETIREMENT_CHECKS,candidates.length);offset+=1) {
+          selected.push(candidates[(start+offset)%candidates.length]);
+        }
+        retirementNames = new Set(selected.map(record => record.name));
+        const nextCursor = selected.at(-1)?.name || '';
+        // 单次请求最多反查64个会话，但游标跨请求持久推进。前一批不可回收
+        // 时，后续安全终态仍会被扫描到，不会永久卡在相同的前64项。
+        bestEffortState(() => mutateState(current => { current.retirement_cursor = nextCursor; }));
+      } else retirementNames = new Set();
+    }
+    let retirementScanned = 0;
+    for (const {name,file,info,value} of records) {
       const activeLock = fs.existsSync(questionLockPath(name.slice(0,-5)));
       const adminExpired = value.schema_version === 2 && value.scope === 'admin'
         && !value.settlement && info.mtimeMs < Date.now()-600000;
-      const settledExpired = value.schema_version === 2 && value.settlement
+      // 只有由 settle 事务写出的完整终态才可按保留期回收。损坏或半写入的
+      // truthy 对象仍代表未知责任，宁可占用容量并报警，也不能静默删除。
+      const settledExpired = value.schema_version === 2
+        && validQuestionSettlement(value.settlement,value)
         && info.mtimeMs < Date.now()-(pressure ? 600000 : 604800000);
-      if (prune && !activeLock && (adminExpired || settledExpired)) { fs.unlinkSync(file); continue; }
+      // 真人接管、总关或任务终结后，runtime 会先以会话状态持久取消责任。
+      // router 只在该权威状态、问题责任绑定和本地缓存身份完全一致时回收；
+      // 正常路径留十分钟观察，容量压力时可立即释放，避免取消竞态永久占满1024项。
+      // 普通推理持久化不能为了统计旧退休项而逐问题再读取一遍 session；
+      // 否则缓存接近上限时每个请求都会产生 O(N) 额外会话 I/O。只在显式
+      // status（prune=false）或容量压力扫描时核对反向责任。
+      const inspectRetirement = value.schema_version === 2
+        && (!prune || pressure && retirementNames.has(name));
+      if (inspectRetirement) retirementScanned += 1;
+      const responsibilityIsRetired = inspectRetirement && responsibilityRetired(value);
+      const retiredExpired = responsibilityIsRetired
+        && info.mtimeMs < Date.now()-(pressure ? 0 : 600000);
+      if (prune && !activeLock && (adminExpired || settledExpired || retiredExpired)) { fs.unlinkSync(file); continue; }
       count++; bytes += info.size;
       if (value.schema_version !== 2) legacy += 1;
-      else if (value.settlement) settled += 1;
+      else if (validQuestionSettlement(value.settlement,value)) settled += 1;
+      else if (responsibilityIsRetired) retired += 1;
       else unsettled += 1;
     }
-    return {count,bytes,settled,unsettled,legacy};
+    return {count,bytes,settled,unsettled,retired,legacy,retirement_scanned:retirementScanned,
+      retirement_scan_limited:pressure && records.filter(record => record.value.schema_version === 2).length
+        > retirementScanned};
   };
   const persistQuestion = (question,lock) => {
     if (!lockCurrent(lock)) throw terminal('question_owner_changed','问题处理所有权已变化');
@@ -517,7 +687,9 @@ function createRouter(environment, invoke) {
     const size = Buffer.byteLength(JSON.stringify(question));
     if (size > 20000000) throw terminal('question_cache_full','问题处理记录超过安全限制');
     let used = storage();
-    if ((!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) && used.settled) used = storage(true);
+    if (!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) {
+      used = storage(true);
+    }
     if (!previous && used.count >= 1024 || used.bytes-previous+size > 67108864) {
       question.record_revision = diskRevision;
       throw terminal('question_cache_full','问题处理缓存已达容量上限');
@@ -542,6 +714,22 @@ function createRouter(environment, invoke) {
     const parts = legacyIdentityParts(envelope,configuration,pool);
     return {identity:hash(JSON.stringify(parts)),binding:hash(JSON.stringify([...parts,generation]))};
   };
+  const legacyV121Binding = (envelope) => envelope?.legacy_v121_origin
+    ? hash(JSON.stringify([envelope.scope || 'conversation',envelope.session_key,envelope.generation,
+      envelope.legacy_v121_origin.runtime_revision,envelope.legacy_v121_origin.pool_revision,
+      envelope.legacy_v121_origin.deadline_at])) : '';
+  const legacyV121CleanupBinding = envelope => legacyV121CleanupEnvelope(envelope)
+    ? hash(JSON.stringify(['conversation',envelope.session_key,envelope.generation,
+      envelope.runtime_revision,envelope.pool_revision,envelope.deadline_at])) : '';
+  const legacyV121QuestionMatchesCleanup = (question,envelope) => Boolean(question
+    && question.schema_version === undefined && question.id === envelope.question_id
+    && question.configuration_binding === undefined && question.execution_binding === undefined
+    && question.responsibility_binding === undefined && question.identity_binding === undefined
+    && question.binding === legacyV121CleanupBinding(envelope)
+    && question.revision === envelope.pool_revision
+    && question.deadline === envelope.deadline_at
+    && Number.isSafeInteger(question.attempts) && question.attempts >= 0
+    && question.stages && typeof question.stages === 'object' && !Array.isArray(question.stages));
   const normalizeQuestion = (question,id,envelope,pool,lock) => {
     lock.recordRevision = Number.isSafeInteger(question?.record_revision) ? question.record_revision : 0;
     if (!question) return null;
@@ -556,6 +744,10 @@ function createRouter(environment, invoke) {
         throw terminal('invalid_state','问题阶段请求身份无效');
       }
     }
+    if (Object.prototype.hasOwnProperty.call(question,'settlement')
+      && !validQuestionSettlement(question.settlement,question)) {
+      throw terminal('invalid_state','问题结算记录无效');
+    }
     const priorGeneration = Number.isSafeInteger(question.attempt_generation) && question.attempt_generation > 0
       ? question.attempt_generation : 1;
     let originalConfiguration = question.configuration;
@@ -563,7 +755,20 @@ function createRouter(environment, invoke) {
       const candidates = [envelopeConfiguration(envelope,pool),envelope?.migration_from].filter(Boolean);
       originalConfiguration = candidates.find(value => {
         const legacy = legacyBindings(envelope,value,pool,priorGeneration);
-        return question.binding === legacy.binding || question.identity_binding === legacy.identity;
+        const v121 = question.schema_version === undefined
+          && question.configuration_binding === undefined && question.execution_binding === undefined
+          && question.responsibility_binding === undefined
+          && question.identity_binding === undefined
+          && envelope.legacy_v121_origin
+          && question.revision === envelope.legacy_v121_origin.pool_revision
+          && Number.isSafeInteger(question.deadline) && question.deadline >= 0
+          && question.deadline === envelope.legacy_v121_origin.deadline_at
+          && question.binding === legacyV121Binding(envelope);
+        if (v121) {
+          question.legacy_v121_migrated_at = Date.now();
+          question.legacy_v121_origin = { ...envelope.legacy_v121_origin };
+        }
+        return v121 || question.binding === legacy.binding || question.identity_binding === legacy.identity;
       });
       if (!originalConfiguration) throw terminal('question_conflict','旧问题记录无法与当前责任安全绑定');
     }
@@ -861,6 +1066,9 @@ function createRouter(environment, invoke) {
             throw error.terminal ? error
               : terminal('question_persistence_failed','推理结果未能安全持久化');
           }
+          // 结果落盘后再次检查取消/配置栅栏。若 runtime 在上一步与此处之间
+          // 提交人工接管或总关，本次结果仍留作可审计事实，但绝不能返回为有效回答。
+          check();
           bestEffortState(() => success(entry,visual));
           bestEffortState(() => record({at:Date.now(),question_id:id,stage,entry_id:entry.id,
             pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),
@@ -1004,6 +1212,91 @@ function createRouter(environment, invoke) {
       return {ok:true,state:'settled'};
     } finally { releaseQuestionLock(lock); }
   };
+  const retire = async (envelope,value={}) => {
+    const purposes = new Set(['conversation_cancelled','global_disabled','input_retired',
+      'non_answer_retired']);
+    if (!envelope?.question_id || envelope.scope !== 'conversation'
+      || !value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join(',') !== 'outcome,purpose'
+      || value.outcome !== 'responsibility_retired' || !purposes.has(value.purpose)) {
+      throw terminal('invalid_input','问题退休内容无效');
+    }
+    const contract = requestContract(envelope);
+    const legacyCleanup = legacyV121CleanupEnvelope(envelope);
+    if (!contract && !legacyCleanup) {
+      throw terminal('provider_request_identity_unknown','退休请求缺少原请求身份');
+    }
+    if (legacyCleanup) {
+      // 公开 v1.2.1 的问题缓存尚无 request contract。它只能通过这一条
+      // cleanup-only 事务释放：签名信封逐字绑定旧 runtime/pool/deadline，
+      // 会话文件再反向授权同一 job 与业务终态；不能 route、replay 或 settle。
+      if (!legacyV121RetirementAuthorized(envelope,value.purpose)) {
+        throw terminal('question_conflict','运行时尚未持久授权退休该旧问题');
+      }
+      const lock = await acquireQuestionLock(envelope.question_id,undefined,Date.now()+5000);
+      try {
+        const question = readQuestion(envelope.question_id);
+        if (!question) return {ok:true,state:'absent'};
+        if (!legacyV121QuestionMatchesCleanup(question,envelope)) {
+          throw terminal('question_conflict','旧问题缓存与退休身份不一致');
+        }
+        if (!lockCurrent(lock)) throw terminal('question_owner_changed','问题处理所有权已变化');
+        const target = questionFile(envelope.question_id), disk = readQuestion(envelope.question_id);
+        if (!disk || canonical(disk) !== canonical(question)) {
+          throw terminal('question_owner_changed','问题处理记录已由新的执行者接管');
+        }
+        fs.unlinkSync(target);
+        const parent = fs.openSync(path.dirname(target),'r');
+        try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+        bestEffortState(() => record({at:Date.now(),question_id:envelope.question_id,
+          stage:'answer',pool_revision:envelope.pool_revision,
+          outcome:'legacy_v121_responsibility_retired',reason:value.purpose}));
+        return {ok:true,state:'retired'};
+      } finally { releaseQuestionLock(lock); }
+    }
+    const pool = currentPool();
+    // retire 只撤销一个已签名、已持久登记的推理责任，不授予 route/replay
+    // 权限，也不要求旧 generation 仍是当前 AI 状态。人工接管和总关正是
+    // 通过这条 cleanup-only 路径在结果竞态中删除不可见缓存。
+    const lock = await acquireQuestionLock(envelope.question_id,undefined,Date.now()+5000);
+    try {
+      const question = normalizeQuestion(readQuestion(envelope.question_id),
+        envelope.question_id,envelope,pool,lock);
+      if (!question) return {ok:true,state:'absent'};
+      const expected = executionBinding(responsibilityBinding(envelope.question_id,envelope),
+        envelopeConfiguration(envelope,pool),envelope.attempt_generation || 1);
+      if (question.execution_binding !== expected) {
+        throw terminal('question_conflict','退休请求与原问题代次不一致');
+      }
+      if (!retirementAuthorized(question,envelope,value.purpose)) {
+        throw terminal('question_conflict','运行时尚未持久授权退休该问题');
+      }
+      if (question.settlement) {
+        if (question.settlement.outcome !== 'plan_persisted'
+          || !sameRequestContract(question.settlement.request_contract,contract)) {
+          throw terminal('question_conflict','问题已经由不同结果结算');
+        }
+      } else {
+        const phase = question.stages?.[envelope.stage || 'answer'];
+        if (!phase || !sameRequestContract(requestContract(phase.request_contract),contract)) {
+          throw terminal('provider_request_identity_unknown','退休目标与原请求或知识上下文身份不一致');
+        }
+      }
+      if (!lockCurrent(lock)) throw terminal('question_owner_changed','问题处理所有权已变化');
+      const target = questionFile(envelope.question_id);
+      const disk = readQuestion(envelope.question_id);
+      if (!disk || disk.record_revision !== lock.recordRevision) {
+        throw terminal('question_owner_changed','问题处理记录已由新的执行者接管');
+      }
+      fs.unlinkSync(target);
+      const parent = fs.openSync(path.dirname(target),'r');
+      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+      bestEffortState(() => record({at:Date.now(),question_id:envelope.question_id,
+        stage:envelope.stage,pool_revision:envelope.pool_revision,
+        outcome:'responsibility_retired',reason:value.purpose}));
+      return {ok:true,state:'retired'};
+    } finally { releaseQuestionLock(lock); }
+  };
   const status = () => {
     const pool = currentPool(), now = Date.now(), current = refreshState(), questions = storage(false,false);
     // 管理面用这一组非敏感身份确认：严格读取了哪一份完整池与秘密代次。
@@ -1019,7 +1312,7 @@ function createRouter(environment, invoke) {
         vision_health:!entry.enabled || !entry.capabilities.vision ? 'disabled' : visionUntil > now ? 'cooling' : visionValues.some(value => value.lease?.until > now) ? 'half_open' : current.health[entry.visionScope] && visionValues.every(value => value.successes >= 2) ? 'healthy' : 'unknown',vision_cooldown_until:visionUntil,vision_last_error:visionValues.find(value => value.last_error)?.last_error || ''};
     })};
   };
-  return {route,replay,settle,status,recent:() => ({ok:true,records:refreshState().recent.slice().reverse()}),
+  return {route,replay,settle,retire,status,recent:() => ({ok:true,records:refreshState().recent.slice().reverse()}),
     loadPool:currentPool,clearHealth:entry => mutateState(current => {
       for (const key of scopes(entry,true)) delete current.health[key]; current.pool_until = 0;
     })};

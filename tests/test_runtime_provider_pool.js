@@ -117,8 +117,18 @@ async function fixture(label) {
     PROVIDER_ADAPTER_MANAGEMENT_URL:adapterBase,
   });
   assert.equal(verifiedPool.code,0,verifiedPool.stderr+verifiedPool.stdout);
-  const postAdapter=async(body,headers={},timeout=10000,route='/v1/chat/completions')=>{
-    const response=await fetch(adapterBase+route,{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
+  const postAdapter=async(body,headers={},timeout=10000,route='/v1/chat/completions',signal)=>{
+    const controller=new AbortController();
+    const abort=()=>controller.abort();
+    signal?.addEventListener('abort',abort,{once:true});
+    if(signal?.aborted)controller.abort();
+    const timer=setTimeout(abort,timeout);
+    let response;
+    try {
+      response=await fetch(adapterBase+route,{method:'POST',headers:{Authorization:'Bearer '+internal,'content-type':'application/json',...headers},body:JSON.stringify(body),signal:controller.signal});
+    } finally {
+      clearTimeout(timer);signal?.removeEventListener('abort',abort);
+    }
     return{status:response.status,body:await response.json()};
   };
   const rag=http.createServer(async(req,res)=>{
@@ -157,9 +167,9 @@ async function fixture(label) {
     }
     assert.equal(parsed.hostname,'127.0.0.1');
     if(options.headers?.['x-crispai-question']){
-      if(['/internal/provider/replay','/internal/provider/settle'].includes(parsed.pathname)){
+      if(['/internal/provider/replay','/internal/provider/settle','/internal/provider/retire'].includes(parsed.pathname)){
         f.adapterInternalRequests.push(parsed.pathname);
-        return postAdapter(options.body||{},options.headers,options.timeout||10000,parsed.pathname);
+        return postAdapter(options.body||{},options.headers,options.timeout||10000,parsed.pathname,options.signal);
       }
       assert.equal(parsed.pathname,'/v1/chat/completions');
       const captured={body:structuredClone(options.body),headers:structuredClone(options.headers),envelope:verifyEnvelope(options.headers['x-crispai-question'],internal)};
@@ -171,12 +181,17 @@ async function fixture(label) {
         if(f.answerSystem!==undefined)captured.body.messages[0].content=f.answerSystem;
       }
       // 重启会更换本地随机端口；始终解析当前 adapter，模拟部署中不变的服务地址。
-      const response=await postAdapter(captured.body,captured.headers,options.timeout||10000);
+      const response=await postAdapter(captured.body,captured.headers,options.timeout||10000,
+        '/v1/chat/completions',options.signal);
       if(captured.envelope.stage==='answer')f.answerResponses.push(response);
       if(f.dropNextAdapterResponse){f.dropNextAdapterResponse=false;const error=new Error('受控 adapter 回程丢失');error.code='ECONNRESET';throw error;}
       return response;
     }
-    const response=await fetch(url,{method:options.method||'GET',headers:{'content-type':'application/json',...options.headers},body:options.body?JSON.stringify(options.body):undefined,signal:AbortSignal.timeout(options.timeout||10000)});
+    const controller=new AbortController();const abort=()=>controller.abort();
+    options.signal?.addEventListener('abort',abort,{once:true});if(options.signal?.aborted)controller.abort();
+    const timer=setTimeout(abort,options.timeout||10000);let response;
+    try { response=await fetch(url,{method:options.method||'GET',headers:{'content-type':'application/json',...options.headers},body:options.body?JSON.stringify(options.body):undefined,signal:controller.signal}); }
+    finally { clearTimeout(timer);options.signal?.removeEventListener('abort',abort); }
     return{status:response.status,body:await response.json()};
   };
   f.restart=()=>{runtime=createRuntime(env,{root,request,lookup:(_host,_opts,callback)=>callback(null,[{address:'8.8.8.8',family:4}])});};f.restart();
@@ -184,6 +199,7 @@ async function fixture(label) {
   f.replayVision=()=>postAdapter(f.visionRequest.body,{'x-crispai-question':f.visionRequest.headers['x-crispai-question']});
   f.decode=token=>verifyEnvelope(token,internal);
   f.question=id=>read(path.join(root,'data/provider-router/questions',id+'.json'));
+  f.questionPath=id=>path.join(root,'data/provider-router/questions',id+'.json');
   f.process=(key,id)=>runtime.process(key,id);
   f.scan=()=>runtime.scan();
   f.makeDue=async(session,id)=>{
@@ -217,7 +233,19 @@ function assertUnresolved(f,event,result,code=''){
 async function recoverOnce(f,event,result){
   f.failed.clear();f.failAnswer=false;f.slow=false;f.behavior=null;f.beforeAnswer=null;f.answerSystem=undefined;
   await f.makeDue(event.data.session_id,result.jobId);await wait(1100);
-  const before=f.sent.length,recovered=await f.process(result.key,result.jobId);assert.equal(recovered.status,'sent');
+  const before=f.sent.length,beforeCalls=f.calls.length;
+  let recovered=await f.process(result.key,result.jobId);
+  if(recovered.status==='unresolved'){
+    assert.equal(f.calls.length,beforeCalls,
+      '模糊技术失败的首次恢复只能只读确认旧代结果，不得再次调用上游');
+    const converged=f.state(event.data.session_id).jobs.find(item=>item.id===result.jobId);
+    assert.equal(converged.inference,undefined,'精确 absent 后才可释放旧推理信封');
+    assert.equal(converged.provider_result_receipt,undefined);
+    assert.equal(f.sent.length,before);
+    await f.makeDue(event.data.session_id,result.jobId);
+    recovered=await f.process(result.key,result.jobId);
+  }
+  assert.equal(recovered.status,'sent');
   assert.equal(f.sent.length,before+1);assert.equal(f.sent.at(-1).session_id,event.data.session_id);
   assert.equal(f.sent.at(-1).content,'受控业务答案：保存后重试。');
   const job=f.state(event.data.session_id).jobs.find(item=>item.id===result.jobId);
@@ -262,16 +290,37 @@ async function recoverOnce(f,event,result){
     await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
   await test('主备等待时真人优先暂停A，B独立回复，不续尝试不发送迟到A答案',async f=>{
-    f.slow=true;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
+    f.slow=true;f.delay=1000;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
     while(!f.calls.length)await wait(5);
     const human=f.event('session_pool_humanA','真人公开处理进度',{from:'operator',automated:false});human.event='message:received';
-    const started=Date.now();await f.deliver(human);assert(Date.now()-started<300);assert.equal(f.state('session_pool_humanA').mode,'human');await pending;
+    const started=Date.now();await f.deliver(human);assert(Date.now()-started<300);assert.equal(f.state('session_pool_humanA').mode,'human');
+    const cancelled=await pending;assert(Date.now()-started<400);assert.equal(cancelled.status,'cancelled');
     assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
+    const cancelledJob=f.state('session_pool_humanA').jobs.find(item=>item.id===cancelled.jobId);
+    assert.equal(cancelledJob.responsibility_status,'intentional_silence');
+    assert(cancelledJob.inference);assert(cancelledJob.provider_result_receipt);
+    assert.equal(cancelledJob.provider_retirement?.state,'pending');
+    const questionPath=f.questionPath(cancelled.jobId);assert(fs.existsSync(questionPath));
     f.slow=false;await f.deliver(f.event('session_pool_humanB','另一个会话的问题'));assert.equal(f.sent.length,1);assert.equal(f.sent[0].session_id,'session_pool-humanB');
+    const selected=await f.scan();assert(selected.some(item=>item.key===cancelled.key&&item.jobId===cancelled.jobId));
+    const retired=await f.process(cancelled.key,cancelled.jobId);assert.equal(retired.status,'provider_retirement_retired');
+    const finished=f.state('session_pool_humanA').jobs.find(item=>item.id===cancelled.jobId);
+    assert.equal(finished.inference,undefined);assert.equal(finished.provider_result_receipt,undefined);
+    assert.deepEqual(Object.keys(finished.provider_retirement).sort(),
+      ['attempts','identity_sha256','purpose','retired_at','schema_version','state'].sort());
+    assert.equal(finished.provider_retirement.state,'retired');
+    assert.equal(fs.existsSync(questionPath),false,'签名退休确认后必须安全回收该问题缓存');
+    assert.equal(f.adapterInternalRequests.filter(path=>path==='/internal/provider/retire').length,1);
   });
   await test('总关与池配置变更取消整条推理；不误发一次错误提示',async f=>{
-    f.slow=true;const pending=f.deliver(f.event('session_pool_global','慢问题'));while(!f.calls.length)await wait(5);
-    f.publishRuntime(false);await pending;assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
+    f.slow=true;f.delay=1000;const pending=f.deliver(f.event('session_pool_global','慢问题'));while(!f.calls.length)await wait(5);
+    const disabledAt=Date.now();f.publishRuntime(false);const cancelled=await pending;
+    assert(Date.now()-disabledAt<400);assert.equal(cancelled.status,'cancelled');assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
+    let stored=f.state('session_pool_global').jobs.find(item=>item.id===cancelled.jobId);
+    assert.equal(stored.responsibility_reason,'global_disabled');assert.equal(stored.provider_retirement?.state,'pending');
+    assert.equal((await f.process(cancelled.key,cancelled.jobId)).status,'provider_retirement_retired');
+    stored=f.state('session_pool_global').jobs.find(item=>item.id===cancelled.jobId);
+    assert.equal(stored.provider_retirement?.state,'retired');assert.equal(stored.inference,undefined);
     f.publishRuntime(true);
     const changed=f.deliver(f.event('session_pool_changed','另一个慢问题'));while(f.calls.length<2)await wait(5);f.publish(pool=>{pool.entries[1].enabled=false;});await changed;assert.equal(f.sent.length,0);assert.equal(f.calls.length,2);
   });

@@ -201,7 +201,9 @@ function createAdapter(environment = process.env, fetchFunction) {
           requireApplied();
           const pool = loadPool(environment);
           if (!environment.PROVIDER_ADAPTER_KEY || pool.entries.some(entry => entry.key === environment.PROVIDER_ADAPTER_KEY)) throw terminal('internal_key_missing','内部认证缺失或与上游认证混用');
-          sendJson(response,200,{ready:true,health:'unknown',revision:getRouter().status().revision});
+          // 容器健康轮询只证明配置可读，不应触发管理状态的全量问题/会话扫描。
+          // 显式 /internal/provider/status 仍保留完整诊断。
+          sendJson(response,200,{ready:true,health:'unknown',revision:pool.revision});
         }
         else { providerSettings(environment); sendJson(response,200,{ready:true}); }
         return;
@@ -215,17 +217,21 @@ function createAdapter(environment = process.env, fetchFunction) {
       if (isPool && request.method === 'GET' && request.url === '/internal/provider/recent') { sendJson(response,200,getRouter().recent()); return; }
       if (request.method !== 'POST') { sendJson(response,404,{error:{message:'不支持的协议路由'}}); return; }
       const body = JSON.parse(await readLimited(request,MAX_INPUT_BYTES));
-      if (isPool && ['/internal/provider/replay','/internal/provider/settle'].includes(request.url)) {
+      if (isPool && ['/internal/provider/replay','/internal/provider/settle',
+        '/internal/provider/retire'].includes(request.url)) {
         let envelope;
         try {
-          // replay/settle 的 HTTP 正文不是原始推理请求；其签名信封仍必须携带
-          // 原请求摘要，由 router 与已持久阶段逐字核对。
+          // replay/settle/retire 的 HTTP 正文不是原始推理请求。当前协议必须携带
+          // 原请求摘要；v1.2.1 cleanup-only 则只允许精确旧身份，并由 router
+          // 反向核对会话授权，不能取得 route/replay/settle 权限。
           envelope = extractEnvelope(body,request.headers['x-crispai-question'],key,true,false);
         }
         catch (_) { throw terminal('invalid_envelope','受管问题信封缺失或无效'); }
         requireApplied();
         const result = request.url.endsWith('/replay')
-          ? await getRouter().replay(envelope) : await getRouter().settle(envelope,body);
+          ? await getRouter().replay(envelope)
+          : request.url.endsWith('/retire')
+            ? await getRouter().retire(envelope,body) : await getRouter().settle(envelope,body);
         requireApplied();
         sendJson(response,200,result); return;
       }
