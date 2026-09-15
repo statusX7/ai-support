@@ -751,10 +751,80 @@ async function test(name, action) {
 
       advancePastRetry(f, event, result.jobId);
       const recovered = await f.process(result.key, result.jobId);
-      assert.equal(recovered.status, 'sent');
+      stored = pendingJob(f, event, result.jobId);
+      const recoveryQuestionState = fs.existsSync(f.questionPath(result.jobId))
+        ? f.question(result.jobId) : null;
+      const routerStatusResponse = await fetchJson(`${f.adapterBase}/internal/provider/status`, {
+        timeout: 1000, headers: { authorization: `Bearer ${f.internal}` },
+      }).catch(() => ({ status: 0, body: null }));
+      const matchesCurrentConfiguration = (payload) => Boolean(payload
+        && payload.runtime_revision === f.providerConfiguration.runtime_revision
+        && payload.pool_revision === f.providerConfiguration.pool_revision
+        && payload.secrets_generation === f.providerConfiguration.secrets_generation
+        && payload.pool_sha256 === f.providerConfiguration.pool_sha256
+        && payload.materials_source_sha256 === f.providerConfiguration.materials_source_sha256);
+      const recoveryDiagnostic = {
+        result_status: recovered?.status || '',
+        job_status: stored?.status || '',
+        responsibility_status: stored?.responsibility_status || '',
+        failure_code: stored?.failure_code || '',
+        failure_rounds: Number.isSafeInteger(stored?.failure_rounds) ? stored.failure_rounds : null,
+        retry_in_ms: Number.isFinite(stored?.retry_at)
+          ? Math.max(0, stored.retry_at - f.now()) : null,
+        data_present: stored?.data !== undefined,
+        inference_present: stored?.inference !== undefined,
+        inference_generation: Number.isSafeInteger(stored?.inference_generation)
+          ? stored.inference_generation : null,
+        active_attempt_generation: Number.isSafeInteger(stored?.inference?.attempt_generation)
+          ? stored.inference.attempt_generation : null,
+        receipt_state: stored?.provider_result_receipt?.state || '',
+        receipt_reason: stored?.provider_result_receipt?.reason || '',
+        receipt_stage: stored?.provider_result_receipt?.stage || '',
+        settlement_state: stored?.provider_settlement?.state || '',
+        plan_purpose: stored?.plan?.purpose || '',
+        plan_diagnostic_code: stored?.plan?.diagnostic_code || '',
+        question_attempt_generation: Number.isSafeInteger(recoveryQuestionState?.attempt_generation)
+          ? recoveryQuestionState.attempt_generation : null,
+        question_attempts: Number.isSafeInteger(recoveryQuestionState?.attempts)
+          ? recoveryQuestionState.attempts : null,
+        question_round_attempts: Number.isSafeInteger(recoveryQuestionState?.round_attempts)
+          ? recoveryQuestionState.round_attempts : null,
+        question_terminal_code: recoveryQuestionState?.terminal?.code || '',
+        question_deadline_remaining_ms: Number.isFinite(recoveryQuestionState?.deadline)
+          ? Math.max(0, recoveryQuestionState.deadline - Date.now()) : null,
+        question_answer_tried_count: Array.isArray(recoveryQuestionState?.stages?.answer?.tried)
+          ? recoveryQuestionState.stages.answer.tried.length : 0,
+        question_answer_owner_present: recoveryQuestionState?.stages?.answer?.owner !== undefined,
+        question_answer_result_present: recoveryQuestionState?.stages?.answer?.result !== undefined,
+        upstream_call_indexes: f.calls.map((call) => call.index),
+        signed_requests: f.signedProviderPayloads.map((entry) => ({
+          path: entry.path,
+          stage: entry.payload?.stage || '',
+          attempt_generation: Number.isSafeInteger(entry.payload?.attempt_generation)
+            ? entry.payload.attempt_generation : null,
+          current_configuration: matchesCurrentConfiguration(entry.payload),
+        })),
+        adapter_responses: f.adapterResponses.map((entry) => ({
+          status: Number.isSafeInteger(entry?.status) ? entry.status : 0,
+          error_code: entry?.body?.error?.code || '',
+        })),
+        router_status_http: routerStatusResponse.status,
+        router_pool_cooldown_remaining_ms: Number.isFinite(routerStatusResponse.body?.pool_cooldown_until)
+          ? Math.max(0, routerStatusResponse.body.pool_cooldown_until - Date.now()) : null,
+        router_entries: Array.isArray(routerStatusResponse.body?.entries)
+          ? routerStatusResponse.body.entries.map((entry, index) => ({
+            index, health: entry.health || '', last_error: entry.last_error || '',
+            cooldown_remaining_ms: Number.isFinite(entry.cooldown_until)
+              ? Math.max(0, entry.cooldown_until - Date.now()) : null,
+          })) : [],
+        router_questions: routerStatusResponse.body?.questions || null,
+        crisp_post_attempts: f.crispPostAttempts.length,
+        visible_sends: f.sent.length,
+      };
+      assert.equal(recovered.status, 'sent',
+        `恢复白名单快照：${JSON.stringify(recoveryDiagnostic)}`);
       assert.deepEqual(f.calls.map((call) => call.index), [0, 1, 0]);
       assertSingleBusinessReply(f);
-      stored = pendingJob(f, event, result.jobId);
       assert.equal(stored.status, 'done');
       assert.equal(stored.responsibility_status, 'answered_confirmed');
       assert.equal(stored.id, result.jobId, '恢复轮不得新建另一问题责任');
