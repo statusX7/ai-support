@@ -823,7 +823,7 @@ async function main() {
       const envelope=f.envelope(),started=Date.now(),result=await f.post({...sample,stream:true},envelope),ended=Date.now();assert.equal(result.status,200,result.text);assert.match(result.text,/data: \[DONE\]/);assert.equal(f.calls.length,21);
       const cooling=(await f.get('status')).entries[0].cooldown_until;assert.ok(cooling>=started+60000);assert.ok(cooling<=ended+63000);
       assert.equal(f.calls[20].body.model,'fixture-model-20');assert.equal(f.calls[20].headers.authorization,'Bearer fixture-key-20');assert.equal(f.calls[20].headers['x-fixture'],'value');assert.ok(!result.text.includes('fixture-key'));
-      assert.equal((await f.post(sample,envelope)).status,200);assert.equal(f.calls.length,21);
+      assert.equal((await f.post({...sample,stream:true},envelope)).status,200);assert.equal(f.calls.length,21);
       const recent=await f.get('recent');assert.equal(recent.records.length,21);assert.ok(!JSON.stringify(recent).includes('fixture-key'));assert.ok(!JSON.stringify(recent).includes('http:'));
       assert.ok(recent.records.every(record=>record.pool_revision===f.pool.revision && Number.isSafeInteger(record.remaining_budget_ms) && record.remaining_budget_ms>=0 && record.remaining_budget_ms<=f.pool.policy.question_timeout_ms));
     }finally{await f.close();}
