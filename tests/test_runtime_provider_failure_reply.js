@@ -1066,14 +1066,18 @@ async function test(name, action) {
     });
     const result = await f.process(accepted.key, accepted.jobId);
     assert.equal(result.status, 'unresolved');
+    assert.equal(result.reason, 'provider_settlement_identity_unresolved');
     assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 0);
     assert.equal(f.signedProviderPayloads.filter((entry) =>
-      ['/v1/chat/completions', '/internal/provider/replay'].includes(entry.path)).length, 0);
+      ['/v1/chat/completions', '/internal/provider/replay', '/internal/provider/settle']
+        .includes(entry.path)).length, 0);
     assertNoVisibleFailureReply(f);
     const stored = pendingJob(f, event, accepted.jobId);
     assert.equal(stored.status, 'received');
     assert.equal(stored.responsibility_status, 'unresolved_failure');
-    assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
+    assert.equal(stored.failure_code, 'provider_settlement_identity_unresolved');
+    assert.equal(stored.provider_settlement_failure_code,
+      'provider_settlement_identity_unresolved');
     assert.deepEqual(stored.inference, legacyInference);
     assert.equal(stored.provider_settlement?.schema_version, 1);
     assert.equal(stored.provider_settlement?.state, 'invalid');
