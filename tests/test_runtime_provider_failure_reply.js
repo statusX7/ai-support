@@ -1972,7 +1972,19 @@ async function test(name, action) {
         content: '受控人工已接管。', fingerprint: 900105, timestamp: f.now() + 1,
         automated: false },
     };
-    assert.equal((await f.receive(operator)).accepted, true);
+    const received = await f.receive(operator);
+    assert.equal(received.accepted, true);
+    const controlled = await f.process(received.key, received.jobId);
+    assert.equal(controlled.status, 'none');
+    const controlJob = f.state(event.data.session_id).jobs
+      .find((entry) => entry.id === received.jobId);
+    assert.equal(controlJob.status, 'done');
+    assert.equal(controlJob.responsibility_status, 'control_handled');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/retire').length, 0,
+    '真人 control 后处理不得抢先执行 Provider 退休');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 1);
+    assertNoVisibleFailureReply(f);
     f.queueRetirementAdapterResponse({ status: 400, headers: {},
       body: { error: { code: 'invalid_envelope' } } });
 
@@ -2624,6 +2636,12 @@ async function test(name, action) {
     };
     const received = await f.receive(operator);
     assert.equal(received.accepted, true);
+    const controlled = await f.process(received.key, received.jobId);
+    assert.equal(controlled.status, 'none');
+    const controlJob = f.state(event.data.session_id).jobs
+      .find((entry) => entry.id === received.jobId);
+    assert.equal(controlJob.status, 'done');
+    assert.equal(controlJob.responsibility_status, 'control_handled');
     let state = f.state(event.data.session_id);
     let stored = state.jobs.find((entry) => entry.id === first.jobId);
     assert.equal(state.mode, 'human');
@@ -2633,6 +2651,9 @@ async function test(name, action) {
     assert.equal(record.status, 'cancelled');
     assert.equal(record.resend_forbidden, true);
     assert.equal(record.body, undefined);
+    assert.equal(f.crispPostAttempts.length, 1,
+      '真人 control 后处理不得重发已拒绝或已取消的正文');
+    assertNoVisibleFailureReply(f);
     f.advance(86400000);
     assert.equal((await f.process(first.key, first.jobId)).status, 'idle');
     assert.equal(f.crispPostAttempts.length, 1);
