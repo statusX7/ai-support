@@ -183,6 +183,7 @@ const assertSingleBusinessReply = (fixture, expected = '受控正常答案。') 
 async function fixture(label, behavior) {
   const root = path.join(base, label);
   const calls = [], sent = [], histories = new Map(), adapterResponses = [], signedProviderPayloads = [];
+  const ragServerRequests = [], ragClientResults = [];
   const crispPostResponses = [], crispPostAttempts = [], retirementAdapterResponses = [];
   let dropNextAdapterResponse = false;
   let armSettlementWritebackFailure = false;
@@ -363,17 +364,25 @@ async function fixture(label, behavior) {
   const providerConfiguration = currentProviderConfiguration();
 
   const rag = http.createServer(async (request, response) => {
+    const observation = { kind: request.method === 'GET' ? 'workspace_read' : 'vector_search',
+      body_read: false, response_started: false, finished: false, closed: false };
+    ragServerRequests.push(observation);
+    response.once('finish', () => { observation.finished = true; });
+    response.once('close', () => { observation.closed = true; });
     assert.equal(request.headers.authorization, 'Bearer synthetic-rag-key');
     response.setHeader('content-type', 'application/json');
     if (request.method === 'GET') {
       assert.equal(request.url, '/api/v1/workspace/synthetic');
+      observation.response_started = true;
       response.end(JSON.stringify({ workspace: { slug: 'synthetic', openAiTemp: 0.25 } }));
       return;
     }
     let raw = '';
     for await (const chunk of request) raw += chunk;
+    observation.body_read = true;
     assert.equal(request.url, '/api/v1/workspace/synthetic/vector-search');
     assert.equal(typeof JSON.parse(raw).query, 'string');
+    observation.response_started = true;
     response.end(JSON.stringify({ results: [{
       id: '44444444-4444-4444-8444-444444444444', text: '受控资料要求先描述具体问题。',
       metadata: { title: projection }, distance: 0.1, score: 0.9,
@@ -446,7 +455,32 @@ async function fixture(label, behavior) {
       adapterResponses.push(structuredClone(response));
       return response;
     }
-    const response = await fetchJson(url, options);
+    const isRag = parsed.port === String(rag.address()?.port || '');
+    let response;
+    try {
+      response = await fetchJson(url, options);
+      if (isRag) ragClientResults.push({
+        kind: options.method === 'GET' ? 'workspace_read' : 'vector_search',
+        outcome: 'response', status: response.status,
+        timeout_ms: Number.isFinite(options.timeout) ? options.timeout : null,
+        execution_aborted: options.signal?.aborted === true,
+      });
+    } catch (error) {
+      if (isRag) {
+        const executionAborted = options.signal?.aborted === true;
+        const transportCodes = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT']);
+        const errorKind = executionAborted ? 'execution_aborted'
+          : error?.name === 'AbortError' ? 'request_aborted'
+            : transportCodes.has(error?.code) ? 'transport_error' : 'other_error';
+        ragClientResults.push({
+          kind: options.method === 'GET' ? 'workspace_read' : 'vector_search',
+          outcome: 'error', error_kind: errorKind,
+          timeout_ms: Number.isFinite(options.timeout) ? options.timeout : null,
+          execution_aborted: executionAborted,
+        });
+      }
+      throw error;
+    }
     if (parsed.port === String(adapterPort) && parsed.pathname === '/internal/provider/retire'
       && pendingRetirementResponseGate) {
       const gate = pendingRetirementResponseGate;
@@ -573,6 +607,7 @@ async function fixture(label, behavior) {
   };
   return {
     root, prompt, pool, providerConfiguration, internal, calls, sent, adapterResponses, signedProviderPayloads,
+    ragServerRequests, ragClientResults,
     crispPostAttempts,
     event, receive, deliver, state,
     get adapterBase() { return adapterBase; },
@@ -643,6 +678,24 @@ async function fixture(label, behavior) {
       runtime.stateKey(env.CRISP_WEBSITE_ID, session), mutate, env.CRISP_WEBSITE_ID, session),
     question: (jobId) => readJson(path.join(root, 'data/provider-router/questions', `${jobId}.json`)),
     questionPath: (jobId) => path.join(root, 'data/provider-router/questions', `${jobId}.json`),
+    knowledgeIntegrity() {
+      try {
+        const current = readJson(materialsPath);
+        return {
+          readback_ok: true,
+          projection_schema_v2: current.schema_version === 2,
+          projection_state_applied: current.state === 'applied',
+          map_matches: digest(fs.readFileSync(mapPath)) === current.knowledge?.map_sha256,
+          settings_matches: digest(fs.readFileSync(settingsPath)) === current.knowledge?.settings_sha256,
+          profile_matches: digest(fs.readFileSync(profilePath)) === current.knowledge?.profile_sha256,
+          lexical_matches: digest(fs.readFileSync(lexicalPath)) === current.knowledge?.lexical_sha256,
+        };
+      } catch (_) {
+        return { readback_ok: false, projection_schema_v2: null, projection_state_applied: null,
+          map_matches: null, settings_matches: null, profile_matches: null,
+          lexical_matches: null };
+      }
+    },
     close,
     adapterErrors: () => adapterErrors,
   };
@@ -818,6 +871,9 @@ async function test(name, action) {
               ? Math.max(0, entry.cooldown_until - Date.now()) : null,
           })) : [],
         router_questions: routerStatusResponse.body?.questions || null,
+        rag_server_requests: f.ragServerRequests.map((entry) => ({ ...entry })),
+        rag_client_results: f.ragClientResults.map((entry) => ({ ...entry })),
+        knowledge_integrity: f.knowledgeIntegrity(),
         crisp_post_attempts: f.crispPostAttempts.length,
         visible_sends: f.sent.length,
       };
