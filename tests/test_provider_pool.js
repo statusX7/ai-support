@@ -775,7 +775,7 @@ async function main() {
       assert.equal((await f.get('recent')).records.length,0);
       const complete={messages:[{role:'system',content:prompt+'\nContext: 合成知识内容。'},{role:'user',content:'合成问题'}]};
       assert.equal((await f.post(complete)).status,200);assert.equal(f.calls.length,1);assert.ok(f.calls[0].body.messages[0].content.includes(prompt));
-      const projection={schema_version:1,state:'applied',revision:1,configuration:{runtime:{revision:1,enabled:true}},prompt:{text:prompt,bytes:Buffer.byteLength(prompt),sha256:crypto.createHash('sha256').update(prompt).digest('hex')}};
+      const projection={schema_version:2,state:'applied',revision:1,configuration:{runtime:{revision:1,enabled:true}},prompt:{text:prompt,bytes:Buffer.byteLength(prompt),sha256:crypto.createHash('sha256').update(prompt).digest('hex')}};
       json(path.join(f.directory,'config/materials-applied.json'),projection);
       fs.writeFileSync(path.join(f.directory,'config/prompt.md'),'尚未应用的编辑稿',{mode:0o600});
       assert.equal((await f.post(complete)).status,200);assert.equal(f.calls.length,2);
