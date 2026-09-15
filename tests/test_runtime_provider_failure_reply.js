@@ -1832,7 +1832,26 @@ async function test(name, action) {
         content: '受控人工已接管。', fingerprint: 900102, timestamp: f.now() + 1,
         automated: false },
     };
-    assert.equal((await f.receive(operator)).accepted, true);
+    const received = await f.receive(operator);
+    assert.equal(received.accepted, true);
+    const controlSelected = await f.scan();
+    assert.equal(controlSelected.some((entry) => entry.key === received.key
+      && entry.jobId === received.jobId && entry.control === true), true,
+    '真人控制任务必须先于 cleanup-only 退休任务完成后处理');
+    assert.equal(controlSelected.some((entry) => entry.key === first.key
+      && entry.jobId === first.jobId), false,
+    '同一会话首轮扫描不得跳过真人控制而直接退休旧 Provider 缓存');
+    const controlled = await f.process(received.key, received.jobId);
+    assert.equal(controlled.status, 'none');
+    const controlJob = f.state(event.data.session_id).jobs
+      .find((entry) => entry.id === received.jobId);
+    assert.equal(controlJob.status, 'done');
+    assert.equal(controlJob.responsibility_status, 'control_handled');
+    assertNoVisibleFailureReply(f);
+    const retirementSelected = await f.scan();
+    assert.equal(retirementSelected.some((entry) => entry.key === first.key
+      && entry.jobId === first.jobId), true,
+    '真人控制后处理完成后的下一轮必须选中到期的 cleanup-only 退休任务');
     f.failNextRetirementRequest();
     const interrupted = await f.process(first.key, first.jobId);
     assert.equal(interrupted.status, 'deferred');
