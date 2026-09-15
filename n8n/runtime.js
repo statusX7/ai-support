@@ -989,7 +989,13 @@ function createRuntime(env = {}, options = {}) {
       }
       if (providerResultDisposition(job) === 'invalid_identity') {
         markUnresolved(job, 'provider_receipt_identity_unresolved');
-        job.retry_at = clock() + 300000;
+        // 配置事务仍在进行时，身份故障只能先作为诊断事实保存，不能穿透
+        // 配置屏障参与普通恢复调度。markUnresolved 会按一般故障语义清掉
+        // deferred_configuration，因此在这个调用点恢复屏障；事务结束后再由
+        // releaseConfigurationDeferrals 清除它并应用身份故障的正常退避。
+        job.deferred_configuration = true;
+        job.retry_at = clock() + 5000;
+        job.lease_until = 0;
         return false;
       }
     }

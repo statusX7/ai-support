@@ -96,7 +96,13 @@ function fixture(label, allowAdmin = false) {
     f.sent.push(entry); history.push(entry); f.history.set(session, history);
     return {status: 200, body: {error: false, data: {fingerprint: entry.fingerprint}}};
   };
-  const runtime = createRuntime(env, {root, request, allowAdmin});
+  let runtime;
+  const restart = () => {
+    runtime = createRuntime(env, {root, request, allowAdmin});
+    f.runtime = runtime;
+    return runtime;
+  };
+  restart();
   f.installLexical = (contents = [fragment]) => {
     const documents = contents.map((content, index) => {
       const suffix = (index + 1).toString(16).padStart(16, '0');
@@ -180,6 +186,21 @@ function fixture(label, allowAdmin = false) {
   f.state = session => runtime.readState(runtime.stateKey(env.CRISP_WEBSITE_ID, session));
   f.key = session => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
   f.runtime = runtime;
+  f.restart = restart;
+  f.ownedBucket = (session, fingerprint) => path.join(root, 'data/runtime', 'owned-' + f.key(session) + '-'
+    + (Number(fingerprint) % 256).toString(16).padStart(2, '0') + '.json');
+  f.seedOwnedFingerprint = (session, fingerprint) => {
+    const value = String(fingerprint);
+    assert.match(value, /^(?:0|[1-9][0-9]{0,15})$/);
+    assert(Number.isSafeInteger(Number(value)));
+    const file = f.ownedBucket(session, value);
+    const index = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {schema_version: 1, fingerprints: []};
+    assert.equal(index.schema_version, 1); assert(Array.isArray(index.fingerprints));
+    if (!index.fingerprints.includes(value)) index.fingerprints.push(value);
+    fs.writeFileSync(file, JSON.stringify(index), {mode: 0o600});
+    fs.chmodSync(file, 0o600);
+    return file;
+  };
   f.registerOwnedHistory = (session, fingerprint) => runtime.transaction(f.key(session), (state) => {
     state.outgoing[String(fingerprint)] = { status: 'sent', created_at: Date.now() };
   }, env.CRISP_WEBSITE_ID, session);
@@ -233,6 +254,61 @@ async function test(name, action) {
     await f.deliver(f.event('session_knowledge-other', question));
     assert(!JSON.stringify(f.generated.at(-1)).includes('此前讨论的是停车位'));
     assert.equal(f.sent.length, 3); assert(f.sent.every(item => item.content === reference));
+
+    const persisted = fixture('history-owned-after-prune'); persisted.applyKnowledgeSettings(0.2);
+    const persistedSession = 'session_knowledge-history-owned';
+    const genericFingerprint = 7022, normalFingerprint = 7023;
+    const normalOwnedFact = '此前已确认预约资料保存成功。';
+    await persisted.registerOwnedHistory(persistedSession, genericFingerprint);
+    await persisted.registerOwnedHistory(persistedSession, normalFingerprint);
+    const genericOwnedFile = persisted.seedOwnedFingerprint(persistedSession, genericFingerprint);
+    const normalOwnedFile = persisted.seedOwnedFingerprint(persistedSession, normalFingerprint);
+    await persisted.runtime.transaction(persisted.key(persistedSession), state => {
+      delete state.outgoing[String(genericFingerprint)];
+      delete state.outgoing[String(normalFingerprint)];
+    });
+    let persistedState = persisted.state(persistedSession);
+    assert.equal(Object.hasOwn(persistedState.outgoing, String(genericFingerprint)), false);
+    assert.equal(Object.hasOwn(persistedState.outgoing, String(normalFingerprint)), false);
+    for (const [file, fingerprint] of [[genericOwnedFile, genericFingerprint], [normalOwnedFile, normalFingerprint]]) {
+      const index = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.deepEqual(Object.keys(index).sort(), ['fingerprints', 'schema_version']);
+      assert(index.fingerprints.includes(String(fingerprint)));
+      assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+      assert(!JSON.stringify(index).includes(retiredGeneric), '持久身份只能保存 fingerprint，不能保存客服正文');
+    }
+    const previousRuntime = persisted.runtime;
+    persisted.restart();
+    assert.notEqual(persisted.runtime, previousRuntime, '必须由新 runtime 从磁盘恢复自有身份');
+    persistedState = persisted.state(persistedSession);
+    assert.equal(Object.hasOwn(persistedState.outgoing, String(genericFingerprint)), false);
+    assert.equal(Object.hasOwn(persistedState.outgoing, String(normalFingerprint)), false);
+    persisted.history.set(persistedSession, [
+      {from: 'user', type: 'text', content: '此前已确认预约编号。', fingerprint: 7021, timestamp: Date.now()-4000},
+      {from: 'operator', type: 'text', content: retiredGeneric, automated: false, fingerprint: genericFingerprint, timestamp: Date.now()-3000},
+      {from: 'operator', type: 'text', content: normalOwnedFact, automated: false, fingerprint: normalFingerprint, timestamp: Date.now()-2000},
+      {from: 'user', type: 'text', content: retiredGeneric, fingerprint: 7024, timestamp: Date.now()-1000},
+    ]);
+    const persistedResult = await persisted.deliver(persisted.event(persistedSession, question));
+    assert.equal(persisted.generated.length, 1);
+    const requestMessages = persisted.generated[0].messages;
+    assert(Array.isArray(requestMessages));
+    assert.equal(requestMessages.filter(item => item.role === 'assistant' && item.content === retiredGeneric).length, 0,
+      '仅由持久 owned 身份确认的退役 generic 不得进入 Provider assistant 历史');
+    assert.equal(requestMessages.filter(item => item.role === 'user' && item.content === retiredGeneric).length, 1,
+      '访客引用相同正文必须保留，不能按内容全局删除');
+    assert.equal(requestMessages.filter(item => item.role === 'assistant' && item.content === normalOwnedFact).length, 1,
+      '正常本项目历史答复必须保留');
+    assert.equal(requestMessages.filter(item => item.role === 'user' && item.content === question).length, 1,
+      '当前问题只进入 Provider 一次');
+    assert(requestMessages.some(item => item.role === 'system' && item.content.includes(reference)),
+      '当前有效知识事实必须进入最终 Provider 请求');
+    persistedState = persisted.state(persistedSession);
+    const persistedJobs = persistedState.jobs.filter(job => job.id === persistedResult.jobId);
+    assert.equal(persistedJobs.length, 1); assert.equal(persistedJobs[0].status, 'done');
+    assert.equal(persistedJobs[0].responsibility_status, 'answered_confirmed');
+    assert.equal(persisted.sent.length, 1); assert.equal(persisted.sent[0].content, reference);
+    assert(!persisted.sent.some(item => typeof item.content === 'string' && item.content.includes(retiredGeneric)));
 
     const recovering = fixture('history-provider-recovery'); recovering.applyKnowledgeSettings(0.2);
     const recoveringSession = 'session_knowledge-history-recovery';

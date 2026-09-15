@@ -501,11 +501,20 @@ async function recoverOnce(f,event,result){
       assert.equal(f.state(event.data.session_id).mode,'ai');
       assert.equal((await f.receive(event)).reason,'重复事件已忽略');
     }
-    assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);f.failed.clear();await wait(1100);
+    assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);
+    const callsBeforeRecovery=f.calls.length;
     for(const [index,event] of [initial,...events].entries()) {
-      const result=index===0?firstResult:results[index-1];await f.makeDue(event.data.session_id,result.jobId);
-      const recovered=await f.process(result.key,result.jobId);assert.equal(recovered.status,'sent');
+      const result=index===0?firstResult:results[index-1];
+      const internalBefore=f.adapterInternalRequests.length;
+      await recoverOnce(f,event,result);
+      assert.deepEqual(f.adapterInternalRequests.slice(internalBefore),
+        ['/internal/provider/replay','/internal/provider/settle'],
+        '模糊失败必须先只读 replay 收敛，再结算唯一新答案');
+      assert.equal(f.state(event.data.session_id).jobs.filter(item=>item.id===result.jobId).length,1,
+        '恢复必须沿用同一应答责任，不得复制任务');
     }
+    assert.equal(f.calls.length,callsBeforeRecovery+6,
+      '每个恢复问题最多新增一次有界上游推理；replay-only 收敛轮不得调用上游');
     assert.equal(f.sent.length,6);
     for(const event of [initial,...events])assert.equal(f.sent.filter(item=>item.session_id===event.data.session_id).length,1);
   });

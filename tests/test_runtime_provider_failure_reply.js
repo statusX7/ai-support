@@ -876,11 +876,18 @@ async function test(name, action) {
     const waiting = await f.process(accepted.key, accepted.jobId);
     assert.equal(waiting.status, 'idle');
     let stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
     assert.equal(stored.inference, 'unknown-legacy-inference');
     assert.equal(stored.deferred_configuration, true);
+    assert.equal(stored.retry_at, f.now() + 5000);
+    assert.equal(stored.lease_until, 0);
     assert.equal(stored.data?.content, event.data.content);
     assert.equal(f.calls.length, 0);
     assert.equal(f.signedProviderPayloads.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
 
     fs.unlinkSync(marker);
     f.advance(Math.max(1, stored.retry_at - f.now() + 1));
@@ -893,8 +900,11 @@ async function test(name, action) {
     assert.equal(stored.inference, 'unknown-legacy-inference');
     assert.equal(stored.data?.content, event.data.content);
     assert.equal(stored.deferred_configuration, undefined);
+    assert.equal(stored.retry_at, f.now() + 300000);
+    assert.equal(stored.lease_until, 0);
     assert.equal(f.calls.length, 0);
     assert.equal(f.signedProviderPayloads.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
     assertNoVisibleFailureReply(f);
   });
 
