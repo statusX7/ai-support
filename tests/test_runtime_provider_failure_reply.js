@@ -1480,8 +1480,26 @@ async function test(name, action) {
     assert.equal(fs.existsSync(questionFile), true,
       '人工事务提交后必须先保留精确Provider身份，不能无签名删除缓存');
 
+    const controlSelected = await f.scan();
+    assert.equal(controlSelected.some((entry) => entry.key === received.key
+      && entry.jobId === received.jobId && entry.control === true), true,
+    '真人控制任务必须先于 cleanup-only 退休任务完成后处理');
+    assert.equal(controlSelected.some((entry) => entry.key === first.key
+      && entry.jobId === first.jobId), false,
+    '同一会话每轮只选一个任务，首轮不得用缓存清理挤占真人控制');
+    const controlled = await f.process(received.key, received.jobId);
+    assert.equal(controlled.status, 'none');
+    const controlJob = f.state(event.data.session_id).jobs
+      .find((entry) => entry.id === received.jobId);
+    assert.equal(controlJob.status, 'done');
+    assert.equal(controlJob.responsibility_status, 'control_handled');
+    assertNoVisibleFailureReply(f);
+    assert.equal(fs.existsSync(questionFile), true,
+      '真人控制完成前后均不得无签名删除 Provider 缓存');
+
     const selected = await f.scan();
-    assert.equal(selected.some((entry) => entry.key === first.key && entry.jobId === first.jobId), true);
+    assert.equal(selected.some((entry) => entry.key === first.key && entry.jobId === first.jobId), true,
+      '真人控制完成后的下一轮必须选择到期的 cleanup-only 退休任务');
     const retired = await f.process(first.key, first.jobId);
     assert.equal(retired.status, 'provider_retirement_retired', f.adapterErrors());
     stored = pendingJob(f, event, first.jobId);
