@@ -568,11 +568,17 @@ async function main() {
       fs.mkdirSync(questions,{recursive:true,mode:0o700});
       for(let index=0;index<8;index+=1) {
         const id=(index+1).toString(16).repeat(64).slice(0,64);
-        const sessionKey=(index+9).toString(16).repeat(64).slice(0,64);
+        const website='fixture-status-website';
+        const sessionId='fixture-status-session-'+index;
+        const sessionKey=digest(website+'\0'+sessionId);
         json(path.join(questions,id+'.json'),{schema_version:2,id,scope:'conversation',
           session_key:sessionKey,conversation_generation:0,
           responsibility_binding:digest(JSON.stringify([id,'conversation',sessionKey,0])),
           attempts:0,stages:{},record_revision:1});
+        json(path.join(f.directory,'data/runtime','session-'+sessionKey+'.json'),{
+          schema_version:2,website_id:website,session_id:sessionId,mode:'ai',generation:0,
+          jobs:[{id,generation:0,status:'received',responsibility_status:'pending'}],
+        });
       }
       let sessionReads=0;
       fs.readFileSync=function(file,...args) {
@@ -585,6 +591,8 @@ async function main() {
       assert.equal(sessionReads,0,'容器健康轮询不得按缓存问题数量同步读取会话');
       const status=await f.get('status');
       assert.equal(status.questions.count,8);
+      assert.equal(status.questions.unsettled,8);
+      assert.equal(status.questions.retirement_scanned,8);
       assert.equal(sessionReads,8,'只有显式管理状态才执行逐问题责任核对');
     }finally{fs.readFileSync=originalReadFileSync;await f.close();}
   });
