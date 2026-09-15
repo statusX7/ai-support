@@ -889,6 +889,41 @@ async function test(name, action) {
     assert.equal(f.crispPostAttempts.length, 0);
     assertNoVisibleFailureReply(f);
 
+    const deferredFailure = {
+      rounds: stored.failure_rounds,
+      since: stored.failure_since,
+      last: stored.last_failure_at,
+      attempts: stored.attempts,
+    };
+    for (let round = 0; round < 3; round += 1) {
+      f.advance(Math.max(1, stored.retry_at - f.now() + 1));
+      if (round % 2 === 0) {
+        const selected = await f.scan();
+        assert.equal(selected.some((entry) => entry.key === accepted.key
+          && entry.jobId === accepted.jobId), false,
+        '配置 marker 存在时 scan 不得把身份故障重新交给执行器');
+      } else {
+        const repeated = await f.process(accepted.key, accepted.jobId);
+        assert.equal(repeated.status, 'idle');
+      }
+      stored = pendingJob(f, event, accepted.jobId);
+      assert.deepEqual({
+        rounds: stored.failure_rounds,
+        since: stored.failure_since,
+        last: stored.last_failure_at,
+        attempts: stored.attempts,
+      }, deferredFailure, '配置 marker 轮询不得虚增故障轮次、时间或尝试数');
+      assert.equal(stored.inference, 'unknown-legacy-inference');
+      assert.equal(stored.deferred_configuration, true);
+      assert.equal(stored.retry_at, f.now() + 5000);
+      assert.equal(stored.lease_until, 0);
+      assert.equal(stored.data?.content, event.data.content);
+      assert.equal(f.calls.length, 0);
+      assert.equal(f.signedProviderPayloads.length, 0);
+      assert.equal(f.crispPostAttempts.length, 0);
+      assertNoVisibleFailureReply(f);
+    }
+
     fs.unlinkSync(marker);
     f.advance(Math.max(1, stored.retry_at - f.now() + 1));
     const protectedResult = await f.process(accepted.key, accepted.jobId);
@@ -902,6 +937,11 @@ async function test(name, action) {
     assert.equal(stored.deferred_configuration, undefined);
     assert.equal(stored.retry_at, f.now() + 300000);
     assert.equal(stored.lease_until, 0);
+    assert.equal(stored.failure_rounds, deferredFailure.rounds + 1,
+      '配置事务结束后才应按身份故障语义登记新的恢复轮次');
+    assert.equal(stored.failure_since, deferredFailure.since);
+    assert.equal(stored.last_failure_at, f.now());
+    assert.equal(stored.attempts, deferredFailure.attempts);
     assert.equal(f.calls.length, 0);
     assert.equal(f.signedProviderPayloads.length, 0);
     assert.equal(f.crispPostAttempts.length, 0);

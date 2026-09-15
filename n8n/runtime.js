@@ -988,11 +988,17 @@ function createRuntime(env = {}, options = {}) {
         return false;
       }
       if (providerResultDisposition(job) === 'invalid_identity') {
-        markUnresolved(job, 'provider_receipt_identity_unresolved');
+        const alreadyDeferredInvalidIdentity = job.status === 'received'
+          && job.responsibility_status === 'unresolved_failure'
+          && job.failure_code === 'provider_receipt_identity_unresolved'
+          && job.deferred_configuration === true;
+        if (!alreadyDeferredInvalidIdentity) {
+          markUnresolved(job, 'provider_receipt_identity_unresolved');
+        }
         // 配置事务仍在进行时，身份故障只能先作为诊断事实保存，不能穿透
-        // 配置屏障参与普通恢复调度。markUnresolved 会按一般故障语义清掉
-        // deferred_configuration，因此在这个调用点恢复屏障；事务结束后再由
-        // releaseConfigurationDeferrals 清除它并应用身份故障的正常退避。
+        // 配置屏障参与普通恢复调度。首次登记故障后，后续五秒轮询不得重复
+        // 增加 failure_rounds 或刷新失败时间；事务结束后再由
+        // releaseConfigurationDeferrals 清除屏障并应用身份故障的正常退避。
         job.deferred_configuration = true;
         job.retry_at = clock() + 5000;
         job.lease_until = 0;
