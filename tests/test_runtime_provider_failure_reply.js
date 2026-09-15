@@ -112,9 +112,30 @@ const executePool = (root, action = 'migrate', environment = {}) => new Promise(
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '', stderr = '';
+  let finished = false;
+  let timedOut = false;
+  let forced = null;
+  let deadline = null;
+  const finish = (code) => {
+    if (finished) return;
+    finished = true;
+    if (deadline) clearTimeout(deadline);
+    if (forced) clearTimeout(forced);
+    resolve({ code: timedOut ? 124 : code, stdout, stderr });
+  };
   child.stdout.on('data', (chunk) => { stdout += chunk; });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  child.on('close', (code) => resolve({ code, stdout, stderr }));
+  child.once('error', (error) => {
+    stderr += `\n受控 provider-pool 子进程启动失败：${error.message}`;
+    finish(127);
+  });
+  child.once('close', (code) => finish(code));
+  deadline = setTimeout(() => {
+    timedOut = true;
+    stderr += '\n受控 provider-pool 子进程超过 60 秒本地截止时间';
+    child.kill('SIGTERM');
+    forced = setTimeout(() => child.kill('SIGKILL'), 2000);
+  }, 60000);
 });
 const reservePort = async () => {
   const server = http.createServer();
@@ -738,7 +759,10 @@ async function test(name, action) {
       assert.equal(stored.responsibility_status, 'answered_confirmed');
       assert.equal(stored.id, result.jobId, '恢复轮不得新建另一问题责任');
       assert.equal(stored.inference_generation, 2);
-      assert.equal(stored.inference?.attempt_generation, 2);
+      assert.equal(stored.inference, undefined,
+        'Provider 计划已结算后必须释放临时推理身份，不能把已完成尝试留成活动责任');
+      assert.equal(stored.provider_result_receipt, undefined);
+      assert.equal(stored.provider_settlement?.state, 'settled');
       assert.equal(Number(stored.response_generation || 0), 0,
         '未向 Crisp 发出旧答案时，Provider 恢复不得擅自换可见回复代次');
       assert.equal(stored.data, undefined);
@@ -1011,9 +1035,9 @@ async function test(name, action) {
     const event = f.event('legacy-inference-migration');
     const accepted = await f.receive(event);
     assert.equal(accepted.accepted, true);
+    const legacyDeadline = f.now() + 7000;
     await f.mutateState(event.data.session_id, (state) => {
       const job = state.jobs.find((entry) => entry.id === accepted.jobId);
-      const legacyDeadline = f.now() + 7000;
       job.inference_generation = 1;
       job.inference = { pool_revision: f.providerConfiguration.pool_revision,
         deadline_at: legacyDeadline };
@@ -1034,14 +1058,19 @@ async function test(name, action) {
     assert.equal(stored.status, 'done');
     assert.equal(stored.responsibility_status, 'answered_confirmed');
     assert.equal(stored.inference_generation, 2);
-    assert.equal(stored.inference?.attempt_generation, 2);
-    assert.equal(stored.inference?.provider_receipt_protocol_version, 1);
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement?.state, 'settled');
     assert.equal(Number.isFinite(stored.legacy_provider_inference_migrated_at), true);
     const question = f.question(accepted.jobId);
     assert.equal(question.schema_version, 2);
     assert.equal(question.attempt_generation, 2);
     assert.equal(Number.isFinite(question.legacy_v121_migrated_at), true);
-    assert.deepEqual(question.legacy_v121_origin, stored.inference.legacy_v121_origin);
+    assert.deepEqual(question.legacy_v121_origin, {
+      runtime_revision: f.providerConfiguration.runtime_revision,
+      pool_revision: f.providerConfiguration.pool_revision,
+      deadline_at: legacyDeadline,
+    });
     assert.equal(stored.id, accepted.jobId);
     assert.equal(f.sent.length, 1);
   });
@@ -1109,20 +1138,21 @@ async function test(name, action) {
       assert.equal(stored.status, 'done', item.name);
       assert.equal(stored.responsibility_status, 'answered_confirmed', item.name);
       assert.equal(stored.inference_generation, 2, item.name);
-      assert.equal(stored.inference?.attempt_generation, 2, item.name);
-      assert.equal(stored.inference?.configuration_binding,
-        appliedB.configuration.configuration_binding, item.name);
+      assert.equal(stored.inference, undefined, item.name);
+      assert.equal(stored.provider_result_receipt, undefined, item.name);
+      assert.equal(stored.provider_settlement?.state, 'settled', item.name);
       assert.equal(stored.legacy_v121_pending_origin, undefined,
         `${item.name}签名迁移完成后必须原子消费临时来源标记`);
-      assert.deepEqual(stored.inference?.legacy_v121_origin, {
+      const question = f.question(item.accepted.jobId);
+      assert.deepEqual(question.legacy_v121_origin, {
         runtime_revision: f.providerConfiguration.runtime_revision,
         pool_revision: f.providerConfiguration.pool_revision,
         deadline_at: item.legacyDeadline,
       }, item.name);
-      const question = f.question(item.accepted.jobId);
       assert.equal(question.schema_version, 2, item.name);
-      assert.deepEqual(question.legacy_v121_origin, stored.inference.legacy_v121_origin, item.name);
       assert.equal(question.configuration.pool_revision, appliedB.configuration.pool_revision, item.name);
+      assert.equal(question.configuration_binding,
+        appliedB.configuration.configuration_binding, item.name);
       assert.equal(question.attempt_generation, 2, item.name);
       assert.equal(JSON.stringify(question).includes('旧版不可直接采用答案。'), false,
         `${item.name}不得把无请求契约旧正文直接出站或继续缓存`);
@@ -1937,8 +1967,12 @@ async function test(name, action) {
     assert.equal(stored.status, 'done');
     assert.equal(stored.responsibility_status, 'answered_confirmed');
     assert.equal(stored.inference_generation, 3);
-    assert.equal(stored.inference?.attempt_generation, 3);
-    assert.equal(stored.inference?.configuration_binding,
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    question = f.question(first.jobId);
+    assert.equal(question.attempt_generation, 3);
+    assert.equal(question.configuration_binding,
       appliedC.configuration.configuration_binding);
     assert.equal(Number(stored.response_generation || 0), 0);
     assert.equal(f.state(event.data.session_id).jobs.filter((entry) => entry.id === first.jobId).length, 1,
@@ -1956,7 +1990,6 @@ async function test(name, action) {
       assert.deepEqual([probes[0].index, probes[0].authorization, probes[0].body.model],
         [index, `Bearer synthetic-transaction-key-${label}`, `synthetic-transaction-${label}`]);
     }
-    question = f.question(first.jobId);
     assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts], [3, 1, 3]);
     assert.equal(question.settlement?.outcome, 'plan_persisted');
     assert.equal(JSON.stringify(question).includes('受控配置 A 的有效答案。'), false,
@@ -2455,7 +2488,9 @@ async function test(name, action) {
     assert.equal(stored.responsibility_status, 'answered_confirmed');
     assert.equal(stored.id, accepted.jobId);
     assert.equal(stored.inference_generation, 2);
-    assert.equal(stored.inference?.attempt_generation, 2);
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement?.state, 'settled');
     assert.equal(Number(stored.response_generation || 0), 0);
     const recoveredQuestion = f.question(accepted.jobId);
     assert.equal(recoveredQuestion.attempt_generation, 2);
@@ -2530,7 +2565,9 @@ async function test(name, action) {
     question = f.question(first.jobId);
     assert.equal(stored.id, first.jobId);
     assert.equal(stored.inference_generation, 3);
-    assert.equal(stored.inference?.attempt_generation, 3);
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement?.state, 'settled');
     assert.equal(Number(stored.response_generation || 0), 0);
     assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts], [3, 1, 5]);
     assert.equal(f.state(event.data.session_id).jobs.filter((entry) => entry.id === first.jobId).length, 1);

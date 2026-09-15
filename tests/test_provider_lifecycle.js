@@ -21,9 +21,24 @@ const write = (file, value) => fs.writeFileSync(file, typeof value === 'string' 
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const command = (program, args, options = {}) => new Promise((resolve, reject) => {
   const child = spawn(program, args, {cwd:work, env:{...process.env,...options.env}, stdio:['pipe','pipe','pipe']});
-  let stdout='', stderr='';
+  let stdout='', stderr='', finished=false, forced=null, timedOut=false, deadline=null;
+  const finish=(result,error=null)=>{
+    if(finished)return;
+    finished=true;
+    if(deadline)clearTimeout(deadline);
+    if(forced)clearTimeout(forced);
+    if(error)reject(error);else resolve(timedOut ? {...result,code:124} : result);
+  };
   child.stdout.on('data', chunk => stdout += chunk); child.stderr.on('data', chunk => stderr += chunk);
-  child.on('error', reject); child.on('close', code => resolve({code,stdout,stderr})); child.stdin.end(options.input || '');
+  child.once('error', error => finish(null,error));
+  child.once('close', code => finish({code,stdout,stderr}));
+  deadline=setTimeout(()=>{
+    timedOut=true;
+    stderr+='\n受控生命周期子进程超过本地截止时间';
+    child.kill('SIGTERM');
+    forced=setTimeout(()=>child.kill('SIGKILL'),2000);
+  },options.timeout || 300000);
+  child.stdin.end(options.input || '');
 });
 const checked = async (program, args, options) => { const result=await command(program,args,options); assert.equal(result.code,0,result.stderr + result.stdout); return result; };
 const files = directory => fs.readdirSync(directory,{withFileTypes:true}).flatMap(entry => {

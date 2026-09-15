@@ -424,8 +424,17 @@ async function main() {
       try { child.kill('SIGKILL'); } catch (_) {}
     }
     await Promise.all(remaining.map((child) => new Promise((resolve) => {
-      if (child.exitCode !== null || child.signalCode !== null) resolve();
-      else child.once('close', resolve);
+      let timer = null;
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      if (child.exitCode !== null || child.signalCode !== null) return done();
+      child.once('close', done);
+      timer = setTimeout(() => {
+        child.removeListener('close', done);
+        resolve();
+      }, 5000);
     })));
     if (complete) fs.rmSync(root, { recursive: true, force: true });
   }

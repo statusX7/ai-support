@@ -6,6 +6,8 @@ const path = require('path');
 const crypto = require('crypto');
 const vm = require('vm');
 const { createRuntime } = require('../n8n/runtime');
+const { verifyEnvelope, requestContract } = require('../scripts/provider-envelope');
+const { chatToResponses, responseToChat, validChat } = require('../scripts/provider-adapter');
 const project = path.resolve(__dirname, '..');
 fs.mkdirSync(path.join(project, '.work', 'v1.3.0'), { recursive: true });
 const root = fs.mkdtempSync(path.join(project, '.work', 'v1.3.0', 'runtime-test-'));
@@ -18,7 +20,8 @@ const readConfig = (name) => JSON.parse(fs.readFileSync(path.join(root, 'config'
 writeConfig('runtime', { schema_version: 2, enabled: true, revision: 1, applied_revision: 1 });
 writeConfig('provider', { provider: { base_url: 'https://provider.invalid/proxy/v1', model: 'controlled-model', api_mode: 'chat_completions', supports_vision: true } });
 const welcomeOff = readConfig('menu'); welcomeOff.welcome.enabled = false; writeConfig('menu', welcomeOff);
-const env = { CRISP_WEBSITE_ID: '11111111-1111-4111-8111-111111111111', CRISP_WEBSITE_HOOK_SECRET: 'test-only-website-secret-0001', CRISP_PLUGIN_SIGNING_SECRET: 'test-only-plugin-secret-0001', CRISP_AUTH_B64: 'test-only-auth', CRISP_TOKEN_TIER: 'website', AI_API_KEY: 'test-only-key', AI_SUPPORTS_VISION: 'true', ANYTHINGLLM_WORKSPACE: 'crisp-support', ANYTHINGLLM_API_KEY: 'test-only-anything-key' };
+const env = { CRISP_WEBSITE_ID: '11111111-1111-4111-8111-111111111111', CRISP_WEBSITE_HOOK_SECRET: 'test-only-website-secret-0001', CRISP_PLUGIN_SIGNING_SECRET: 'test-only-plugin-secret-0001', CRISP_AUTH_B64: 'test-only-auth', CRISP_TOKEN_TIER: 'website', AI_API_KEY: 'test-only-key', AI_SUPPORTS_VISION: 'true', ANYTHINGLLM_WORKSPACE: 'crisp-support', ANYTHINGLLM_API_KEY: 'test-only-anything-key', PROVIDER_ADAPTER_KEY: 'test-only-provider-adapter-key-0001', PROVIDER_POOL_REQUIRED: 'true', PROVIDER_POOL_READBACK_REQUIRED: 'true', PROVIDER_ADAPTER_URL: 'https://provider.invalid/proxy/v1' };
+const fixtureStartedAt = Date.now();
 const projection = 'kb_1111111111111111_doc_2222222222222222.md';
 fs.writeFileSync(path.join(root, 'data/runtime/knowledge-map.json'), JSON.stringify({ schema_version: 2, documents: [{
   library_id: 'kb_1111111111111111', document_id: 'doc_2222222222222222', projection,
@@ -29,18 +32,28 @@ const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).joi
     : JSON.stringify(value);
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const writeJson = (file, value) => fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+const atomicWriteJson = (file, value) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = file + '.candidate-' + crypto.randomBytes(8).toString('hex');
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+};
 const materialsKnowledge = () => {
   const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
   const mapRaw = fs.readFileSync(mapFile);
   const map = JSON.parse(mapRaw);
   const settingsFile = path.join(root, 'data/runtime/knowledge-settings.json');
-  const settings = { schema_version: 1, workspace_slug: env.ANYTHINGLLM_WORKSPACE, temperature: 0.7, observed_at: Date.now() };
+  const settings = { schema_version: 1, workspace_slug: env.ANYTHINGLLM_WORKSPACE, temperature: 0.7, observed_at: fixtureStartedAt };
   writeJson(settingsFile, settings);
   const profileValue = { engine: 'native', model: 'synthetic-embedding', chunk_size: 1000, chunk_overlap: 20,
     passage_prefix: '', query_prefix: '', component_version: 'synthetic' };
   const profileFile = path.join(root, 'data/runtime/knowledge-profile.json');
   writeJson(profileFile, { schema_version: 1, state: 'applied', profile: profileValue,
-    fingerprint: digest(canonical(profileValue)), applied_at: Date.now() });
+    fingerprint: digest(canonical(profileValue)), applied_at: fixtureStartedAt });
   const payload = { schema_version: 2, algorithm: 'crispai-lexical-v2', map_sha256: digest(mapRaw), complete: false,
     coverage: { source_documents: map.documents.length, indexed_documents: 0, omitted_documents: map.documents.length,
       source_bytes: map.documents.length, indexed_bytes: 0, omitted_bytes: map.documents.length,
@@ -76,15 +89,135 @@ const sealMaterials = value => {
   return value;
 };
 const makeMaterials = (configuration, prompt, revision) => sealMaterials({
-  schema_version: 2, revision, state: 'applied', applied_at: Date.now(), source_sha256: '', source_components: {},
+  schema_version: 2, revision, state: 'applied', applied_at: fixtureStartedAt + revision, source_sha256: '', source_components: {},
   configuration, prompt: { text: prompt, sha256: digest(prompt), bytes: Buffer.byteLength(prompt) },
   knowledge: materialsKnowledge(),
 });
+const materialsPath = path.join(root, 'config/materials-applied.json');
+const assertReplyReadyMaterials = (materials) => {
+  const mapRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-map.json'));
+  const settingsRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-settings.json'));
+  const profileRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-profile.json'));
+  const lexicalRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-lexical.json'));
+  const map = JSON.parse(mapRaw);
+  const settings = JSON.parse(settingsRaw);
+  const profile = JSON.parse(profileRaw);
+  const lexical = JSON.parse(lexicalRaw);
+  assert.equal(materials.schema_version, 2);
+  assert.equal(materials.state, 'applied');
+  assert.equal(typeof materials.configuration.runtime.enabled, 'boolean');
+  assert.equal(materials.configuration.runtime.revision, materials.revision);
+  assert.equal(materials.configuration.runtime.applied_revision, materials.revision);
+  assert.equal(materials.prompt.bytes, Buffer.byteLength(materials.prompt.text));
+  assert.equal(materials.prompt.sha256, digest(materials.prompt.text));
+  assert.equal(materials.knowledge.map_sha256, digest(mapRaw));
+  assert.equal(materials.knowledge.settings_sha256, digest(settingsRaw));
+  assert.equal(materials.knowledge.profile_sha256, digest(profileRaw));
+  assert.equal(materials.knowledge.lexical_sha256, digest(lexicalRaw));
+  assert.equal(map.schema_version, 2);
+  assert.equal(materials.knowledge.enabled_document_count, map.documents.length);
+  assert.deepEqual(materials.knowledge.enabled_library_ids,
+    [...new Set(map.documents.map((item) => item.library_id))].sort());
+  assert.equal(settings.schema_version, 1);
+  assert.equal(settings.workspace_slug, env.ANYTHINGLLM_WORKSPACE);
+  assert.equal(typeof settings.temperature, 'number');
+  assert.equal(profile.schema_version, 1);
+  assert.equal(profile.state, 'applied');
+  assert.equal(profile.fingerprint, digest(canonical(profile.profile)));
+  assert.equal(lexical.schema_version, 2);
+  assert.equal(lexical.map_sha256, digest(mapRaw));
+  const { payload_sha256, ...lexicalPayload } = lexical;
+  assert.equal(payload_sha256, digest(canonical(lexicalPayload)));
+  const runtimeConfiguration = structuredClone(materials.configuration.runtime);
+  delete runtimeConfiguration.revision;
+  delete runtimeConfiguration.applied_revision;
+  assert.deepEqual(materials.source_components, {
+    runtime: digest(canonical(runtimeConfiguration)),
+    handoff: digest(canonical(materials.configuration.handoff)),
+    keyword: digest(canonical(materials.configuration.keyword)),
+    menu: digest(canonical(materials.configuration.menu)),
+    tags: digest(canonical(materials.configuration.tags)),
+    feedback: digest(canonical(materials.configuration.feedback)),
+    prompt: materials.prompt.sha256,
+    knowledge: digest(canonical(materials.knowledge)),
+  });
+  assert.equal(materials.source_sha256, digest(canonical(materials.source_components)));
+  assert.equal(fs.existsSync(path.join(root, 'data/runtime/knowledge-migration.json')), false);
+};
+const managedConfiguration = () => Object.fromEntries(
+  ['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']
+    .map((name) => [name, readConfig(name)]));
+const initialMaterials = makeMaterials(managedConfiguration(),
+  fs.readFileSync(path.join(root, 'config/prompt.md'), 'utf8'), 1);
+atomicWriteJson(materialsPath, initialMaterials);
+assertReplyReadyMaterials(JSON.parse(fs.readFileSync(materialsPath, 'utf8')));
+assert.equal(initialMaterials.configuration.runtime.enabled, true);
+const publishConfiguration = (name, value) => {
+  assert(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].includes(name));
+  const previous = JSON.parse(fs.readFileSync(materialsPath, 'utf8'));
+  const revision = previous.revision + 1;
+  const configuration = structuredClone(previous.configuration);
+  const next = structuredClone(value);
+  if (name === 'runtime') {
+    const crossed = previous.configuration.runtime.enabled === true && next.enabled === false;
+    next.disable_epoch = Math.min(2147483647,
+      Number(previous.configuration.runtime.disable_epoch || 0) + (crossed ? 1 : 0));
+    next.revision = revision;
+    next.applied_revision = revision;
+    configuration.runtime = next;
+  } else {
+    configuration[name] = next;
+    configuration.runtime = { ...configuration.runtime, revision, applied_revision: revision };
+  }
+  writeConfig(name, next);
+  writeConfig('runtime', configuration.runtime);
+  const applied = makeMaterials(configuration, previous.prompt.text, revision);
+  atomicWriteJson(materialsPath, applied);
+  assertReplyReadyMaterials(JSON.parse(fs.readFileSync(materialsPath, 'utf8')));
+  return applied;
+};
+const providerPoolPath = path.join(root, 'config/provider-pool-applied.json');
+const providerReadbackPath = path.join(root, 'config/provider-pool-readback.json');
+const providerEntryId = 'p_111111111111111111111111';
+const publishProviderPool = (apiMode, revision = 1) => {
+  assert(['chat_completions', 'responses'].includes(apiMode));
+  const generation = digest('workflow-provider-secrets-' + revision).slice(0, 32);
+  const pool = {
+    schema_version: 1, revision, secrets_generation: generation, primary_id: providerEntryId,
+    entries: [{ id: providerEntryId, name: '受控主接口', role: 'primary', order: 0, enabled: true,
+      base_url: 'https://provider.invalid/proxy/v1', model: 'controlled-model', api_mode: apiMode,
+      custom_header_names: [], capabilities: { chat_completions: apiMode === 'chat_completions',
+        responses: apiMode === 'responses', vision: true }, context_window: 8192,
+      max_output_tokens: 1200, draft: false }],
+    policy: { question_timeout_ms: 7000, call_timeout_ms: 1500, connect_timeout_ms: 100,
+      max_attempts: 1, cooldown_initial_ms: 1000, cooldown_max_ms: 2000,
+      pool_cooldown_ms: 100 },
+  };
+  const secretPath = path.join(root, 'secrets/provider/generations', generation + '.json');
+  atomicWriteJson(secretPath, { schema_version: 1, generation, revision,
+    entries: { [providerEntryId]: { api_key: env.AI_API_KEY, custom_headers: {} } } });
+  atomicWriteJson(providerPoolPath, pool);
+  const poolSha256 = digest(fs.readFileSync(providerPoolPath));
+  atomicWriteJson(providerReadbackPath, { schema_version: 1, readback_contract_version: 1,
+    revision, secrets_generation: generation, pool_sha256: poolSha256,
+    verified_at: fixtureStartedAt + revision });
+  const readback = JSON.parse(fs.readFileSync(providerReadbackPath, 'utf8'));
+  assert.equal(readback.revision, pool.revision);
+  assert.equal(readback.secrets_generation, pool.secrets_generation);
+  assert.equal(readback.pool_sha256, poolSha256);
+  const rawProvider = readConfig('provider');
+  rawProvider.provider.api_mode = apiMode;
+  rawProvider.provider.model = pool.entries[0].model;
+  rawProvider.provider.base_url = pool.entries[0].base_url;
+  writeConfig('provider', rawProvider);
+  return { pool, readback };
+};
+publishProviderPool('chat_completions');
 const messagesOf = body => body.messages || body.input;
 const textOf = message => typeof message.content === 'string' ? message.content
   : message.content.filter(part => ['text', 'input_text', 'output_text'].includes(part.type)).map(part => part.text).join('\n');
 const textOfRequest = body => messagesOf(body).map(textOf).join('\n');
-let now = Date.now();
+let now = fixtureStartedAt;
 let sequence = 1000;
 let delayed;
 let delayedAll;
@@ -113,6 +246,16 @@ const retrievalRequests = [];
 const segments = new Map();
 let runtime;
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const awaitNamedGate = async (promise, label, timeout = 5000) => {
+  let timer;
+  try {
+    await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('等待' + label + '超过本地截止时间')), timeout);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
 const request = async (url, options = {}) => {
   const parsed = new URL(url);
   const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
@@ -176,24 +319,67 @@ const request = async (url, options = {}) => {
       ...(unknownSources ? {} : { metadata: { title: projection } }), distance: low ? 0.9 : 0.1, score: low ? 0.1 : 0.9 }] } };
   }
   if (parsed.hostname === 'provider.invalid') {
-    assert.equal(options.method, 'POST'); assert.equal(options.headers.Authorization, 'Bearer ' + env.AI_API_KEY);
-    assert.equal(parsed.pathname, options.body.input ? '/proxy/v1/responses' : '/proxy/v1/chat/completions');
-    const hasImage = messagesOf(options.body).some(message => Array.isArray(message.content)
+    assert.equal(options.method, 'POST');
+    assert.equal(options.headers.Authorization, 'Bearer ' + env.PROVIDER_ADAPTER_KEY);
+    const envelope = verifyEnvelope(options.headers['x-crispai-question'], env.PROVIDER_ADAPTER_KEY);
+    if (parsed.pathname === '/proxy/internal/provider/settle') {
+      assert.equal(options.body.outcome, 'plan_persisted');
+      assert.match(options.body.plan_sha256, /^[a-f0-9]{64}$/);
+      return { status: 200, body: { state: 'settled' } };
+    }
+    if (parsed.pathname === '/proxy/internal/provider/retire') {
+      assert.equal(options.body.outcome, 'responsibility_retired');
+      return { status: 200, body: { state: 'absent' } };
+    }
+    const poolRaw = fs.readFileSync(providerPoolPath);
+    const pool = JSON.parse(poolRaw);
+    const materials = JSON.parse(fs.readFileSync(materialsPath, 'utf8'));
+    assert.equal(envelope.runtime_revision, materials.revision);
+    assert.equal(envelope.pool_revision, pool.revision);
+    assert.equal(envelope.secrets_generation, pool.secrets_generation);
+    assert.equal(envelope.pool_sha256, digest(poolRaw));
+    assert.equal(envelope.materials_source_sha256, materials.source_sha256);
+    assert.equal(envelope.configuration_binding, digest(JSON.stringify([
+      envelope.runtime_revision, envelope.pool_revision, envelope.secrets_generation,
+      envelope.pool_sha256, envelope.materials_source_sha256,
+    ])));
+    if (parsed.pathname === '/proxy/internal/provider/replay') {
+      return { status: 409, body: { error: { code: 'question_result_absent' } } };
+    }
+    assert.equal(parsed.pathname, '/proxy/v1/chat/completions');
+    assert.equal(requestContract(options.body).request_sha256, envelope.request_sha256,
+      'adapter 输入正文必须与受管问题信封绑定');
+    const entry = pool.entries.find((item) => item.id === pool.primary_id);
+    assert(entry && entry.enabled && entry.draft === false);
+    const upstreamBody = entry.api_mode === 'responses'
+      ? chatToResponses(options.body, { model: entry.model, maxOutput: entry.max_output_tokens })
+      : { model: entry.model, messages: options.body.messages, stream: false,
+        max_tokens: entry.max_output_tokens,
+        ...(options.body.temperature !== undefined ? { temperature: options.body.temperature } : {}),
+        ...(options.body.top_p !== undefined ? { top_p: options.body.top_p } : {}) };
+    const upstreamPath = new URL(entry.base_url).pathname.replace(/\/$/, '')
+      + (entry.api_mode === 'responses' ? '/responses' : '/chat/completions');
+    const hasImage = messagesOf(upstreamBody).some(message => Array.isArray(message.content)
       && message.content.some(part => ['image_url', 'input_image'].includes(part.type)));
     let answer;
     if (hasImage) {
-      providerRequests.push({ path: parsed.pathname, body: structuredClone(options.body) });
+      providerRequests.push({ path: upstreamPath, body: structuredClone(upstreamBody) });
       if (delayedVision) { const pending = delayedVision; delayedVision = null; await pending; }
       answer = visualAnswer;
     } else {
-      modelRequests.push(structuredClone(options.body));
-      assert.equal(options.body.temperature, 0.7);
+      modelRequests.push(structuredClone(upstreamBody));
+      assert.equal(upstreamBody.temperature, 0.7);
       if (delayedAll) await delayedAll;
       if (delayed) { const pending = delayed; delayed = null; await pending; }
-      if (modelFailure) return { status: 503, body: { error: 'provider_failed' } };
-      answer = modelAnswerOverride ?? '受控协议回答：' + textOf(messagesOf(options.body).at(-1)).slice(-25);
+      if (modelFailure) return { status: 503, body: { error: { code: 'upstream_unavailable' } } };
+      answer = modelAnswerOverride ?? '受控协议回答：' + textOf(messagesOf(upstreamBody).at(-1)).slice(-25);
     }
-    return { status: 200, body: options.body.input ? { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: answer }] }] } : { choices: [{ message: { content: answer } }] } };
+    const upstreamResult = entry.api_mode === 'responses'
+      ? { status: 'completed', output: [{ type: 'message', role: 'assistant',
+        content: [{ type: 'output_text', text: answer }] }] }
+      : { choices: [{ message: { role: 'assistant', content: answer } }] };
+    return { status: 200, body: entry.api_mode === 'responses'
+      ? responseToChat(upstreamResult, entry.model) : validChat(upstreamResult, entry.model) };
   }
   if (parsed.hostname === 'storage.crisp.chat') {
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -225,7 +411,22 @@ const recoverUnresolved = async (session, result) => {
     const job = current.jobs.find((item) => item.id === result.jobId); assert(job); job.retry_at = 0;
   });
   const before = sent.filter((item) => item.session_id === session).length;
-  assert.equal((await runtime.process(result.key, result.jobId)).status, 'sent');
+  let recovered = await runtime.process(result.key, result.jobId);
+  if (recovered.status === 'unresolved') {
+    const replayed = state(session).jobs.find((item) => item.id === result.jobId);
+    assert(replayed, '同一应答责任必须保留');
+    assert.equal(replayed.responsibility_status, 'unresolved_failure');
+    assert.equal(replayed.inference, undefined,
+      'adapter 明确返回 absent 后才可释放旧推理代');
+    assert.equal(replayed.provider_result_receipt, undefined);
+    assert.equal(sent.filter((item) => item.session_id === session).length, before,
+      '只读 replay 收敛轮不得产生可见出站');
+    await runtime.transaction(result.key, (current) => {
+      const job = current.jobs.find((item) => item.id === result.jobId); assert(job); job.retry_at = 0;
+    });
+    recovered = await runtime.process(result.key, result.jobId);
+  }
+  assert.equal(recovered.status, 'sent');
   assert.equal(sent.filter((item) => item.session_id === session).length, before + 1);
   assert.equal(state(session).jobs.find((item) => item.id === result.jobId).responsibility_status, 'answered_confirmed');
 };
@@ -616,24 +817,45 @@ const abortablePending = (signal, started) => {
   await test('C03 已确认 Crisp 拒绝只发送一次，保留脱敏状态且不自动转人工', async () => {
     for (const status of [400, 401, 403, 404, 413]) {
       const session = 'session_rejected-' + status;
-      sendRejection = status;
-      const attempts = sendAttempts;
-      const modelCount = modelRequests.length;
-      const result = await deliver(message(session, '虚构发送拒绝回归问题'));
-      assert.equal(result.status, 'failed');
-      assert.equal(sendAttempts, attempts + 1);
-      assert.equal(modelRequests.length, modelCount + 1);
-      assert.equal(state(session).mode, 'ai');
-      const failed = Object.values(state(session).outgoing).at(-1);
-      assert.equal(failed.status, 'failed');
-      assert.equal(failed.failure, 'crisp_http_' + status);
-      assert.equal('body' in failed, false);
-      now += 15000;
-      await runtime.process(key(session));
-      assert.equal(sendAttempts, attempts + 1);
-      assert.equal(modelRequests.length, modelCount + 1);
+      try {
+        sendRejection = status;
+        const attempts = sendAttempts;
+        const modelCount = modelRequests.length;
+        const result = await deliver(message(session, '虚构发送拒绝回归问题'));
+        assert.equal(result.status, 'rejected');
+        assert.equal(sendAttempts, attempts + 1);
+        assert.equal(modelRequests.length, modelCount + 1);
+        const rejectedState = state(session);
+        assert.equal(rejectedState.mode, 'ai');
+        const job = rejectedState.jobs.find((item) => item.id === result.jobId); assert(job);
+        assert.equal(job.status, 'received');
+        assert.equal(job.responsibility_status, 'unresolved_failure');
+        assert.equal(job.failure_code, 'crisp_http_' + status);
+        assert(job.data && job.plan, '明确拒绝不得删除原始问题或已生成答案');
+        const [fingerprint, rejected] = Object.entries(rejectedState.outgoing)
+          .find(([, record]) => record.job_id === result.jobId);
+        assert.equal(rejected.status, 'rejected');
+        assert.equal(rejected.failure, 'crisp_http_' + status);
+        assert.equal(rejected.resend_forbidden, undefined);
+        assert.equal(rejected.recovery_deferred, true);
+        assert(Number.isSafeInteger(rejected.next_action_at));
+        assert(rejected.body, '明确未接收的正文必须留作同一内容恢复');
+        const frozenBody = structuredClone(rejected.body);
+        sendRejection = 0;
+        now = Math.max(now + 1, rejected.next_action_at + 1);
+        const recovered = await runtime.process(result.key, result.jobId);
+        assert.equal(recovered.status, 'sent');
+        assert.equal(sendAttempts, attempts + 2, '恢复只重投同一持久正文一次');
+        assert.equal(modelRequests.length, modelCount + 1, 'Crisp 拒绝恢复不得重新推理');
+        assert.deepEqual(sent.at(-1), { ...frozenBody, session_id: session });
+        const finished = state(session);
+        assert.equal(finished.jobs.find((item) => item.id === result.jobId).responsibility_status,
+          'answered_confirmed');
+        assert.equal(finished.outgoing[fingerprint].status, 'sent');
+      } finally {
+        sendRejection = 0;
+      }
     }
-    sendRejection = 0;
   });
   await test('T19/T21 真点击缺少from/type、原fingerprint已见也只暂停A', async () => {
     const card = sent.find((entry) => entry.session_id === 'session_client-a' && entry.type === 'picker');
@@ -659,10 +881,10 @@ const abortablePending = (signal, started) => {
     await deliver(fake); assert.equal(state('session_client-b').mode, 'ai');
   });
   await test('T22/T23 到期、否定词、规则禁用和旧代次', async () => {
-    const original = readConfig('keyword'); const revised = structuredClone(original); revised.rules[0].offer_ttl_seconds = 1; writeConfig('keyword', revised);
+    const original = readConfig('keyword'); const revised = structuredClone(original); revised.rules[0].offer_ttl_seconds = 1; publishConfiguration('keyword', revised);
     await deliver(message('session_expired01', '人工')); const card = sent.at(-1); now += 1100; await deliver(click('session_expired01', card)); assert.equal(state('session_expired01').mode, 'ai');
     assert.equal(runtime.matchRule('不需要人工'), undefined);
-    revised.rules[0].enabled = false; writeConfig('keyword', revised); assert.equal(runtime.matchRule('人工'), undefined); writeConfig('keyword', original);
+    revised.rules[0].enabled = false; publishConfiguration('keyword', revised); assert.equal(runtime.matchRule('人工'), undefined); publishConfiguration('keyword', original);
     await deliver(message('session_oldoffer1', '人工')); const stale = sent.at(-1); await runtime.resume(key('session_oldoffer1')); await deliver(click('session_oldoffer1', stale)); assert.equal(state('session_oldoffer1').mode, 'ai');
   });
   await test('T24/T25/T26 真人公开全部类型、自己的回流和非公开事件', async () => {
@@ -957,7 +1179,7 @@ const abortablePending = (signal, started) => {
     assert.equal(fencedRecord.status, 'sending', '旧实例不得用迟到回执覆盖新 attempt 的状态');
   });
   await test('T29/T30 十秒截止、真人追加、访客与乱序不改时间', async () => {
-    const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 10; writeConfig('handoff', handoff);
+    const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 10; publishConfiguration('handoff', handoff);
     const start = now += 100; await operator('session_timeline01');
     assert.equal(state('session_timeline01').resume_at, start + 10000);
     now = start + 5000; await deliver(message('session_timeline01', '访客消息')); assert.equal(state('session_timeline01').resume_at, start + 10000);
@@ -999,7 +1221,7 @@ const abortablePending = (signal, started) => {
     assert.equal(state(session).mode, 'ai');
   });
   await test('T30/T31 零秒人工重建runtime与八天后不丢失', async () => {
-    const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 0; writeConfig('handoff', handoff);
+    const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 0; publishConfiguration('handoff', handoff);
     now += 100; await operator('session_permanent1'); assert.equal(state('session_permanent1').resume_at, null);
     now += 8 * 86400000; runtime = createRuntime(env, runtimeOptions); await runtime.scan(); assert.equal(state('session_permanent1').mode, 'human');
     const before = sent.length; await deliver(message('session_permanent1', '永久人工后问题')); assert.equal(sent.length, before);
@@ -1007,19 +1229,19 @@ const abortablePending = (signal, started) => {
   await test('T32/T33 总开关关闭阻断在途且仍接收真人控制', async () => {
     let finish; delayed = new Promise((resolve) => { finish = resolve; }); const entry = await receive(message('session_globalrace', '慢回复'));
     const pending = runtime.process(entry.key, entry.jobId); await wait(20);
-    writeConfig('runtime', { schema_version: 2, enabled: false, revision: 2, applied_revision: 2 });
+    publishConfiguration('runtime', { schema_version: 2, enabled: false });
     const before = sent.length; finish(); await pending; await deliver(message('session_globalnew1', '人工')); assert.equal(sent.length, before);
     now += 10; await operator('session_globalhuman'); assert.equal(state('session_globalhuman').mode, 'human');
-    writeConfig('runtime', { schema_version: 2, enabled: true, revision: 3, applied_revision: 3 }); await deliver(message('session_globalhuman', '仍人工')); assert.equal(sent.length, before);
+    publishConfiguration('runtime', { schema_version: 2, enabled: true }); await deliver(message('session_globalhuman', '仍人工')); assert.equal(sent.length, before);
   });
   await test('T34/T35 欢迎独立、SDK事件与公开白名单按会话控制', async () => {
-    const menu = readConfig('menu'); menu.welcome = { enabled: true, text: '自定义欢迎\n第二行 😀', trigger: 'widget_load', auto_open: true, show_menu: false }; writeConfig('menu', menu);
+    const menu = readConfig('menu'); menu.welcome = { enabled: true, text: '自定义欢迎\n第二行 😀', trigger: 'widget_load', auto_open: true, show_menu: false }; publishConfiguration('menu', menu);
     const signal = { ...message('session_welcome001', ''), event: 'session:sync:events', data: { session_id: 'session_welcome001', events: [{ text: 'crispai_widget_load', timestamp: now }] } };
     await deliver(signal); assert.equal(sent.at(-1).content, menu.welcome.text); const before = sent.length;
     await deliver(signal); now += 1; signal.timestamp = now; await deliver(signal); assert.equal(sent.length, before);
     const publicOptions = await runtime.publicConfig({ website_id: env.CRISP_WEBSITE_ID, session_id: 'session_welcome001' }); assert.equal(publicOptions.auto_open, true); assert.deepEqual(Object.keys(publicOptions).sort(), ['auto_open', 'enabled', 'revision', 'trigger', 'welcome_enabled']);
     await operator('session_welcome001'); assert.equal((await runtime.publicConfig({ website_id: env.CRISP_WEBSITE_ID, session_id: 'session_welcome001' })).auto_open, false);
-    menu.welcome.enabled = false; writeConfig('menu', menu); await deliver(message('session_welcomeoff', '普通问题')); assert(!sent.at(-1).content.includes('自定义欢迎'));
+    menu.welcome.enabled = false; publishConfiguration('menu', menu); await deliver(message('session_welcomeoff', '普通问题')); assert(!sent.at(-1).content.includes('自定义欢迎'));
   });
   await test('T36 菜单原生选择、返回与人工二次确认', async () => {
     await deliver(message('session_menu0001', '菜单')); let card = sent.at(-1); assert.equal(card.type, 'picker');
@@ -1044,7 +1266,10 @@ const abortablePending = (signal, started) => {
     assert.match(textOfRequest(modelRequests.at(-1)), /受控视觉协议回答/);
     assert.equal('sessionId' in modelRequests.at(-1), false); assert.equal('reset' in modelRequests.at(-1), false);
     assert.equal(sent.at(-1).session_id, 'session_image001');
-    const provider = readConfig('provider'); provider.provider.api_mode = 'responses'; writeConfig('provider', provider);
+    const previousPool = JSON.parse(fs.readFileSync(providerPoolPath, 'utf8'));
+    const switchedPool = publishProviderPool('responses', previousPool.revision + 1);
+    assert.equal(switchedPool.readback.revision, switchedPool.pool.revision);
+    assert.equal(switchedPool.pool.entries[0].api_mode, 'responses');
     await deliver(message('session_image002', image, { type: 'file' })); assert.match(providerRequests.at(-1).body.input.at(-1).content[1].image_url, /^data:image/);
     assert.equal(providerRequests.at(-1).path, '/proxy/v1/responses');
     assert.deepEqual(retrievalRequests.at(-1), { query: visualAnswer });
@@ -1097,12 +1322,12 @@ const abortablePending = (signal, started) => {
       for (let tries = 0; tries < 200 && providerRequests.length === count; tries += 1) await wait(5);
       assert.equal(providerRequests.length, count + 1);
       if (reason === 'human') await operator(session);
-      else { const global = readConfig('runtime'); global.enabled = false; global.revision += 1; global.applied_revision = global.revision; writeConfig('runtime', global); }
+      else { const global = readConfig('runtime'); global.enabled = false; publishConfiguration('runtime', global); }
       release(); await pending;
       assert.equal((state(session).image_context || []).length, 0);
       assert(!sent.some((item) => item.session_id === session));
       if (reason === 'human') assert.equal(state(session).mode, 'human');
-      else { const global = readConfig('runtime'); global.enabled = true; global.revision += 1; global.applied_revision = global.revision; writeConfig('runtime', global); }
+      else { const global = readConfig('runtime'); global.enabled = true; publishConfiguration('runtime', global); }
     }
   });
   await test('T39 持久任务重启、重复Hook和发送结果未知对账', async () => {
@@ -1200,7 +1425,7 @@ const abortablePending = (signal, started) => {
     assert.equal((await rotated.observations()).hook_observed, false);
   });
   await test('统计保留天数实际清理旧事件，不清除永久人工状态', async () => {
-    const feedback = readConfig('feedback'); feedback.feedback.retention_days = 1; writeConfig('feedback', feedback);
+    const feedback = readConfig('feedback'); feedback.feedback.retention_days = 1; publishConfiguration('feedback', feedback);
     const file = path.join(root, 'data/analytics/events.jsonl');
     fs.appendFileSync(file, JSON.stringify({ type: 'synthetic_expired', at: new Date(now - 172800000).toISOString() }) + '\n');
     fs.appendFileSync(file, JSON.stringify({ type: 'synthetic_current', at: new Date(now).toISOString() }) + '\n');
@@ -1355,6 +1580,7 @@ const abortablePending = (signal, started) => {
   await test('W03/W04 生效投影隔离未完成编辑，同一会话的新问按新版本规则回答', async () => {
     const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));
     const file = path.join(root, 'config/materials-applied.json');
+    const originalMaterials = fs.readFileSync(file);
     const originalKeyword = fs.readFileSync(path.join(root, 'config/keyword.yaml'));
     const originalPrompt = fs.readFileSync(path.join(root, 'config/prompt.md'));
     const prompt = '完整中文提示 😀\n' + 'x'.repeat(31000) + '\nSYNTHETIC_PROMPT_TAIL';
@@ -1396,11 +1622,12 @@ const abortablePending = (signal, started) => {
     } finally {
       fs.writeFileSync(path.join(root, 'config/keyword.yaml'), originalKeyword);
       fs.writeFileSync(path.join(root, 'config/prompt.md'), originalPrompt);
-      fs.unlinkSync(file);
+      fs.writeFileSync(file, originalMaterials, { mode: 0o600 });
     }
   });
   await test('W03/B01 应用过渡取消旧答案，保留真人控制，期间新问题按新代恢复一次', async () => {
     const file = path.join(root, 'config/materials-applied.json');
+    const originalMaterials = fs.readFileSync(file);
     const mapFile = path.join(root, 'data/runtime/knowledge-map.json');
     const originalMap = fs.existsSync(mapFile) ? fs.readFileSync(mapFile) : null;
     const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback'].map((name) => [name, readConfig(name)]));
@@ -1446,7 +1673,7 @@ const abortablePending = (signal, started) => {
     } finally {
       if (finish) finish();
       if (originalMap) fs.writeFileSync(mapFile, originalMap); else if (fs.existsSync(mapFile)) fs.unlinkSync(mapFile);
-      fs.unlinkSync(file);
+      fs.writeFileSync(file, originalMaterials, { mode: 0o600 });
     }
   });
   await test('V122-R03 普通长任务跨执行限为七个，Webhook/人工控制不等待并保留扫描公平性', async () => {
@@ -1696,21 +1923,26 @@ const abortablePending = (signal, started) => {
     histories.set(session, [{ ...body.data }]);
     const entry = await guarded.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = guarded.process(entry.key, entry.jobId);
-    await started;
-    await waitForPermitSlot(0);
-    const replacement = replacePermitOwner(0, 'ordinary');
-    const result = await Promise.race([running, wait(1000).then(() => ({ status: 'timeout' }))]);
-    assert.deepEqual(result, { status: 'deferred', reason: 'processing_permit_lost' });
-    let stored = guarded.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
-    assert.equal(stored.status, 'received');
-    assert.equal(stored.attempts, 0, '许可换代不得消耗业务失败次数');
-    assert.equal(stored.processing_permit_losses, 1);
-    assert.equal(stored.retry_at, now + 1000);
-    assert.equal(stored.execution_token, undefined);
-    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(replacement.slotPath, 'owner.json'), 'utf8')).token,
-      replacement.token, '旧执行 finally 不得删除新持有者');
-    replacement.cleanup();
+    let replacement;
+    let stored;
+    try {
+      await awaitNamedGate(started, '普通推理进入受控上游');
+      await waitForPermitSlot(0);
+      replacement = replacePermitOwner(0, 'ordinary');
+      const result = await Promise.race([running, wait(1000).then(() => ({ status: 'timeout' }))]);
+      assert.deepEqual(result, { status: 'deferred', reason: 'processing_permit_lost' });
+      stored = guarded.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+      assert.equal(stored.status, 'received');
+      assert.equal(stored.attempts, 0, '许可换代不得消耗业务失败次数');
+      assert.equal(stored.processing_permit_losses, 1);
+      assert.equal(stored.retry_at, now + 1000);
+      assert.equal(stored.execution_token, undefined);
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(replacement.slotPath, 'owner.json'), 'utf8')).token,
+        replacement.token, '旧执行 finally 不得删除新持有者');
+    } finally {
+      replacement?.cleanup();
+    }
 
     now += 1001;
     const recovered = createRuntime(env, runtimeOptions);
@@ -1724,8 +1956,12 @@ const abortablePending = (signal, started) => {
     const session = 'session_permit-lost-superseded';
     const beforeSent = sent.filter((entry) => entry.session_id === session).length;
     let startedResolve, releaseProvider;
+    let providerReleased = false;
     const started = new Promise((resolve) => { startedResolve = resolve; });
     const release = new Promise((resolve) => { releaseProvider = resolve; });
+    const releaseProviderGate = () => {
+      if (!providerReleased && releaseProvider) { providerReleased = true; releaseProvider(); }
+    };
     const staleRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
       request: async (url, options = {}) => {
         const parsed = new URL(url);
@@ -1739,32 +1975,37 @@ const abortablePending = (signal, started) => {
     histories.set(session, [{ ...body.data }]);
     const entry = await staleRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = staleRuntime.process(entry.key, entry.jobId);
-    await started;
-    await waitForPermitSlot(0);
-    const replacement = replacePermitOwner(0, 'ordinary');
-    const newerToken = 'f'.repeat(24);
-    await staleRuntime.transaction(entry.key, (current) => {
-      const stored = current.jobs.find((job) => job.id === entry.jobId);
-      stored.execution_token = newerToken;
-      stored.status = 'processing';
-      stored.attempts = 41;
-      stored.lease_until = now + 300000;
-      current.worker = { job: stored.id, token: newerToken, until: now + 300000 };
-    });
-    releaseProvider();
-    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
-    const stored = staleRuntime.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
-    assert.equal(stored.execution_token, newerToken);
-    assert.equal(stored.status, 'processing');
-    assert.equal(stored.attempts, 41);
-    assert.equal(staleRuntime.readState(entry.key).worker.token, newerToken);
-    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
-    replacement.cleanup();
-    await staleRuntime.transaction(entry.key, (current) => {
-      const currentJob = current.jobs.find((job) => job.id === entry.jobId);
-      currentJob.status = 'cancelled'; currentJob.lease_until = 0; delete currentJob.execution_token;
-      current.worker = null;
-    });
+    let replacement;
+    try {
+      await awaitNamedGate(started, '忽略取消的旧推理进入受控上游');
+      await waitForPermitSlot(0);
+      replacement = replacePermitOwner(0, 'ordinary');
+      const newerToken = 'f'.repeat(24);
+      await staleRuntime.transaction(entry.key, (current) => {
+        const stored = current.jobs.find((job) => job.id === entry.jobId);
+        stored.execution_token = newerToken;
+        stored.status = 'processing';
+        stored.attempts = 41;
+        stored.lease_until = now + 300000;
+        current.worker = { job: stored.id, token: newerToken, until: now + 300000 };
+      });
+      releaseProviderGate();
+      assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+      const stored = staleRuntime.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+      assert.equal(stored.execution_token, newerToken);
+      assert.equal(stored.status, 'processing');
+      assert.equal(stored.attempts, 41);
+      assert.equal(staleRuntime.readState(entry.key).worker.token, newerToken);
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+      await staleRuntime.transaction(entry.key, (current) => {
+        const currentJob = current.jobs.find((job) => job.id === entry.jobId);
+        currentJob.status = 'cancelled'; currentJob.lease_until = 0; delete currentJob.execution_token;
+        current.worker = null;
+      });
+    } finally {
+      releaseProviderGate();
+      replacement?.cleanup();
+    }
   });
   await test('P0 控制任务失去许可不提前释放人工归属栅栏', async () => {
     const session = 'session_permit-lost-control';
@@ -1781,18 +2022,22 @@ const abortablePending = (signal, started) => {
     const entry = await controlRuntime.receive({ body: { website_id: env.CRISP_WEBSITE_ID,
       event: 'message:received', timestamp: now, data }, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = controlRuntime.process(entry.key, entry.jobId);
-    await started;
-    await waitForPermitSlot(7);
-    const replacement = replacePermitOwner(7, 'control');
-    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
-    const current = controlRuntime.readState(entry.key);
-    const stored = current.jobs.find((job) => job.id === entry.jobId);
-    assert.equal(stored.status, 'received');
-    assert.equal(stored.attempts, 0);
-    assert.equal(stored.operator_resolution, undefined);
-    assert(current.uncertain_events.includes(entry.jobId), '未确认归属前必须保留栅栏');
-    assert.equal(current.mode, 'ai');
-    replacement.cleanup();
+    let replacement;
+    try {
+      await awaitNamedGate(started, '人工归属精确回查开始');
+      await waitForPermitSlot(7);
+      replacement = replacePermitOwner(7, 'control');
+      assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+      const current = controlRuntime.readState(entry.key);
+      const stored = current.jobs.find((job) => job.id === entry.jobId);
+      assert.equal(stored.status, 'received');
+      assert.equal(stored.attempts, 0);
+      assert.equal(stored.operator_resolution, undefined);
+      assert(current.uncertain_events.includes(entry.jobId), '未确认归属前必须保留栅栏');
+      assert.equal(current.mode, 'ai');
+    } finally {
+      replacement?.cleanup();
+    }
     now += 1001;
     const recovered = createRuntime(env, runtimeOptions);
     assert.notEqual((await recovered.process(entry.key, entry.jobId)).status, 'failed');
@@ -1802,8 +2047,12 @@ const abortablePending = (signal, started) => {
     // 旧 resolve_operator 不得写入 unknown/human，也不得改变新任务的尝试次数。
     const staleSession = 'session_permit-lost-control-stale';
     let staleStartedResolve, releaseLookup;
+    let lookupReleased = false;
     const staleStarted = new Promise((resolve) => { staleStartedResolve = resolve; });
     const lookupRelease = new Promise((resolve) => { releaseLookup = resolve; });
+    const releaseLookupGate = () => {
+      if (!lookupReleased && releaseLookup) { lookupReleased = true; releaseLookup(); }
+    };
     const staleControl = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
       request: async (url, options = {}) => {
         const parsed = new URL(url);
@@ -1819,29 +2068,34 @@ const abortablePending = (signal, started) => {
     const staleEntry = await staleControl.receive({ body: { website_id: env.CRISP_WEBSITE_ID,
       event: 'message:received', timestamp: now, data: staleData }, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const staleRunning = staleControl.process(staleEntry.key, staleEntry.jobId);
-    await staleStarted;
-    await waitForPermitSlot(7);
-    const staleReplacement = replacePermitOwner(7, 'control');
-    const newerToken = 'e'.repeat(24);
-    await staleControl.transaction(staleEntry.key, (state) => {
-      const job = state.jobs.find((item) => item.id === staleEntry.jobId);
-      job.execution_token = newerToken; job.status = 'processing'; job.attempts = 23;
-      job.lease_until = now + 300000;
-    });
-    releaseLookup();
-    assert.deepEqual(await staleRunning, { status: 'deferred', reason: 'processing_permit_lost' });
-    const staleState = staleControl.readState(staleEntry.key);
-    const staleJob = staleState.jobs.find((item) => item.id === staleEntry.jobId);
-    assert.equal(staleJob.execution_token, newerToken);
-    assert.equal(staleJob.status, 'processing');
-    assert.equal(staleJob.attempts, 23);
-    assert.equal(staleJob.operator_resolution, undefined);
-    assert(staleState.uncertain_events.includes(staleEntry.jobId));
-    staleReplacement.cleanup();
-    await staleControl.transaction(staleEntry.key, (state) => {
-      const job = state.jobs.find((item) => item.id === staleEntry.jobId);
-      job.status = 'cancelled'; job.lease_until = 0; delete job.execution_token;
-    });
+    let staleReplacement;
+    try {
+      await awaitNamedGate(staleStarted, '旧人工归属精确回查开始');
+      await waitForPermitSlot(7);
+      staleReplacement = replacePermitOwner(7, 'control');
+      const newerToken = 'e'.repeat(24);
+      await staleControl.transaction(staleEntry.key, (state) => {
+        const job = state.jobs.find((item) => item.id === staleEntry.jobId);
+        job.execution_token = newerToken; job.status = 'processing'; job.attempts = 23;
+        job.lease_until = now + 300000;
+      });
+      releaseLookupGate();
+      assert.deepEqual(await staleRunning, { status: 'deferred', reason: 'processing_permit_lost' });
+      const staleState = staleControl.readState(staleEntry.key);
+      const staleJob = staleState.jobs.find((item) => item.id === staleEntry.jobId);
+      assert.equal(staleJob.execution_token, newerToken);
+      assert.equal(staleJob.status, 'processing');
+      assert.equal(staleJob.attempts, 23);
+      assert.equal(staleJob.operator_resolution, undefined);
+      assert(staleState.uncertain_events.includes(staleEntry.jobId));
+      await staleControl.transaction(staleEntry.key, (state) => {
+        const job = state.jobs.find((item) => item.id === staleEntry.jobId);
+        job.status = 'cancelled'; job.lease_until = 0; delete job.execution_token;
+      });
+    } finally {
+      releaseLookupGate();
+      staleReplacement?.cleanup();
+    }
   });
   await test('P0 Crisp POST 中失去许可保留 unknown 对账，回执确认后不重新推理或重复发送', async () => {
     const session = 'session_permit-lost-outgoing';
@@ -1867,20 +2121,26 @@ const abortablePending = (signal, started) => {
     histories.set(session, [{ ...body.data }]);
     const entry = await outgoingRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = outgoingRuntime.process(entry.key, entry.jobId);
-    await started;
-    await waitForPermitSlot(0);
-    const replacement = replacePermitOwner(0, 'ordinary');
-    assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
-    let current = outgoingRuntime.readState(entry.key);
-    const unknown = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
-    assert.equal(unknown.status, 'unknown');
-    assert.equal(unknown.delivery_uncertain, true);
-    assert.equal(unknown.cancellation_reason, 'processing_permit_lost');
-    assert.equal(current.jobs.find((job) => job.id === entry.jobId).status, 'received');
-    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
-    const afterFirstModels = modelRequests.length;
-    assert.equal(afterFirstModels, beforeModels + 1);
-    replacement.cleanup();
+    let replacement;
+    let current;
+    let afterFirstModels;
+    try {
+      await awaitNamedGate(started, 'Crisp 正文 POST 开始');
+      await waitForPermitSlot(0);
+      replacement = replacePermitOwner(0, 'ordinary');
+      assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
+      current = outgoingRuntime.readState(entry.key);
+      const unknown = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
+      assert.equal(unknown.status, 'unknown');
+      assert.equal(unknown.delivery_uncertain, true);
+      assert.equal(unknown.cancellation_reason, 'processing_permit_lost');
+      assert.equal(current.jobs.find((job) => job.id === entry.jobId).status, 'received');
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+      afterFirstModels = modelRequests.length;
+      assert.equal(afterFirstModels, beforeModels + 1);
+    } finally {
+      replacement?.cleanup();
+    }
 
     now += 1001;
     const recovered = createRuntime(env, runtimeOptions);
@@ -1910,20 +2170,24 @@ const abortablePending = (signal, started) => {
     histories.set(session, [{ ...body.data }]);
     const entry = await sentRuntime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = sentRuntime.process(entry.key, entry.jobId);
-    await started;
-    await waitForPermitSlot(0);
-    const replacement = replacePermitOwner(0, 'ordinary');
-    const result = await running;
-    assert.equal(result.status, 'sent');
-    const current = sentRuntime.readState(entry.key);
-    const stored = current.jobs.find((job) => job.id === entry.jobId);
-    const outgoing = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
-    assert.equal(stored.status, 'done');
-    assert.equal(stored.retry_at, null);
-    assert.equal(stored.execution_token, undefined);
-    assert.equal(outgoing.status, 'sent');
-    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
-    replacement.cleanup();
+    let replacement;
+    try {
+      await awaitNamedGate(started, '答案发送后的标签读取开始');
+      await waitForPermitSlot(0);
+      replacement = replacePermitOwner(0, 'ordinary');
+      const result = await running;
+      assert.equal(result.status, 'sent');
+      const current = sentRuntime.readState(entry.key);
+      const stored = current.jobs.find((job) => job.id === entry.jobId);
+      const outgoing = Object.values(current.outgoing).find((record) => record.job_id === entry.jobId);
+      assert.equal(stored.status, 'done');
+      assert.equal(stored.retry_at, null);
+      assert.equal(stored.execution_token, undefined);
+      assert.equal(outgoing.status, 'sent');
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+    } finally {
+      replacement?.cleanup();
+    }
   });
   await test('V122-R03 控制优先时仍为普通会话保留一个扫描名额', async () => {
     const ordinary = await receive(message('session_capacity-fair-ordinary', '普通待处理问题'));
@@ -1947,16 +2211,37 @@ const abortablePending = (signal, started) => {
     const variants = [injected, JSON.stringify(injected), encodeURIComponent(injected), Buffer.from(injected).toString('base64')];
     for (const [index, variant] of variants.entries()) {
       const isolated = createRuntime(env, { ...runtimeOptions, request: async () => { throw new SyntaxError(variant); } });
-      const body = message('session_log-private-' + index, '无敏感资料的虚构问题');
+      const session = 'session_log-private-' + index;
+      const beforeSent = sent.filter((item) => item.session_id === session).length;
+      const beforeModels = modelRequests.length;
+      const body = message(session, '无敏感资料的虚构问题');
       const entry = await isolated.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
       const result = await isolated.process(entry.key, entry.jobId);
-      assert.equal(result.status, 'failed');
+      assert.deepEqual(result, { status: 'deferred', reason: 'answer_responsibility_unresolved' });
+      const unresolved = isolated.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+      assert(unresolved?.data, '技术异常后必须保留原始应答责任');
+      assert.equal(unresolved.status, 'received');
+      assert.equal(unresolved.responsibility_status, 'unresolved_failure');
+      assert.equal(unresolved.failure_code, 'runtime_processing_failed');
+      assert(Number.isFinite(unresolved.retry_at));
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent,
+        '技术异常不得生成可见机械或空泛话术');
       const log = fs.readFileSync(path.join(root, 'data/analytics/events.jsonl'), 'utf8');
       assert(log.includes('配置或协议 JSON 解析失败'));
       for (const secret of variants) {
         assert(!log.includes(secret), '异常正文不得进入落盘日志');
         assert(!JSON.stringify(result).includes(secret));
       }
+      await runtime.transaction(entry.key, (current) => {
+        const job = current.jobs.find((item) => item.id === entry.jobId); assert(job); job.retry_at = 0;
+      });
+      const recovered = await runtime.process(entry.key, entry.jobId);
+      assert.equal(recovered.status, 'sent');
+      assert.equal(modelRequests.length, beforeModels + 1);
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1,
+        '恢复后同一问题只发送一份有效答案');
+      assert.equal(state(session).jobs.find((job) => job.id === entry.jobId).responsibility_status,
+        'answered_confirmed');
     }
     assert.equal(state('session_permanent1').mode, 'human');
   });

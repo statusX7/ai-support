@@ -38,8 +38,14 @@ const until = async (check,message,timeout=5000) => {
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const execute = (args,environment={}) => new Promise(resolve=>{
   const child=spawn('python3',[path.join(project,'scripts/provider-pool.py'),...args],{env:{...process.env,...environment}});
-  let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
-  child.on('close',code=>resolve({code,stdout,stderr}));
+  let stdout='',stderr='',finished=false,forced=null,timedOut=false,deadline=null;
+  const finish=code=>{if(finished)return;finished=true;if(deadline)clearTimeout(deadline);if(forced)clearTimeout(forced);
+    resolve({code:timedOut?124:code,stdout,stderr});};
+  child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+  child.once('error',error=>{stderr+='\n受控 provider-pool 子进程启动失败：'+error.message;finish(127);});
+  child.once('close',code=>finish(code));
+  deadline=setTimeout(()=>{timedOut=true;stderr+='\n受控 provider-pool 子进程超过 60 秒本地截止时间';child.kill('SIGTERM');
+    forced=setTimeout(()=>child.kill('SIGKILL'),2000);},60000);
 });
 
 async function fixture(label) {
