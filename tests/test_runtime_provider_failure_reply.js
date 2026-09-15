@@ -2547,34 +2547,39 @@ async function test(name, action) {
   await test('router结算后本地写回失败仍保留已生成计划，恢复时不再推理', async (f) => {
     f.failNextSettlementWriteback();
     const event = f.event('settled-local-writeback-failure');
-    const first = await f.deliver(event);
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.route, 'process');
+    const first = await f.process(accepted.key, accepted.jobId);
     assert.equal(first.status, 'deferred');
     assert.equal(first.reason, 'answer_responsibility_unresolved');
     assert.equal(f.settlementWritebackFailures(), 1, '夹具必须精确命中结算后的本地写回');
     assert.equal(f.calls.length, 1);
     assertNoVisibleFailureReply(f);
-    let stored = pendingJob(f, event, first.jobId);
+    let stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(f.state(event.data.session_id).jobs.filter((job) => job.id === accepted.jobId).length, 1,
+      '接收阶段返回的权威任务身份必须始终对应唯一持久责任');
     assert.equal(stored.status, 'received');
     assert.equal(stored.responsibility_status, 'unresolved_failure');
     assert.equal(stored.failure_code, 'persisted_plan_delivery_pending');
     assert.equal(stored.plan?.content, '受控正常答案。');
     assert.equal(stored.data?.content, event.data.content);
-    const settled = f.question(first.jobId);
+    const settled = f.question(accepted.jobId);
     assert.equal(settled.settlement?.outcome, 'plan_persisted');
     assert.equal(settled.stages.answer.result, undefined,
       'router 已结算后不得继续保留可重放正文');
 
-    advancePastRetry(f, event, first.jobId);
-    const recovered = await f.process(first.key, first.jobId);
+    advancePastRetry(f, event, accepted.jobId);
+    const recovered = await f.process(accepted.key, accepted.jobId);
     assert.equal(recovered.status, 'sent');
     assert.equal(f.calls.length, 1, '已持久计划恢复不得重新调用 Provider');
     assertSingleBusinessReply(f);
-    stored = pendingJob(f, event, first.jobId);
+    stored = pendingJob(f, event, accepted.jobId);
     assert.equal(stored.status, 'done');
     assert.equal(stored.responsibility_status, 'answered_confirmed');
     assert.equal(stored.provider_result_receipt, undefined);
     assert.equal(stored.plan, undefined);
-    assert.equal((await f.process(first.key, first.jobId)).status, 'idle');
+    assert.equal((await f.process(accepted.key, accepted.jobId)).status, 'idle');
     assert.equal(f.calls.length, 1);
     assert.equal(f.sent.length, 1);
   });
