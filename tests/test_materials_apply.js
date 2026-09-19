@@ -192,6 +192,22 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
+  const invokeProjectionValidator=(validator,file)=>new Promise(resolve=>{
+    const child=spawn('bash',['-c','source "$1"; if "$2" "$3"; then exit 0; else exit 1; fi',
+      'materials-validator',path.join(root,'scripts/materials.sh'),validator,file],{
+      cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
+    });
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+  const invokeCatalogReconcile=(output,semantic)=>new Promise(resolve=>{
+    const child=spawn('bash',['-c','source "$1"; if materials_reconcile_catalog "$2" "$3" "$4"; then exit 0; else exit 1; fi',
+      'materials-reconcile',path.join(root,'scripts/materials.sh'),deploy,output,semantic],{
+      cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
+    });
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
   const invokeSnapshotValidate=()=>new Promise(resolve=>{
     const child=spawn('bash',['-c','source "$1"; materials_snapshot_validate_generation "$2" "$3" "$4"',
       'materials-snapshot',path.join(root,'scripts/materials.sh'),deploy,
@@ -263,6 +279,37 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(emptyProjection.source_components.knowledge,digest(canonical(emptyProjection.knowledge)));
     assert.equal(emptyProjection.source_sha256,digest(canonical(emptyProjection.source_components)));
     pass('旧部署经回读建立 schema v2 投影，空知识兼容无 profile 或同代有效 profile 且完整知识身份受保护');
+
+    const validatorRoot=path.join(work,'validator-cases');
+    fs.mkdirSync(validatorRoot,{mode:0o700});
+    const invalidV2=structuredClone(emptyProjection);
+    invalidV2.prompt.sha256='0'.repeat(64);
+    const invalidV2Path=path.join(validatorRoot,'invalid-v2.json');
+    fs.writeFileSync(invalidV2Path,JSON.stringify(invalidV2)+'\n',{mode:0o600});
+    result=await invokeProjectionValidator('materials_projection_validate',invalidV2Path);
+    assert.notEqual(result.code,0,'v2 坏 Prompt 摘要在 if 条件调用中不得被后续配置校验覆盖');
+
+    const validLegacy=structuredClone(emptyProjection);
+    validLegacy.schema_version=1;
+    const legacyPath=path.join(validatorRoot,'legacy.json');
+    fs.writeFileSync(legacyPath,JSON.stringify(validLegacy)+'\n',{mode:0o600});
+    result=await invokeProjectionValidator('materials_projection_validate_legacy',legacyPath);
+    assert.equal(result.code,0,result.stderr||result.stdout);
+    validLegacy.prompt.sha256='0'.repeat(64);
+    fs.writeFileSync(legacyPath,JSON.stringify(validLegacy)+'\n',{mode:0o600});
+    result=await invokeProjectionValidator('materials_projection_validate_legacy',legacyPath);
+    assert.notEqual(result.code,0,'legacy 坏 Prompt 摘要在 if 条件调用中不得被后续配置校验覆盖');
+
+    const reconciledCatalog=path.join(validatorRoot,'catalog.json');
+    const semanticDirectory=path.join(validatorRoot,'semantic-is-directory');
+    fs.mkdirSync(semanticDirectory,{mode:0o700});
+    result=await invokeCatalogReconcile(reconciledCatalog,semanticDirectory);
+    assert.notEqual(result.code,0,'目录调和的第二个输出失败时不得被第一个有效输出覆盖');
+    const reconciledValue=JSON.parse(fs.readFileSync(reconciledCatalog,'utf8'));
+    assert.equal(reconciledValue.schema_version,2);
+    assert.equal(Array.isArray(reconciledValue.libraries),true);
+    assert.equal(fs.statSync(semanticDirectory).isDirectory(),true);
+    pass('投影摘要与目录调和在 Bash 条件上下文中显式传播 Python 校验失败');
 
     const projectionPath=path.join(deploy,'config/materials-applied.json');
     const stableHash=sha(projectionPath);

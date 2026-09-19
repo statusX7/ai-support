@@ -38,10 +38,15 @@ fail() { printf '失败：[UNIT/CONTRACT] %s\n' "$1" >&2; exit 1; }
 pass() { ((PASSED += 1)); printf '通过：[UNIT/CONTRACT] %s\n' "$1"; }
 
 assert_result() {
-  local id=$1 expected=$2 file=${3:-$OUT}
-  jq -e --arg id "$id" --arg expected "$expected" \
-    'any(.results[]; .id == $id and .status == $expected)' "$file" >/dev/null \
-    || fail "${id} 应为 ${expected}"
+  local id=$1 expected=$2 file=${3:-$OUT} context=${4:-} actual
+  if jq -e --arg id "$id" --arg expected "$expected" \
+      'any(.results[]; .id == $id and .status == $expected)' "$file" >/dev/null; then
+    return
+  fi
+  actual=$(jq -M -r --arg id "$id" \
+    '[.results[] | select(.id == $id)][-1].status // "MISSING"' "$file" 2>/dev/null || printf 'INVALID')
+  [[ "$actual" =~ ^(PASS|WARN|FAIL|SKIP|MISSING|INVALID)$ ]] || actual=INVALID
+  fail "${context:+${context}：}${id} 应为 ${expected}，实际 ${actual}"
 }
 
 fixture_env() {
@@ -1045,7 +1050,7 @@ for projection_tamper in schema-v1 prompt-digest; do
   invoke --local
   (( LAST_RC == 1 )) || fail "资料投影 ${projection_tamper} 损坏时应退出 1"
   assert_result anything.workspace FAIL
-  assert_result materials.applied FAIL
+  assert_result materials.applied FAIL "$OUT" "资料投影 ${projection_tamper}"
   assert_result business.settings FAIL
   cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
 done
@@ -1057,7 +1062,7 @@ ln -- "$projection_hardlink_source" "${DEPLOY}/config/materials-applied.json"
 invoke --local
 (( LAST_RC == 1 )) || fail '资料投影硬链接不得通过工作区、资料或业务运行门禁'
 assert_result anything.workspace FAIL
-assert_result materials.applied FAIL
+assert_result materials.applied FAIL "$OUT" '资料投影 hardlink'
 assert_result business.settings FAIL
 rm -f -- "${DEPLOY}/config/materials-applied.json" "$projection_hardlink_source"
 cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"

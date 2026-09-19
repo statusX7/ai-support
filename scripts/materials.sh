@@ -96,7 +96,7 @@ materials_reconcile_catalog() {
   materials_validate_private_file "$catalog" "$MATERIALS_CATALOG_MAX_BYTES" '知识库目录' || return 1
   knowledge_catalog_validate "$catalog" \
     || { materials_error '知识库目录结构无效'; return 1; }
-  python3 - "$deploy_dir" "$catalog" "$output" "$semantic" "$MATERIALS_DOCUMENT_MAX_BYTES" <<'PY'
+  python3 - "$deploy_dir" "$catalog" "$output" "$semantic" "$MATERIALS_DOCUMENT_MAX_BYTES" <<'PY' || return 1
 import copy
 import hashlib
 import json
@@ -435,7 +435,7 @@ materials_projection_validate_legacy() {
     (.configuration.runtime.applied_revision <= .revision) and
     (if .state == "applied" then .configuration.runtime.applied_revision == .revision else true end)
   ' "$file" >/dev/null || return 1
-  python3 - "$file" <<'PY'
+  python3 - "$file" <<'PY' || return 1
 import hashlib
 import json
 import pathlib
@@ -448,7 +448,7 @@ if not encoded or b"\x00" in encoded or len(encoded) != raw["prompt"]["bytes"]:
 if hashlib.sha256(encoded).hexdigest() != raw["prompt"]["sha256"]:
     raise SystemExit(1)
 PY
-  materials_projection_validate_configuration "$file"
+  materials_projection_validate_configuration "$file" || return 1
 }
 
 materials_projection_validate() {
@@ -493,7 +493,7 @@ materials_projection_validate() {
        .configuration.runtime.applied_revision <= .revision
      end)
   ' "$file" >/dev/null || return 1
-  python3 - "$file" <<'PY'
+  python3 - "$file" <<'PY' || return 1
 import hashlib
 import json
 import pathlib
@@ -529,7 +529,7 @@ if hashlib.sha256(canonical(knowledge)).hexdigest() != raw["source_components"][
 if hashlib.sha256(canonical(raw["source_components"])).hexdigest() != raw["source_sha256"]:
     raise SystemExit(1)
 PY
-  materials_projection_validate_configuration "$file"
+  materials_projection_validate_configuration "$file" || return 1
 }
 
 materials_prepare_candidate() {
