@@ -874,6 +874,122 @@ const abortablePending = (signal, started) => {
       runtime = createRuntime(env, runtimeOptions);
     }
   });
+  await test('P0 未确认 operator 延期落盘失败后保留同一问题并由 scanner 恢复', async () => {
+    const session = 'session_processing-operator-persistence-failure';
+    const modelCount = modelRequests.length;
+    const postCount = sendAttempts;
+    const visibleCount = sent.filter((entry) => entry.session_id === session).length;
+    const originalRenameSync = fs.renameSync;
+    let armed = false;
+    let injected = false;
+    let control;
+    let ambiguousData;
+    let visitor;
+    const stateFile = path.join(root, 'data/runtime',
+      'session-' + runtime.stateKey(env.CRISP_WEBSITE_ID, session) + '.json');
+    fs.renameSync = function (source, destination) {
+      if (armed && !injected && path.resolve(String(destination)) === path.resolve(stateFile)
+        && String(source).startsWith(stateFile + '.tmp-')) {
+        const current = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        const stored = current.jobs.find((job) => job.id === visitor?.jobId);
+        if (stored?.status === 'processing' && current.uncertain_events.includes(control?.jobId)) {
+          armed = false;
+          injected = true;
+          const failure = new Error('受控 operator 延期状态提交失败');
+          failure.code = 'EIO';
+          throw failure;
+        }
+      }
+      return originalRenameSync.apply(this, arguments);
+    };
+    const gatedRequest = async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (!control && match && decodeURIComponent(match[1]) === session
+        && match[2] === '/messages') {
+        const claimed = state(session).jobs.find((job) => job.id === visitor.jobId); assert(claimed);
+        assert.equal(claimed.status, 'processing');
+        assert.equal(claimed.attempts, 1);
+        assert(claimed.data, '故障注入必须发生在原始问题已持久的 processing 窗口');
+        assert.equal(claimed.plan, undefined);
+        assert.equal(claimed.inference, undefined);
+        assert.equal(Object.values(state(session).outgoing || {})
+          .some((record) => record?.job_id === visitor.jobId), false);
+        now += 1;
+        ambiguousData = {
+          session_id: session, from: 'operator', type: 'text',
+          content: '延期写入失败前的待确认 operator 事件',
+          fingerprint: ++sequence, timestamp: now,
+          user: { type: 'website', nickname: '受控待确认来源' },
+        };
+        control = await runtime.receive({
+          body: { website_id: env.CRISP_WEBSITE_ID, event: 'message:received',
+            timestamp: now, data: ambiguousData },
+          query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+        });
+        assert.equal(control.route, 'process');
+        assert(state(session).uncertain_events.includes(control.jobId));
+        armed = true;
+      }
+      return request(url, options);
+    };
+    runtime = createRuntime(env, { ...runtimeOptions, request: gatedRequest });
+    try {
+      visitor = await receive(message(session, '延期事务失败也必须保留的普通问题'));
+      const interrupted = await runtime.process(visitor.key, visitor.jobId);
+      assert.equal(injected, true, '必须精确命中首次 operator 延期状态提交');
+      assert.deepEqual([interrupted.status, interrupted.reason],
+        ['deferred', 'operator_identity_persistence_failed']);
+      let snapshot = state(session);
+      let preserved = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(snapshot.mode, 'ai');
+      assert.equal(preserved.status, 'processing');
+      assert.equal(preserved.responsibility_status, 'pending');
+      assert(preserved.data, '技术性延期写入失败不得删除原始访客问题');
+      assert.equal(preserved.plan, undefined);
+      assert.equal(preserved.inference, undefined);
+      assert(preserved.lease_until > now, '原 processing lease 必须留给 scanner 有界回收');
+      assert(snapshot.uncertain_events.includes(control.jobId));
+      assert.equal(modelRequests.length, modelCount);
+      assert.equal(sendAttempts, postCount);
+
+      now = preserved.lease_until + 1;
+      const scheduled = await runtime.scan();
+      assert(scheduled.some((entry) => entry.key === visitor.key && entry.jobId === control.jobId),
+        'lease 到期后 scanner 必须继续调度同会话 operator 控制责任');
+      snapshot = state(session);
+      preserved = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(preserved.status, 'received');
+      assert.equal(preserved.responsibility_status, 'pending');
+      assert(preserved.data);
+      assert.equal(preserved.execution_token, undefined);
+
+      histories.set(session, [{ ...ambiguousData, automated: true },
+        ...(histories.get(session) || [])]);
+      const controlResult = await runtime.process(control.key, control.jobId);
+      assert(!['failed', 'unresolved'].includes(controlResult.status));
+      snapshot = state(session);
+      assert.equal(snapshot.uncertain_events.length, 0);
+      assert.equal(snapshot.jobs.find((job) => job.id === control.jobId)
+        .operator_resolution.result, 'not-human');
+      preserved = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(preserved.status, 'received');
+      assert.equal(preserved.deferred_control, undefined);
+
+      const completed = await runtime.process(visitor.key, visitor.jobId);
+      assert.equal(completed.status, 'sent');
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(sendAttempts, postCount + 1);
+      assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount + 1);
+      assert.equal(state(session).jobs.find((job) => job.id === visitor.jobId)
+        .responsibility_status, 'answered_confirmed');
+      assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'idle');
+      assert.equal(sendAttempts, postCount + 1, '恢复后不得重复发送同一答案');
+    } finally {
+      fs.renameSync = originalRenameSync;
+      runtime = createRuntime(env, runtimeOptions);
+    }
+  });
   await test('P0 历史 operator 缺失或超前时间必须先持久回查，不得冒充当前真人', async () => {
     const cases = [
       { suffix: 'not-human', raw: {}, firstExact: { automated: true }, human: false },

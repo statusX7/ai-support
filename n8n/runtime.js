@@ -6292,25 +6292,37 @@ function createRuntime(env = {}, options = {}) {
         let reason = error.reason === 'global_disabled'
           ? 'global_disabled' : 'conversation_state_changed';
         if (error.reason === 'operator_identity_pending' && job) {
+          let operatorDeferral;
           try {
-            const operatorDeferral = await transaction(key, (state) =>
+            operatorDeferral = await transaction(key, (state) =>
               deferOrdinaryForOperatorIdentity(state, job, token, true));
-            if (operatorDeferral.deferred) {
-              appendEvent('processing_deferred', { reason: operatorDeferral.reason,
-                kind: job.control ? 'control' : 'ordinary' });
-              return { status: 'deferred', reason: operatorDeferral.reason,
-                key, jobId: job.id };
-            }
-            if (['global_disabled', 'conversation_state_changed'].includes(operatorDeferral.reason)) {
-              reason = operatorDeferral.reason;
-            }
-            if (operatorDeferral.reason === 'execution_superseded') {
-              appendEvent('processing_deferred', { reason: 'execution_superseded',
-                kind: job.control ? 'control' : 'ordinary' });
-              return { status: 'deferred', reason: 'execution_superseded',
-                key, jobId: job.id };
-            }
-          } catch (_) {}
+          } catch (_) {
+            // 未确认 operator 只是持久身份屏障。延期事务自身写入失败不等于
+            // 已确认真人或总关；保留原 processing/lease，由 scanner 到期回收。
+            appendEvent('processing_deferred', { reason: 'operator_identity_persistence_failed',
+              kind: job.control ? 'control' : 'ordinary' });
+            return { status: 'deferred', reason: 'operator_identity_persistence_failed',
+              key, jobId: job.id };
+          }
+          if (operatorDeferral.deferred) {
+            appendEvent('processing_deferred', { reason: operatorDeferral.reason,
+              kind: job.control ? 'control' : 'ordinary' });
+            return { status: 'deferred', reason: operatorDeferral.reason,
+              key, jobId: job.id };
+          }
+          if (operatorDeferral.reason === 'execution_superseded') {
+            appendEvent('processing_deferred', { reason: 'execution_superseded',
+              kind: job.control ? 'control' : 'ordinary' });
+            return { status: 'deferred', reason: 'execution_superseded',
+              key, jobId: job.id };
+          }
+          if (!['global_disabled', 'conversation_state_changed'].includes(operatorDeferral.reason)) {
+            appendEvent('processing_deferred', { reason: 'operator_identity_persistence_failed',
+              kind: job.control ? 'control' : 'ordinary' });
+            return { status: 'deferred', reason: 'operator_identity_persistence_failed',
+              key, jobId: job.id };
+          }
+          reason = operatorDeferral.reason;
         }
         if (job) {
           try { await transaction(key, (state) => {
