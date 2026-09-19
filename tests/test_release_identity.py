@@ -379,6 +379,10 @@ def formal_fixture(base, temporary, name, checks):
     environment.update({
         "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
         "REAL_GIT": real_git,
+        "GIT_AUTHOR_NAME": "Release Identity Test",
+        "GIT_AUTHOR_EMAIL": "release@example.invalid",
+        "GIT_COMMITTER_NAME": "Release Identity Test",
+        "GIT_COMMITTER_EMAIL": "release@example.invalid",
         "FAKE_GH_STATE": str(temporary / (name + "-gh-state.json")),
         "FAKE_GH_ASSETS": str(temporary / (name + "-gh-assets")),
         "FAKE_GH_LOG": str(temporary / (name + "-gh.log")),
