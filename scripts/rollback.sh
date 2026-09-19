@@ -320,6 +320,8 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
       && ! -L "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" ]] \
       || die 'v1.3.0 快照缺少成套资料投影或规范原文包'
     mkdir -m 0700 -p -- "${PAYLOAD}/tmp"
+    normalize_runtime_control_files "$PAYLOAD" \
+      || die 'v1.3.0 快照的知识运行投影权限或文件身份不安全；未修改部署'
     materials_snapshot_validate_generation "$PAYLOAD" \
       "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" \
       "${PAYLOAD}/config/materials-applied.json" \
