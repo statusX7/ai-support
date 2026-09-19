@@ -1446,7 +1446,7 @@ doctor_knowledge_lexical_check() {
     > "$report" 2>/dev/null || rc=$?
   if (( rc == 124 || rc == 137 )) || ! doctor_remaining >/dev/null; then
     doctor_deadline_add knowledge.lexical '知识词法补召回' filesystem "$start"
-  elif (( rc != 0 )) || ! jq -e '.ok == true and .read_only == true and .schema_version == 1
+  elif (( rc != 0 )) || ! jq -e '.ok == true and .read_only == true and .schema_version == 2
     and (.complete | type == "boolean") and (.coverage | type == "object")
     and all([.coverage.omitted_documents,.coverage.omitted_bytes][]; type == "number" and floor == . and . >= 0)
     and (.map_sha256 | type == "string" and test("^[a-f0-9]{64}$"))' "$report" >/dev/null 2>&1 \
