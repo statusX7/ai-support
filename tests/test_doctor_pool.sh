@@ -206,6 +206,150 @@ assert_result runtime.feedback WARN
 cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
 pass '旧评价残留只读报告，不清人工状态和普通任务'
 
+RESPONSIBILITY_NOW=$(date -u '+%s%3N')
+RESPONSIBILITY_OLD=$((RESPONSIBILITY_NOW - 600001))
+RESPONSIBILITY_EXPIRED=$((RESPONSIBILITY_NOW - 1000))
+RESPONSIBILITY_ACTIVE=$((RESPONSIBILITY_NOW + 300000))
+RESPONSIBILITY_RUNTIME_REVISION=$(jq -r '.configuration.runtime.revision' \
+  "${DEPLOY}/config/materials-applied.json")
+RESPONSIBILITY_CONTENT='CASE-M02合成正文不得出现在诊断结果'
+RESPONSIBILITY_JOB_ID=$(printf '9%.0s' {1..64})
+
+answer_status() {
+  jq -r '[.results[] | select(.id == "runtime.answer_responsibilities")][-1].status // "MISSING"' "$OUT"
+}
+
+assert_answer_counts() {
+  local expected_status=$1 stalled=$2 pending=$3 silence=$4
+  jq -e --arg status "$expected_status" --arg stalled "$stalled" --arg pending "$pending" \
+    --arg silence "$silence" '
+      [.results[] | select(.id == "runtime.answer_responsibilities")][-1] as $item |
+      $item.status == $status and
+      ($item.summary | contains("长期处理无产物 \($stalled)")) and
+      ($item.summary | contains("待处理/处理中 \($pending)")) and
+      ($item.summary | contains("未知发送 0")) and
+      ($item.summary | contains("明确政策静默 \($silence)"))
+    ' "$OUT" >/dev/null || fail '应答责任 JSON 未按脱敏计数报告长期无产物状态'
+  jq -e --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+      [.results[] | select(.id == "runtime.answer_responsibilities")][-1] as $item |
+      ($item | tostring) as $serialized |
+      (($serialized | contains($content)) or ($serialized | contains($job)) or
+        ($serialized | contains("session_doctor_fixture"))) | not
+    ' "$OUT" >/dev/null || fail '应答责任 JSON 摘要泄漏了正文、任务或会话身份'
+  ! grep -Fq "$RESPONSIBILITY_CONTENT" "$ERR" \
+    || fail '应答责任 JSON stderr 泄漏合成正文'
+  ! grep -Fq "$RESPONSIBILITY_JOB_ID" "$ERR" \
+    || fail '应答责任 JSON stderr 泄漏任务身份'
+  ! grep -Fq 'session_doctor_fixture' "$ERR" \
+    || fail '应答责任 JSON stderr 泄漏会话身份'
+}
+
+assert_answer_text() {
+  local label=$1 expected_rc=$2 stalled=$3 pending=$4 silence=$5 suffix=$6
+  local text_out="${TEST_ROOT}/answer-${suffix}.out" text_err="${TEST_ROOT}/answer-${suffix}.err" text_rc=0
+  fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --local > "$text_out" 2> "$text_err" || text_rc=$?
+  (( text_rc == expected_rc )) || fail "应答责任中文状态退出码错误：${suffix}"
+  grep -Fq "[${label}] 应答责任：" "$text_out" || fail "应答责任中文状态标签错误：${suffix}"
+  grep -Fq "长期处理无产物 ${stalled}" "$text_out" || fail "中文摘要缺少长期无产物脱敏计数：${suffix}"
+  grep -Fq "待处理/处理中 ${pending}" "$text_out" || fail "中文摘要缺少待处理脱敏计数：${suffix}"
+  grep -Fq '未知发送 0' "$text_out" || fail "中文摘要缺少未知发送脱敏计数：${suffix}"
+  grep -Fq "明确政策静默 ${silence}" "$text_out" || fail "中文摘要缺少政策静默脱敏计数：${suffix}"
+  ! grep -Fq "$RESPONSIBILITY_CONTENT" "$text_out" "$text_err" \
+    || fail '应答责任中文输出泄漏合成正文'
+  ! grep -Fq "$RESPONSIBILITY_JOB_ID" "$text_out" "$text_err" \
+    || fail '应答责任中文输出泄漏任务身份'
+  ! grep -Fq 'session_doctor_fixture' "$text_out" "$text_err" \
+    || fail '应答责任中文输出泄漏会话身份'
+}
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null |
+    .outgoing={} | .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90001}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+received_status=$(answer_status)
+if [[ "$received_status" != FAIL ]]; then
+  [[ "$received_status" == WARN ]] \
+    || fail "长期 received 无产物责任状态异常：${received_status}"
+  fail '预期红：超过十分钟且已处理一次的 received 无产物责任当前仍仅 WARN'
+fi
+(( LAST_RC == 1 )) || fail '长期 received 无产物责任必须使本地自检退出 1'
+assert_answer_counts FAIL 1 1 0
+assert_answer_text '故障' 1 1 1 0 received
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了长期 received 原问题责任'
+pass '长期 received 且无计划、推理或出站时应答责任明确失败'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson expired "$RESPONSIBILITY_EXPIRED" \
+  --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" --arg content "$RESPONSIBILITY_CONTENT" \
+  --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 |
+    .outgoing={} | .worker={job:$job,token:"aaaaaaaaaaaaaaaaaaaaaaaa",until:$expired} |
+    .jobs=[{id:$job,event:"message:send",status:"processing",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:$expired,
+      execution_token:"aaaaaaaaaaaaaaaaaaaaaaaa",responsibility_status:"pending",
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90002}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '租约已过期的长期 processing 无产物责任必须退出 1'
+assert_answer_counts FAIL 1 1 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了到期 processing 原问题责任'
+pass '租约到期的长期 processing 无产物责任明确失败'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson active "$RESPONSIBILITY_ACTIVE" \
+  --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" --arg content "$RESPONSIBILITY_CONTENT" \
+  --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 |
+    .outgoing={} | .worker={job:$job,token:"bbbbbbbbbbbbbbbbbbbbbbbb",until:$active} |
+    .jobs=[{id:$job,event:"message:send",status:"processing",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:$active,
+      execution_token:"bbbbbbbbbbbbbbbbbbbbbbbb",responsibility_status:"pending",
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90003}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '仍持有合法活动租约的 processing 责任应警告而非故障'
+assert_answer_counts WARN 0 1 0
+assert_answer_text '需关注' 2 0 1 0 active
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了活动 processing 原问题责任'
+pass '合法活动 processing 租约不被长期无产物规则误报'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" '
+    .mode="ai" | .resume_at=null | .pause_reason=null | .human_event_id=null |
+    .worker=null | .outgoing={} | .jobs=[
+      {id:("7"*64),event:"message:send",status:"cancelled",control:false,
+        revision:$revision,generation:.generation,response_generation:0,sequence:4,
+        received_at:$old,event_time:$old,attempts:1,lease_until:0,
+        responsibility_status:"intentional_silence",responsibility_reason:"human_reply"},
+      {id:("8"*64),event:"message:send",status:"cancelled",control:false,
+        revision:$revision,generation:.generation,response_generation:0,sequence:5,
+        received_at:$old,event_time:$old,attempts:1,lease_until:0,
+        responsibility_status:"intentional_silence",responsibility_reason:"global_disabled"}
+    ]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities PASS
+(( LAST_RC == 0 )) || fail '人工与总关明确静默不应被长期无产物规则计为故障'
+assert_answer_counts PASS 0 0 2
+assert_answer_text '通过' 0 0 0 2 silence
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了人工或总关明确静默责任'
+cp -p -- "${TEST_ROOT}/session.saved" "$SESSION_FILE"
+pass '人工接管与总关明确静默不计入长期无产物责任'
+
 NULL_CONTEXT_SHA=$(printf '%s' null | sha256sum | awk '{print $1}')
 jq --arg context_sha "$NULL_CONTEXT_SHA" '.jobs[0].status="received" |
     .jobs[0].responsibility_status="pending" |

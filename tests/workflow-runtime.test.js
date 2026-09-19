@@ -586,6 +586,211 @@ const abortablePending = (signal, started) => {
     histories.set(session, [{ ...ambiguous.data, ...resolved }, ...(histories.get(session) || [])]);
     return { session, control, visitor, visitorJob };
   };
+  const processingOperatorBarrierCase = async (suffix, resolvedAsHuman) => {
+    const session = 'session_processing-operator-' + suffix;
+    const parallelSession = 'session_processing-operator-parallel-' + suffix;
+    const modelCount = modelRequests.length;
+    const postCount = sendAttempts;
+    const visibleCount = sent.filter((entry) => entry.session_id === session).length;
+    let targetJobId = '';
+    let releaseSettlement;
+    let settlementReleased = false;
+    let settlementEnteredResolve;
+    let settlementAbortedResolve;
+    let settlementSignal;
+    let settlementEnvelope;
+    let heldSettlements = 0;
+    let running;
+    let runningSettled = false;
+    const settlementEntered = new Promise((resolve) => { settlementEnteredResolve = resolve; });
+    const settlementAborted = new Promise((resolve) => { settlementAbortedResolve = resolve; });
+    const settlementRelease = new Promise((resolve) => { releaseSettlement = resolve; });
+    const releaseSettlementGate = () => {
+      if (settlementReleased) return;
+      settlementReleased = true;
+      releaseSettlement();
+    };
+    const boundedResult = async (promise, label, timeout = 5000) => {
+      let value;
+      await awaitNamedGate(Promise.resolve(promise).then((result) => { value = result; }), label, timeout);
+      return value;
+    };
+    const gatedRequest = async (url, options = {}) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === '/proxy/internal/provider/settle' && heldSettlements === 0) {
+        heldSettlements += 1;
+        settlementEnvelope = verifyEnvelope(options.headers['x-crispai-question'], env.PROVIDER_ADAPTER_KEY);
+        settlementSignal = options.signal;
+        const observeAbort = () => settlementAbortedResolve();
+        if (settlementSignal?.aborted) observeAbort();
+        else settlementSignal?.addEventListener('abort', observeAbort, { once: true });
+        settlementEnteredResolve();
+        let timer;
+        try {
+          await Promise.race([settlementRelease, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('等待释放受控 Provider 结算门超过本地截止时间')), 10000);
+          })]);
+        } finally {
+          if (timer) clearTimeout(timer);
+          settlementSignal?.removeEventListener('abort', observeAbort);
+        }
+      }
+      return request(url, options);
+    };
+
+    try {
+      runtime = createRuntime(env, { ...runtimeOptions, request: gatedRequest });
+      const visitor = await receive(message(session, '未确认 operator 屏障前的普通问题'));
+      targetJobId = visitor.jobId;
+      running = runtime.process(visitor.key, visitor.jobId).then((result) => {
+        runningSettled = true;
+        return result;
+      }, (error) => {
+        runningSettled = true;
+        throw error;
+      });
+      await awaitNamedGate(settlementEntered, '普通问题进入 Provider 结算网络门');
+      assert.equal(heldSettlements, 1);
+      assert.equal(settlementEnvelope.question_id, targetJobId,
+        '受控结算门必须绑定当前普通访客责任');
+      const beforeBarrier = state(session);
+      const claimed = beforeBarrier.jobs.find((job) => job.id === visitor.jobId); assert(claimed);
+      assert.equal(claimed.status, 'processing');
+      assert.equal(claimed.attempts, 1);
+      assert(claimed.data && claimed.plan && claimed.inference && claimed.provider_result_receipt
+        && claimed.provider_settlement, '屏障测试必须在答案和推理回执均已持久后挂起');
+      assert.equal(claimed.provider_result_receipt.state, 'available');
+      assert.equal(claimed.provider_settlement.state, 'pending');
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
+      const frozen = Object.fromEntries(['data', 'plan', 'inference', 'provider_result_receipt',
+        'provider_settlement'].map((name) => [name, structuredClone(claimed[name])]));
+
+      now += 1;
+      const operatorFingerprint = ++sequence;
+      const ambiguousData = {
+        session_id: session, from: 'operator', type: 'text', content: '待确认归属的公开 operator 事件',
+        fingerprint: operatorFingerprint, timestamp: now,
+        user: { type: 'website', nickname: '受控待确认来源' },
+      };
+      const control = await receive({ website_id: env.CRISP_WEBSITE_ID,
+        event: 'message:received', timestamp: now, data: ambiguousData });
+      assert.equal(control.route, 'process');
+      assert(state(session).uncertain_events.includes(control.jobId),
+        '未确认 operator 必须先建立持久屏障');
+      await awaitNamedGate(settlementAborted, '未确认 operator 屏障中止普通处理网络');
+      assert.equal(settlementSignal.aborted, true);
+      releaseSettlementGate();
+      const interrupted = await boundedResult(running, '屏障中止后的普通处理收敛');
+
+      const afterBarrier = state(session);
+      const preserved = afterBarrier.jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(preserved.status, 'received',
+        '未确认 operator 屏障只能延后同一责任；不得压成 conversation_state_changed 后终态取消并删除 data');
+      assert(preserved.deferred_control === true || afterBarrier.uncertain_events.includes(control.jobId),
+        '未确认 operator 必须以 deferred_control 或等价持久屏障保留原责任');
+      assert.notEqual(preserved.responsibility_status, 'intentional_silence');
+      assert.equal(preserved.attempts, 1);
+      assert.equal(afterBarrier.worker, null);
+      for (const name of Object.keys(frozen)) {
+        assert.deepEqual(preserved[name], frozen[name], '屏障中止不得改写已持久的 ' + name);
+      }
+      assert.equal(interrupted.status, 'deferred');
+      assert.equal(typeof interrupted.reason, 'string');
+      assert.notEqual(interrupted.reason, 'conversation_state_changed',
+        '未确认屏障不得被压成已确认会话状态变化');
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(sendAttempts, postCount);
+
+      histories.set(session, [{ ...ambiguousData, automated: !resolvedAsHuman },
+        ...(histories.get(session) || [])]);
+      const controlResult = await boundedResult(runtime.process(control.key, control.jobId),
+        'operator 归属控制任务完成');
+      assert(!['failed', 'unresolved'].includes(controlResult.status));
+      const resolvedState = state(session);
+      const resolvedControl = resolvedState.jobs.find((job) => job.id === control.jobId); assert(resolvedControl);
+      assert.equal(resolvedControl.operator_resolution.result, resolvedAsHuman ? 'human' : 'not-human');
+      assert.equal(resolvedControl.responsibility_status, 'control_handled');
+
+      if (!resolvedAsHuman) {
+        const ready = resolvedState.jobs.find((job) => job.id === visitor.jobId); assert(ready);
+        assert.equal(resolvedState.mode, 'ai');
+        assert.equal(ready.status, 'received');
+        assert.equal(ready.deferred_control, undefined);
+        assert.deepEqual(ready.plan, frozen.plan);
+        assert.deepEqual(ready.inference, frozen.inference);
+        assert.deepEqual(ready.provider_result_receipt, frozen.provider_result_receipt);
+        assert.deepEqual(ready.provider_settlement, frozen.provider_settlement);
+        let recovered = await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          'not-human 后恢复原普通问题第一步');
+        if (['provider_settlement_settled', 'provider_settlement_absent'].includes(recovered.status)) {
+          assert.equal(sendAttempts, postCount,
+            '独立 Provider 结算收敛步骤不得提前 POST Crisp');
+          assert.equal(modelRequests.length, modelCount + 1,
+            '独立 Provider 结算收敛步骤不得重新推理');
+          recovered = await boundedResult(runtime.process(visitor.key, visitor.jobId),
+            'not-human 后恢复原普通问题第二步');
+        }
+        assert.equal(recovered.status, 'sent');
+        const completed = state(session).jobs.find((job) => job.id === visitor.jobId); assert(completed);
+        assert.equal(completed.status, 'done');
+        assert.equal(completed.responsibility_status, 'answered_confirmed');
+        assert.equal(modelRequests.length, modelCount + 1,
+          'not-human 恢复必须复用已持久答案，不能重新推理');
+        assert.equal(sendAttempts, postCount + 1);
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount + 1);
+        assert.equal((await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          'not-human 恢复后的重复 process')).status, 'idle');
+        assert.equal(sendAttempts, postCount + 1, '重复 process 不得再次 POST 同一答案');
+      } else {
+        const cancelled = resolvedState.jobs.find((job) => job.id === visitor.jobId); assert(cancelled);
+        assert.equal(resolvedState.mode, 'human');
+        assert.equal(cancelled.status, 'cancelled');
+        assert.equal(cancelled.responsibility_status, 'intentional_silence');
+        assert.equal(cancelled.responsibility_reason, 'human_reply');
+        assert.equal(cancelled.data, undefined);
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount,
+          '确认真人后的迟到答案不得发送');
+        assert.equal(sendAttempts, postCount);
+        assert.equal(modelRequests.length, modelCount + 1);
+        const cleanup = await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          '真人确认后的 Provider 清理');
+        assert(['provider_settlement_settled', 'provider_settlement_absent',
+          'provider_retirement_absent', 'provider_retirement_retired'].includes(cleanup.status),
+          '已冻结 Provider 身份必须通过独立结算或退休步骤收敛，不能静默遗失');
+        assert.equal(sendAttempts, postCount,
+          '真人确认后的结算或退休清理不得 POST Crisp');
+        assert.equal(modelRequests.length, modelCount + 1,
+          '真人确认后的结算或退休清理不得重新推理');
+        assert.equal((await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          '真人确认后的重复原任务')).status, 'idle');
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
+        assert.equal(modelRequests.length, modelCount + 1,
+          '真人取消与 Provider 清理均不得重放推理');
+
+        const parallel = await boundedResult(deliver(message(parallelSession, '另一会话继续正常回答')),
+          '另一会话独立回答');
+        assert.equal(parallel.status, 'sent');
+        assert.equal(state(parallelSession).mode, 'ai');
+        assert.equal(sent.filter((entry) => entry.session_id === parallelSession).length, 1);
+        assert.equal(modelRequests.length, modelCount + 2);
+        assert.equal(sendAttempts, postCount + 1);
+      }
+    } finally {
+      releaseSettlementGate();
+      if (running && !runningSettled) {
+        try { await awaitNamedGate(running.catch(() => undefined),
+          '失败分支释放普通处理网络门', 2000); } catch (_) {}
+      }
+      runtime = createRuntime(env, runtimeOptions);
+    }
+  };
+  await test('P0 processing 遇未确认 operator 后，确认自动化时复用同一答案继续一次', async () => {
+    await processingOperatorBarrierCase('not-human', false);
+  });
+  await test('P0 processing 遇未确认 operator 后，确认真人才静默且另一会话继续', async () => {
+    await processingOperatorBarrierCase('human', true);
+  });
   await test('P0 不确定 operator 回查为自动消息后，期间访客任务继续调度', async () => {
     const before = sent.length;
     const item = await deferredOperatorCase('automated', { automated: true });
