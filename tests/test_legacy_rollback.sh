@@ -195,6 +195,23 @@ bash "${PROJECT_ROOT}/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" \
 [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]] \
   || fail '升级代缺少 doctor.sh'
 
+# 降到不理解 v1.3.0 资料双层状态的旧版本时，不允许管理员跳过成套安全
+# 快照。该策略必须在停服务前拒绝；后续成员完整性与真实回滚场景使用默认
+# 安全路径，不能靠测试参数绕过生产保护。
+: > "$MOCK_DOCKER_LOG"
+unsafe_downgrade_status=0
+"${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" \
+  --snapshot "$LEGACY_SNAPSHOT_ID" --no-safety-snapshot \
+  > "${TEST_ROOT}/unsafe-downgrade.log" 2>&1 || unsafe_downgrade_status=$?
+(( unsafe_downgrade_status != 0 )) || fail '旧版降级错误允许跳过安全快照'
+grep -Fq '降到不识别资料双层状态的旧版本时必须先创建安全快照' \
+  "${TEST_ROOT}/unsafe-downgrade.log" || fail '旧版降级没有准确说明强制安全快照策略'
+if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
+  fail '拒绝不安全旧版降级后仍停止了服务'
+fi
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] \
+  || fail '拒绝不安全旧版降级后修改了当前版本'
+
 # 缺少传统四入口之一的快照即使校验和自洽，也必须在停止服务前拒绝。
 BROKEN_ID="legacy-missing-install-${LEGACY_SNAPSHOT_ID}"
 BROKEN_DIR="${DEPLOY_DIR}/backups/versions/${BROKEN_ID}"
@@ -211,7 +228,7 @@ chmod 600 "${BROKEN_DIR}/snapshot.tar.gz" "${BROKEN_DIR}/manifest.json"
 : > "$MOCK_DOCKER_LOG"
 broken_status=0
 "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" \
-  --snapshot "$BROKEN_ID" --no-safety-snapshot \
+  --snapshot "$BROKEN_ID" \
   > "${TEST_ROOT}/broken-rollback.log" 2>&1 || broken_status=$?
 (( broken_status != 0 )) || fail '缺少传统入口的旧快照被错误接受'
 grep -Fq '版本快照缺少必要入口：install.sh' "${TEST_ROOT}/broken-rollback.log" \
@@ -225,7 +242,7 @@ fi
 
 : > "$MOCK_DOCKER_LOG"
 "${DEPLOY_DIR}/scripts/rollback.sh" --deploy-dir "$DEPLOY_DIR" \
-  --snapshot "$LEGACY_SNAPSHOT_ID" --no-safety-snapshot \
+  --snapshot "$LEGACY_SNAPSHOT_ID" \
   > "${TEST_ROOT}/legacy-rollback.log" 2>&1
 
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.1.0 ]] || fail '旧版快照回滚后 VERSION 不正确'
@@ -252,6 +269,8 @@ grep -Fq '目标快照不含 scripts/doctor.sh，已移除当前版本的受管�
   "${TEST_ROOT}/legacy-rollback.log" || fail '回滚日志未记录 doctor.sh 降代移除'
 grep -Fq '目标快照不含 scripts/visitor-output.js，已移除当前版本的受管模块' \
   "${TEST_ROOT}/legacy-rollback.log" || fail '回滚日志未记录访客输出策略降代移除'
+grep -Fq '回滚前安全快照：' "${TEST_ROOT}/legacy-rollback.log" \
+  || fail '旧版降级没有创建强制安全快照'
 grep -Fq 'pg_restore' "$MOCK_DOCKER_LOG" || fail '旧版快照未实际执行数据库恢复路径'
 grep -Fq -- '--force-recreate anythingllm' "$MOCK_DOCKER_LOG" \
   || fail '旧版快照未实际重建 AnythingLLM bind mount'
