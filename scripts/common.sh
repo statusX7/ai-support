@@ -991,11 +991,11 @@ env_set() {
     fi
   fi
   if (( publish_status != 0 )); then
-    if (( (publish_status == 73 || publish_status == 74) \
-      && ! -e "${env_file}.crispai-atomic.json" \
-      && ! -L "${env_file}.crispai-atomic.json" \
-      && ! -e "${env_file}.crispai-atomic.next" \
-      && ! -L "${env_file}.crispai-atomic.next" )); then
+    if (( publish_status == 73 || publish_status == 74 )) \
+      && [[ ! -e "${env_file}.crispai-atomic.json" \
+        && ! -L "${env_file}.crispai-atomic.json" \
+        && ! -e "${env_file}.crispai-atomic.next" \
+        && ! -L "${env_file}.crispai-atomic.next" ]]; then
       rm -f -- "$source" "$temp"
     fi
     return 1

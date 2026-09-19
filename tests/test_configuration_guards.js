@@ -91,6 +91,10 @@ const pythonWrapper = path.join(pythonWrapperDirectory, 'python3');
 fs.writeFileSync(pythonWrapper, `#!/usr/bin/env bash
 set -euo pipefail
 if [[ \${1:-} == */atomic-config.py && -n \${CRISPAI_TEST_FORCE_EXIT:-} ]]; then
+  if [[ -n \${CRISPAI_TEST_FORCE_MARKER:-} ]]; then
+    printf '%s:%s\n' "$CRISPAI_TEST_FORCE_EXIT" "\${2:-}" > "$CRISPAI_TEST_FORCE_MARKER"
+    chmod 600 "$CRISPAI_TEST_FORCE_MARKER"
+  fi
   exit "$CRISPAI_TEST_FORCE_EXIT"
 fi
 if [[ \${1:-} == */atomic-config.py && \${2:-} == "\${CRISPAI_TEST_RACE_MODE:-}" ]]; then
@@ -125,6 +129,25 @@ assert.equal(fs.readFileSync(createRaceEnv, 'utf8'), 'SAFE=concurrent\n');
 assert.deepEqual(fs.readdirSync(envGuardRoot).filter(name => name.startsWith('create-race.env.source.')
   || name.startsWith('create-race.env.tmp.')), []);
 record('新环境配置原子创建遇并发目标时不覆盖且不伪报成功');
+const recoverableExitEnv = path.join(envGuardRoot, 'recoverable-exit.env');
+const recoverableExitMarker = path.join(envGuardRoot, 'recoverable-exit.marker');
+fs.writeFileSync(recoverableExitEnv, 'SAFE=before\n', { mode: 0o600 });
+guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE candidate', 'guard', recoverableExitEnv], {
+  cwd: project,
+  encoding: 'utf8',
+  env: { ...process.env, PATH: pythonWrapperDirectory + path.delimiter + process.env.PATH,
+    CRISPAI_TEST_REAL_PYTHON: realPython, CRISPAI_TEST_FORCE_EXIT: '74',
+    CRISPAI_TEST_FORCE_MARKER: recoverableExitMarker },
+});
+assert.notEqual(guarded.status, 0, guarded.stderr);
+assert.equal(fs.readFileSync(recoverableExitMarker, 'utf8'), '74:replace\n');
+assert.equal(fs.readFileSync(recoverableExitEnv, 'utf8'), 'SAFE=before\n');
+assert.deepEqual(fs.readdirSync(envGuardRoot).filter(name =>
+  name.startsWith('recoverable-exit.env.source.') || name.startsWith('recoverable-exit.env.tmp.')), []);
+assert.equal(fs.existsSync(recoverableExitEnv + '.crispai-atomic.json'), false);
+assert.equal(fs.existsSync(recoverableExitEnv + '.crispai-atomic.next'), false);
+fs.unlinkSync(recoverableExitMarker);
+record('原子helper明确返回可恢复错误且无journal时清理本次临时材料');
 const unknownExitEnv = path.join(envGuardRoot, 'unknown-exit.env');
 fs.writeFileSync(unknownExitEnv, 'SAFE=before\n', { mode: 0o600 });
 guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE candidate', 'guard', unknownExitEnv], {
