@@ -195,6 +195,24 @@ bash "${PROJECT_ROOT}/scripts/launcher.sh" install --deploy-dir "$DEPLOY_DIR" \
 [[ -f "${DEPLOY_DIR}/scripts/doctor.sh" && ! -L "${DEPLOY_DIR}/scripts/doctor.sh" ]] \
   || fail '升级代缺少 doctor.sh'
 
+# 当前代的强制安全快照只接受已经由统一资料事务发布、并与规范原文包
+# 同代的 applied 投影。旧版安装没有这一状态，因此升级夹具也必须走正式
+# initialize CLI；不能手工伪造 materials JSON 来绕过生产预检。
+bash "${DEPLOY_DIR}/scripts/materials.sh" --deploy-dir "$DEPLOY_DIR" initialize \
+  > "${TEST_ROOT}/materials-initialize.log"
+jq -M -e '
+  .initialized == true and .state == "applied" and
+  (.revision | type == "number" and floor == . and . >= 1) and
+  (.source_sha256 | test("^[a-f0-9]{64}$"))
+' "${TEST_ROOT}/materials-initialize.log" >/dev/null \
+  || fail '当前程序代未通过受管资料初始化形成 applied 投影'
+jq -M -e '.schema_version == 2 and .state == "applied"' \
+  "${DEPLOY_DIR}/config/materials-applied.json" >/dev/null \
+  || fail '当前程序代缺少有效 schema v2 applied 资料投影'
+[[ -f "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+  && ! -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" ]] \
+  || fail '当前程序代缺少同代规范资料原文包'
+
 # 降到不理解 v1.3.0 资料双层状态的旧版本时，不允许管理员跳过成套安全
 # 快照。该策略必须在停服务前拒绝；后续成员完整性与真实回滚场景使用默认
 # 安全路径，不能靠测试参数绕过生产保护。
