@@ -1314,6 +1314,45 @@ function createRuntime(env = {}, options = {}) {
   };
   const processingCancelled = (error) => error?.code === 'PROCESSING_CANCELLED';
   const processingInterrupted = (error) => processingPermitLost(error) || processingCancelled(error);
+  const retryableVectorNetworkFailure = (error) => {
+    if (!error || processingInterrupted(error)) return false;
+    const retryableCodes = new Set([
+      'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN',
+      'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+      'UND_ERR_ABORTED', 'UND_ERR_DESTROYED', 'ERR_INVALID_STATE',
+    ]);
+    const pending = [{ value: error, depth: 0 }];
+    const seen = new Set();
+    let inspected = 0;
+    while (pending.length && inspected < 12) {
+      const { value, depth } = pending.shift();
+      if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) continue;
+      seen.add(value);
+      inspected += 1;
+      let code = '';
+      let message = '';
+      let cause;
+      let errors = [];
+      try {
+        code = String(value.code || '');
+        message = value.message;
+        if (depth < 2) {
+          cause = value.cause;
+          if (Array.isArray(value.errors)) errors = value.errors.slice(0, 4);
+        }
+      } catch (_) { continue; }
+      if (retryableCodes.has(code) || message === '请求超时') return true;
+      if (depth >= 2) continue;
+      const enqueue = (nested) => {
+        if (inspected + pending.length >= 12 || !nested
+          || (typeof nested !== 'object' && typeof nested !== 'function') || seen.has(nested)) return;
+        pending.push({ value: nested, depth: depth + 1 });
+      };
+      enqueue(cause);
+      for (const nested of errors) enqueue(nested);
+    }
+    return false;
+  };
   const combinedAbortSignal = (...values) => {
     const signals = values.filter((signal) => signal && typeof signal.addEventListener === 'function');
     if (!signals.length) return { signal: undefined, cleanup() {} };
@@ -4527,9 +4566,22 @@ function createRuntime(env = {}, options = {}) {
       // 其它问题仍以当前问题单独做向量召回，历史只在最终生成阶段进入上下文。
       if (!strongLexical) {
         try {
-          const response = await guardedNetwork(workspaceUrl + '/vector-search', {
-            method: 'POST', timeout: Math.min(inferenceRemaining(job), 15000), headers: authorization, body: { query: text },
-          }, execution);
+          let response;
+          for (let attempt = 1; attempt <= 2; attempt += 1) {
+            assertProcessingPermit(execution);
+            if (!await current()) return null;
+            const remaining = inferenceRemaining(job);
+            if (!remaining) return fail('question_budget_exhausted');
+            try {
+              response = await guardedNetwork(workspaceUrl + '/vector-search', {
+                method: 'POST', timeout: Math.min(remaining, 15000), headers: authorization, body: { query: text },
+              }, execution);
+              break;
+            } catch (error) {
+              if (processingInterrupted(error) || execution?.signal?.aborted) throw error;
+              if (attempt >= 2 || !retryableVectorNetworkFailure(error)) throw error;
+            }
+          }
           if (!await current()) return null;
           // 先独立校验固定组件响应；错误结构不能借词法命中伪装成正常向量结果。
           prepareKnowledgeContext({ question: text, prompt, history: prior, directive,
