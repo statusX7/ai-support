@@ -12,6 +12,93 @@ fixture_compose_owned() {
     && "$4" == --env-file && "$5" == "$fixture_dir/.env" && "$6" == -f && "$7" == "$fixture_dir/docker-compose.yml" \
     && -f "$fixture_dir/docker-compose.yml" && ! -L "$fixture_dir/.env" && ! -L "$fixture_running" ]]
 }
+
+# 生产读回会在 n8n 容器内校验整期资料代，而不是仅比较投影文件 SHA。
+# 生命周期夹具在宿主隔离根执行同一份契约，避免初始化和安全快照假绿。
+fixture_materials_projection_readback() {
+  node - "$fixture_dir" <<'NODE'
+'use strict';
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const deploy = process.argv[2];
+const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const canonical = (value) => Array.isArray(value)
+  ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object'
+    ? '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const regular = (file, maximum, optional = false) => {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > maximum) {
+      throw new Error('unsafe');
+    }
+    return fs.readFileSync(file);
+  } catch (error) {
+    if (optional && error.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+const env = {};
+for (const line of fs.readFileSync(path.join(deploy, '.env'), 'utf8').split(/\r?\n/)) {
+  if (!line || line.startsWith('#') || !line.includes('=')) continue;
+  const index = line.indexOf('=');
+  const name = line.slice(0, index);
+  let value = line.slice(index + 1);
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    value = JSON.parse(value.replace(/\$\$/g, '$'));
+  } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    value = value.slice(1, -1);
+  }
+  if (!(name in env)) env[name] = value;
+}
+const projectionRaw = regular(path.join(deploy, 'config/materials-applied.json'), 16777216);
+const value = JSON.parse(projectionRaw.toString('utf8'));
+if (value.schema_version !== 2 || value.state !== 'applied'
+  || value.configuration?.runtime?.revision !== value.revision
+  || value.configuration.runtime.applied_revision !== value.revision) throw new Error('projection');
+const runtime = { ...value.configuration.runtime };
+delete runtime.revision;
+delete runtime.applied_revision;
+const embedded = { runtime, handoff: value.configuration.handoff, keyword: value.configuration.keyword,
+  menu: value.configuration.menu, tags: value.configuration.tags, feedback: value.configuration.feedback };
+for (const [name, item] of Object.entries(embedded)) {
+  if (digest(canonical(item)) !== value.source_components?.[name]) throw new Error('component');
+}
+if (digest(value.prompt.text) !== value.prompt.sha256
+  || Buffer.byteLength(value.prompt.text) !== value.prompt.bytes
+  || value.source_components.prompt !== value.prompt.sha256) throw new Error('prompt');
+if (digest(canonical(value.knowledge)) !== value.source_components.knowledge
+  || digest(canonical(value.source_components)) !== value.source_sha256) throw new Error('identity');
+const base = path.join(deploy, 'data/runtime');
+const map = regular(path.join(base, 'knowledge-map.json'), 16777216);
+const settings = regular(path.join(base, 'knowledge-settings.json'), 65536);
+const lexical = regular(path.join(base, 'knowledge-lexical.json'), 16777216);
+const profile = regular(path.join(base, 'knowledge-profile.json'), 65536, true);
+if (digest(map) !== value.knowledge.map_sha256 || digest(settings) !== value.knowledge.settings_sha256
+  || digest(lexical) !== value.knowledge.lexical_sha256
+  || (profile === null ? '' : digest(profile)) !== value.knowledge.profile_sha256) {
+  throw new Error('runtime knowledge');
+}
+const mapValue = JSON.parse(map.toString('utf8'));
+const settingsValue = JSON.parse(settings.toString('utf8'));
+if (mapValue?.schema_version !== 2 || !Array.isArray(mapValue.documents)
+  || mapValue.documents.length !== value.knowledge.enabled_document_count) throw new Error('map count');
+if (settingsValue?.schema_version !== 1
+  || settingsValue.workspace_slug !== String(env.ANYTHINGLLM_WORKSPACE || 'crisp-support')
+  || typeof settingsValue.temperature !== 'number' || !Number.isFinite(settingsValue.temperature)
+  || settingsValue.temperature < 0 || settingsValue.temperature > 2
+  || !Number.isSafeInteger(settingsValue.observed_at) || settingsValue.observed_at < 0) throw new Error('settings');
+if (profile !== null) {
+  const profileValue = JSON.parse(profile.toString('utf8'));
+  if (profileValue?.schema_version !== 1 || profileValue.state !== 'applied'
+    || !/^[a-f0-9]{64}$/.test(profileValue.fingerprint || '')
+    || digest(canonical(profileValue.profile)) !== profileValue.fingerprint) throw new Error('profile');
+} else if (value.knowledge.enabled_document_count > 0) throw new Error('profile missing');
+process.stdout.write(digest(projectionRaw) + ':' + value.revision + ':ready');
+NODE
+}
 if [[ $# -eq 4 && "$1" == context && "$2" == inspect && "$3" == --format && "$4" == '{{(index .Endpoints "docker").Host}}' ]]; then
   printf 'unix:///var/run/docker.sock\n'
   exit 0
@@ -107,8 +194,18 @@ if [[ "$*" == *" ps --services --filter status=running"* ]]; then
   fi
   exit 0
 fi
-if [[ "$*" == *materials-applied.json* ]]; then
-  sha256sum -- "${CONFIGURATION_FIXTURE_DEPLOY:?}/config/materials-applied.json" | awk '{printf "%s",$1}'
+if [[ $# -eq 13 && "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == n8n \
+  && "${11:-}" == node && "${12:-}" == -e \
+  && "${13:-}" == *'/opt/crisp-ai/config/materials-applied.json'* \
+  && "${13:-}" == *'crypto.createHash("sha256")'* ]]; then
+  fixture_compose_owned "$@" || exit 64
+  [[ -f "$fixture_dir/config/materials-applied.json" \
+    && ! -L "$fixture_dir/config/materials-applied.json" ]] || exit 1
+  if [[ "${13}" == *'digest(projectionRaw)+":"+value.revision+":ready"'* ]]; then
+    fixture_materials_projection_readback
+  else
+    sha256sum -- "$fixture_dir/config/materials-applied.json" | awk '{printf "%s",$1}'
+  fi
   exit 0
 fi
 if [[ "$*" == *"exec -T anythingllm node -e"* && "$*" == *"/chat/completions"* ]]; then
