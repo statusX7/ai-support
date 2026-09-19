@@ -1280,65 +1280,105 @@ materials_cleanup_workspace_delta() {
 
 materials_external_restore() {
   local deploy_dir=$1 recovery=$2 restore_prompt=${3:-true} restore_knowledge=${4:-true} revision=$5
-  local stage restore_deploy current_locations restored_projection status=0
-  python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" cleanup-upload-orphan >/dev/null || return 1
-  python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" validate >/dev/null || return 1
-  stage=$(mktemp -d "${deploy_dir}/tmp/materials-restore.XXXXXXXX") || return 1
+  local stage restore_deploy current_locations restored_projection status=0 failure_stage='准备恢复事务'
+  if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+      --recovery "$recovery" cleanup-upload-orphan >/dev/null; then
+    materials_error "资料外部恢复未完成：${failure_stage}"
+    return 1
+  fi
+  failure_stage='校验旧资料保全'
+  if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+      --recovery "$recovery" validate >/dev/null; then
+    materials_error "资料外部恢复未完成：${failure_stage}"
+    return 1
+  fi
+  failure_stage='建立受限恢复目录'
+  stage=$(mktemp -d "${deploy_dir}/tmp/materials-restore.XXXXXXXX") \
+    || { materials_error "资料外部恢复未完成：${failure_stage}"; return 1; }
   restore_deploy="${stage}/deploy"
+  failure_stage='读取旧资料原文包'
   materials_snapshot_extract "${recovery}/source.tar.gz" "$restore_deploy" \
-    || { rm -rf -- "$stage"; return 1; }
+    || { materials_error "资料外部恢复未完成：${failure_stage}"; rm -rf -- "$stage"; return 1; }
+  failure_stage='准备旧资料重建目录'
   mkdir -p -- "${restore_deploy}/tmp" "${restore_deploy}/data" \
-    || { rm -rf -- "$stage"; return 1; }
+    || { materials_error "资料外部恢复未完成：${failure_stage}"; rm -rf -- "$stage"; return 1; }
   if [[ "$restore_prompt" == true ]]; then
+    failure_stage='恢复 Prompt'
     configuration_prompt_sync_file "$deploy_dir" "${restore_deploy}/config/prompt.md" >/dev/null 2>&1 || status=1
   fi
   if (( status == 0 )) && [[ "$restore_knowledge" == true ]]; then
     anythingllm_connection "$deploy_dir"
+    failure_stage='读取当前知识位置'
     current_locations=$(mktemp "${deploy_dir}/tmp/materials-workspace-current.XXXXXXXX") \
-      || { rm -rf -- "$stage"; return 1; }
-    if ! anythingllm_workspace_locations > "$current_locations" \
-      || ! materials_cleanup_workspace_delta "$deploy_dir" "$recovery" "$current_locations"; then
+      || { materials_error "资料外部恢复未完成：${failure_stage}"; rm -rf -- "$stage"; return 1; }
+    if ! anythingllm_workspace_locations > "$current_locations"; then
       status=1
     fi
     if (( status == 0 )); then
+      failure_stage='清理本次未完成知识变更'
+      materials_cleanup_workspace_delta "$deploy_dir" "$recovery" "$current_locations" || status=1
+    fi
+    if (( status == 0 )); then
+      failure_stage='复核清理后的知识位置'
       anythingllm_workspace_locations > "$current_locations" || status=1
       if (( status == 0 )); then
+        failure_stage='准备旧知识重建记录'
         python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
           --recovery "$recovery" prepare-rebuild --current-workspace-locations "$current_locations" >/dev/null \
           || status=1
       fi
       if (( status == 0 )); then
+        failure_stage='生成旧知识投影源'
         knowledge_catalog_project "$restore_deploy" || status=1
       fi
       if (( status == 0 )); then
+        failure_stage='重建旧知识索引'
         knowledge_sync_legacy "$deploy_dir" 1 null "${restore_deploy}/knowledge" >&2 || status=1
       fi
       if (( status == 0 )); then
+        failure_stage='发布旧知识投影清单'
         install -m 600 -- "${restore_deploy}/data/knowledge-projection.json" \
           "${deploy_dir}/data/knowledge-projection.json" || status=1
       fi
       if (( status == 0 )); then
+        failure_stage='回读旧知识目录'
         knowledge_catalog_readback "$deploy_dir" all false "${restore_deploy}/knowledge/catalog.json" false || status=1
       fi
     fi
     rm -f -- "$current_locations"
   fi
-  if (( status == 0 )) \
-    && ! materials_knowledge_generation_validate "$deploy_dir" "${restore_deploy}/knowledge/catalog.json"; then
-    status=1
+  if (( status == 0 )); then
+    failure_stage='校验旧知识重建代次'
+    materials_knowledge_generation_validate "$deploy_dir" "${restore_deploy}/knowledge/catalog.json" || status=1
   fi
   if (( status == 0 )); then
     restored_projection="${stage}/materials-restored.json"
-      python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-        --recovery "$recovery" build-projection --revision "$revision" --output "$restored_projection" >/dev/null \
-      && materials_snapshot_publish "$deploy_dir" "${recovery}/source.tar.gz" \
-        "${deploy_dir}/backups/config-history/materials.applied.tar.gz" \
-      && materials_projection_write "$deploy_dir" "$restored_projection" \
-      && materials_applied_external_readback "$deploy_dir" \
-        "${deploy_dir}/backups/config-history/materials.applied.tar.gz" "$restored_projection" \
-      && materials_recovery_finish_tracking "$deploy_dir" || status=1
+    failure_stage='生成旧资料恢复投影'
+    if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+        --recovery "$recovery" build-projection --revision "$revision" --output "$restored_projection" >/dev/null; then
+      status=1
+    fi
+    if (( status == 0 )); then
+      failure_stage='发布旧资料原文包'
+      materials_snapshot_publish "$deploy_dir" "${recovery}/source.tar.gz" \
+        "${deploy_dir}/backups/config-history/materials.applied.tar.gz" || status=1
+    fi
+    if (( status == 0 )); then
+      failure_stage='发布旧资料恢复投影'
+      materials_projection_write "$deploy_dir" "$restored_projection" || status=1
+    fi
+    if (( status == 0 )); then
+      failure_stage='回读旧资料恢复结果'
+      materials_applied_external_readback "$deploy_dir" \
+        "${deploy_dir}/backups/config-history/materials.applied.tar.gz" "$restored_projection" || status=1
+    fi
+    if (( status == 0 )); then
+      failure_stage='收口旧资料恢复责任'
+      materials_recovery_finish_tracking "$deploy_dir" || status=1
+    fi
+  fi
+  if (( status != 0 )); then
+    materials_error "资料外部恢复未完成：${failure_stage}"
   fi
   rm -rf -- "$stage"
   (( status == 0 ))
