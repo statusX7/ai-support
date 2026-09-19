@@ -212,7 +212,8 @@ prepare_fixture() {
   for name in common.sh doctor.sh healthcheck.sh provider.sh configuration.sh provider-adapter.js visitor-output.js launcher.sh bootstrap.sh \
     wizard.sh package-release.sh knowledge.sh migration.sh crisp-settings.sh full-backup.sh archive-guard.py \
     backup.sh restore.sh analytics.sh snapshot.sh rollback.sh menu-ui.sh materials.sh logs.sh log-redact.py \
-    knowledge-profile.py knowledge-profile.sh knowledge-component.js knowledge-lexical.py; do
+    materials-recovery.py atomic-config.py knowledge-profile.py knowledge-profile.sh \
+    knowledge-component.js knowledge-lexical.py; do
     cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
   done
   for name in runtime provider keyword menu handoff tags feedback logging; do
@@ -760,6 +761,56 @@ doctor_permit_cases() {
   pass '许可 doctor 区分坏权限/链接/不可回收过期与合法短时饱和，且仅显式停写修复明确过期项'
 }
 
+doctor_atomic_config_cases() {
+  local name marker before_digest
+  local -a modules=(provider-router.js provider-envelope.js provider-pool.py
+    menu-display.py menu-provider-ui.sh materials-recovery.py atomic-config.py)
+  local -a temporary_modules=(provider-router.js provider-envelope.js provider-pool.py
+    menu-display.py menu-provider-ui.sh)
+  cp -p -- "${DEPLOY}/VERSION" "${TEST_ROOT}/doctor-atomic-version.saved"
+  cp -p -- "${DEPLOY}/.crisp-ai-installation" \
+    "${TEST_ROOT}/doctor-atomic-installation.saved"
+  printf 'v1.3.0\n' > "${DEPLOY}/VERSION"
+  sed -i 's/^installed_version=.*/installed_version=v1.3.0/' \
+    "${DEPLOY}/.crisp-ai-installation"
+  for name in "${modules[@]}"; do
+    cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
+  done
+
+  for name in materials-recovery.py atomic-config.py; do
+    rm -f -- "${DEPLOY}/scripts/${name}"
+    invoke --local
+    (( LAST_RC == 1 )) || fail "v1.3.0 缺少 ${name} 时必须退出 1"
+    assert_result installation.files FAIL
+    cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
+  done
+  invoke --local
+  assert_result installation.files PASS
+  assert_result config.atomic_transaction PASS
+
+  for marker in .env.crispai-atomic.json .env.crispai-atomic.next \
+    .env.source.fixture .env.tmp.fixture; do
+    printf 'synthetic restricted recovery material\n' > "${DEPLOY}/${marker}"
+    chmod 0600 "${DEPLOY}/${marker}"
+    before_digest=$(sha256sum "${DEPLOY}/${marker}" | cut -d ' ' -f 1)
+    invoke --local
+    (( LAST_RC == 1 )) || fail "未决敏感配置材料 ${marker} 应退出 1"
+    assert_result config.atomic_transaction FAIL
+    [[ -f "${DEPLOY}/${marker}" && ! -L "${DEPLOY}/${marker}" \
+      && "$before_digest" == "$(sha256sum "${DEPLOY}/${marker}" | cut -d ' ' -f 1)" ]] \
+      || fail "只读 doctor 改写或删除了 ${marker}"
+    rm -f -- "${DEPLOY}/${marker}"
+  done
+
+  cp -p -- "${TEST_ROOT}/doctor-atomic-version.saved" "${DEPLOY}/VERSION"
+  cp -p -- "${TEST_ROOT}/doctor-atomic-installation.saved" \
+    "${DEPLOY}/.crisp-ai-installation"
+  for name in "${temporary_modules[@]}"; do
+    rm -f -- "${DEPLOY}/scripts/${name}"
+  done
+  pass 'v1.3.0 doctor 要求完整事务 helper，并只读暴露日志、过渡日志及无归属恢复材料'
+}
+
 if [[ "${DOCTOR_TEST_FOCUS:-}" == workflow ]]; then
   doctor_workflow_lexical_cases
   pass '工作流实际 Node 校验的 6 个词法内联、挂载与漏件正负例'
@@ -778,12 +829,18 @@ elif [[ "${DOCTOR_TEST_FOCUS:-}" == permits ]]; then
   doctor_permit_cases
   printf '后台任务执行许可自检聚焦完成，%s 组通过。\n' "$PASSED"
   exit 0
+elif [[ "${DOCTOR_TEST_FOCUS:-}" == atomic ]]; then
+  doctor_atomic_config_cases
+  printf '敏感配置原子事务自检聚焦完成，%s 组通过。\n' "$PASSED"
+  exit 0
 fi
 
 before=$(business_hash)
 SESSION_FILE=$(find "${DEPLOY}/data/runtime" -maxdepth 1 -type f -name 'session-*.json' -print -quit)
 ORIGINAL_WEBSITE_HOOK_SECRET=$(env_get "${DEPLOY}/.env" CRISP_WEBSITE_HOOK_SECRET)
 ORIGINAL_DB_PASSWORD=$(env_get "${DEPLOY}/.env" POSTGRES_PASSWORD)
+
+doctor_atomic_config_cases
 
 # install.sh/update.sh 使用的 legacy --application 门禁必须只验证本地接线，
 # 不能在每次安装或回滚健康判断中产生付费模型请求。

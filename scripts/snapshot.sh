@@ -153,6 +153,21 @@ snapshot_version_at_least() {
     || (10#$major == wanted_major && 10#$minor == wanted_minor && 10#$patch >= wanted_patch) ))
 }
 
+snapshot_assert_atomic_config_settled() {
+  local -a artifacts=()
+  local marker
+  for marker in "${DEPLOY_DIR}/.env.crispai-atomic.json" \
+    "${DEPLOY_DIR}/.env.crispai-atomic.next"; do
+    [[ ! -e "$marker" && ! -L "$marker" ]] \
+      || die '敏感配置提交事务尚未收口；拒绝把恢复责任写入版本快照'
+  done
+  shopt -s nullglob
+  artifacts=("${DEPLOY_DIR}"/.env.source.* "${DEPLOY_DIR}"/.env.tmp.*)
+  shopt -u nullglob
+  (( ${#artifacts[@]} == 0 )) \
+    || die '敏感配置存在未归属的恢复材料；拒绝创建可能混代的版本快照'
+}
+
 # get.sh 与 doctor.sh 是 v1.1.1 新增的版本能力。目标版本自身缺失时拒绝生成
 # 不完整快照；从 v1.1.0 升级时则允许旧部署尚无这些文件。
 if snapshot_version_at_least "$VERSION_VALUE" 1 1 1; then
@@ -181,6 +196,34 @@ fi
 if snapshot_version_at_least "$VERSION_VALUE" 1 2 2; then
   # adapter 会直接 require 这一公共访客输出策略；必须与调用者成套快照。
   SCRIPT_FILES+=(visitor-output.js)
+fi
+if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
+  # materials.sh 的失败恢复与敏感配置发布依赖同版事务 helper；缺一不可
+  # 建立可回滚快照。
+  SCRIPT_FILES+=(materials-recovery.py atomic-config.py)
+  snapshot_assert_atomic_config_settled
+  # shellcheck source=scripts/materials.sh
+  source "${SCRIPT_DIR}/materials.sh"
+  materials_recovery_cleanup_orphans "$DEPLOY_DIR" \
+    || die '资料恢复遗留临时对象不安全；拒绝创建版本快照'
+  [[ ! -e "${DEPLOY_DIR}/backups/config-history/materials.recovery" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history/materials.recovery" ]] \
+    || die '资料应用事务尚未收口；不能建立会丢失恢复责任的版本快照'
+  [[ -f "${DEPLOY_DIR}/config/materials-applied.json" \
+    && ! -L "${DEPLOY_DIR}/config/materials-applied.json" ]] \
+    && jq -e '.schema_version == 2 and .state == "applied"' \
+      "${DEPLOY_DIR}/config/materials-applied.json" >/dev/null \
+    || die '资料投影尚未完整应用；不能建立版本快照'
+  [[ ! -e "${DEPLOY_DIR}/backups/config-history/materials.initialize" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history/materials.initialize" ]] \
+    || die '资料初始化事务尚未收口；不能建立混合代快照'
+  [[ -f "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" ]] \
+    || die '资料规范原文包缺失或不安全'
+  materials_applied_external_readback "$DEPLOY_DIR" \
+    "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    "${DEPLOY_DIR}/config/materials-applied.json" \
+    || die '资料原文、知识索引、投影或运行回读不同代；拒绝快照'
 fi
 
 snapshot_validate_file() {
@@ -358,6 +401,9 @@ SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/postgres")
 for name in "${OPTIONAL_DATA_FILES[@]}"; do
   [[ ! -f "${DEPLOY_DIR}/data/${name}" ]] || SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/${name}")
 done
+if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
+  SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz")
+fi
 
 snapshot_capacity_check() {
   local reserve_kib required_kib source
@@ -414,7 +460,7 @@ trap cleanup EXIT
 
 mkdir -p -- "$STAGING/payload/config" "$STAGING/payload/knowledge" "$STAGING/payload/n8n" \
   "$STAGING/payload/scripts" "$STAGING/payload/docs" "$STAGING/payload/data/anythingllm" \
-  "$STAGING/payload/data/postgres"
+  "$STAGING/payload/data/postgres" "$STAGING/payload/backups/config-history"
 
 require_docker_runtime
 RUNNING_SERVICES=$(docker_compose "$DEPLOY_DIR" ps --services --filter status=running 2>/dev/null || true)
@@ -520,6 +566,10 @@ for name in "${OPTIONAL_DATA_FILES[@]}"; do
     install -m 0600 -- "${DEPLOY_DIR}/data/${name}" "$STAGING/payload/data/${name}"
   fi
 done
+if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
+  install -m 0600 -- "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    "$STAGING/payload/backups/config-history/materials.applied.tar.gz"
+fi
 
 if find "${DEPLOY_DIR}/data/anythingllm" -mindepth 1 \! -type f \! -type d -print -quit | grep -q .; then
   die "AnythingLLM 数据包含链接或特殊文件，拒绝创建回滚快照"
@@ -543,6 +593,20 @@ fi
   die "n8n PostgreSQL 逻辑备份为空"
 }
 chmod 600 "$STAGING/payload/data/postgres/n8n.dump"
+
+# 源树可能在逐目录复制期间被外部编辑。归档前以已经复制完成的 payload
+# 重新核对 canonical、投影、manifest/map/profile/cache 与词法索引，避免
+# 把各自正确但彼此不同代的文件冻结成“可恢复”快照。editable Prompt/知识
+# 可以合法领先于 applied 代，因此本门禁只用 canonical 作为运行代依据。
+mkdir -m 0700 -p -- "$STAGING/payload/tmp"
+if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
+  materials_snapshot_validate_generation "$STAGING/payload" \
+    "$STAGING/payload/backups/config-history/materials.applied.tar.gz" \
+    "$STAGING/payload/config/materials-applied.json" \
+    || { restart_paused_services; die '版本快照复制期间资料代次发生变化，未生成混合快照'; }
+fi
+rmdir -- "$STAGING/payload/tmp" \
+  || { restart_paused_services; die '版本快照校验留下了未收口临时文件'; }
 
 IMAGES='[]'
 N8N_IMAGE_VALUE=$(env_get "${DEPLOY_DIR}/.env" N8N_IMAGE 2>/dev/null || printf 'docker.n8n.io/n8nio/n8n:2.33.0')

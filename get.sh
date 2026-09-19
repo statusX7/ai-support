@@ -484,6 +484,12 @@ EOF
   cat <<'EOF'
 scripts/visitor-output.js
 EOF
+  capability=$(version_compare "$release" v1.3.0)
+  (( capability >= 0 )) || return 0
+  cat <<'EOF'
+scripts/materials-recovery.py
+scripts/atomic-config.py
+EOF
 }
 
 resolve_latest_release() {

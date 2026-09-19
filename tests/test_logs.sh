@@ -61,7 +61,8 @@ prepare() {
   local name
   mkdir -p "$DEPLOY"/{scripts,config,logs/doctor-history,logs/diagnostics,tmp,knowledge,data/runtime,data/analytics,backups} \
     "$SYSTEMD_DIR" "$SYSTEMD_STATE"
-  cp -p "$PROJECT_ROOT/scripts/common.sh" "$PROJECT_ROOT/scripts/logs.sh" "$PROJECT_ROOT/scripts/log-redact.py" "$DEPLOY/scripts/"
+  cp -p "$PROJECT_ROOT/scripts/common.sh" "$PROJECT_ROOT/scripts/atomic-config.py" \
+    "$PROJECT_ROOT/scripts/logs.sh" "$PROJECT_ROOT/scripts/log-redact.py" "$DEPLOY/scripts/"
   cp -p "$PROJECT_ROOT/scripts/bootstrap.sh" "$PROJECT_ROOT/scripts/wizard.sh" "$PROJECT_ROOT/scripts/menu-ui.sh" \
     "$PROJECT_ROOT/scripts/menu-provider-ui.sh" "$PROJECT_ROOT/scripts/menu-display.py" "$DEPLOY/scripts/"
   cp -p "$PROJECT_ROOT/manage.sh" "$DEPLOY/manage.sh"

@@ -274,10 +274,13 @@ async function main(){
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
       assert(!fs.existsSync(path.join(payload,'config/provider-pool-readback.json')));
-      for(const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
+      for(const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh','materials-recovery.py','atomic-config.py'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
       for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert.equal(fs.statSync(path.join(payload,'data/knowledge-projection.json')).mode&0o777,0o600);
+      assert.deepEqual(fs.readFileSync(path.join(payload,'backups/config-history/materials.applied.tar.gz')),
+        fs.readFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz')));
+      assert.equal(fs.statSync(path.join(payload,'backups/config-history/materials.applied.tar.gz')).mode&0o777,0o600);
       assert.deepEqual(fs.readFileSync(path.join(payload,'.env')),fs.readFileSync(path.join(f.deploy,'.env')));
       assert.match(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8'),/stop .*provider-adapter/);
 
@@ -305,6 +308,8 @@ async function main(){
       fs.mkdirSync(directory);const archive=path.join(directory,'snapshot.tar.gz');
       await checked('tar',['-czf',archive,'-C',stage,'payload']);
       write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
+      const expectedMaterials=fs.readFileSync(path.join(payload,'backups/config-history/materials.applied.tar.gz'));
+      fs.writeFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz'),'synthetic-invalid-current-canonical',{mode:0o600});
 
       const guardBin=path.join(work,'readback-guard-bin'),guardLog=path.join(work,'readback-guard.log');
       fs.mkdirSync(guardBin);write(guardLog,'');
@@ -330,6 +335,7 @@ async function main(){
       assert.notEqual(receipt.verified_at,1);assert.equal(receipt.revision,current.revision);
       assert.equal(receipt.secrets_generation,current.secrets_generation);
       assert.equal(receipt.pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
+      assert.deepEqual(fs.readFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz')),expectedMaterials);
       await f.ok('provider.sh',['readback']);
     });
     await test('PL09 缺秘密代次的自洽快照在停服务前拒绝，不留下混合恢复',async()=>{
@@ -339,6 +345,37 @@ async function main(){
       write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
       const before=f.capture();write(f.snapshotEnv.MOCK_DOCKER_LOG,'');const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],f.snapshotEnv);
       assert.notEqual(result.code,0);assert.match(result.stderr,/接口池与秘密代次不完整/);assert.deepEqual(f.capture(),before);assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+    });
+    await test('PL09A 活动资料恢复或初始化事务在停服务前阻止版本回滚',async()=>{
+      for(const journal of ['materials.recovery','materials.initialize']){
+        const target=path.join(f.deploy,'backups/config-history',journal);fs.mkdirSync(target,{mode:0o700});
+        try{
+          const before=f.capture();write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+          const result=await f.invoke('rollback.sh',['--snapshot',path.basename(fullSnapshot),'--no-safety-snapshot'],f.snapshotEnv);
+          assert.notEqual(result.code,0,journal);assert.match(result.stderr,/资料事务尚未收口/,journal);
+          assert.deepEqual(f.capture(),before);assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')),journal);
+        }finally{fs.rmdirSync(target);}
+      }
+    });
+    await test('PL09B 未决敏感配置事务与恢复材料在停服务前阻止无安全快照回滚',async()=>{
+      const variants=[
+        ['journal','.env.crispai-atomic.json',/敏感配置提交事务尚未收口/],
+        ['transition','.env.crispai-atomic.next',/敏感配置提交事务尚未收口/],
+        ['source','.env.source.synthetic',/敏感配置存在未归属恢复材料/],
+        ['candidate','.env.tmp.synthetic',/敏感配置存在未归属恢复材料/],
+      ];
+      for(const [name,relative,expected] of variants){
+        const target=path.join(f.deploy,relative),body='synthetic-atomic-recovery-'+name+'\n';
+        write(target,body);
+        try{
+          const before=f.capture(),callCount=f.calls.length;write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+          const result=await f.invoke('rollback.sh',['--snapshot',path.basename(fullSnapshot),'--no-safety-snapshot'],f.snapshotEnv);
+          assert.notEqual(result.code,0,name);assert.match(result.stderr,expected,name);
+          assert.deepEqual(f.capture(),before,name);assert.equal(f.calls.length,callCount,name);
+          assert.equal(fs.readFileSync(target,'utf8'),body,name);
+          assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')),name);
+        }finally{fs.unlinkSync(target);}
+      }
     });
     await test('PL12 知识中间代、部分模块及冒充旧候选的自洽载荷全部停前拒绝',async()=>{
       const clearNewModules=payload=>{
@@ -359,6 +396,20 @@ async function main(){
         ['missing-runtime',payload=>fs.unlinkSync(path.join(payload,'n8n/runtime.js')),/缺少必要文件.*runtime/],
         ['missing-adapter',payload=>fs.unlinkSync(path.join(payload,'scripts/provider-adapter.js')),/主备版本快照缺少必要文件.*provider-adapter/],
         ['missing-visitor-output',payload=>fs.unlinkSync(path.join(payload,'scripts/visitor-output.js')),/访客输出策略快照缺少必要文件.*visitor-output/],
+        ['missing-materials-recovery',payload=>fs.unlinkSync(path.join(payload,'scripts/materials-recovery.py')),/资料恢复事务快照缺少必要文件.*materials-recovery/],
+        ['missing-atomic-config',payload=>fs.unlinkSync(path.join(payload,'scripts/atomic-config.py')),/敏感配置原子提交快照缺少必要文件.*atomic-config/],
+        ['missing-materials-canonical',payload=>fs.unlinkSync(path.join(payload,'backups/config-history/materials.applied.tar.gz')),/缺少成套资料投影或规范原文包/],
+        ['mismatched-materials-canonical',async payload=>{
+          const canonical=path.join(payload,'backups/config-history/materials.applied.tar.gz');
+          const inner=path.join(work,'mismatched-materials-canonical-inner');fs.mkdirSync(inner);
+          await checked('tar',['-xzf',canonical,'-C',inner]);
+          fs.appendFileSync(path.join(inner,'config/prompt.md'),'\n不属于投影的候选文本\n');
+          await checked('tar',['-czf',canonical,'-C',inner,'config','knowledge']);
+        },/资料原文、知识索引与投影不同代/],
+        ['unbound-knowledge-settings',payload=>{
+          const file=path.join(payload,'data/runtime/knowledge-settings.json'),value=read(file);
+          value.observed_at=(value.observed_at||0)+1;write(file,value);
+        },/资料原文、知识索引与投影不同代/],
         ['linked-module',payload=>{fs.unlinkSync(path.join(payload,knowledgeModules[0]));fs.symlinkSync('synthetic-missing',path.join(payload,knowledgeModules[0]));},/链接或特殊文件/],
         ['declared-lexical',payload=>clearNewModules(payload),/声明了缺失的词法/],
         ['retained-profile',payload=>{clearNewModules(payload);clearLexicalMetadata(payload);write(path.join(payload,'data/runtime/knowledge-profile.json'),{state:'applied'});},/保留新索引代次/],
@@ -366,7 +417,7 @@ async function main(){
       ];
       for(const [name,mutate,expected] of variants){
         const stage=path.join(work,'knowledge-broken-'+name);fs.mkdirSync(stage);
-        await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);mutate(path.join(stage,'payload'));
+        await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);await mutate(path.join(stage,'payload'));
         const id='synthetic-knowledge-'+name,directory=path.join(f.deploy,'backups/versions',id);fs.mkdirSync(directory);
         const archive=path.join(directory,'snapshot.tar.gz');await checked('tar',['-czf',archive,'-C',stage,'payload']);
         write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
@@ -408,15 +459,25 @@ async function main(){
       const snapshot=await checked('bash',[path.join(project,'scripts/snapshot.sh'),'--deploy-dir',legacy,'--quiet','--reason','synthetic-v110-restore'],{env:legacyEnv});const id=snapshot.stdout.trim();
       fs.cpSync(path.join(legacy,'backups/versions',id),path.join(f.deploy,'backups/versions',id),{recursive:true});
       const previous=f.pool(),previousSecret=f.secretEntries(),newRouter=fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json'));
+      const appliedSource=path.join(work,'legacy-downgrade-applied-source');fs.mkdirSync(appliedSource);
+      await checked('tar',['-xzf',path.join(f.deploy,'backups/config-history/materials.applied.tar.gz'),'-C',appliedSource]);
+      const appliedPrompt=fs.readFileSync(path.join(appliedSource,'config/prompt.md'));
+      const pendingPrompt='## 仅待编辑、尚未应用的降版保全 Prompt\n';
+      fs.writeFileSync(path.join(f.deploy,'config/prompt.md'),pendingPrompt,{mode:0o640});
       assert(!fs.existsSync(path.join(legacy,'data/knowledge-projection.json')));
       assert(fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       write(path.join(f.deploy,'data/runtime/synthetic-current-only.json'),{synthetic:true,version:currentVersion});
       write(f.snapshotEnv.MOCK_DOCKER_LOG,'');write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\nprovider-adapter\n');
       f.adapter.closeAllConnections();await new Promise(resolve=>f.adapter.close(resolve));f.adapter=null;
-      const result=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],legacyEnv);
+      const rejected=await f.invoke('rollback.sh',['--snapshot',id,'--no-safety-snapshot'],legacyEnv);
+      assert.notEqual(rejected.code,0);assert.match(rejected.stderr,/必须先创建安全快照/);
+      assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+      assert.equal(fs.readFileSync(path.join(f.deploy,'config/prompt.md'),'utf8'),pendingPrompt);
+      write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+      const result=await f.invoke('rollback.sh',['--snapshot',id],legacyEnv);
       write(path.join(work,'legacy-rollback.log'),result.stdout+result.stderr);assert.equal(result.code,0,result.stdout+result.stderr);
       for(const name of ['VERSION','install.sh','manage.sh','scripts/common.sh','scripts/provider.sh','n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(legacy,name)));
-      for(const name of ['visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','menu-display.py','menu-provider-ui.sh'])assert(!fs.existsSync(path.join(f.deploy,'scripts',name)));
+      for(const name of ['visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','menu-display.py','menu-provider-ui.sh','materials-recovery.py','atomic-config.py'])assert(!fs.existsSync(path.join(f.deploy,'scripts',name)));
       for(const name of knowledgeModules)assert(!fs.existsSync(path.join(f.deploy,name)),name);
       assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool-applied.json')));assert(!fs.existsSync(path.join(f.deploy,'config/provider-pool.yaml')));
@@ -427,13 +488,23 @@ async function main(){
       assert.equal(kept.length,2);assert(kept.every(directory=>(fs.statSync(directory).mode&0o777)===0o700));
       const retainedSecret=kept.map(directory=>path.join(directory,'secrets/provider/generations',previous.secrets_generation+'.json')).find(file=>fs.existsSync(file));assert.deepEqual(read(retainedSecret).entries,previousSecret);
       const retainedRouter=kept.map(directory=>path.join(directory,'provider-router/synthetic-preserved.json')).find(file=>fs.existsSync(file));assert.deepEqual(fs.readFileSync(retainedRouter),newRouter);
+      const safetyDirectory=fs.readdirSync(path.join(f.deploy,'backups/versions')).map(name=>path.join(f.deploy,'backups/versions',name))
+        .find(directory=>fs.existsSync(path.join(directory,'manifest.json'))
+          && read(path.join(directory,'manifest.json')).reason===`pre-rollback-${id}`);
+      assert.ok(safetyDirectory,'降版前必须保留成套安全快照');
+      const safetyStage=path.join(work,'legacy-downgrade-safety');fs.mkdirSync(safetyStage);
+      await checked('tar',['-xzf',path.join(safetyDirectory,'snapshot.tar.gz'),'-C',safetyStage]);
+      assert.equal(fs.readFileSync(path.join(safetyStage,'payload/config/prompt.md'),'utf8'),pendingPrompt);
+      const safetyCanonical=path.join(work,'legacy-downgrade-safety-canonical');fs.mkdirSync(safetyCanonical);
+      await checked('tar',['-xzf',path.join(safetyStage,'payload/backups/config-history/materials.applied.tar.gz'),'-C',safetyCanonical]);
+      assert.deepEqual(fs.readFileSync(path.join(safetyCanonical,'config/prompt.md')),appliedPrompt);
       const docker=fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8');assert.match(docker,/pg_restore/);assert.match(docker,/--force-recreate anythingllm/);assert.equal(fs.readFileSync(legacyEnv.MOCK_POSTGRES_PASSWORD_DIGEST_FILE,'utf8').trim(),digest('synthetic-lifecycle-database-password'));
     });
     await test('PL13 旧版回滚后真实程序复制补齐七模块，不改知识原文或人工状态',async()=>{
       const protectedFiles=files(path.join(f.deploy,'knowledge')).concat(files(path.join(f.deploy,'data/runtime')));
       const before=Object.fromEntries(protectedFiles.map(file=>[file,digest(fs.readFileSync(file))]));
       await checked('bash',['-c','set -euo pipefail\nsource "$1/scripts/common.sh"\ncopy_project_files "$1" "$2"','--',project,f.deploy]);
-      for(const name of ['scripts/visitor-output.js',...knowledgeModules,'n8n/runtime.js','n8n/workflow.json'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(project,name)),name);
+      for(const name of ['scripts/visitor-output.js','scripts/materials-recovery.py','scripts/atomic-config.py',...knowledgeModules,'n8n/runtime.js','n8n/workflow.json'])assert.deepEqual(fs.readFileSync(path.join(f.deploy,name)),fs.readFileSync(path.join(project,name)),name);
       for(const [file,hash] of Object.entries(before))assert.equal(digest(fs.readFileSync(file)),hash,file);
       assert(!fs.existsSync(path.join(f.deploy,'data/knowledge-projection.json')));
       // 此组只验证真实升级的程序复制阶段，不冒充组件启动或索引迁移验收。

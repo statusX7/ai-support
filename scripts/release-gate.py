@@ -43,6 +43,7 @@ ESSENTIAL_RELEASE_FILES = {
     "docker-compose.yml", "config/app.yaml", POLICY_PATH, "n8n/workflow.json", "n8n/runtime.js",
     "n8n/knowledge-lexical.js", "n8n/build-workflow.js", "scripts/doctor.sh",
     "scripts/package-release.sh", "scripts/visitor-output.js",
+    "scripts/materials-recovery.py", "scripts/atomic-config.py",
     "scripts/release-gate.py", MANIFEST_PATH, "scripts/publish-release.sh",
     "tests/run.sh", "tests/test_install_resume.sh", "tests/test_doctor.sh",
     "tests/test_runtime_missing_reply_p0.js", "tests/test_runtime_provider_failure_reply.js",

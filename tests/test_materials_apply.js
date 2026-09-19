@@ -5,7 +5,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
-const {spawn} = require('node:child_process');
+const {spawn,execFileSync} = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -24,7 +24,7 @@ async function main() {
   fs.mkdirSync(evidenceRoot, {recursive:true});
   const work = fs.mkdtempSync(path.join(evidenceRoot, 'materials-'));
   const deploy = path.join(work, 'deploy');
-  for (const directory of ['config','knowledge','tmp','data/runtime','data/anythingllm/documents/custom-documents','backups/config-history','bin']) {
+  for (const directory of ['config','knowledge','tmp','data/runtime','data/anythingllm/documents/custom-documents','data/anythingllm/vector-cache','backups/config-history','bin']) {
     fs.mkdirSync(path.join(deploy, directory), {recursive:true});
   }
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=ready\n',{mode:0o600});
@@ -49,8 +49,26 @@ async function main() {
   let embeddingUpdates=0;
   let workspaceReads=0;
   let promptDelayMs=0;
+  let failReadAfterNextEmbedding=false;
+  let workspaceReadFailureCountdown=0;
+  let removeFailures=0;
+  let removeFailureAfterDelete=0;
+  let uploadFailureAfterWrite=0;
+  let uploadReplyLostAfterWrite=0;
+  let uploadLocationsPerDocument=1;
+  let reuseNextLocation=null;
   let applyingObservation=null;
   const documents=new Map();
+  const urlNamespace=Buffer.from('6ba7b8119dad11d180b400c04fd430c8','hex');
+  const cacheName=location=>{
+    const bytes=crypto.createHash('sha1').update(urlNamespace).update(location).digest().subarray(0,16);
+    bytes[6]=(bytes[6]&0x0f)|0x50;bytes[8]=(bytes[8]&0x3f)|0x80;
+    const hex=bytes.toString('hex');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}.json`;
+  };
+  const cachePath=location=>path.join(deploy,'data/anythingllm/vector-cache',cacheName(location));
+  const parsedText=location=>JSON.parse(fs.readFileSync(
+    path.join(deploy,'data/anythingllm/documents',location),'utf8')).pageContent;
   const server=http.createServer(async(request,response)=>{
     let data=Buffer.alloc(0);
     for await(const chunk of request) data=Buffer.concat([data,chunk]);
@@ -59,6 +77,7 @@ async function main() {
     if(request.headers['content-type']?.includes('application/json')) body=JSON.parse(data.toString('utf8')||'{}');
     if(request.url==='/api/v1/workspace/crisp-support' && request.method==='GET') {
       workspaceReads++;
+      if(workspaceReadFailureCountdown>0&&--workspaceReadFailureCountdown===0){send(500,{error:true});return;}
       send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update') {
@@ -76,23 +95,44 @@ async function main() {
       send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;
     }
     if(request.url==='/api/v1/document/upload') {
-      const filename=/filename="([^"]+)"/.exec(data.toString('latin1'))?.[1] || `document-${sequence}`;
-      const location=`custom-documents/${filename}.${++sequence}.json`;
-      documents.set(location,{filename});
-      fs.writeFileSync(path.join(deploy,'data/anythingllm/documents',location),JSON.stringify({pageContent:`# ${filename}\n虚构资料正文。\n`})+'\n',{mode:0o600});
-      send(200,{success:true,documents:[{location}]});return;
+      const raw=data.toString('latin1');
+      const match=/filename="([^"]+)"/.exec(raw);
+      const filename=match?.[1] || `document-${sequence}`;
+      const boundary=/boundary=([^;]+)/.exec(request.headers['content-type']||'')?.[1];
+      const contentStart=match?raw.indexOf('\r\n\r\n',match.index)+4:-1;
+      const contentEnd=boundary&&contentStart>=4?raw.indexOf(`\r\n--${boundary}`,contentStart):-1;
+      if(contentStart<4||contentEnd<contentStart){send(400,{error:true});return;}
+      const pageContent=data.subarray(contentStart,contentEnd).toString('utf8');
+      const uploaded=[];
+      for(let index=0;index<uploadLocationsPerDocument;index++) {
+        const location=index===0&&reuseNextLocation?reuseNextLocation:`custom-documents/${filename}.${++sequence}.json`;
+        uploaded.push({location});
+        reuseNextLocation=null;
+        documents.set(location,{filename,pageContent});
+        fs.writeFileSync(path.join(deploy,'data/anythingllm/documents',location),JSON.stringify({pageContent})+'\n',{mode:0o600});
+      }
+      if(uploadReplyLostAfterWrite>0){uploadReplyLostAfterWrite--;response.destroy();return;}
+      if(uploadFailureAfterWrite>0){uploadFailureAfterWrite--;send(500,{error:true,documents:uploaded});return;}
+      send(200,{success:true,documents:uploaded});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update-embeddings') {
       embeddingUpdates++;
       if(embeddingFailures>0){embeddingFailures--;send(400,{error:true});return;}
+      for(const location of body.adds||[]) {
+        fs.writeFileSync(cachePath(location),JSON.stringify({location,embedding:[0.1,0.2,0.3]})+'\n',{mode:0o600});
+      }
       locations=[...new Set([...locations,...(body.adds||[])])].filter(item=>!(body.deletes||[]).includes(item));
+      if(failReadAfterNextEmbedding&&(body.adds||[]).length>0){failReadAfterNextEmbedding=false;workspaceReadFailureCountdown=3;}
       send(200,{success:true});return;
     }
     if(request.url==='/api/v1/system/remove-documents') {
+      if(removeFailures>0){removeFailures--;send(500,{error:true});return;}
       for(const name of body.names||[]) {
         documents.delete(name);
         fs.rmSync(path.join(deploy,'data/anythingllm/documents',name),{force:true});
+        fs.rmSync(cachePath(name),{force:true});
       }
+      if(removeFailureAfterDelete>0){removeFailureAfterDelete--;send(500,{error:true});return;}
       send(200,{success:true});return;
     }
     send(404,{error:true});
@@ -152,6 +192,33 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
+  const invokeSnapshotValidate=()=>new Promise(resolve=>{
+    const child=spawn('bash',['-c','source "$1"; materials_snapshot_validate_generation "$2" "$3" "$4"',
+      'materials-snapshot',path.join(root,'scripts/materials.sh'),deploy,
+      path.join(deploy,'backups/config-history/materials.applied.tar.gz'),
+      path.join(deploy,'config/materials-applied.json')],{
+      cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
+    });
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+  const invokeRecovery=(recovery,args)=>new Promise(resolve=>{
+    const child=spawn('python3',['-B',path.join(root,'scripts/materials-recovery.py'),
+      '--deploy-dir',deploy,'--recovery',recovery,...args],{cwd:work,env:{...process.env}});
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+  const assertProjectionArtifacts=async projection=>{
+    const files={manifest:'data/knowledge-manifest.json',map:'data/runtime/knowledge-map.json',
+      settings:'data/runtime/knowledge-settings.json',profile:'data/runtime/knowledge-profile.json',
+      lexical:'data/runtime/knowledge-lexical.json'};
+    for(const [key,relative] of Object.entries(files)) {
+      const target=path.join(deploy,relative);
+      assert.equal(fs.existsSync(target)?sha(target):'',projection.knowledge[`${key}_sha256`],`${key} 摘要`);
+    }
+    const readback=await invokeReadback();assert.equal(readback.code,0,readback.stderr||readback.stdout);
+    const snapshot=await invokeSnapshotValidate();assert.equal(snapshot.code,0,snapshot.stderr||snapshot.stdout);
+  };
   const writeProfile=()=>{
     const value={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
       passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
@@ -168,6 +235,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     fs.writeFileSync(path.join(deploy,'data/runtime/knowledge-profile.json'),JSON.stringify({schema_version:1,state:'applied',
       profile:value,fingerprint,applied_at:Date.now()})+'\n',{mode:0o640});
   };
+  writeProfile();
   try {
     prompt='## 尚未同步的远端 Prompt\n';
     let result=await invoke(['initialize']);
@@ -261,7 +329,6 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     }]})+'\n',{mode:0o640});
     const failedPrompt='## 等待修复的 Prompt\n';
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),failedPrompt,{mode:0o640});
-    writeProfile();
     embeddingFailures=1;
     result=await invoke(['apply']);
     assert.notEqual(result.code,0);
@@ -275,10 +342,16 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       if(typeof process.getuid==='function'&&process.getuid()===0) {assert.equal(info.uid,0);assert.equal(info.gid,1000);}
     }
     assert.equal(sha(path.join(deploy,'data/runtime/knowledge-lexical.json')),rolledBack.knowledge.lexical_sha256);
+    const restoredEmptyManifest=JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json')));
+    const restoredEmptyProfile=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-profile.json')));
+    assert.equal(restoredEmptyManifest.embedding_profile,restoredEmptyProfile.fingerprint);
+    assert.deepEqual(restoredEmptyManifest.files,{});assert.deepEqual(restoredEmptyManifest.pending_files,{});
+    assert.deepEqual(restoredEmptyManifest.garbage_locations,[]);assert.deepEqual(locations,[]);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    await assertProjectionArtifacts(rolledBack);
     assert.equal(JSON.parse((await invoke(['status'])).stdout).pending,true);
     pass('Prompt 已写外部而知识失败时恢复旧外部状态、旧投影以新代次生效且保留待修原文');
 
-    writeProfile();
     await ok(['apply']);
     const knowledgeApplied=JSON.parse(fs.readFileSync(projectionPath));
     const catalog=JSON.parse(fs.readFileSync(path.join(deploy,'knowledge/catalog.json')));
@@ -286,6 +359,200 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(knowledgeApplied.knowledge.document_count,1);assert.notEqual(knowledgeApplied.knowledge.map_sha256,'');
     assert.equal(prompt,failedPrompt);
     pass('重试后直接编辑的登记文档哈希、索引 map 与 Prompt 同代生效');
+
+    const nonemptyBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const nonemptyManifest=JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json')));
+    const nonemptyLocations=[...locations];
+    assert.match(parsedText(nonemptyLocations[0]),/橙色/);
+    fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为蓝色。\n',{mode:0o640});
+    reuseNextLocation=nonemptyLocations[0];
+    embeddingFailures=1;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const nonemptyRestored=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(nonemptyRestored.state,'applied');assert.equal(nonemptyRestored.source_sha256,nonemptyBaseline.source_sha256);
+    assert.equal(locations.length,1);assert.notDeepEqual(locations,nonemptyLocations);
+    assert.match(parsedText(locations[0]),/橙色/);assert.doesNotMatch(parsedText(locations[0]),/蓝色/);
+    assert.notDeepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json'))),nonemptyManifest);
+    assert.equal(fs.readFileSync(sourcePath,'utf8').includes('蓝色'),true);
+    await assertProjectionArtifacts(nonemptyRestored);
+    assert.equal(JSON.parse((await invoke(['status'])).stdout).pending,true);
+    pass('上游复用旧 location 并覆盖正文时拒绝快速复用，从冻结旧原文重建且待应用原文不被覆盖');
+
+    await ok(['apply']);
+    const beforeRebuild=JSON.parse(fs.readFileSync(projectionPath));
+    const beforeRebuildLocations=[...locations];
+    fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为紫色。\n',{mode:0o640});
+    failReadAfterNextEmbedding=true;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const rebuiltOld=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(rebuiltOld.state,'applied');assert.equal(rebuiltOld.prompt.text,beforeRebuild.prompt.text);
+    assert.equal(rebuiltOld.knowledge.catalog_sha256,beforeRebuild.knowledge.catalog_sha256);
+    assert.equal(locations.length,1);assert.notDeepEqual(locations,beforeRebuildLocations);
+    const rebuiltManifest=JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json')));
+    assert.deepEqual(rebuiltManifest.pending_files,{});assert.deepEqual(rebuiltManifest.garbage_locations,[]);
+    assert.equal(rebuiltManifest.files[`${library}_${document}.md`].locations[0],locations[0]);
+    assert.equal(rebuiltManifest.files[`${library}_${document}.md`].cache_bindings[0].location,locations[0]);
+    assert.equal(fs.readFileSync(sourcePath,'utf8').includes('紫色'),true);
+    assert.match(parsedText(locations[0]),/蓝色/);assert.doesNotMatch(parsedText(locations[0]),/紫色/);
+    await assertProjectionArtifacts(rebuiltOld);
+    assert.equal(JSON.parse((await invoke(['status'])).stdout).pending,true);
+    pass('候选已替换旧 location 后读回失败时，从旧原文在真实根重建并按新 location/cache 生成恢复投影');
+
+    await ok(['apply']);
+
+    const uncertainUploadBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为青色。\n',{mode:0o640});
+    uploadFailureAfterWrite=1;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const uncertainUploadRestored=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(uncertainUploadRestored.state,'applied');
+    assert.equal(uncertainUploadRestored.source_sha256,uncertainUploadBaseline.source_sha256);
+    assert.equal(locations.length,1);assert.equal(documents.size,1);
+    assert.match(parsedText(locations[0]),/紫色/);assert.doesNotMatch(parsedText(locations[0]),/青色/);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    await assertProjectionArtifacts(uncertainUploadRestored);
+    pass('上传已生成非workspace文档但返回5xx时持久取得location，回滚精确清理后从旧原文重建');
+
+    await ok(['apply']);
+
+    const lostUploadReplyBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    fs.writeFileSync(sourcePath,'# 虚构资料\n上传回执完全丢失后标记改为银色。\n',{mode:0o640});
+    uploadReplyLostAfterWrite=1;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const lostUploadReplyRestored=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(lostUploadReplyRestored.state,'applied');
+    assert.equal(lostUploadReplyRestored.source_sha256,lostUploadReplyBaseline.source_sha256);
+    assert.equal(locations.length,1);assert.equal(documents.size,1);
+    assert.match(parsedText(locations[0]),/青色/);assert.doesNotMatch(parsedText(locations[0]),/银色/);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    assert.deepEqual(fs.readdirSync(path.join(deploy,'backups/config-history')).filter(name=>name.startsWith('materials.recovery.retired.')),[]);
+    await assertProjectionArtifacts(lostUploadReplyRestored);
+    pass('上传已写源文档但HTTP回执完全丢失时，按持久上传意图识别受管位置并恢复旧代');
+
+    await ok(['apply']);
+
+    const dispatchCrashBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    fs.writeFileSync(sourcePath,'# 虚构资料\n上传发出前崩溃后标记改为金色。\n',{mode:0o640});
+    const realCurl=execFileSync('sh',['-c','command -v curl'],{encoding:'utf8'}).trim();
+    assert.equal(fs.existsSync(realCurl),true);
+    const curlWrapper=path.join(deploy,'bin/curl');
+    const dispatchMarker=path.join(work,'kill-before-upload-dispatch');
+    fs.writeFileSync(dispatchMarker,'armed\n',{mode:0o600});
+    fs.writeFileSync(curlWrapper,[
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      `if [[ " $* " == *"/api/v1/document/upload"* && -f ${JSON.stringify(dispatchMarker)} ]]; then`,
+      `  rm -f -- ${JSON.stringify(dispatchMarker)}`,
+      '  kill -KILL "$PPID"',
+      '  exit 137',
+      'fi',
+      `exec ${JSON.stringify(realCurl)} "$@"`,
+      '',
+    ].join('\n'),{mode:0o700});
+    try {
+      result=await invoke(['apply']);assert.notEqual(result.code,0);
+    } finally {
+      fs.rmSync(curlWrapper,{force:true});
+      fs.rmSync(dispatchMarker,{force:true});
+    }
+    const dispatchRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    assert.equal(fs.existsSync(path.join(dispatchRecovery,'upload-intent.json')),true);
+    assert.equal(fs.existsSync(path.join(dispatchRecovery,'upload-payload')),true);
+    assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+    await ok(['apply']);
+    const dispatchRecovered=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(dispatchRecovered.state,'applied');
+    assert.notEqual(dispatchRecovered.source_sha256,dispatchCrashBaseline.source_sha256);
+    assert.equal(fs.existsSync(dispatchRecovery),false);
+    assert.equal(locations.length,1);assert.equal(documents.size,1);
+    assert.match(parsedText(locations[0]),/金色/);
+    await assertProjectionArtifacts(dispatchRecovered);
+    pass('上传意图与正文持久化后进程在发出请求前崩溃，重入只重放该责任并完成同代应用');
+
+    const unknownDeleteBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    fs.writeFileSync(sourcePath,'# 虚构资料\n删除回执丢失后标记改为黄色。\n',{mode:0o640});
+    embeddingFailures=1;removeFailures=1;removeFailureAfterDelete=1;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const unknownDeleteRestored=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(unknownDeleteRestored.state,'applied');
+    assert.equal(unknownDeleteRestored.source_sha256,unknownDeleteBaseline.source_sha256);
+    assert.equal(locations.length,1);assert.equal(documents.size,1);
+    assert.match(parsedText(locations[0]),/金色/);assert.doesNotMatch(parsedText(locations[0]),/黄色/);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    await assertProjectionArtifacts(unknownDeleteRestored);
+    pass('源文档删除已完成但HTTP回执丢失时，以受管持久卷缺失证据幂等收口且不遗留孤儿');
+
+    await ok(['apply']);
+
+    const partialBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    fs.writeFileSync(sourcePath,'# 虚构资料\n失败恢复后标记改为绿色。\n',{mode:0o640});
+    embeddingFailures=1;removeFailures=2;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+    const recoveryRoot=path.join(deploy,'backups/config-history/materials.recovery');
+    assert.equal(fs.existsSync(path.join(recoveryRoot,'cleanup.json')),true);
+    assert.equal(fs.existsSync(path.join(recoveryRoot,'touched.json')),true);
+    assert.equal(fs.statSync(recoveryRoot).mode&0o777,0o700);
+    assert.equal(fs.statSync(path.join(recoveryRoot,'complete.json')).mode&0o777,0o600);
+    const outsideProjection=path.join(work,'outside-restored.json');
+    let helper=await invokeRecovery(recoveryRoot,['build-projection','--revision','99','--output',outsideProjection]);
+    assert.notEqual(helper.code,0);assert.equal(fs.existsSync(outsideProjection),false);
+    const frozenProjectionList=path.join(recoveryRoot,'metadata/data/knowledge-projection.json');
+    const savedProjectionList=fs.readFileSync(frozenProjectionList);
+    fs.writeFileSync(frozenProjectionList,'["synthetic-wrong.md"]\n',{mode:0o600});
+    helper=await invokeRecovery(recoveryRoot,['validate']);assert.notEqual(helper.code,0);
+    fs.writeFileSync(frozenProjectionList,savedProjectionList,{mode:0o600});
+    fs.chmodSync(path.join(recoveryRoot,'complete.json'),0o644);
+    helper=await invokeRecovery(recoveryRoot,['validate']);assert.notEqual(helper.code,0);
+    fs.chmodSync(path.join(recoveryRoot,'complete.json'),0o600);
+    helper=await invokeRecovery(recoveryRoot,['validate']);assert.equal(helper.code,0,helper.stderr);
+    const interruptedPayload=path.join(recoveryRoot,'upload-payload');
+    fs.writeFileSync(interruptedPayload,'',{mode:0o600});
+    helper=await invokeRecovery(recoveryRoot,['cleanup-upload-orphan']);
+    assert.equal(helper.code,0,helper.stderr);assert.equal(JSON.parse(helper.stdout).cleaned,true);
+    assert.equal(fs.existsSync(interruptedPayload),false);
+    const historyRoot=path.dirname(recoveryRoot);
+    const siblingOrphans=[
+      'materials.recovery.upload-payload.'+'a'.repeat(32),
+      'materials.recovery.upload-intent.Ab12Cd34',
+      'materials.recovery.touched.Ab12Cd34',
+      'materials.recovery.cleanup.Ab12Cd34',
+      'materials.applied.tar.gz.tmp.Ab12Cd34',
+    ];
+    const captureOrphan=path.join(historyRoot,'materials.recovery.Ab12Cd34');
+    fs.mkdirSync(captureOrphan,{mode:0o700});
+    fs.writeFileSync(path.join(captureOrphan,'partial.json'),'{}\n',{mode:0o600});
+    for(const name of siblingOrphans)fs.writeFileSync(path.join(historyRoot,name),'',{mode:0o600});
+    helper=await invokeRecovery(recoveryRoot,['cleanup-orphans']);
+    assert.equal(helper.code,0,helper.stderr);
+    assert.deepEqual(JSON.parse(helper.stdout).removed.sort(),[path.basename(captureOrphan),...siblingOrphans].sort());
+    for(const name of [path.basename(captureOrphan),...siblingOrphans])assert.equal(fs.existsSync(path.join(historyRoot,name)),false,name);
+    assert.equal(fs.existsSync(recoveryRoot),true);
+    helper=await invokeRecovery(recoveryRoot,['validate']);assert.equal(helper.code,0,helper.stderr);
+    pass('严格命名、归属和权限均匹配的 SIGKILL 临时对象可安全收口，固定恢复事务及未知外部责任保持不变');
+    assert.equal(partialBaseline.state,'applied');
+    await ok(['apply']);
+    const partialRecovered=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(partialRecovered.state,'applied');assert.equal(fs.existsSync(recoveryRoot),false);
+    assert.equal(locations.length,1);assert.equal(documents.size,1);
+    assert.match(parsedText(locations[0]),/绿色/);
+    assert.equal(fs.readdirSync(path.join(deploy,'data/anythingllm/documents/custom-documents')).length,1);
+    pass('workspace 去嵌入成功而源文档删除失败时持久保留清理责任，重入收口后再应用候选且无孤儿');
+
+    fs.writeFileSync(sourcePath,'# 虚构资料\n同一源文件由解析器返回两个受管位置。\n',{mode:0o640});
+    uploadLocationsPerDocument=2;
+    try {
+      await ok(['apply']);
+    } finally {
+      uploadLocationsPerDocument=1;
+    }
+    const multiLocationProjection=JSON.parse(fs.readFileSync(projectionPath));
+    const multiLocationMap=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-map.json')));
+    assert.equal(locations.length,2);assert.equal(documents.size,2);
+    assert.equal(multiLocationMap.documents.length,2);
+    assert.equal(multiLocationProjection.knowledge.enabled_document_count,2);
+    await assertProjectionArtifacts(multiLocationProjection);
+    pass('一个登记源解析成两个 AnythingLLM location 时，运行计数按 map 位置计算且快照同代门禁通过');
 
     const settingsPath=path.join(deploy,'data/runtime/knowledge-settings.json');
     const profilePath=path.join(deploy,'data/runtime/knowledge-profile.json');
@@ -315,6 +582,19 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     fs.writeFileSync(projectionPath,savedIdentity.projection,{mode:0o640});
     fs.writeFileSync(settingsPath,savedIdentity.settings,{mode:0o640});
     fs.writeFileSync(profilePath,savedIdentity.profile,{mode:0o640});
+    const unboundSettings=JSON.parse(savedIdentity.settings);unboundSettings.observed_at+=1;
+    fs.writeFileSync(settingsPath,JSON.stringify(unboundSettings)+'\n',{mode:0o640});
+    result=await invokeSnapshotValidate();assert.notEqual(result.code,0,
+      '快照门禁必须拒绝未写入生效投影摘要的 settings 变化');
+    fs.writeFileSync(settingsPath,savedIdentity.settings,{mode:0o640});
+    const wrongEnabled=JSON.parse(savedIdentity.projection);
+    assert.ok(wrongEnabled.knowledge.enabled_document_count>0);
+    wrongEnabled.knowledge.enabled_document_count-=1;
+    fs.writeFileSync(projectionPath,JSON.stringify(resealProjection(wrongEnabled))+'\n',{mode:0o640});
+    result=await invokeSnapshotValidate();assert.notEqual(result.code,0,
+      '即使投影重新自签，enabled_document_count 也必须和实际 map/canonical 一致');
+    fs.writeFileSync(projectionPath,savedIdentity.projection,{mode:0o640});
+    pass('快照复制后门禁把五项运行知识摘要与投影绑定，并拒绝自签但计数错误的混合代');
     pass('候选与容器回读均拒绝 workspace 错配及 profile 正文/fingerprint 错配，即使外层哈希已重封');
 
     const orphan=path.join(sourceDir,'doc_3333333333333333.txt');
@@ -444,6 +724,28 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(prompt,unconfirmedPrompt);
     fs.writeFileSync(projectionPath,validProjection,{mode:0o640});
     pass('已存在的坏投影 fail-closed，绝不回退读取可编辑原文');
+
+    const duplicateCatalogPath=path.join(deploy,'knowledge/catalog.json');
+    const duplicateCatalog=JSON.parse(fs.readFileSync(duplicateCatalogPath));
+    const duplicateLibrary='kb_4444444444444444';
+    const duplicateSourceDir=path.join(deploy,'knowledge',duplicateLibrary,'sources');
+    fs.mkdirSync(duplicateSourceDir,{recursive:true});
+    const duplicateSource=path.join(duplicateSourceDir,`${document}.md`);
+    fs.writeFileSync(duplicateSource,'# 另一虚构资料库\n跨库可以使用相同稳定文档 ID。\n',{mode:0o640});
+    duplicateCatalog.revision+=1;
+    duplicateCatalog.libraries.push({
+      id:duplicateLibrary,name:'第二个虚构库',enabled:true,revision:1,status:'pending',last_sync:null,error:null,
+      documents:[{id:document,name:'跨库同 ID.md',source:`sources/${document}.md`,
+        projection:`${duplicateLibrary}_${document}.md`,sha256:'0'.repeat(64)}],
+    });
+    fs.writeFileSync(duplicateCatalogPath,JSON.stringify(duplicateCatalog)+'\n',{mode:0o640});
+    await ok(['apply']);
+    const duplicateMap=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-map.json')));
+    const duplicateRows=duplicateMap.documents.filter(row=>row.document_id===document);
+    assert.equal(duplicateRows.length,3);
+    assert.equal(new Set(duplicateRows.map(row=>row.library_id)).size,2);
+    assert.equal(new Set(duplicateRows.map(row=>row.projection)).size,2);
+    pass('文档 ID 只要求库内唯一；两个命名库可使用相同 ID，秘密和索引映射仍按稳定库 ID 隔离');
 
     const bytesResult=await new Promise(resolve=>{
       const child=spawn('bash',['-c','source scripts/knowledge.sh; knowledge_utf8_bytes 人工客服'],{cwd:root});

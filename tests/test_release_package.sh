@@ -92,6 +92,7 @@ PRODUCTION_EXECUTABLES=(
   scripts/package-release.sh
   scripts/doctor.sh
   scripts/materials.sh
+  scripts/materials-recovery.py
   scripts/logs.sh
   scripts/knowledge-profile.sh
   scripts/knowledge-profile.py
@@ -101,6 +102,7 @@ for relative in "${PRODUCTION_EXECUTABLES[@]}"; do
   require_executable_file "${PROJECT_ROOT}/${relative}"
 done
 require_regular_file "${PROJECT_ROOT}/scripts/common.sh"
+require_regular_file "${PROJECT_ROOT}/scripts/atomic-config.py"
 bash -n \
   "${PROJECT_ROOT}/install.sh" \
   "${PROJECT_ROOT}/manage.sh" \
@@ -352,7 +354,7 @@ for relative in scripts/common.sh docker-compose.yml n8n/workflow.json \
   scripts/provider.sh scripts/provider-adapter.js scripts/migration.sh scripts/full-backup.sh \
   scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py \
   scripts/crisp-settings.sh scripts/archive-guard.py n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/web-chat.js \
-  scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
+  scripts/materials.sh scripts/materials-recovery.py scripts/atomic-config.py scripts/logs.sh scripts/log-redact.py config/logging.yaml.example \
   docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md; do
   require_regular_file "${PACKAGE_ROOT}/${relative}"
 done

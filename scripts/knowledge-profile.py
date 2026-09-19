@@ -19,10 +19,19 @@ MODELS = {
 }
 MAX_METADATA_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_MATERIALS_SNAPSHOT_BYTES = 50 * 1024 * 1024 * 1024
 METADATA = ("data/knowledge-manifest.json", "data/runtime/knowledge-profile.json",
             "data/knowledge-projection.json", "data/runtime/knowledge-map.json",
             "data/runtime/knowledge-settings.json", "data/runtime/knowledge-lexical.json",
-            "knowledge/catalog.json", "config/materials-applied.json")
+            "knowledge/catalog.json", "config/materials-applied.json",
+            "backups/config-history/materials.applied.tar.gz")
+# catalog 作为旧运行代证据进入完整性清单，但它同时是用户可编辑源。
+# 恢复只回放索引/运行投影 A；迁移期间的 catalog B 必须保留为待应用编辑。
+PRESERVE_LIVE_ON_RESTORE = {"knowledge/catalog.json", "config/materials-applied.json"}
+# 旧版迁移保全可能已有 materials 投影、尚未纳入 canonical 原文包。
+# 只在备份确实缺少该成员时保留 live canonical；Shell 随后必须用旧投影
+# 做完整外部回读，不能因兼容旧 pointer 而接受不匹配的原文代。
+PRESERVE_IF_ABSENT_ON_RESTORE = {"backups/config-history/materials.applied.tar.gz"}
 
 
 class KnowledgeError(Exception):
@@ -162,7 +171,12 @@ def metadata_record(path):
             "uid": info.st_uid, "gid": info.st_gid}
 
 
-def validate_backup(backup, plan):
+def metadata_maximum(relative):
+    return MAX_MATERIALS_SNAPSHOT_BYTES if relative == "backups/config-history/materials.applied.tar.gz" \
+        else MAX_METADATA_BYTES
+
+
+def validate_backup(backup, plan, allow_legacy_materials=False):
     if backup.is_symlink() or not backup.is_dir():
         fail("知识组件保全目录无效")
     complete = read(backup / "complete.json")
@@ -177,8 +191,15 @@ def validate_backup(backup, plan):
     records = complete.get("metadata_records")
     if not isinstance(names, list) or len(names) != len(set(names)) or not isinstance(records, dict) or set(names) != set(records):
         fail("知识组件保全元数据清单无效")
+    projection_present = "config/materials-applied.json" in names
+    canonical_present = "backups/config-history/materials.applied.tar.gz" in names
+    if canonical_present and not projection_present \
+            or projection_present and not canonical_present and not allow_legacy_materials:
+        fail("知识组件保全缺少成套资料原文包或投影")
     for relative in names:
-        if relative not in METADATA or metadata_record(safe_path(backup / "metadata", relative)) != records[relative]:
+        record = metadata_record(safe_path(backup / "metadata", relative))
+        if relative not in METADATA or not 0 < record["size"] <= metadata_maximum(relative) \
+                or record != records[relative]:
             fail("知识组件保全元数据不完整或已改变")
     return complete
 
@@ -501,7 +522,19 @@ def main():
         if not storage.is_dir() or backup.exists() and any(backup.iterdir()):
             fail("知识组件或保全目录状态无效")
         size = scan_tree(storage)
-        if shutil.disk_usage(root).free < 2 * size + 2147483648:
+        metadata_size = 0
+        for relative in METADATA:
+            source = safe_path(root, relative)
+            if source.exists():
+                if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1 \
+                        or not 0 < source.stat().st_size <= metadata_maximum(relative):
+                    fail("知识保全元数据不是安全的普通文件")
+                metadata_size += source.stat().st_size
+        projection_present = safe_path(root, "config/materials-applied.json").exists()
+        canonical_present = safe_path(root, "backups/config-history/materials.applied.tar.gz").exists()
+        if projection_present != canonical_present:
+            fail("资料投影与规范原文包不成套，拒绝开始知识迁移")
+        if shutil.disk_usage(root).free < 2 * (size + metadata_size) + 2147483648:
             fail("知识模型迁移保全空间不足，未改索引")
         backup.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(backup, 0o700)
@@ -591,7 +624,7 @@ def main():
         if isinstance(active, dict) and active.get("state") == "applying" \
                 and (active.get("fingerprint") != plan["fingerprint"] or active.get("profile") != plan["profile"]):
             fail("当前存在另一份知识索引迁移，拒绝交叉恢复")
-        complete = validate_backup(backup, plan)
+        complete = validate_backup(backup, plan, allow_legacy_materials=True)
         # 在触碰当前组件前复制并再次核对候选；损坏备份不能先替换可运行目录。
         restored = Path(tempfile.mkdtemp(prefix=".anythingllm-restore.", dir=storage.parent))
         restored.rmdir()
@@ -601,7 +634,7 @@ def main():
             fail("知识组件恢复候选复制不完整")
         candidates = {}
         for relative in complete["metadata"]:
-            if relative == "config/materials-applied.json":
+            if relative in PRESERVE_LIVE_ON_RESTORE:
                 continue
             source = safe_path(backup / "metadata", relative)
             destination = safe_path(root, relative)
@@ -617,12 +650,16 @@ def main():
         os.replace(storage, rejected)
         os.replace(restored, storage)
         for relative in METADATA:
-            # 只恢复索引元数据；资料投影由 Shell 提升代次后恢复，绝不恢复 data/runtime 会话目录。
-            if relative == "config/materials-applied.json":
+            # 投影由 Shell 提升代次后恢复；catalog 是用户可编辑源，仅在备份
+            # 清单中校验而不回放。其余索引元数据与 canonical 原文包在此成套
+            # 回放，绝不恢复 data/runtime 会话目录。
+            if relative in PRESERVE_LIVE_ON_RESTORE:
                 continue
             destination = safe_path(root, relative)
             if relative in complete["metadata"]:
                 os.replace(candidates[relative], destination)
+            elif relative in PRESERVE_IF_ABSENT_ON_RESTORE:
+                continue
             elif destination.exists():
                 os.replace(destination, backup / ("rejected-" + relative.replace("/", "_")))
     print(json.dumps({"success": True, "action": args.action}, ensure_ascii=False))

@@ -127,7 +127,7 @@ class SnapshotLiveTests(unittest.TestCase):
 
     def run_function(self, mode="validate", extra=None, unprivileged=False):
         definitions = "\n".join(production_function(name) for name in
-                                ("snapshot_scan_sources", "snapshot_validate_tree", "snapshot_capacity_check", "copy_snapshot_tree", "snapshot_assert_provider_settled"))
+                                ("snapshot_scan_sources", "snapshot_validate_tree", "snapshot_capacity_check", "copy_snapshot_tree", "snapshot_assert_provider_settled", "snapshot_assert_atomic_config_settled"))
         script = "set -euo pipefail\ndie(){ printf '%s\\n' \"$*\" >&2; exit 1; }\ninfo(){ :; }\n" + definitions
         script += '\nDEPLOY_DIR=$1\nSTAGING="$1/staging"\nVERSIONS_DIR="$1"\nQUIET=1\nSNAPSHOT_MIN_FREE_MB_VALUE=0\n'
         if mode == "capacity":
@@ -136,6 +136,8 @@ class SnapshotLiveTests(unittest.TestCase):
             script += 'copy_snapshot_tree data/runtime\n'
         elif mode == "pending":
             script += 'snapshot_assert_provider_settled\n'
+        elif mode == "atomic":
+            script += 'snapshot_assert_atomic_config_settled\n'
         else:
             script += 'snapshot_validate_tree data/runtime\n'
         environment = {**self.env, **(extra or {})}
@@ -541,6 +543,88 @@ class SnapshotLiveTests(unittest.TestCase):
                 self.assertTrue(destination.exists() or destination.is_symlink())
                 self.assertEqual(untouched.read_text(), "keep")
                 destination.unlink()
+
+    def test_17_materials_archive_has_a_strict_positive_member_set(self):
+        """资料包仅允许固定配置、目录和受管文档；链接、额外成员、重复和超限均拒绝。"""
+        guard = ROOT / "scripts/archive-guard.py"
+
+        def archive(name, entries):
+            target = self.base / name
+            with tarfile.open(target, "w:gz") as output:
+                for member_name, kind, data in entries:
+                    item = tarfile.TarInfo(member_name)
+                    item.type = kind
+                    item.mode = 0o700 if kind == tarfile.DIRTYPE else 0o600
+                    if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                        item.linkname = "../../synthetic-outside"
+                    item.size = len(data)
+                    output.addfile(item, io.BytesIO(data))
+            return target
+
+        valid = archive("materials-valid.tar.gz", [
+            ("config", tarfile.DIRTYPE, b""),
+            ("config/runtime.yaml", tarfile.REGTYPE, b"schema_version: 2\n"),
+            ("config/handoff.yaml", tarfile.REGTYPE, b"handoff: {}\n"),
+            ("config/keyword.yaml", tarfile.REGTYPE, b"keyword: {}\n"),
+            ("config/menu.yaml", tarfile.REGTYPE, b"welcome: {}\n"),
+            ("config/tags.yaml", tarfile.REGTYPE, b"tags: {}\n"),
+            ("config/feedback.yaml", tarfile.REGTYPE, b"feedback: {}\n"),
+            ("config/prompt.md", tarfile.REGTYPE, b"synthetic prompt"),
+            ("knowledge", tarfile.DIRTYPE, b""),
+            ("knowledge/catalog.json", tarfile.REGTYPE, b'{"schema_version":2,"libraries":[]}'),
+            ("knowledge/kb_1111111111111111", tarfile.DIRTYPE, b""),
+            ("knowledge/kb_1111111111111111/sources", tarfile.DIRTYPE, b""),
+            ("knowledge/kb_1111111111111111/sources/doc_2222222222222222.md", tarfile.REGTYPE, b"synthetic"),
+        ])
+        result = subprocess.run([sys.executable, str(guard), str(valid), "--kind", "materials"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        invalid = (
+            ("materials-missing-required.tar.gz", [("config", tarfile.DIRTYPE, b""),
+                                                     ("config/prompt.md", tarfile.REGTYPE, b"x")]),
+            ("materials-extra.tar.gz", [("unexpected", tarfile.REGTYPE, b"x")]),
+            ("materials-traversal.tar.gz", [("../outside", tarfile.REGTYPE, b"x")]),
+            ("materials-link.tar.gz", [("config/prompt.md", tarfile.SYMTYPE, b"")]),
+            ("materials-special.tar.gz", [("knowledge/catalog.json", tarfile.FIFOTYPE, b"")]),
+            ("materials-duplicate.tar.gz", [("config/prompt.md", tarfile.REGTYPE, b"x"),
+                                               ("config/prompt.md", tarfile.REGTYPE, b"y")]),
+        )
+        for name, entries in invalid:
+            with self.subTest(name=name):
+                target = archive(name, entries)
+                result = subprocess.run([sys.executable, str(guard), str(target), "--kind", "materials"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+                self.assertNotEqual(result.returncode, 0)
+        oversized = archive("materials-oversized.tar.gz", [("config/prompt.md", tarfile.REGTYPE, b"xx")])
+        result = subprocess.run([sys.executable, str(guard), str(oversized), "--kind", "materials", "--max-bytes", "1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_18_rollback_safety_snapshot_precedes_service_stop(self):
+        """默认安全快照需要运行中容器回读，必须先于版本回滚自己的停服务边界。"""
+        source = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
+        safety = source.index('SAFETY_ID=$("${SCRIPT_DIR}/snapshot.sh"')
+        stop = source.index('docker_compose "$DEPLOY_DIR" stop "${PAUSED_APP_SERVICES[@]}"')
+        mutation = source.index('MUTATION_STARTED=1')
+        self.assertLess(safety, stop)
+        self.assertLess(stop, mutation)
+
+    def test_19_atomic_config_recovery_is_never_snapshotted(self):
+        """未决日志及无归属秘密副本均保留现场并阻止混代快照。"""
+        self.assertEqual(self.run_function("atomic").returncode, 0)
+        for name in (".env.crispai-atomic.json", ".env.crispai-atomic.next",
+                     ".env.source.fixture", ".env.tmp.fixture"):
+            with self.subTest(name=name):
+                target = self.base / name
+                target.write_text("synthetic restricted recovery material\n", encoding="utf-8")
+                target.chmod(0o600)
+                try:
+                    result = self.run_function("atomic")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(target.is_file())
+                finally:
+                    target.unlink()
 
 
 if __name__ == "__main__":

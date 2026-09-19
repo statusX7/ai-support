@@ -508,6 +508,18 @@ def main():
                      if line != "tests/test_doctor.sh"]
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        def omit_materials_recovery(repository):
+            path = repository / "scripts/release-manifest.txt"
+            lines = [line for line in manifest_original.splitlines()
+                     if line != "scripts/materials-recovery.py"]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        def omit_atomic_config(repository):
+            path = repository / "scripts/release-manifest.txt"
+            lines = [line for line in manifest_original.splitlines()
+                     if line != "scripts/atomic-config.py"]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
         def missing_tree_blob(repository):
             path = repository / "scripts/release-manifest.txt"
             path.write_text(manifest_original + "not-tracked.txt\n", encoding="utf-8")
@@ -546,6 +558,8 @@ def main():
             ("固定清单遗漏自举成员时拒绝打包", omit_essential),
             ("固定清单遗漏访客全池失败回归时拒绝打包", omit_provider_failure_reply),
             ("固定清单遗漏补偿与软删除自检回归时拒绝打包", omit_doctor_contract),
+            ("固定清单遗漏资料恢复事务模块时拒绝打包", omit_materials_recovery),
+            ("固定清单遗漏敏感配置原子提交模块时拒绝打包", omit_atomic_config),
             ("固定清单引用非 HEAD blob 时拒绝打包", missing_tree_blob),
             ("版本投影与 VERSION 不一致时拒绝打包", version_drift),
             ("版本政策改变为未授权版本时拒绝打包", release_policy_drift),

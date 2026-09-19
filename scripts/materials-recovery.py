@@ -1,0 +1,1015 @@
+#!/usr/bin/env python3
+"""资料应用事务的旧生效代冻结、校验与恢复投影生成。"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import time
+import tarfile
+import uuid
+
+
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024 * 1024
+MUTABLE_MEMBERS = {"cleanup.json", "touched.json", "upload-response.json", "upload-intent.json", "upload-payload"}
+METADATA = {
+    "data/knowledge-manifest.json": (True, 0o600, MAX_JSON_BYTES),
+    "data/knowledge-projection.json": (True, 0o600, MAX_JSON_BYTES),
+    "data/runtime/knowledge-profile.json": (False, 0o640, 65536),
+    "data/runtime/knowledge-map.json": (True, 0o640, MAX_JSON_BYTES),
+    "data/runtime/knowledge-settings.json": (True, 0o640, 65536),
+    "data/runtime/knowledge-lexical.json": (True, 0o640, MAX_JSON_BYTES),
+}
+
+
+class RecoveryError(Exception):
+    pass
+
+
+def fail(message):
+    raise RecoveryError(message)
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def value_hash(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def stable_copy(source, destination, maximum, mode, gid=0):
+    """不跟随链接地流式复制，并在复制前后确认来源 inode 没有变化。"""
+    source_fd = target_fd = None
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size < 1 \
+                or before.st_size > maximum:
+            fail("资料恢复来源类型、链接数或大小无效")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1048576)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > maximum:
+                fail("资料恢复来源在复制期间超出限制")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    fail("资料恢复目标写入没有推进")
+                view = view[written:]
+        after = os.fstat(source_fd)
+        if copied != before.st_size or file_identity(after) != file_identity(before):
+            fail("资料恢复来源在冻结期间发生变化")
+        os.fsync(target_fd)
+        os.fchmod(target_fd, mode)
+        if os.geteuid() == 0:
+            os.fchown(target_fd, 0, gid)
+        return file_identity(before)
+    except OSError:
+        fail("资料恢复来源无法安全复制")
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+def verify_identity(path, expected):
+    try:
+        current = path.lstat()
+    except OSError:
+        fail("资料恢复来源在冻结期间消失")
+    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 \
+            or file_identity(current) != expected:
+        fail("资料恢复来源在冻结期间发生变化")
+
+
+def regular(path, maximum, empty=False):
+    try:
+        info = path.lstat()
+    except OSError:
+        fail("资料恢复成员缺失")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (not empty and info.st_size < 1) \
+            or info.st_size > maximum:
+        fail("资料恢复成员类型、链接数或大小无效")
+    return info
+
+
+def expected_owner():
+    return 0 if os.geteuid() == 0 else os.geteuid()
+
+
+def private_file(path, maximum, mode=0o600, empty=False):
+    info = regular(path, maximum, empty=empty)
+    expected_gid = (1000 if mode == 0o640 else 0) if os.geteuid() == 0 else os.getegid()
+    if stat.S_IMODE(info.st_mode) != mode or info.st_uid != expected_owner() or info.st_gid != expected_gid:
+        fail("资料恢复成员权限或所有者无效")
+    return info
+
+
+def read_json(path, maximum=MAX_JSON_BYTES):
+    regular(path, maximum)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return json.load(stream)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        fail("资料恢复 JSON 无效")
+
+
+def atomic_json(path, value, mode, temporary_directory=None, temporary_prefix=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = Path(temporary_directory) if temporary_directory is not None else path.parent
+    prefix = temporary_prefix if temporary_prefix is not None else path.name + "."
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        if os.geteuid() == 0 and mode == 0o640:
+            os.chown(temporary, 0, 1000)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def fsync_directory(path):
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.fsync(descriptor)
+    except OSError:
+        fail("资料恢复目录状态无法持久化")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def safe_root(raw):
+    root = Path(raw).absolute()
+    if str(root) in ("/", "/root", "/opt", "/tmp") or root.resolve() != root or not root.is_dir() or root.is_symlink():
+        fail("部署目录无效")
+    return root
+
+
+def recovery_root(root, raw):
+    recovery = Path(raw).absolute()
+    parent = safe_member(root, "backups/config-history")
+    try:
+        parent_info = parent.lstat()
+    except OSError:
+        fail("资料恢复父目录无效")
+    if not stat.S_ISDIR(parent_info.st_mode) or parent.is_symlink() \
+            or parent_info.st_uid != expected_owner() or stat.S_IMODE(parent_info.st_mode) & 0o022:
+        fail("资料恢复父目录无效")
+    expected = parent / "materials.recovery"
+    if recovery != expected or recovery.is_symlink():
+        fail("资料恢复目录不安全")
+    return recovery
+
+
+def safe_member(root, relative):
+    parsed = PurePosixPath(relative)
+    if parsed.is_absolute() or not parsed.parts or any(part in ("", ".", "..") for part in parsed.parts) \
+            or any(ord(character) < 32 for character in relative):
+        fail("资料恢复成员路径无效")
+    current = root
+    for index, part in enumerate(parsed.parts):
+        current /= part
+        if current.exists() or current.is_symlink():
+            try:
+                info = current.lstat()
+            except OSError:
+                fail("资料恢复成员路径状态无效")
+            if stat.S_ISLNK(info.st_mode) or index < len(parsed.parts) - 1 and not stat.S_ISDIR(info.st_mode):
+                fail("资料恢复成员路径包含链接或非目录父级")
+    return current
+
+
+def controlled_input(root, raw, kind):
+    value = Path(raw).absolute()
+    try:
+        relative = value.relative_to(root).as_posix()
+    except ValueError:
+        fail("资料恢复参数越出部署目录")
+    patterns = {
+        "projection": r"tmp/materials-effective\.[A-Za-z0-9]+",
+        "snapshot": r"backups/config-history/materials\.applied\.tar\.gz",
+        "workspace": r"tmp/materials-workspace\.[A-Za-z0-9]+",
+        "current-workspace": r"tmp/materials-workspace-current\.[A-Za-z0-9]+",
+        "output": r"tmp/materials-restore\.[A-Za-z0-9]+/materials-restored\.json",
+    }
+    if kind not in patterns or re.fullmatch(patterns[kind], relative) is None:
+        fail("资料恢复参数不在受管临时路径")
+    safe = safe_member(root, relative)
+    if kind != "output":
+        regular(safe, MAX_SNAPSHOT_BYTES if kind == "snapshot" else MAX_JSON_BYTES)
+    else:
+        if not safe.parent.is_dir() or safe.parent.is_symlink():
+            fail("资料恢复输出目录无效")
+    return safe
+
+
+def controlled_upload_source(root, raw):
+    value = Path(raw).absolute()
+    try:
+        relative = value.relative_to(root).as_posix()
+    except ValueError:
+        fail("知识上传源越出部署目录")
+    allowed = relative.startswith("knowledge/") or re.match(
+        r"^tmp/materials-restore\.[A-Za-z0-9]+/deploy/knowledge/", relative) is not None
+    if not allowed:
+        fail("知识上传源不在受管资料目录")
+    source = safe_member(root, relative)
+    regular(source, 50 * 1024 * 1024)
+    return source
+
+
+def snapshot_projection_list(snapshot):
+    try:
+        with tarfile.open(snapshot, "r:gz") as archive:
+            members = [item for item in archive.getmembers() if item.name == "knowledge/catalog.json"]
+            if len(members) != 1 or not members[0].isfile() or members[0].size < 1 \
+                    or members[0].size > MAX_JSON_BYTES:
+                fail("旧原文包缺少唯一知识目录")
+            stream = archive.extractfile(members[0])
+            if stream is None:
+                fail("旧原文包知识目录不可读")
+            catalog = json.loads(stream.read().decode("utf-8"))
+    except (tarfile.TarError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        fail("旧原文包知识目录无效")
+    libraries = catalog.get("libraries") if isinstance(catalog, dict) else None
+    if not isinstance(libraries, list):
+        fail("旧原文包知识目录结构无效")
+    projections = []
+    for library in libraries:
+        if not isinstance(library, dict) or type(library.get("enabled")) is not bool \
+                or not isinstance(library.get("documents"), list):
+            fail("旧原文包知识库结构无效")
+        if not library["enabled"]:
+            continue
+        for document in library["documents"]:
+            projection = document.get("projection") if isinstance(document, dict) else None
+            if not isinstance(projection, str) or not projection or "/" in projection or "\\" in projection \
+                    or any(ord(character) < 32 for character in projection):
+                fail("旧原文包知识投影名无效")
+            projections.append(projection)
+    return sorted(set(projections))
+
+
+def snapshot_catalog_contract(snapshot):
+    """核对规范原文包中的 catalog 与每个登记源文，返回解码目录。"""
+    try:
+        with tarfile.open(snapshot, "r:gz") as archive:
+            members = archive.getmembers()
+            by_name = {}
+            for member in members:
+                if member.name in by_name:
+                    fail("旧原文包含重复成员")
+                by_name[member.name] = member
+            catalog_member = by_name.get("knowledge/catalog.json")
+            if catalog_member is None or not catalog_member.isfile() or not 0 < catalog_member.size <= MAX_JSON_BYTES:
+                fail("旧原文包缺少唯一知识目录")
+            stream = archive.extractfile(catalog_member)
+            if stream is None:
+                fail("旧原文包知识目录不可读")
+            catalog = json.loads(stream.read().decode("utf-8", "strict"))
+            libraries = catalog.get("libraries") if isinstance(catalog, dict) else None
+            if catalog.get("schema_version") != 2 or not isinstance(catalog.get("revision"), int) \
+                    or catalog["revision"] < 0 or not isinstance(libraries, list):
+                fail("旧原文包知识目录结构无效")
+            library_ids, projections = set(), set()
+            for library in libraries:
+                if not isinstance(library, dict) or not isinstance(library.get("id"), str) \
+                        or not isinstance(library.get("name"), str) or type(library.get("enabled")) is not bool \
+                        or not isinstance(library.get("documents"), list) or library["id"] in library_ids:
+                    fail("旧原文包知识库结构无效")
+                library_ids.add(library["id"])
+                document_ids = set()
+                for document in library["documents"]:
+                    if not isinstance(document, dict) or not isinstance(document.get("id"), str) \
+                            or not isinstance(document.get("source"), str) \
+                            or not isinstance(document.get("projection"), str) \
+                            or not isinstance(document.get("sha256"), str) \
+                            or re.fullmatch(r"[a-f0-9]{64}", document["sha256"]) is None \
+                            or document["id"] in document_ids or document["projection"] in projections:
+                        fail("旧原文包知识文档结构无效")
+                    source = PurePosixPath(document["source"])
+                    if source.is_absolute() or len(source.parts) != 2 or source.parts[0] != "sources" \
+                            or any(part in ("", ".", "..") for part in source.parts):
+                        fail("旧原文包知识源路径无效")
+                    member = by_name.get(f"knowledge/{library['id']}/{document['source']}")
+                    if member is None or not member.isfile() or member.size < 1 or member.size > MAX_SNAPSHOT_BYTES:
+                        fail("旧原文包缺少登记的知识源")
+                    source_stream = archive.extractfile(member)
+                    if source_stream is None:
+                        fail("旧原文包知识源不可读")
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: source_stream.read(1048576), b""):
+                        digest.update(chunk)
+                    if digest.hexdigest() != document["sha256"]:
+                        fail("旧原文包知识源与目录摘要不一致")
+                    document_ids.add(document["id"])
+                    projections.add(document["projection"])
+            return catalog
+    except (tarfile.TarError, OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        fail("旧原文包知识代无效")
+
+
+def generation_contract(recovery, projection, manifest):
+    """证明冻结的原文、manifest、map、lexical 和外层投影来自同一已应用代。"""
+    catalog = snapshot_catalog_contract(recovery / "source.tar.gz")
+    projected = read_json(recovery / "metadata/data/knowledge-projection.json")
+    mapping_path = recovery / "metadata/data/runtime/knowledge-map.json"
+    lexical_path = recovery / "metadata/data/runtime/knowledge-lexical.json"
+    mapping = read_json(mapping_path)
+    lexical = read_json(lexical_path)
+    enabled = []
+    all_documents = 0
+    enabled_libraries = []
+    for library in catalog["libraries"]:
+        all_documents += len(library["documents"])
+        if not library["enabled"]:
+            continue
+        enabled_libraries.append(library["id"])
+        for document in library["documents"]:
+            enabled.append((library, document))
+    expected_names = sorted(document["projection"] for _library, document in enabled)
+    files = manifest.get("files")
+    if not isinstance(files, dict) or sorted(files) != expected_names or projected != expected_names:
+        fail("冻结的 catalog、manifest 与投影清单不同代")
+    expected_map = []
+    for library, document in enabled:
+        record = files.get(document["projection"])
+        if not isinstance(record, dict) or record.get("sha256") != document["sha256"]:
+            fail("冻结的 catalog 与 manifest 文档不同代")
+        for location in record.get("locations", []):
+            expected_map.append({"location": safe_location(location), "library_id": library["id"],
+                                 "library_name": library["name"], "document_id": document["id"],
+                                 "projection": document["projection"]})
+    if mapping != {"schema_version": 2, "revision": catalog["revision"], "documents": expected_map}:
+        fail("冻结的知识 map 与 catalog/manifest 不同代")
+    knowledge = projection.get("knowledge") if isinstance(projection, dict) else None
+    if not isinstance(knowledge, dict) or knowledge.get("catalog_revision") != catalog["revision"] \
+            or knowledge.get("library_count") != len(catalog["libraries"]) \
+            or knowledge.get("document_count") != all_documents \
+            or knowledge.get("enabled_document_count") != len(expected_map) \
+            or knowledge.get("enabled_library_ids") != enabled_libraries:
+        fail("冻结的知识统计与原文不同代")
+    if not isinstance(lexical, dict) or lexical.get("schema_version") != 2 \
+            or lexical.get("map_sha256") != file_hash(mapping_path):
+        fail("冻结的词法索引与 map 不同代")
+    payload = {key: value for key, value in lexical.items() if key != "payload_sha256"}
+    if lexical.get("payload_sha256") != value_hash(payload) or not isinstance(lexical.get("passages"), list):
+        fail("冻结的词法索引完整性无效")
+    mapped = {item["location"]: item for item in expected_map}
+    for passage in lexical["passages"]:
+        source = mapped.get(passage.get("location")) if isinstance(passage, dict) else None
+        if source is None or any(passage.get(key) != source[key]
+                                 for key in ("library_id", "document_id", "projection", "location")):
+            fail("冻结的词法片段引用了非当前 map 文档")
+
+
+def member_hash(root, relative, maximum=MAX_JSON_BYTES):
+    target = safe_member(root, relative)
+    regular(target, maximum)
+    return file_hash(target)
+
+
+def safe_location(value):
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 1024 or "\\" in value \
+            or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        fail("知识位置无效")
+    parsed = PurePosixPath(value)
+    if parsed.is_absolute() or len(parsed.parts) != 2 or parsed.parts[0] != "custom-documents" \
+            or any(part in ("", ".", "..") for part in parsed.parts) or not value.endswith(".json"):
+        fail("知识位置无效")
+    return value
+
+
+def cache_path(root, location):
+    name = str(uuid.uuid5(uuid.NAMESPACE_URL, safe_location(location))) + ".json"
+    return safe_member(root, "data/anythingllm/vector-cache/" + name)
+
+
+def locations(value):
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        fail("工作区位置清单无效")
+    checked = [safe_location(item) for item in value]
+    if len(checked) != len(set(checked)) or len(checked) > 100000:
+        fail("工作区位置清单重复或过大")
+    return sorted(checked)
+
+
+def profile_contract(profile, manifest):
+    files = manifest.get("files")
+    if manifest.get("version") != 1 or not isinstance(files, dict) \
+            or manifest.get("pending_files") != {} or manifest.get("garbage_locations") != []:
+        fail("旧知识 manifest 不是完整已应用状态")
+    if profile is None:
+        if files or manifest.get("embedding_profile") not in (None, ""):
+            fail("非空知识代缺少 profile")
+        return []
+    if not isinstance(profile, dict) or profile.get("schema_version") != 1 or profile.get("state") != "applied" \
+            or not isinstance(profile.get("profile"), dict) or profile.get("fingerprint") != value_hash(profile["profile"]):
+        fail("旧知识 profile 无效")
+    key = profile["fingerprint"]
+    if manifest.get("embedding_profile") != key:
+        fail("旧知识 profile 与 manifest 不同代")
+    managed = []
+    seen = set()
+    for name, record in files.items():
+        if not isinstance(name, str) or not name or not isinstance(record, dict) \
+                or record.get("embedding_profile") != key:
+            fail("旧知识文档记录无效")
+        item_locations = record.get("locations")
+        bindings = record.get("cache_bindings")
+        if not isinstance(item_locations, list) or not item_locations or not isinstance(bindings, list) \
+                or len(item_locations) != len(bindings):
+            fail("旧知识位置或缓存绑定不完整")
+        expected = {}
+        for item in bindings:
+            if not isinstance(item, dict) or set(item) != {"location", "sha256"} \
+                    or not isinstance(item.get("sha256"), str) or len(item["sha256"]) != 64 \
+                    or any(character not in "0123456789abcdef" for character in item["sha256"]):
+                fail("旧知识缓存绑定无效")
+            location = safe_location(item.get("location"))
+            if location in expected:
+                fail("旧知识缓存绑定重复")
+            expected[location] = item["sha256"]
+        checked = [safe_location(item) for item in item_locations]
+        if set(checked) != set(expected) or any(item in seen for item in checked):
+            fail("旧知识位置与缓存绑定不一致")
+        managed.extend(checked)
+        seen.update(checked)
+    return sorted(managed)
+
+
+def validate_live_bindings(root, profile, manifest):
+    if profile is None:
+        return
+    for record in manifest["files"].values():
+        bindings = {item["location"]: item["sha256"] for item in record["cache_bindings"]}
+        for location in record["locations"]:
+            cached = cache_path(root, location)
+            regular(cached, MAX_SNAPSHOT_BYTES)
+            if file_hash(cached) != bindings[location]:
+                fail("旧知识缓存与冻结绑定不一致")
+
+
+def inventory(directory):
+    result = []
+    for child in sorted(directory.rglob("*"), key=lambda item: os.fsencode(item.relative_to(directory).as_posix())):
+        info = child.lstat()
+        relative = child.relative_to(directory).as_posix()
+        if stat.S_ISDIR(info.st_mode):
+            result.append({"path": relative, "type": "directory", "mode": stat.S_IMODE(info.st_mode),
+                           "uid": info.st_uid, "gid": info.st_gid})
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            result.append({"path": relative, "type": "file", "mode": stat.S_IMODE(info.st_mode),
+                           "uid": info.st_uid, "gid": info.st_gid,
+                           "size": info.st_size, "sha256": file_hash(child)})
+        else:
+            fail("资料恢复包含链接、硬链接或特殊文件")
+    return result
+
+
+def validate_complete(root, recovery):
+    try:
+        recovery_info = recovery.lstat()
+    except OSError:
+        fail("资料恢复目录缺失")
+    if not stat.S_ISDIR(recovery_info.st_mode) or stat.S_IMODE(recovery_info.st_mode) != 0o700 \
+            or recovery_info.st_uid != expected_owner() \
+            or recovery_info.st_gid != (0 if os.geteuid() == 0 else os.getegid()):
+        fail("资料恢复目录权限或所有者无效")
+    private_file(recovery / "complete.json", 1048576)
+    complete = read_json(recovery / "complete.json", 1048576)
+    required = {"schema_version", "created_at", "projection_sha256", "source_sha256", "metadata_presence",
+                "managed_locations", "workspace_locations", "inventory"}
+    if not isinstance(complete, dict) or set(complete) != required or complete.get("schema_version") != 1 \
+            or not isinstance(complete.get("created_at"), int) or complete["created_at"] < 0:
+        fail("资料恢复清单无效")
+    expected_inventory = complete["inventory"]
+    actual_inventory = [item for item in inventory(recovery)
+                        if item["path"] not in MUTABLE_MEMBERS and item["path"] != "complete.json"]
+    if expected_inventory != actual_inventory:
+        fail("资料恢复包成员已改变")
+    private_file(recovery / "projection.json", MAX_JSON_BYTES)
+    private_file(recovery / "source.tar.gz", MAX_SNAPSHOT_BYTES)
+    projection = read_json(recovery / "projection.json")
+    if file_hash(recovery / "projection.json") != complete["projection_sha256"] \
+            or file_hash(recovery / "source.tar.gz") != complete["source_sha256"]:
+        fail("资料恢复投影或原文包已改变")
+    presence = complete["metadata_presence"]
+    if not isinstance(presence, dict) or set(presence) != set(METADATA) \
+            or any(type(value) is not bool for value in presence.values()):
+        fail("资料恢复元数据存在性清单无效")
+    for relative, (required_member, expected_mode, maximum) in METADATA.items():
+        member = recovery / "metadata" / relative
+        if presence[relative]:
+            private_file(member, maximum, expected_mode)
+        elif required_member or member.exists() or member.is_symlink():
+            fail("资料恢复元数据缺失或出现额外成员")
+    manifest = read_json(recovery / "metadata/data/knowledge-manifest.json")
+    profile = read_json(recovery / "metadata/data/runtime/knowledge-profile.json", 65536) \
+        if presence["data/runtime/knowledge-profile.json"] else None
+    managed = profile_contract(profile, manifest)
+    if managed != locations(complete["managed_locations"]):
+        fail("资料恢复受管位置清单不一致")
+    workspace = locations(complete["workspace_locations"])
+    if not set(managed).issubset(workspace):
+        fail("冻结时工作区缺少旧代受管位置")
+    knowledge = projection.get("knowledge") if isinstance(projection, dict) else None
+    if projection.get("schema_version") != 2 or projection.get("state") != "applied" or not isinstance(knowledge, dict):
+        fail("冻结的旧资料投影无效")
+    expected = {
+        "data/knowledge-manifest.json": knowledge.get("manifest_sha256"),
+        "data/runtime/knowledge-map.json": knowledge.get("map_sha256"),
+        "data/runtime/knowledge-settings.json": knowledge.get("settings_sha256"),
+        "data/runtime/knowledge-profile.json": knowledge.get("profile_sha256"),
+        "data/runtime/knowledge-lexical.json": knowledge.get("lexical_sha256"),
+    }
+    for relative, digest in expected.items():
+        member = recovery / "metadata" / relative
+        actual = file_hash(member) if presence[relative] else ""
+        if not isinstance(digest, str) or actual != digest:
+            fail("旧资料投影与恢复元数据摘要不一致")
+    generation_contract(recovery, projection, manifest)
+    cleanup_path = recovery / "cleanup.json"
+    if cleanup_path.exists() or cleanup_path.is_symlink():
+        private_file(cleanup_path, MAX_JSON_BYTES)
+        cleanup = read_json(cleanup_path)
+        if not isinstance(cleanup, dict) or set(cleanup) != {"schema_version", "locations"} \
+                or cleanup.get("schema_version") != 1:
+            fail("资料恢复清理责任无效")
+        locations(cleanup.get("locations"))
+    touched_path = recovery / "touched.json"
+    if touched_path.exists() or touched_path.is_symlink():
+        private_file(touched_path, MAX_JSON_BYTES)
+        touched = read_json(touched_path)
+        if not isinstance(touched, dict) or set(touched) != {"schema_version", "locations"} \
+                or touched.get("schema_version") != 1:
+            fail("资料恢复上传位置账本无效")
+        locations(touched.get("locations"))
+    response_path = recovery / "upload-response.json"
+    if response_path.exists() or response_path.is_symlink():
+        private_file(response_path, MAX_JSON_BYTES, empty=True)
+    intent_path = recovery / "upload-intent.json"
+    if intent_path.exists() or intent_path.is_symlink():
+        private_file(intent_path, 65536)
+        intent = read_json(intent_path, 65536)
+        filename = intent.get("filename") if isinstance(intent, dict) else None
+        if set(intent) != {"schema_version", "attempt_id", "filename", "upload_filename", "created_at",
+                           "baseline_matches", "payload_sha256", "payload_size"} \
+                or intent.get("schema_version") != 2 \
+                or not isinstance(intent.get("attempt_id"), str) \
+                or re.fullmatch(r"[a-f0-9]{32}", intent["attempt_id"]) is None \
+                or not isinstance(filename, str) or filename in ("", ".", "..") or len(filename.encode("utf-8")) > 255 \
+                or "/" in filename or "\\" in filename or ";" in filename or "," in filename \
+                or any(ord(character) < 32 or ord(character) == 127 for character in filename) \
+                or re.search(r"\.([A-Za-z0-9]{1,16})$", filename) is None \
+                or intent.get("upload_filename") != "crispai-upload-" + intent["attempt_id"] + "." \
+                    + filename.rsplit(".", 1)[-1].lower() \
+                or not isinstance(intent.get("payload_sha256"), str) \
+                or re.fullmatch(r"[a-f0-9]{64}", intent["payload_sha256"]) is None \
+                or type(intent.get("payload_size")) is not int or not 0 < intent["payload_size"] <= 50 * 1024 * 1024 \
+                or not isinstance(intent.get("created_at"), int) or intent["created_at"] < 0:
+            fail("知识上传意图记录无效")
+        locations(intent.get("baseline_matches"))
+        payload_path = recovery / "upload-payload"
+        private_file(payload_path, 50 * 1024 * 1024)
+        if payload_path.stat().st_size != intent["payload_size"] \
+                or file_hash(payload_path) != intent["payload_sha256"]:
+            fail("知识上传恢复正文与意图记录不一致")
+    elif (recovery / "upload-payload").exists() or (recovery / "upload-payload").is_symlink():
+        fail("存在无意图记录的知识上传正文")
+    return complete, projection
+
+
+def upload_matches(root, filename):
+    document_root = safe_member(root, "data/anythingllm/documents/custom-documents")
+    if not document_root.is_dir() or document_root.is_symlink():
+        fail("知识源文档目录无效")
+    matches = []
+    prefixes = (filename + ".", filename + "-")
+    for member in document_root.iterdir():
+        try:
+            info = member.lstat()
+        except OSError:
+            fail("知识源文档状态无效")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or member.is_symlink():
+            fail("知识源文档目录含链接或特殊文件")
+        name = member.name
+        if name == filename + ".json" or name.endswith(".json") and name.startswith(prefixes):
+            matches.append(safe_location("custom-documents/" + name))
+    return sorted(set(matches))
+
+
+def validate_orphan_tree(path):
+    """只允许删除本 helper 自己留下、由当前身份拥有的普通目录树。"""
+    try:
+        root_info = path.lstat()
+    except OSError:
+        fail("资料恢复临时目录状态无效")
+    expected_gid = 0 if os.geteuid() == 0 else os.getegid()
+    if not stat.S_ISDIR(root_info.st_mode) or path.is_symlink() \
+            or stat.S_IMODE(root_info.st_mode) != 0o700 \
+            or root_info.st_uid != expected_owner() or root_info.st_gid != expected_gid:
+        fail("资料恢复临时目录归属或权限无效")
+    total = 0
+    for directory, names, files in os.walk(path, topdown=True, followlinks=False):
+        for name in names + files:
+            member = Path(directory) / name
+            try:
+                info = member.lstat()
+            except OSError:
+                fail("资料恢复临时成员状态无效")
+            if stat.S_ISDIR(info.st_mode):
+                if member.is_symlink() or info.st_uid != expected_owner() or info.st_gid != expected_gid \
+                        or stat.S_IMODE(info.st_mode) & 0o022:
+                    fail("资料恢复临时目录包含不安全成员")
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 \
+                    or info.st_uid != expected_owner() or info.st_gid != expected_gid \
+                    or stat.S_IMODE(info.st_mode) & 0o022:
+                fail("资料恢复临时目录包含链接或特殊成员")
+            total += info.st_size
+            if total > MAX_SNAPSHOT_BYTES + 4 * MAX_JSON_BYTES:
+                fail("资料恢复临时目录异常过大")
+
+
+def cleanup_sibling_orphans(recovery):
+    """清理由 SIGKILL 留下的、名称和归属均严格匹配的同级临时对象。"""
+    stage_pattern = re.compile(r"materials\.recovery\.[A-Za-z0-9_]{8}")
+    file_pattern = re.compile(
+        r"(?:(materials\.recovery\.(upload-payload|upload-intent|touched|cleanup)\."
+        r"(?:[A-Za-z0-9_]{8}|[a-f0-9]{32}))|"
+        r"(materials\.applied\.tar\.gz\.tmp\.[A-Za-z0-9_]{8}))")
+    removed = []
+    for member in recovery.parent.iterdir():
+        match = file_pattern.fullmatch(member.name)
+        if stage_pattern.fullmatch(member.name):
+            validate_orphan_tree(member)
+            try:
+                shutil.rmtree(member)
+            except OSError:
+                fail("资料恢复临时目录无法清理")
+            removed.append(member.name)
+            continue
+        if match is None:
+            continue
+        kind = match.group(2)
+        maximum = MAX_SNAPSHOT_BYTES if match.group(3) is not None \
+            else 50 * 1024 * 1024 if kind == "upload-payload" else MAX_JSON_BYTES
+        private_file(member, maximum, empty=True)
+        try:
+            member.unlink()
+        except OSError:
+            fail("资料恢复临时文件无法清理")
+        removed.append(member.name)
+    if removed:
+        fsync_directory(recovery.parent)
+    return sorted(removed)
+
+
+def cleanup_upload_orphan(recovery):
+    payload = recovery / "upload-payload"
+    intent = recovery / "upload-intent.json"
+    response = recovery / "upload-response.json"
+    if not payload.exists() and not payload.is_symlink():
+        return False
+    if intent.exists() or intent.is_symlink() or response.exists() or response.is_symlink():
+        return False
+    # 正文固定路径只会在网络请求前建立。若意图和响应均不存在，零字节或
+    # 复制到一半的文件也没有外部副作用，可按严格归属安全删除。
+    private_file(payload, 50 * 1024 * 1024, empty=True)
+    payload.unlink()
+    fsync_directory(recovery)
+    return True
+
+
+def begin_upload(root, recovery, filename, source_raw):
+    cleanup_sibling_orphans(recovery)
+    cleanup_upload_orphan(recovery)
+    validate_complete(root, recovery)
+    source = controlled_upload_source(root, source_raw)
+    if not isinstance(filename, str) or filename in ("", ".", "..") or len(filename.encode("utf-8")) > 255 \
+            or "/" in filename or "\\" in filename or ";" in filename or "," in filename \
+            or any(ord(character) < 32 or ord(character) == 127 for character in filename):
+        fail("知识上传文件名无效")
+    intent_path = recovery / "upload-intent.json"
+    response_path = recovery / "upload-response.json"
+    payload_path = recovery / "upload-payload"
+    if intent_path.exists() or intent_path.is_symlink() or response_path.exists() or response_path.is_symlink() \
+            or payload_path.exists() or payload_path.is_symlink():
+        fail("已有未收口的知识上传责任")
+    match = re.search(r"\.([A-Za-z0-9]{1,16})$", filename)
+    if match is None:
+        fail("知识上传文件扩展名无效")
+    attempt = uuid.uuid4().hex
+    upload_filename = "crispai-upload-" + attempt + "." + match.group(1).lower()
+    payload_temporary = recovery.with_name(recovery.name + ".upload-payload." + uuid.uuid4().hex)
+    try:
+        identity = stable_copy(source, payload_temporary, 50 * 1024 * 1024, 0o600)
+        verify_identity(source, identity)
+        os.replace(payload_temporary, payload_path)
+        fsync_directory(recovery)
+        intent = {"schema_version": 2, "attempt_id": attempt, "filename": filename,
+                  "upload_filename": upload_filename, "created_at": int(time.time()),
+                  "baseline_matches": upload_matches(root, upload_filename),
+                  "payload_sha256": file_hash(payload_path), "payload_size": payload_path.stat().st_size}
+        atomic_json(intent_path, intent, 0o600, recovery.parent,
+                    recovery.name + ".upload-intent.")
+        fsync_directory(recovery)
+    except (RecoveryError, OSError):
+        payload_temporary.unlink(missing_ok=True)
+        payload_path.unlink(missing_ok=True)
+        raise
+    return intent
+
+
+def resolve_upload(root, recovery):
+    validate_complete(root, recovery)
+    intent_path = recovery / "upload-intent.json"
+    if not intent_path.exists() and not intent_path.is_symlink():
+        fail("知识上传意图记录缺失")
+    intent = read_json(intent_path, 65536)
+    filename = intent["upload_filename"]
+    baseline = set(locations(intent["baseline_matches"]))
+    matches = sorted(set(upload_matches(root, filename)) - baseline)
+    # alias 含本事务的随机 attempt，所有 post-baseline 同 alias 结果都
+    # 来自本责任的崩溃重放；一律登记后精确清理。空集由 Shell
+    # 使用冻结 payload 重放，不在这里假定请求从未发出。
+    return matches
+
+
+def retired_directories(recovery):
+    prefix = recovery.name + ".retired."
+    result = []
+    for member in recovery.parent.iterdir():
+        if not member.name.startswith(prefix):
+            continue
+        suffix = member.name[len(prefix):]
+        if re.fullmatch(r"[a-f0-9]{32}", suffix) is None:
+            continue
+        try:
+            info = member.lstat()
+        except OSError:
+            continue
+        expected_gid = 0 if os.geteuid() == 0 else os.getegid()
+        if not stat.S_ISDIR(info.st_mode) or member.is_symlink() \
+                or info.st_uid != expected_owner() or info.st_gid != expected_gid \
+                or stat.S_IMODE(info.st_mode) != 0o700:
+            fail("已退役资料事务目录不安全")
+        result.append(member)
+    return result
+
+
+def cleanup_retired(recovery):
+    pending = []
+    for member in retired_directories(recovery):
+        try:
+            shutil.rmtree(member)
+        except OSError:
+            pending.append(member.name)
+    return not pending
+
+
+def retire(root, recovery):
+    validate_complete(root, recovery)
+    if any((recovery / name).exists() or (recovery / name).is_symlink() for name in MUTABLE_MEMBERS):
+        fail("资料恢复仍有未完成的外部责任，拒绝退役事务")
+    tombstone = recovery.with_name(recovery.name + ".retired." + uuid.uuid4().hex)
+    os.replace(recovery, tombstone)
+    return cleanup_retired(recovery)
+
+
+def capture(root, recovery, projection_path, snapshot_path, workspace_path):
+    cleanup_sibling_orphans(recovery)
+    projection_path = controlled_input(root, projection_path, "projection")
+    snapshot_path = controlled_input(root, snapshot_path, "snapshot")
+    workspace_path = controlled_input(root, workspace_path, "workspace")
+    regular(snapshot_path, MAX_SNAPSHOT_BYTES)
+    required_bytes = snapshot_path.stat().st_size + projection_path.stat().st_size
+    for relative, (_required, _mode, maximum) in METADATA.items():
+        source = safe_member(root, relative)
+        if source.exists() or source.is_symlink():
+            required_bytes += regular(source, maximum).st_size
+    if shutil.disk_usage(recovery.parent).free < required_bytes + 268435456:
+        fail("资料恢复事务可用空间不足，未开始外部修改")
+    stage = Path(tempfile.mkdtemp(prefix="materials.recovery.", dir=recovery.parent))
+    try:
+        os.chmod(stage, 0o700)
+        source_identities = []
+        source_identities.append((projection_path, stable_copy(
+            projection_path, stage / "projection.json", MAX_JSON_BYTES, 0o600)))
+        source_identities.append((snapshot_path, stable_copy(
+            snapshot_path, stage / "source.tar.gz", MAX_SNAPSHOT_BYTES, 0o600)))
+        workspace_copy = stage / "workspace.json"
+        source_identities.append((workspace_path, stable_copy(
+            workspace_path, workspace_copy, MAX_JSON_BYTES, 0o600)))
+        projection = read_json(stage / "projection.json")
+        if projection.get("schema_version") != 2 or projection.get("state") != "applied":
+            fail("只能冻结完整已应用资料代")
+        workspace = locations(read_json(workspace_copy, MAX_JSON_BYTES))
+        workspace_copy.unlink()
+        presence = {}
+        for relative, (required_member, mode, maximum) in METADATA.items():
+            source = safe_member(root, relative)
+            exists = source.exists() or source.is_symlink()
+            presence[relative] = exists
+            if not exists:
+                if required_member:
+                    fail("旧资料代缺少必需元数据")
+                continue
+            destination = stage / "metadata" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(destination.parent, 0o700)
+            source_identities.append((source, stable_copy(
+                source, destination, maximum, mode, 1000 if mode == 0o640 else 0)))
+        manifest = read_json(stage / "metadata/data/knowledge-manifest.json")
+        profile = read_json(stage / "metadata/data/runtime/knowledge-profile.json", 65536) \
+            if presence["data/runtime/knowledge-profile.json"] else None
+        managed = profile_contract(profile, manifest)
+        validate_live_bindings(root, profile, manifest)
+        if not set(managed).issubset(workspace):
+            fail("当前工作区缺少旧代受管位置，未开始资料修改")
+        content_inventory = inventory(stage)
+        complete = {"schema_version": 1, "created_at": int(time.time()),
+                    "projection_sha256": file_hash(stage / "projection.json"),
+                    "source_sha256": file_hash(stage / "source.tar.gz"),
+                    "metadata_presence": presence, "managed_locations": managed,
+                    "workspace_locations": workspace, "inventory": content_inventory}
+        atomic_json(stage / "complete.json", complete, 0o600)
+        validate_complete(root, stage)
+        for source, identity in source_identities:
+            verify_identity(source, identity)
+        if recovery.exists() or recovery.is_symlink():
+            fail("已有资料恢复事务，拒绝覆盖")
+        os.replace(stage, recovery)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+def prepare_rebuild(root, recovery, current_workspace_path):
+    current_workspace_path = controlled_input(root, current_workspace_path, "current-workspace")
+    complete, _projection = validate_complete(root, recovery)
+    current = locations(read_json(current_workspace_path, MAX_JSON_BYTES))
+    old_managed = set(complete["managed_locations"])
+    baseline = set(complete["workspace_locations"])
+    if set(current) - baseline:
+        fail("工作区仍有来源未确认的新位置，拒绝重建旧代")
+    garbage = sorted(old_managed)
+    profile_relative = "data/runtime/knowledge-profile.json"
+    profile_target = safe_member(root, profile_relative)
+    if complete["metadata_presence"][profile_relative]:
+        source = recovery / "metadata" / profile_relative
+        profile = read_json(source, 65536)
+        temporary = profile_target.with_name(profile_target.name + ".restore." + uuid.uuid4().hex)
+        shutil.copy2(source, temporary)
+        os.chmod(temporary, 0o640)
+        if os.geteuid() == 0:
+            os.chown(temporary, 0, 1000)
+        os.replace(temporary, profile_target)
+        key = profile["fingerprint"]
+    else:
+        if profile_target.exists() or profile_target.is_symlink():
+            if profile_target.is_symlink() or not profile_target.is_file():
+                fail("候选知识 profile 类型无效")
+            profile_target.unlink()
+        key = ""
+    manifest = {"version": 1, "files": {}, "pending_files": {}, "garbage_locations": garbage}
+    if key:
+        manifest["embedding_profile"] = key
+    atomic_json(safe_member(root, "data/knowledge-manifest.json"), manifest, 0o600)
+    atomic_json(safe_member(root, "data/knowledge-projection.json"), [], 0o600)
+
+
+def build_projection(root, recovery, revision, output):
+    output = controlled_input(root, output, "output")
+    _complete, old = validate_complete(root, recovery)
+    if revision < 1 or revision > 2147483647:
+        fail("恢复投影 revision 无效")
+    actual = {
+        "manifest_sha256": member_hash(root, "data/knowledge-manifest.json"),
+        "map_sha256": member_hash(root, "data/runtime/knowledge-map.json"),
+        "settings_sha256": member_hash(root, "data/runtime/knowledge-settings.json", 65536),
+        "profile_sha256": member_hash(root, "data/runtime/knowledge-profile.json", 65536)
+            if safe_member(root, "data/runtime/knowledge-profile.json").is_file() else "",
+        "lexical_sha256": member_hash(root, "data/runtime/knowledge-lexical.json"),
+    }
+    map_value = read_json(safe_member(root, "data/runtime/knowledge-map.json"))
+    if map_value.get("schema_version") != 2 or not isinstance(map_value.get("documents"), list) \
+            or len(map_value["documents"]) != old["knowledge"].get("enabled_document_count"):
+        fail("恢复后的知识映射文档数与旧生效代不一致")
+    restored = json.loads(json.dumps(old, ensure_ascii=False))
+    restored["revision"] = revision
+    restored["state"] = "applied"
+    restored["applied_at"] = int(time.time())
+    restored["configuration"]["runtime"]["revision"] = revision
+    restored["configuration"]["runtime"]["applied_revision"] = revision
+    restored["knowledge"].update(actual)
+    restored["source_components"]["knowledge"] = value_hash(restored["knowledge"])
+    restored["source_sha256"] = value_hash(restored["source_components"])
+    atomic_json(output, restored, 0o600)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--deploy-dir", required=True)
+    parser.add_argument("--recovery", required=True)
+    commands = parser.add_subparsers(dest="action", required=True)
+    capture_command = commands.add_parser("capture")
+    capture_command.add_argument("--projection", required=True)
+    capture_command.add_argument("--snapshot", required=True)
+    capture_command.add_argument("--workspace-locations", required=True)
+    commands.add_parser("validate")
+    rebuild = commands.add_parser("prepare-rebuild")
+    rebuild.add_argument("--current-workspace-locations", required=True)
+    build = commands.add_parser("build-projection")
+    build.add_argument("--revision", required=True, type=int)
+    build.add_argument("--output", required=True)
+    commands.add_parser("baseline-locations")
+    commands.add_parser("managed-locations")
+    begin = commands.add_parser("begin-upload")
+    begin.add_argument("--filename", required=True)
+    begin.add_argument("--source", required=True)
+    commands.add_parser("resolve-upload")
+    commands.add_parser("cleanup-upload-orphan")
+    commands.add_parser("cleanup-orphans")
+    commands.add_parser("retire")
+    commands.add_parser("cleanup-retired")
+    args = parser.parse_args()
+    root = safe_root(args.deploy_dir)
+    recovery = recovery_root(root, args.recovery)
+    if args.action == "capture":
+        capture(root, recovery, Path(args.projection), Path(args.snapshot), Path(args.workspace_locations))
+    elif args.action == "validate":
+        validate_complete(root, recovery)
+    elif args.action == "prepare-rebuild":
+        prepare_rebuild(root, recovery, Path(args.current_workspace_locations))
+    elif args.action == "build-projection":
+        build_projection(root, recovery, args.revision, Path(args.output))
+    elif args.action in ("baseline-locations", "managed-locations"):
+        complete, _projection = validate_complete(root, recovery)
+        key = "workspace_locations" if args.action == "baseline-locations" else "managed_locations"
+        print(json.dumps(complete[key], ensure_ascii=False, separators=(",", ":")))
+    elif args.action == "begin-upload":
+        print(json.dumps(begin_upload(root, recovery, args.filename, args.source), ensure_ascii=False, separators=(",", ":")))
+    elif args.action == "resolve-upload":
+        print(json.dumps(resolve_upload(root, recovery), ensure_ascii=False, separators=(",", ":")))
+    elif args.action == "cleanup-upload-orphan":
+        print(json.dumps({"ok": True, "action": args.action, "cleaned": cleanup_upload_orphan(recovery)},
+                         ensure_ascii=False))
+    elif args.action == "cleanup-orphans":
+        print(json.dumps({"ok": True, "action": args.action,
+                          "removed": cleanup_sibling_orphans(recovery)}, ensure_ascii=False))
+    elif args.action == "retire":
+        print(json.dumps({"ok": True, "action": args.action, "cleaned": retire(root, recovery)}, ensure_ascii=False))
+    elif args.action == "cleanup-retired":
+        print(json.dumps({"ok": True, "action": args.action, "cleaned": cleanup_retired(recovery)}, ensure_ascii=False))
+    if args.action not in ("baseline-locations", "managed-locations", "begin-upload", "resolve-upload",
+                           "cleanup-upload-orphan", "cleanup-orphans", "retire", "cleanup-retired"):
+        print(json.dumps({"ok": True, "action": args.action}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RecoveryError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
+    except (OSError, ValueError, KeyError, TypeError, MemoryError, RecursionError):
+        print("资料恢复事务失败；旧代保全保持不变，自动回复继续受阻止。", file=sys.stderr)
+        sys.exit(1)

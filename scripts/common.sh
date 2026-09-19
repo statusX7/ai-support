@@ -886,7 +886,9 @@ env_set() {
   local env_file=$1
   local key=$2
   local value=$3
-  local temp line replaced=0 encoded
+  local parent source temp line replaced=0 encoded
+  local existing=0 initial_identity current_identity link_count compare_status
+  local initial_device initial_inode publish_status
 
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "环境变量名称无效：$key"
   validate_env_value "$value" || die "${key} 包含不安全字符或为空"
@@ -894,30 +896,118 @@ env_set() {
     encoded=$value
   else
     require_command jq
-    encoded=$(printf '%s' "$value" | jq -Rs '.')
+    encoded=$(printf '%s' "$value" | jq -Rs '.') || return 1
     # Compose 会展开双引号值中的 `$`；使用 `$$` 保留原始字面值。
     encoded=${encoded//\$/\$\$}
   fi
-  mkdir -p -- "$(dirname -- "$env_file")"
-  touch -- "$env_file"
-  temp=$(mktemp "${env_file}.tmp.XXXXXX")
-  chmod 600 "$temp"
+  parent=$(dirname -- "$env_file") || return 1
+  mkdir -p -- "$parent" || return 1
+  [[ -d "$parent" ]] || return 1
+
+  source=$(mktemp "${env_file}.source.XXXXXX") || return 1
+  chmod 600 "$source" || { rm -f -- "$source"; return 1; }
+  if [[ -e "$env_file" || -L "$env_file" ]]; then
+    [[ -f "$env_file" && ! -L "$env_file" ]] \
+      || { rm -f -- "$source"; return 1; }
+    link_count=$(stat -c '%h' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    [[ "$link_count" == 1 ]] || { rm -f -- "$source"; return 1; }
+    initial_identity=$(stat -c '%d:%i:%s:%y:%z:%h:%f' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    initial_device=$(stat -c '%d' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    initial_inode=$(stat -c '%i' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    cp -- "$env_file" "$source" || { rm -f -- "$source"; return 1; }
+    chmod 600 "$source" || { rm -f -- "$source"; return 1; }
+    current_identity=$(stat -c '%d:%i:%s:%y:%z:%h:%f' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    [[ "$current_identity" == "$initial_identity" && -f "$env_file" && ! -L "$env_file" ]] \
+      || { rm -f -- "$source"; return 1; }
+    link_count=$(stat -c '%h' -- "$env_file") \
+      || { rm -f -- "$source"; return 1; }
+    [[ "$link_count" == 1 ]] || { rm -f -- "$source"; return 1; }
+    if cmp -s -- "$env_file" "$source"; then
+      :
+    else
+      compare_status=$?
+      rm -f -- "$source"
+      (( compare_status == 1 )) || return 1
+      # A successful copy followed by different content means the live file changed.
+      return 1
+    fi
+    existing=1
+  fi
+
+  temp=$(mktemp "${env_file}.tmp.XXXXXX") \
+    || { rm -f -- "$source"; return 1; }
+  chmod 600 "$temp" || { rm -f -- "$source" "$temp"; return 1; }
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" == "${key}="* ]]; then
       if (( replaced == 0 )); then
-        printf '%s=%s\n' "$key" "$encoded" >> "$temp"
+        printf '%s=%s\n' "$key" "$encoded" >> "$temp" \
+          || { rm -f -- "$source" "$temp"; return 1; }
         replaced=1
       fi
     else
-      printf '%s\n' "$line" >> "$temp"
+      printf '%s\n' "$line" >> "$temp" \
+        || { rm -f -- "$source" "$temp"; return 1; }
     fi
-  done < "$env_file"
+  done < "$source"
   if (( replaced == 0 )); then
-    printf '%s=%s\n' "$key" "$encoded" >> "$temp"
+    printf '%s=%s\n' "$key" "$encoded" >> "$temp" \
+      || { rm -f -- "$source" "$temp"; return 1; }
   fi
-  mv -f -- "$temp" "$env_file"
-  chmod 600 "$env_file"
+
+  if (( existing == 1 )); then
+    current_identity=$(stat -c '%d:%i:%s:%y:%z:%h:%f' -- "$env_file") \
+      || { rm -f -- "$source" "$temp"; return 1; }
+    [[ "$current_identity" == "$initial_identity" && -f "$env_file" && ! -L "$env_file" ]] \
+      || { rm -f -- "$source" "$temp"; return 1; }
+    link_count=$(stat -c '%h' -- "$env_file") \
+      || { rm -f -- "$source" "$temp"; return 1; }
+    [[ "$link_count" == 1 ]] || { rm -f -- "$source" "$temp"; return 1; }
+    if ! cmp -s -- "$env_file" "$source"; then
+      rm -f -- "$source" "$temp"
+      return 1
+    fi
+  elif [[ -e "$env_file" || -L "$env_file" ]]; then
+    rm -f -- "$source" "$temp"
+    return 1
+  fi
+  if (( existing == 1 )); then
+    if python3 "${COMMON_DIR}/atomic-config.py" replace "$env_file" "$source" "$temp" \
+      "$initial_device" "$initial_inode"; then
+      publish_status=0
+    else
+      publish_status=$?
+    fi
+  else
+    if python3 "${COMMON_DIR}/atomic-config.py" create "$env_file" "$source" "$temp"; then
+      publish_status=0
+    else
+      publish_status=$?
+    fi
+  fi
+  if (( publish_status != 0 )); then
+    if (( (publish_status == 73 || publish_status == 74) \
+      && ! -e "${env_file}.crispai-atomic.json" \
+      && ! -L "${env_file}.crispai-atomic.json" \
+      && ! -e "${env_file}.crispai-atomic.next" \
+      && ! -L "${env_file}.crispai-atomic.next" )); then
+      rm -f -- "$source" "$temp"
+    fi
+    return 1
+  fi
+  [[ ! -e "${env_file}.crispai-atomic.json" \
+    && ! -L "${env_file}.crispai-atomic.json" \
+    && ! -e "${env_file}.crispai-atomic.next" \
+    && ! -L "${env_file}.crispai-atomic.next" ]] || return 1
+  rm -f -- "$source" || return 1
+  rm -f -- "$temp" || return 1
+  [[ ! -e "$source" && ! -L "$source" \
+    && ! -e "$temp" && ! -L "$temp" ]] || return 1
 }
 
 env_unset() {
@@ -1516,7 +1606,7 @@ copy_project_files() {
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/build-workflow.js n8n/web-chat.js
     scripts/provider-adapter.js scripts/visitor-output.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
     scripts/knowledge-component.js
-    scripts/menu-display.py scripts/archive-guard.py scripts/log-redact.py knowledge/README.md
+    scripts/menu-display.py scripts/archive-guard.py scripts/atomic-config.py scripts/log-redact.py knowledge/README.md
     docs/INSTALL.md docs/ARCHITECTURE.md docs/CONFIG.md docs/SECURITY.md docs/TESTING.md docs/RELEASE.md
     docs/MENU.md docs/CRISP.md docs/TROUBLESHOOTING.md docs/ADVANCED.md
   )
@@ -1527,7 +1617,7 @@ copy_project_files() {
     scripts/bootstrap.sh scripts/wizard.sh scripts/package-release.sh
     scripts/launcher.sh scripts/menu-ui.sh scripts/menu-provider-ui.sh scripts/configuration.sh scripts/provider.sh
     scripts/knowledge.sh scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh
-    scripts/doctor.sh scripts/materials.sh scripts/logs.sh scripts/knowledge-profile.sh scripts/knowledge-profile.py scripts/knowledge-lexical.py
+    scripts/doctor.sh scripts/materials.sh scripts/materials-recovery.py scripts/logs.sh scripts/knowledge-profile.sh scripts/knowledge-profile.py scripts/knowledge-lexical.py
   )
 
   mkdir -p -- "$deploy_dir" "${deploy_dir}/config" "${deploy_dir}/knowledge" "${deploy_dir}/n8n" \
@@ -2223,10 +2313,12 @@ anythingllm_secure_request() {
   if [[ ! "$max_time" =~ ^[0-9]+$ ]] || (( max_time < 1 || max_time > 3600 )); then
     die "AnythingLLM 请求超时参数无效"
   fi
-  config_file=$(mktemp "${deploy_dir}/tmp/curl-config.XXXXXX")
-  payload_file=$(mktemp "${deploy_dir}/tmp/curl-body.XXXXXX")
-  chmod 600 "$config_file" "$payload_file"
-  {
+  config_file=$(mktemp "${deploy_dir}/tmp/curl-config.XXXXXX") || return 1
+  payload_file=$(mktemp "${deploy_dir}/tmp/curl-body.XXXXXX") \
+    || { rm -f -- "$config_file"; return 1; }
+  chmod 600 "$config_file" "$payload_file" \
+    || { rm -f -- "$config_file" "$payload_file"; return 1; }
+  if ! {
     printf 'header = "Accept: application/json"\n'
     if [[ -n "$auth_value" ]]; then
       validate_env_value "$auth_value" || die "AnythingLLM 认证值无效"
@@ -2236,9 +2328,13 @@ anythingllm_secure_request() {
     if [[ "$method" == POST || "$method" == DELETE ]]; then
       printf 'header = "Content-Type: application/json"\n'
     fi
-  } > "$config_file"
+  } > "$config_file"; then
+    rm -f -- "$config_file" "$payload_file"
+    return 1
+  fi
   if [[ "$method" == POST || "$method" == DELETE ]]; then
-    printf '%s' "$payload" > "$payload_file"
+    printf '%s' "$payload" > "$payload_file" \
+      || { rm -f -- "$config_file" "$payload_file"; return 1; }
     status=$(curl --silent --output "$output_file" --write-out '%{http_code}' \
       --connect-timeout 5 --max-time "$max_time" --config "$config_file" \
       --request "$method" \
@@ -2605,10 +2701,11 @@ anythingllm_connection() {
 anythingllm_workspace_locations() {
   local response_file status locations
 
-  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/workspace-documents.XXXXXX")
+  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/workspace-documents.XXXXXX") || return 1
   status=$(anythingllm_secure_request "$ANYTHING_DEPLOY_DIR" GET \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}" \
-    "$ANYTHING_KEY" "" "$response_file")
+    "$ANYTHING_KEY" "" "$response_file") \
+    || { rm -f -- "$response_file"; return 1; }
   if [[ "$status" != 2?? ]]; then
     rm -f -- "$response_file"
     return 1
@@ -2626,10 +2723,11 @@ anythingllm_workspace_locations() {
 
 anythingllm_workspace_runtime_settings() {
   local deploy_dir=$1 response_file status target temporary now
-  response_file=$(mktemp "${deploy_dir}/tmp/workspace-settings.XXXXXX")
+  response_file=$(mktemp "${deploy_dir}/tmp/workspace-settings.XXXXXX") || return 1
   status=$(anythingllm_secure_request "$deploy_dir" GET \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}" \
-    "$ANYTHING_KEY" "" "$response_file")
+    "$ANYTHING_KEY" "" "$response_file") \
+    || { rm -f -- "$response_file"; return 1; }
   if [[ "$status" != 2?? ]] || ! jq -M -e --arg slug "$ANYTHING_WORKSPACE" '
     .workspace as $value |
     (if ($value|type) == "array" then $value elif ($value|type) == "object" then [$value] else [] end) as $items |
@@ -2642,15 +2740,19 @@ anythingllm_workspace_runtime_settings() {
   fi
   target="${deploy_dir}/data/runtime/knowledge-settings.json"
   now=$(date +%s)
-  temporary=$(mktemp "${target}.tmp.XXXXXX")
-  jq -M -n --arg slug "$ANYTHING_WORKSPACE" --argjson now "$now" \
+  temporary=$(mktemp "${target}.tmp.XXXXXX") \
+    || { rm -f -- "$response_file"; return 1; }
+  if ! jq -M -n --arg slug "$ANYTHING_WORKSPACE" --argjson now "$now" \
     --argjson temperature "$(jq -M -r '.workspace | (if type == "array" then .[0] else . end) |
       if .openAiTemp == null then 0.7 else .openAiTemp end' "$response_file")" \
-    '{schema_version:1,workspace_slug:$slug,temperature:$temperature,observed_at:$now}' > "$temporary"
+    '{schema_version:1,workspace_slug:$slug,temperature:$temperature,observed_at:$now}' > "$temporary"; then
+    rm -f -- "$response_file" "$temporary"
+    return 1
+  fi
   rm -f -- "$response_file"
-  chmod 640 "$temporary"
+  chmod 640 "$temporary" || { rm -f -- "$temporary"; return 1; }
   chown root:1000 "$temporary" 2>/dev/null || true
-  mv -f -- "$temporary" "$target"
+  mv -f -- "$temporary" "$target" || { rm -f -- "$temporary"; return 1; }
 }
 
 anythingllm_locations_have_state() {
@@ -2703,10 +2805,11 @@ anythingllm_update_embeddings() {
     || (( state_timeout < 0 || state_timeout > 3600 )); then
     state_timeout=180
   fi
-  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/update-embeddings.XXXXXX")
+  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/update-embeddings.XXXXXX") || return 1
   status=$(anythingllm_secure_request "$ANYTHING_DEPLOY_DIR" POST \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/workspace/${ANYTHING_WORKSPACE}/update-embeddings" \
-    "$ANYTHING_KEY" "$payload" "$response_file" "$request_timeout")
+    "$ANYTHING_KEY" "$payload" "$response_file" "$request_timeout") \
+    || { rm -f -- "$response_file"; return 1; }
   if [[ -s "$response_file" ]] \
     && jq -e '.error == true' "$response_file" >/dev/null 2>&1; then
     rm -f -- "$response_file"
@@ -2741,10 +2844,11 @@ anythingllm_remove_documents() {
 
   [[ "$names" != "[]" ]] || return 0
   payload=$(jq -cn --argjson names "$names" '{names:$names}')
-  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/remove-documents.XXXXXX")
+  response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/remove-documents.XXXXXX") || return 1
   status=$(anythingllm_secure_request "$ANYTHING_DEPLOY_DIR" DELETE \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/system/remove-documents" \
-    "$ANYTHING_KEY" "$payload" "$response_file")
+    "$ANYTHING_KEY" "$payload" "$response_file") \
+    || { rm -f -- "$response_file"; return 1; }
   if [[ "$status" != 2?? ]] || ! jq -e '.success == true' "$response_file" >/dev/null 2>&1; then
     rm -f -- "$response_file"
     return 1
@@ -2758,12 +2862,15 @@ knowledge_record_garbage() {
   local manifest_temp
 
   [[ "$locations" != "[]" ]] || return 0
-  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-  jq --argjson garbage "$locations" \
+  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") || return 1
+  if ! jq --argjson garbage "$locations" \
     '.garbage_locations = (((.garbage_locations // []) + $garbage) | unique)' \
-    "$manifest" > "$manifest_temp"
-  chmod 600 "$manifest_temp"
-  mv -f -- "$manifest_temp" "$manifest"
+    "$manifest" > "$manifest_temp"; then
+    rm -f -- "$manifest_temp"
+    return 1
+  fi
+  chmod 600 "$manifest_temp" || { rm -f -- "$manifest_temp"; return 1; }
+  mv -f -- "$manifest_temp" "$manifest" || { rm -f -- "$manifest_temp"; return 1; }
 }
 
 knowledge_current_profile() {
@@ -2789,8 +2896,8 @@ knowledge_record_pending() {
   local manifest_temp now
 
   now=$(date +%s)
-  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-  jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
+  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") || return 1
+  if ! jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
     --argjson old_locations "$old_locations" --argjson started_at "$now" --arg profile "$embedding_profile" \
     '.pending_files = (.pending_files // {}) |
      .pending_files[$name] = {
@@ -2798,9 +2905,12 @@ knowledge_record_pending() {
        locations:$locations,
        old_locations:$old_locations,
        started_at:$started_at
-     } + (if $profile == "" then {} else {embedding_profile:$profile} end)' "$manifest" > "$manifest_temp"
-  chmod 600 "$manifest_temp"
-  mv -f -- "$manifest_temp" "$manifest"
+     } + (if $profile == "" then {} else {embedding_profile:$profile} end)' "$manifest" > "$manifest_temp"; then
+    rm -f -- "$manifest_temp"
+    return 1
+  fi
+  chmod 600 "$manifest_temp" || { rm -f -- "$manifest_temp"; return 1; }
+  mv -f -- "$manifest_temp" "$manifest" || { rm -f -- "$manifest_temp"; return 1; }
 }
 
 knowledge_clear_pending() {
@@ -2808,25 +2918,37 @@ knowledge_clear_pending() {
   local filename=$2
   local manifest_temp
 
-  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-  jq --arg name "$filename" \
+  manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") || return 1
+  if ! jq --arg name "$filename" \
     '.pending_files = (.pending_files // {}) | del(.pending_files[$name])' \
-    "$manifest" > "$manifest_temp"
-  chmod 600 "$manifest_temp"
-  mv -f -- "$manifest_temp" "$manifest"
+    "$manifest" > "$manifest_temp"; then
+    rm -f -- "$manifest_temp"
+    return 1
+  fi
+  chmod 600 "$manifest_temp" || { rm -f -- "$manifest_temp"; return 1; }
+  mv -f -- "$manifest_temp" "$manifest" || { rm -f -- "$manifest_temp"; return 1; }
 }
 
 knowledge_sync_legacy() {
   local deploy_dir=$1
   local force=${2:-0}
   local scope=${3:-null}
-  local knowledge_dir="${deploy_dir}/knowledge"
+  local knowledge_dir=${4:-${deploy_dir}/knowledge}
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
-  local response_file manifest_temp file filename hash old_hash locations old_locations payload status upload_config stale_locations garbage_locations escaped_key
+  local response_file manifest_temp file filename hash old_hash locations old_locations payload status=000 upload_config stale_locations garbage_locations escaped_key
+  local upload_filename='' upload_file=''
+  local curl_result=0 response_persistent=false
   local pending_hash pending_locations pending_old_locations pending_started pending_age pending_retry_after update_status
   local embedding_profile manifest_profile old_profile pending_profile profile_mismatch
   local failures=0 uploaded=0 removed=0 skipped=0
   local -a files=()
+
+  if [[ "$knowledge_dir" != "${deploy_dir}/knowledge" ]]; then
+    [[ "$knowledge_dir" == "${deploy_dir}/tmp/"* && -d "$knowledge_dir" && ! -L "$knowledge_dir" ]] \
+      || die '知识恢复来源目录不在本实例受管临时目录'
+    [[ $(realpath -e -- "$knowledge_dir") == "$(realpath -e -- "${deploy_dir}/tmp")/"* ]] \
+      || die '知识恢复来源目录越出本实例受管临时目录'
+  fi
 
   require_command curl
   require_command jq
@@ -2861,11 +2983,16 @@ knowledge_sync_legacy() {
     payload=$(jq -cn --argjson deletes "$garbage_locations" '{adds:[],deletes:$deletes}')
     if anythingllm_update_embeddings "$payload" \
       && anythingllm_remove_documents "$garbage_locations"; then
-      manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-      jq '.garbage_locations = []' "$manifest" > "$manifest_temp"
-      chmod 600 "$manifest_temp"
-      mv -f -- "$manifest_temp" "$manifest"
-      info "已清理上次同步遗留的 AnythingLLM 源文档"
+      if manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") \
+        && jq '.garbage_locations = []' "$manifest" > "$manifest_temp" \
+        && chmod 600 "$manifest_temp" \
+        && mv -f -- "$manifest_temp" "$manifest"; then
+        info "已清理上次同步遗留的 AnythingLLM 源文档"
+      else
+        rm -f -- "${manifest_temp:-}"
+        warn "服务端旧文档已清理，但本机知识责任记录未能提交"
+        ((failures += 1))
+      fi
     else
       warn "上次同步遗留的 AnythingLLM 源文档仍未清理，将在下次同步重试"
       ((failures += 1))
@@ -2919,7 +3046,8 @@ knowledge_sync_legacy() {
           ((failures += 1))
           continue
         fi
-        knowledge_clear_pending "$manifest" "$filename"
+        knowledge_clear_pending "$manifest" "$filename" \
+          || { warn "无法持久更新知识恢复记录：$filename"; ((failures += 1)); continue; }
         pending_hash=''
         info "已清理发生变化文件的旧索引进度：$filename"
       elif anythingllm_wait_locations_state "$pending_locations" true \
@@ -2935,7 +3063,8 @@ knowledge_sync_legacy() {
         fi
         payload=$(jq -cn --argjson adds "$pending_locations" '{adds:$adds,deletes:[]}')
         knowledge_record_pending "$manifest" "$filename" "$hash" \
-          "$pending_locations" "$pending_old_locations" "$embedding_profile"
+          "$pending_locations" "$pending_old_locations" "$embedding_profile" \
+          || { warn "无法持久更新知识索引进度：$filename"; ((failures += 1)); continue; }
         if anythingllm_update_embeddings "$payload"; then
           locations=$pending_locations
           old_locations=$pending_old_locations
@@ -2954,34 +3083,116 @@ knowledge_sync_legacy() {
         continue
       fi
 
-      response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX")
-      upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX")
-      chmod 600 "$upload_config"
-      escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
-        || { rm -f -- "$upload_config" "$response_file"; die "AnythingLLM API Key 无法安全写入请求配置"; }
-      printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"
-      status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
-        --connect-timeout 5 --max-time 300 \
-        --config "$upload_config" \
-        --form "file=@${file}" \
-        "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null || true)
-      rm -f -- "$upload_config"
-      if [[ "$status" != 2?? ]] || ! jq -e '.success == true and (.documents | type == "array")' "$response_file" >/dev/null 2>&1; then
-        warn "知识文件同步失败：$filename（HTTP ${status:-000}）"
+      response_persistent=false
+      upload_file=$file
+      if declare -F materials_recovery_upload_response_file >/dev/null \
+        && [[ -d "${deploy_dir}/backups/config-history/materials.recovery" \
+          && ! -L "${deploy_dir}/backups/config-history/materials.recovery" ]]; then
+        if ! response_file=$(materials_recovery_upload_response_file "$deploy_dir" "$filename" "$file"); then
+          warn "无法建立知识上传恢复记录：$filename"
+          ((failures += 1))
+          continue
+        fi
+        response_persistent=true
+        upload_filename=$(jq -M -er '.upload_filename | select(type == "string" and test("^crispai-upload-[a-f0-9]{32}\\.[A-Za-z0-9]{1,16}$"))' \
+          "${deploy_dir}/backups/config-history/materials.recovery/upload-intent.json") \
+          || { materials_recovery_finish_upload "$deploy_dir" || true; ((failures += 1)); continue; }
+        upload_file="${deploy_dir}/backups/config-history/materials.recovery/upload-payload"
+      else
+        response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX") \
+          || { warn "无法建立知识上传临时文件：$filename"; ((failures += 1)); continue; }
+      fi
+      if ! upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX"); then
+        warn "无法建立知识上传请求配置：$filename"
         rm -f -- "$response_file"
+        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
         ((failures += 1))
         continue
       fi
-      locations=$(jq -c '[.documents[]?.location | select(type == "string")]' "$response_file")
-      rm -f -- "$response_file"
-      if [[ "$locations" == "[]" ]]; then
-        warn "AnythingLLM 未返回文档位置：$filename"
+      if ! chmod 600 "$upload_config"; then
+        rm -f -- "$upload_config" "$response_file"
+        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
         ((failures += 1))
         continue
+      fi
+      escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
+        || { rm -f -- "$upload_config" "$response_file";
+          [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true;
+          die "AnythingLLM API Key 无法安全写入请求配置"; }
+      if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"; then
+        rm -f -- "$upload_config" "$response_file"
+        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
+        ((failures += 1))
+        continue
+      fi
+      if [[ "$response_persistent" == true ]]; then
+        if status=$(cd "${deploy_dir}/backups/config-history/materials.recovery" \
+          && curl --silent --output "$response_file" --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 300 --config "$upload_config" \
+            --form "file=@upload-payload;filename=${upload_filename}" \
+            "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null); then
+          curl_result=0
+        else
+          curl_result=$?
+        fi
+      else
+        if status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
+          --connect-timeout 5 --max-time 300 --config "$upload_config" \
+          --form "file=@${upload_file}" \
+          "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null); then
+          curl_result=0
+        else
+          curl_result=$?
+        fi
+      fi
+      rm -f -- "$upload_config"
+      locations=$(jq -M -ce '[.documents[]?.location | select(type == "string")] | unique' \
+        "$response_file" 2>/dev/null || printf '[]')
+      if [[ "$response_persistent" == true && "$locations" != '[]' ]]; then
+        if ! materials_recovery_track_locations "$deploy_dir" "$locations"; then
+          warn "知识上传位置未能写入恢复账本：$filename"
+          ((failures += 1))
+          continue
+        fi
+      fi
+      if [[ "$status" != 2?? ]] || ! jq -e '.success == true and (.documents | type == "array")' "$response_file" >/dev/null 2>&1; then
+        warn "知识文件同步失败：$filename（HTTP ${status:-000}）"
+        if [[ "$response_persistent" == false ]]; then
+          rm -f -- "$response_file"
+        elif [[ "$locations" != '[]' ]]; then
+          materials_recovery_finish_upload "$deploy_dir" \
+            || warn "知识上传位置已登记，但本次上传账本尚未收口：$filename"
+        elif [[ "$curl_result" == 0 && "$status" == 4?? && "$status" != 408 && "$status" != 409 && "$status" != 429 ]]; then
+          # 明确的非重试客户端拒绝没有接收候选正文，可立即收口意图记录。
+          materials_recovery_finish_upload "$deploy_dir" \
+            || warn "知识上传拒绝结果尚未收口：$filename"
+        elif (( curl_result == 3 || curl_result == 6 || curl_result == 7 )); then
+          # URL/解析/建连或本地读取在 HTTP 请求被服务端接收前已确定
+          # 失败；只有这些 curl 分类允许收口空上传意图。超时、断流和
+          # HTTP 5xx 仍属结果未知。
+          materials_recovery_finish_upload "$deploy_dir" \
+            || warn "知识上传未发出结果尚未收口：$filename"
+        else
+          warn "上传结果无法确认，已保留受限恢复记录并阻止本次资料发布：$filename"
+        fi
+        ((failures += 1))
+        continue
+      fi
+      if [[ "$locations" == "[]" ]]; then
+        warn "AnythingLLM 未返回文档位置：$filename"
+        [[ "$response_persistent" == true ]] || rm -f -- "$response_file"
+        ((failures += 1))
+        continue
+      fi
+      if [[ "$response_persistent" == true ]]; then
+        materials_recovery_finish_upload "$deploy_dir" || { ((failures += 1)); continue; }
+      else
+        rm -f -- "$response_file" || { ((failures += 1)); continue; }
       fi
 
       old_locations=$(jq -c --arg name "$filename" '.files[$name].locations // []' "$manifest")
-      knowledge_record_pending "$manifest" "$filename" "$hash" "$locations" "$old_locations" "$embedding_profile"
+      knowledge_record_pending "$manifest" "$filename" "$hash" "$locations" "$old_locations" "$embedding_profile" \
+        || { warn "无法持久登记知识上传结果：$filename"; ((failures += 1)); continue; }
       payload=$(jq -cn --argjson adds "$locations" '{adds:$adds,deletes:[]}')
       if anythingllm_update_embeddings "$payload"; then
         update_status=0
@@ -2994,10 +3205,12 @@ knowledge_sync_legacy() {
         else
           warn "知识索引被 AnythingLLM 明确拒绝，已保留旧索引：$filename"
           if anythingllm_remove_documents "$locations"; then
-            knowledge_clear_pending "$manifest" "$filename"
+            knowledge_clear_pending "$manifest" "$filename" \
+              || warn "源文档已清理，但知识进度记录将在下次同步继续收口：$filename"
           else
-            knowledge_record_garbage "$manifest" "$locations"
-            knowledge_clear_pending "$manifest" "$filename"
+            knowledge_record_garbage "$manifest" "$locations" \
+              && knowledge_clear_pending "$manifest" "$filename" \
+              || warn "源文档清理责任未能写回知识清单，将由资料恢复账本继续阻止发布：$filename"
             warn "本次上传的源文档清理失败，已登记供下次同步重试：$filename"
           fi
         fi
@@ -3011,7 +3224,8 @@ knowledge_sync_legacy() {
       payload=$(jq -cn --argjson deletes "$stale_locations" '{adds:[],deletes:$deletes}')
       if [[ "$stale_locations" != "[]" ]] && ! anythingllm_update_embeddings "$payload"; then
         warn "旧索引清理结果无法确认；新索引保持可用，旧位置已登记供下次重试：$filename"
-        knowledge_record_garbage "$manifest" "$stale_locations"
+        knowledge_record_garbage "$manifest" "$stale_locations" \
+          || { warn "旧索引清理责任未能持久化：$filename"; ((failures += 1)); continue; }
         ((failures += 1))
         stale_locations='[]'
       fi
@@ -3022,16 +3236,22 @@ knowledge_sync_legacy() {
       garbage_locations=$stale_locations
       ((failures += 1))
     fi
-    manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-    jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
+    manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") \
+      || { ((failures += 1)); continue; }
+    if ! jq --arg name "$filename" --arg hash "$hash" --argjson locations "$locations" \
       --argjson garbage "$garbage_locations" --arg profile "$embedding_profile" \
       '.files[$name] = ({sha256:$hash, locations:$locations} +
          (if $profile == "" then {} else {embedding_profile:$profile} end)) |
        .pending_files = (.pending_files // {}) | del(.pending_files[$name]) |
        .garbage_locations = (((.garbage_locations // []) + $garbage) | unique)' \
-      "$manifest" > "$manifest_temp"
-    chmod 600 "$manifest_temp"
-    mv -f -- "$manifest_temp" "$manifest"
+      "$manifest" > "$manifest_temp"; then
+      rm -f -- "$manifest_temp"
+      ((failures += 1))
+      continue
+    fi
+    chmod 600 "$manifest_temp" \
+      && mv -f -- "$manifest_temp" "$manifest" \
+      || { rm -f -- "$manifest_temp"; ((failures += 1)); continue; }
     ((uploaded += 1))
   done
 
@@ -3057,7 +3277,8 @@ knowledge_sync_legacy() {
       ((failures += 1))
       continue
     fi
-    knowledge_clear_pending "$manifest" "$filename"
+    knowledge_clear_pending "$manifest" "$filename" \
+      || { warn "无法持久清理知识索引进度：$filename"; ((failures += 1)); continue; }
     ((removed += 1))
   done < <(jq -r '(.pending_files // {}) | keys[]' "$manifest")
 
@@ -3081,13 +3302,19 @@ knowledge_sync_legacy() {
       garbage_locations=$old_locations
       ((failures += 1))
     fi
-    manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX")
-    jq --arg name "$filename" --argjson garbage "$garbage_locations" \
+    manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") \
+      || { ((failures += 1)); continue; }
+    if ! jq --arg name "$filename" --argjson garbage "$garbage_locations" \
       'del(.files[$name]) |
        .garbage_locations = (((.garbage_locations // []) + $garbage) | unique)' \
-      "$manifest" > "$manifest_temp"
-    chmod 600 "$manifest_temp"
-    mv -f -- "$manifest_temp" "$manifest"
+      "$manifest" > "$manifest_temp"; then
+      rm -f -- "$manifest_temp"
+      ((failures += 1))
+      continue
+    fi
+    chmod 600 "$manifest_temp" \
+      && mv -f -- "$manifest_temp" "$manifest" \
+      || { rm -f -- "$manifest_temp"; ((failures += 1)); continue; }
     ((removed += 1))
   done < <(jq -r '.files | keys[]' "$manifest")
 

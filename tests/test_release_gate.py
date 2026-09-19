@@ -43,6 +43,24 @@ def main():
         digest = hashlib.sha256(original).hexdigest()
         checksum = artifacts / "SHA256SUMS"
         assert checksum.read_text(encoding="ascii") == digest + "  " + archive.name + "\n"
+        for required in ("scripts/materials-recovery.py", "scripts/atomic-config.py"):
+            broken = identity.create_repository(
+                temporary / ("missing-" + Path(required).stem),
+            )
+            manifest = broken / gate.MANIFEST_PATH
+            lines = [line for line in manifest.read_text(encoding="utf-8").splitlines()
+                     if line != required]
+            manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            assert run(["git", "add", gate.MANIFEST_PATH], broken).returncode == 0
+            assert run(["git", "commit", "-m", "fixture missing required helper"], broken).returncode == 0
+            broken_commit = run(["git", "rev-parse", "HEAD"], broken).stdout.strip()
+            try:
+                gate.release_manifest(broken, broken_commit, "v1.3.0")
+            except ValueError as error:
+                assert str(error) == "manifest"
+            else:
+                raise AssertionError(f"发布门禁接受了缺少 {required} 的清单")
+            print(f"通过：[UNIT/CONTRACT] 发布门禁拒绝遗漏 {required}", flush=True)
         receipt = temporary / "receipt.json"
         accepted = {
             "schema_version": 2, "version": "v1.3.0", "commit": commit,

@@ -564,6 +564,7 @@ doctor_files_and_config_check() {
   local website tier hook_mode hook_secret identifier token auth expected_auth
   local runtime_config menu_config handoff_config
   local business_runtime_config business_menu_config business_handoff_config business_source business_projection_rc=0
+  local -a atomic_artifacts=()
   local -a required=(VERSION docker-compose.yml .env get.sh install.sh manage.sh update.sh uninstall.sh
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/build-workflow.js n8n/web-chat.js
     config/app.yaml config/Caddyfile.example config/runtime.yaml config/provider.yaml config/prompt.md
@@ -576,6 +577,7 @@ doctor_files_and_config_check() {
     scripts/full-backup.sh scripts/archive-guard.py scripts/materials.sh scripts/logs.sh scripts/log-redact.py
     scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-component.js
     scripts/knowledge-lexical.py n8n/knowledge-lexical.js)
+  installed_version=$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)
   DOCTOR_POOL_ENABLED=0
   if [[ -e "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" \
     || $(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]] \
@@ -584,13 +586,15 @@ doctor_files_and_config_check() {
     required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh)
   fi
   DOCTOR_VISITOR_OUTPUT_ENABLED=0
-  installed_version=$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)
   if version_at_least "$installed_version" v1.2.2 \
     || [[ -e "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" \
       || -L "${DOCTOR_DEPLOY_DIR}/scripts/visitor-output.js" ]] \
     || grep -Fq '/scripts/visitor-output.js' "${DOCTOR_DEPLOY_DIR}/docker-compose.yml" 2>/dev/null; then
     DOCTOR_VISITOR_OUTPUT_ENABLED=1
     required+=(scripts/visitor-output.js)
+  fi
+  if version_at_least "$installed_version" v1.3.0; then
+    required+=(scripts/materials-recovery.py scripts/atomic-config.py)
   fi
   start=$(doctor_now_ms)
   for relative in "${required[@]}"; do
@@ -600,6 +604,30 @@ doctor_files_and_config_check() {
     doctor_add installation.files '生产文件' PASS critical '全部必要生产模块均存在且不是符号链接' filesystem '' "$start"
   else
     doctor_add installation.files '生产文件' FAIL critical "缺失或不安全的生产文件：${missing# }" filesystem '从同版本完整发布包恢复程序文件' "$start"
+  fi
+
+  if version_at_least "$installed_version" v1.3.0; then
+    start=$(doctor_now_ms)
+    shopt -s nullglob
+    atomic_artifacts=("${DOCTOR_DEPLOY_DIR}"/.env.source.* "${DOCTOR_DEPLOY_DIR}"/.env.tmp.*)
+    shopt -u nullglob
+    if [[ -e "${DOCTOR_DEPLOY_DIR}/.env.crispai-atomic.json" \
+      || -L "${DOCTOR_DEPLOY_DIR}/.env.crispai-atomic.json" \
+      || -e "${DOCTOR_DEPLOY_DIR}/.env.crispai-atomic.next" \
+      || -L "${DOCTOR_DEPLOY_DIR}/.env.crispai-atomic.next" ]]; then
+      doctor_add config.atomic_transaction '敏感配置提交事务' FAIL critical \
+        '发现尚未收口的敏感配置提交事务；当前配置代次不能据此判定完成' filesystem \
+        '停止并发配置修改后，从原配置菜单重新保存以执行受控恢复；失败时导出脱敏诊断' "$start"
+    elif (( ${#atomic_artifacts[@]} > 0 )); then
+      doctor_add config.atomic_transaction '敏感配置提交事务' FAIL critical \
+        "发现 ${#atomic_artifacts[@]} 份未归属的受限配置恢复材料；未自动删除" filesystem \
+        '不要手工选取或公开这些文件；先导出脱敏诊断并核对当前配置代次' "$start"
+    else
+      doctor_add config.atomic_transaction '敏感配置提交事务' PASS critical \
+        '敏感配置没有未决提交日志或遗留恢复材料' filesystem '' "$start"
+    fi
+  else
+    doctor_skip config.atomic_transaction '敏感配置提交事务' '当前安装版本尚未使用 v1.3.0 原子配置事务' filesystem
   fi
 
   start=$(doctor_now_ms)

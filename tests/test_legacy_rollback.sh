@@ -235,6 +235,8 @@ fi
   || fail '回滚 v1.1.0 后残留新代 doctor.sh'
 [[ ! -e "${DEPLOY_DIR}/scripts/visitor-output.js" && ! -L "${DEPLOY_DIR}/scripts/visitor-output.js" ]] \
   || fail '回滚 v1.1.0 后残留新代访客输出策略模块'
+[[ ! -e "${DEPLOY_DIR}/scripts/atomic-config.py" && ! -L "${DEPLOY_DIR}/scripts/atomic-config.py" ]] \
+  || fail '回滚 v1.1.0 后残留新代敏感配置原子提交模块'
 for relative in install.sh manage.sh update.sh uninstall.sh scripts/common.sh scripts/rollback.sh \
   scripts/launcher.sh n8n/runtime.js; do
   cmp -s -- "${LEGACY_SOURCE}/${relative}" "${DEPLOY_DIR}/${relative}" \

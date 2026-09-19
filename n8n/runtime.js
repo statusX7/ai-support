@@ -247,7 +247,8 @@ function createRuntime(env = {}, options = {}) {
         || !Number.isSafeInteger(knowledge.library_count) || knowledge.library_count < 0 || knowledge.library_count > 100
         || knowledge.enabled_library_ids.length > knowledge.library_count
         || !Number.isSafeInteger(knowledge.enabled_document_count) || knowledge.enabled_document_count < 0
-        || !Number.isSafeInteger(knowledge.document_count) || knowledge.document_count < knowledge.enabled_document_count
+        || knowledge.enabled_document_count > 1000000
+        || !Number.isSafeInteger(knowledge.document_count) || knowledge.document_count < 0
         || knowledge.document_count > 1000000
         || knowledge.enabled_document_count > 0 && !/^[a-f0-9]{64}$/.test(knowledge.profile_sha256 || '')) {
         throw new Error('生效资料投影身份无效，请使用资料应用功能恢复');

@@ -67,6 +67,8 @@ scripts/crisp-settings.sh
 scripts/full-backup.sh
 scripts/archive-guard.py
 scripts/materials.sh
+scripts/materials-recovery.py
+scripts/atomic-config.py
 scripts/logs.sh
 scripts/log-redact.py
 docs/ARCHITECTURE.md

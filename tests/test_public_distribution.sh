@@ -327,6 +327,7 @@ required = {
     "docker-compose.yml", "scripts/common.sh", "scripts/bootstrap.sh",
     "scripts/doctor.sh", "scripts/healthcheck.sh", "scripts/menu-ui.sh",
     "scripts/rollback.sh", "scripts/archive-guard.py", "scripts/package-release.sh",
+    "scripts/materials-recovery.py", "scripts/atomic-config.py",
     "n8n/workflow.json", "n8n/runtime.js", "n8n/admin-query.js", "n8n/knowledge-lexical.js",
     "scripts/knowledge-component.js", "scripts/knowledge-profile.py",
     "scripts/knowledge-profile.sh", "scripts/knowledge-lexical.py",

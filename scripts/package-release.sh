@@ -118,7 +118,7 @@ REQUIRED_RELEASE_FILES=(
   scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh
   scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py
   scripts/launcher.sh scripts/doctor.sh scripts/migration.sh scripts/full-backup.sh scripts/archive-guard.py
-  scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example
+  scripts/materials.sh scripts/materials-recovery.py scripts/atomic-config.py scripts/logs.sh scripts/log-redact.py config/logging.yaml.example
   n8n/runtime-cli.js n8n/admin-query.js n8n/web-chat.js config/provider.yaml.example
   tests/run.sh tests/test_get.sh tests/test_doctor.sh tests/test_public_distribution.sh
   tests/test_legacy_rollback.sh tests/test_install_resume.sh tests/test_runtime_missing_reply_p0.js

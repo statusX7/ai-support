@@ -7,6 +7,10 @@ source "${SCRIPT_DIR}/common.sh"
 # 预检必须使用当前可信程序，不能执行快照中附带的脚本来验证快照自身。
 # shellcheck source=scripts/configuration.sh
 source "${SCRIPT_DIR}/configuration.sh"
+# v1.3.0 快照必须由当前可信程序验证资料原文、索引与投影代次；不得执行
+# 快照内脚本来证明快照自身安全。
+# shellcheck source=scripts/materials.sh
+source "${SCRIPT_DIR}/materials.sh"
 
 DEPLOY_REQUEST=""
 SNAPSHOT_ID=""
@@ -244,6 +248,38 @@ PAYLOAD="${STAGING}/payload"
 [[ "$(<"${PAYLOAD}/VERSION")" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "快照 VERSION 格式无效"
 ROLLBACK_TARGET_VERSION=$(<"${PAYLOAD}/VERSION")
 jq empty "${PAYLOAD}/n8n/workflow.json" || die "快照 workflow 无效"
+if ! version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0 && (( SAFETY_SNAPSHOT == 0 )); then
+  die '降到不识别资料双层状态的旧版本时必须先创建安全快照；拒绝 --no-safety-snapshot'
+fi
+# 无论是否跳过安全快照，都必须在停止服务或覆盖 .env 前拒绝未决配置事务。
+# journal 与 source/candidate 是同一恢复责任，不能由另一代回滚载荷接管或清理。
+for marker in "${DEPLOY_DIR}/.env.crispai-atomic.json" \
+  "${DEPLOY_DIR}/.env.crispai-atomic.next"; do
+  [[ ! -e "$marker" && ! -L "$marker" ]] \
+    || die '当前敏感配置提交事务尚未收口；不能开始版本回滚'
+done
+shopt -s nullglob
+ATOMIC_CONFIG_ARTIFACTS=("${DEPLOY_DIR}"/.env.source.* "${DEPLOY_DIR}"/.env.tmp.*)
+shopt -u nullglob
+(( ${#ATOMIC_CONFIG_ARTIFACTS[@]} == 0 )) \
+  || die '当前敏感配置存在未归属恢复材料；不能开始版本回滚'
+materials_recovery_cleanup_orphans "$DEPLOY_DIR" \
+  || die '当前资料恢复遗留临时对象不安全；不能开始版本回滚'
+[[ ! -e "${DEPLOY_DIR}/backups/config-history/materials.recovery" \
+  && ! -L "${DEPLOY_DIR}/backups/config-history/materials.recovery" \
+  && ! -e "${DEPLOY_DIR}/backups/config-history/materials.initialize" \
+  && ! -L "${DEPLOY_DIR}/backups/config-history/materials.initialize" ]] \
+  || die '当前资料事务尚未收口；不能用版本回滚丢弃恢复责任'
+MATERIALS_DOWNGRADE_BACKUP=""
+if ! version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0 \
+  && [[ -e "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    || -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" ]]; then
+  MATERIALS_DOWNGRADE_BACKUP="${DEPLOY_DIR}/backups/config-history/materials.applied.pre-v1.3.${SNAPSHOT_ID}.tar.gz"
+  [[ -f "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    && ! -e "$MATERIALS_DOWNGRADE_BACKUP" && ! -L "$MATERIALS_DOWNGRADE_BACKUP" ]] \
+    || die '降版资料原文包保全路径不安全；未修改部署'
+fi
 for name in runtime.yaml keyword.yaml menu.yaml handoff.yaml tags.yaml feedback.yaml; do
   if [[ -f "${PAYLOAD}/config/${name}" ]]; then
     # 兼容旧版本 schema，只做共用严格语法/字节检查；保留原始 YAML 不改写。
@@ -272,6 +308,22 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
   if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.2.2; then
     [[ -f "${PAYLOAD}/scripts/visitor-output.js" && ! -L "${PAYLOAD}/scripts/visitor-output.js" ]] \
       || die '访客输出策略快照缺少必要文件：scripts/visitor-output.js'
+  fi
+  if version_at_least "$(sed -n '1p' "${PAYLOAD}/VERSION")" v1.3.0; then
+    [[ -f "${PAYLOAD}/scripts/materials-recovery.py" && ! -L "${PAYLOAD}/scripts/materials-recovery.py" ]] \
+      || die '资料恢复事务快照缺少必要文件：scripts/materials-recovery.py'
+    [[ -f "${PAYLOAD}/scripts/atomic-config.py" && ! -L "${PAYLOAD}/scripts/atomic-config.py" ]] \
+      || die '敏感配置原子提交快照缺少必要文件：scripts/atomic-config.py'
+    [[ -f "${PAYLOAD}/config/materials-applied.json" \
+      && ! -L "${PAYLOAD}/config/materials-applied.json" \
+      && -f "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" \
+      && ! -L "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" ]] \
+      || die 'v1.3.0 快照缺少成套资料投影或规范原文包'
+    mkdir -m 0700 -p -- "${PAYLOAD}/tmp"
+    materials_snapshot_validate_generation "$PAYLOAD" \
+      "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" \
+      "${PAYLOAD}/config/materials-applied.json" \
+      || die 'v1.3.0 快照的资料原文、知识索引与投影不同代；未修改部署'
   fi
   if [[ -e "${PAYLOAD}/config/provider-pool-applied.json" ]]; then
     python3 "${SCRIPT_DIR}/provider-pool.py" --deploy-dir "$PAYLOAD" list >/dev/null \
@@ -330,7 +382,7 @@ done
 validate_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" get.sh
 validate_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" scripts/doctor.sh
 validate_optional_version_file "${PAYLOAD}/data/knowledge-projection.json" "${DEPLOY_DIR}/data/knowledge-projection.json" data/knowledge-projection.json
-for module in materials.sh logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
+for module in materials.sh materials-recovery.py atomic-config.py logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   validate_optional_version_file "${PAYLOAD}/scripts/${module}" "${DEPLOY_DIR}/scripts/${module}" "scripts/${module}"
 done
@@ -350,15 +402,19 @@ while IFS=$'\t' read -r reference image_id; do
     || die "本机缺少回滚所需历史镜像：$reference ($image_id)"
 done < <(jq -r '.images[]? | [.reference,.id] | @tsv' "$MANIFEST")
 
+# 安全快照自身需要对仍在运行的 n8n 做投影/Prompt 回读，并负责在一致性
+# 窗口内暂停和恢复应用服务。必须在本回滚停止容器前完成；否则真实 Docker
+# 不允许对已停止的 n8n exec，默认回滚会在任何数据修改前确定性失败。
+if (( SAFETY_SNAPSHOT )); then
+  SAFETY_ID=$("${SCRIPT_DIR}/snapshot.sh" --deploy-dir "$DEPLOY_DIR" \
+    --reason "pre-rollback-${SNAPSHOT_ID}" --protect "$SNAPSHOT_ID" --quiet)
+  info "回滚前安全快照：$SAFETY_ID"
+fi
+
 mapfile -t PAUSED_APP_SERVICES < <(docker_compose "$DEPLOY_DIR" config --services | grep -E '^(n8n|anythingllm|provider-adapter)$')
 (( ${#PAUSED_APP_SERVICES[@]} )) || PAUSED_APP_SERVICES=(n8n anythingllm)
 docker_compose "$DEPLOY_DIR" stop "${PAUSED_APP_SERVICES[@]}"
 SERVICES_STOPPED=1
-
-if (( SAFETY_SNAPSHOT )); then
-  SAFETY_ID=$("${SCRIPT_DIR}/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --reason "pre-rollback-${SNAPSHOT_ID}" --protect "$SNAPSHOT_ID" --quiet)
-  info "回滚前安全快照：$SAFETY_ID"
-fi
 
 MUTATION_STARTED=1
 # 新代调度和兼容入口不能悬挂在降代后的旧模块上；完整恢复后由目标版本重建。
@@ -427,7 +483,7 @@ fi
 # 避免旧 manage/common 与新 doctor/get 组成未经验证的混合代；新快照则正常同步。
 sync_optional_version_file "${PAYLOAD}/get.sh" "${DEPLOY_DIR}/get.sh" 0750 get.sh
 sync_optional_version_file "${PAYLOAD}/scripts/doctor.sh" "${DEPLOY_DIR}/scripts/doctor.sh" 0750 scripts/doctor.sh
-for module in materials.sh logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
+for module in materials.sh materials-recovery.py atomic-config.py logs.sh log-redact.py provider-adapter.js visitor-output.js provider-router.js provider-envelope.js provider-pool.py provider.sh configuration.sh menu-display.py menu-provider-ui.sh \
   knowledge-component.js knowledge-profile.py knowledge-profile.sh knowledge-lexical.py; do
   module_mode=0750
   case "$module" in *.js|*.py) module_mode=0640 ;; esac
@@ -471,6 +527,22 @@ if [[ "$SNAPSHOT_FORMAT" == ai-support-snapshot-v3 ]]; then
       info "旧版本不识别的主备秘密或状态已受限保留：$provider_previous"
     fi
   done
+fi
+
+if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
+  [[ -d "${DEPLOY_DIR}/backups/config-history" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history" ]] \
+    || die '资料历史目录不安全；应用保持停止'
+  materials_snapshot_publish "$DEPLOY_DIR" \
+    "${PAYLOAD}/backups/config-history/materials.applied.tar.gz" \
+    "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    || die '回滚资料规范原文包发布失败；应用保持停止'
+elif [[ -n "$MATERIALS_DOWNGRADE_BACKUP" ]]; then
+  # 旧版本不理解 canonical 原文包。安全快照之外再受限保全一份，避免活动路径
+  # 与旧投影混用；不把它留在旧程序会误识别的固定名称。
+  mv -- "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" "$MATERIALS_DOWNGRADE_BACKUP"
+  chmod 0600 "$MATERIALS_DOWNGRADE_BACKUP"
+  info '新代资料规范原文包已受限保全，旧版本不会将其误作当前投影'
 fi
 
 if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
@@ -552,10 +624,20 @@ if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
   python3 "${DEPLOY_DIR}/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" verify-applied >/dev/null \
     || die '回滚后的主备接口配置未通过运行组件完整回读；应用保持保护状态'
 fi
-sync_prompt_to_anythingllm "$DEPLOY_DIR"
+if ! version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
+  # 旧快照没有同代 canonical 契约，只能沿用旧版的显式同步行为。
+  sync_prompt_to_anythingllm "$DEPLOY_DIR"
+fi
 import_and_publish_workflow "$DEPLOY_DIR"
 wait_for_local_health "$DEPLOY_DIR"
-if [[ -f "${DEPLOY_DIR}/scripts/materials.sh" && ! -L "${DEPLOY_DIR}/scripts/materials.sh" ]]; then
+if version_at_least "$ROLLBACK_TARGET_VERSION" v1.3.0; then
+  # AnythingLLM 数据库、Prompt、知识索引、投影和原文包均来自同一快照。
+  # 这里只读回确认，绝不把快照中可能待编辑的资料重新应用并抬升代次。
+  materials_applied_external_readback "$DEPLOY_DIR" \
+    "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    "${DEPLOY_DIR}/config/materials-applied.json" \
+    || die '回滚后的 Prompt、知识索引、投影或规范原文包不同代；应用保持保护状态'
+elif [[ -f "${DEPLOY_DIR}/scripts/materials.sh" && ! -L "${DEPLOY_DIR}/scripts/materials.sh" ]]; then
   bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
     || die '回滚后的资料投影与实际应用不一致；未提交完成状态'
 fi

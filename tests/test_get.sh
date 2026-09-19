@@ -147,7 +147,7 @@ write_mock_package() {
     scripts/provider-adapter.js n8n/workflow.json n8n/runtime.js
     config/app.yaml config/provider.yaml.example
   )
-  if [[ "$layout" == current || "$layout" == v120 || "$layout" == v121 || "$layout" == v122 ]]; then
+  if [[ "$layout" == current || "$layout" == v120 || "$layout" == v121 || "$layout" == v122 || "$layout" == v130 ]]; then
     required+=(
       .env.example get.sh
       config/Caddyfile.example config/feedback.yaml.example config/handoff.yaml.example
@@ -158,14 +158,17 @@ write_mock_package() {
       scripts/restore.sh scripts/rollback.sh scripts/snapshot.sh scripts/menu-ui.sh
       scripts/migration.sh scripts/crisp-settings.sh scripts/full-backup.sh scripts/archive-guard.py
     )
-    if [[ "$layout" == v120 || "$layout" == v121 || "$layout" == v122 ]]; then
+    if [[ "$layout" == v120 || "$layout" == v121 || "$layout" == v122 || "$layout" == v130 ]]; then
       required+=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
     fi
-    if [[ "$layout" == v121 || "$layout" == v122 ]]; then
+    if [[ "$layout" == v121 || "$layout" == v122 || "$layout" == v130 ]]; then
       required+=(scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py scripts/menu-display.py scripts/menu-provider-ui.sh n8n/admin-query.js n8n/knowledge-lexical.js scripts/knowledge-component.js scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-lexical.py)
     fi
-    if [[ "$layout" == v122 ]]; then
+    if [[ "$layout" == v122 || "$layout" == v130 ]]; then
       required+=(scripts/visitor-output.js)
+    fi
+    if [[ "$layout" == v130 ]]; then
+      required+=(scripts/materials-recovery.py scripts/atomic-config.py)
     fi
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
@@ -267,6 +270,7 @@ write_mock_package v1.1.2
 write_mock_package v1.2.0 v120
 write_mock_package v1.2.1 v121
 write_mock_package v1.2.2 v122
+write_mock_package v1.3.0 v130
 V120_REQUIRED=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
 for entry_index in "${!V120_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 40))"
@@ -288,6 +292,7 @@ for entry_index in "${!V122_REQUIRED[@]}"; do
   rm -f -- "${BUILD_ROOT}/ai-support-${missing_release}/${V122_REQUIRED[entry_index]}"
   repack_mock_package "$missing_release"
 done
+V130_REQUIRED=(scripts/materials-recovery.py scripts/atomic-config.py)
 
 # SHA 正确但缺少次级生产模块时，也必须在执行 install.sh 前拒绝。
 write_mock_package v1.1.8
@@ -736,6 +741,34 @@ for entry_index in "${!V122_REQUIRED[@]}"; do
     'v1.2.2 缺失访客输出策略未在执行前准确拒绝'
 done
 pass 'v1.2.2 访客输出策略缺失即使 SHA 正确也在执行包内程序前拒绝'
+
+V130_CAPTURE="${TEST_ROOT}/v130.capture"
+: > "$V130_CAPTURE"
+run_tty "$CALLER_DIR" "${TEST_ROOT}/v130.typescript" "$V130_CAPTURE" \
+  --release v1.3.0 --deploy-dir "${TEST_ROOT}/v130-deploy"
+assert_contains "$V130_CAPTURE" 'action=install' 'v1.3.0 完整包没有进入正式安装器'
+pass 'v1.3.0 完整包包含资料恢复与敏感配置原子提交模块'
+
+for entry_index in "${!V130_REQUIRED[@]}"; do
+  write_mock_package v1.3.0 v130
+  rm -f -- "${BUILD_ROOT}/ai-support-v1.3.0/${V130_REQUIRED[entry_index]}"
+  repack_mock_package v1.3.0
+  MISSING_CAPTURE="${TEST_ROOT}/missing-v130-${entry_index}.capture"
+  MISSING_DEPLOY="${TEST_ROOT}/missing-v130-${entry_index}.deploy"
+  MISSING_LOG="${TEST_ROOT}/missing-v130-${entry_index}.typescript"
+  : > "$MISSING_CAPTURE"
+  set +e
+  run_tty "$CALLER_DIR" "$MISSING_LOG" "$MISSING_CAPTURE" \
+    --release v1.3.0 --deploy-dir "$MISSING_DEPLOY"
+  MISSING_STATUS=$?
+  set -e
+  [[ "$MISSING_STATUS" != 0 && ! -s "$MISSING_CAPTURE" && ! -e "$MISSING_DEPLOY" ]] \
+    || fail 'v1.3.0 包缺少事务模块却执行了安装器'
+  assert_contains "$MISSING_LOG" "归档缺少生产文件：${V130_REQUIRED[entry_index]}" \
+    'v1.3.0 缺失事务模块未在执行前准确拒绝'
+done
+write_mock_package v1.3.0 v130
+pass 'v1.3.0 事务模块缺失即使 SHA 正确也在执行包内程序前拒绝'
 
 for entry_index in "${!V121_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 10))"

@@ -159,7 +159,7 @@ function fixture(label, allowAdmin = false) {
       lexical_sha256: digest(fs.readFileSync(lexical)),
       enabled_library_ids: enabledLibraries,
       library_count: enabledLibraries.length,
-      document_count: currentMap.documents.length,
+      document_count: options.sourceDocumentCount ?? currentMap.documents.length,
       enabled_document_count: currentMap.documents.length,
     };
     const materials = sealMaterials({schema_version: 2, revision: 1, state: 'applied', applied_at: Date.now(),
@@ -213,6 +213,24 @@ async function test(name, action) {
   catch (error) { failed++; console.error('失败 UNIT/PROTOCOL：' + name + '\n' + error.stack); }
 }
 (async () => {
+  await test('W07 一个源文档对应多个已索引 location 时运行时按两个维度验收', async () => {
+    const f = fixture('one-source-multiple-locations', true);
+    const first = f.mapping.documents[0];
+    const second = {...first,
+      location: 'custom-documents/' + first.projection + '-55555555-5555-4555-8555-555555555555.json'};
+    const firstParsed = path.join(f.root, 'data/anythingllm/documents', first.location);
+    const secondParsed = path.join(f.root, 'data/anythingllm/documents', second.location);
+    fs.mkdirSync(path.dirname(secondParsed), {recursive: true});
+    fs.copyFileSync(firstParsed, secondParsed);
+    f.mapping.documents = [first, second];
+    f.write('data/runtime/knowledge-map.json', f.mapping);
+    const materials = f.applyKnowledgeSettings(0.2, {sourceDocumentCount: 1});
+    assert.equal(materials.knowledge.document_count, 1);
+    assert.equal(materials.knowledge.enabled_document_count, 2);
+    const result = await f.admin(question);
+    assert.equal(result.answer, reference);
+    assert.equal(result.verified, true);
+  });
   await test('K01 当前问题纯检索，相关片段完整进入生成并返回明确事实', async () => {
     const f = fixture('plain'); f.applyKnowledgeSettings(0.2);
     await f.deliver(f.event('session_knowledge-plain', question));

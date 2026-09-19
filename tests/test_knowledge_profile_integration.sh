@@ -212,18 +212,75 @@ def update_control(**fields):
     value.update(fields)
     save(C, value)
     return value
+def mutate_editable(phase):
+    control = read(C)
+    if control.get('editable_edit_phase') != phase or control.get('editable_edit_consumed'):
+        return
+    prompt = ('# 迁移期间待应用的合成 Prompt\n'
+              '本内容必须保留，但未经显式应用不得进入运行代。\n')
+    prompt_path = D / 'config/prompt.md'
+    prompt_path.write_text(prompt, encoding='utf-8')
+    prompt_path.chmod(0o600)
+    handoff_path = D / 'config/handoff.yaml'
+    handoff = read(handoff_path)
+    handoff['handoff']['resume_after_seconds'] = 3599
+    save(handoff_path, handoff)
+    catalog_path = D / 'knowledge/catalog.json'
+    catalog = read(catalog_path)
+    library = catalog['libraries'][0]
+    document = library['documents'][0]
+    source_path = D / 'knowledge' / library['id'] / document['source']
+    source = ('# 迁移期间待应用的合成知识\n'
+              '蓝色指示灯仅表示测试编辑已保存，不代表已应用。\n')
+    source_path.write_text(source, encoding='utf-8')
+    source_path.chmod(0o600)
+    document['sha256'] = digest(source.encode('utf-8'))
+    document['index_status'] = 'pending'
+    document['last_error'] = None
+    library['revision'] = int(library.get('revision', 0)) + 1
+    library['status'] = 'pending'
+    library['last_sync'] = None
+    library['error'] = None
+    catalog['revision'] = int(catalog.get('revision', 0)) + 1
+    save(catalog_path, catalog)
+    save(F / 'expected-editable.json', {
+        'phase': phase,
+        'handoff_sha256': digest(canonical(handoff)),
+        'prompt_sha256': digest(prompt.encode('utf-8')),
+        'source_sha256': digest(source.encode('utf-8')),
+        'catalog_sha256': digest(canonical(catalog)),
+    })
+    update_control(editable_edit_consumed=True)
+    log('editable_edit', edit_phase=phase)
 mode, args = sys.argv[1], sys.argv[2:]
 control = read(C)
 if mode == 'python3':
     offset = 1 if args and args[0] == '-B' else 0
+    if len(args) > offset and pathlib.Path(args[offset]).name == 'atomic-config.py':
+        atomic_args = args[offset:]
+        target = atomic_args[2] if len(atomic_args) > 2 else ''
+        if target == str(D / '.env'):
+            count = int(control.get('env_set_move_count', 0)) + 1
+            control = update_control(env_set_move_count=count)
+            if count == control.get('env_set_failure_at'):
+                log('env_set_failure', move_count=count)
+                # 注入发生在 helper 执行前，目标从未改变；普通失败应清理候选，
+                # 不能伪装成需要人工恢复的交换后不确定状态。
+                raise SystemExit(74)
+        os.execv(os.environ['KPI_PYTHON'], [os.environ['KPI_PYTHON'], *args])
     if len(args) > offset and pathlib.Path(args[offset]).name == 'knowledge-profile.py':
         profile_args = args[offset:]
         if profile_args[1:3] != ['--deploy-dir', str(D)]: reject()
         action = profile_args[3]
         log('python_' + action + '_before', arguments=profile_args[4:])
         result = subprocess.run([os.environ['KPI_PYTHON'], *args], check=False)
+        if action == 'commit' and result.returncode == 0:
+            mutate_editable('after_commit')
         log('python_' + action + '_after', code=result.returncode, arguments=profile_args[4:])
         raise SystemExit(result.returncode)
+    if len(args) > offset and pathlib.Path(args[offset]).name == 'archive-guard.py' \
+            and any('knowledge-profile-final.' in item for item in args[offset + 1:]):
+        mutate_editable('before_publish')
     os.execv(os.environ['KPI_PYTHON'], [os.environ['KPI_PYTHON'], *args])
 elif mode == 'awk':
     if args == ['/^MemTotal:/ {print $2; exit}', '/proc/meminfo']:
@@ -233,6 +290,28 @@ elif mode == 'awk':
 elif mode == 'date':
     if args == ['+%s']: print(control['clock'])
     else: os.execv(os.environ['KPI_DATE'], [os.environ['KPI_DATE'], *args])
+elif mode == 'mv':
+    pointer = str(D / 'data/runtime/knowledge-migration.json')
+    if control.get('pointer_publish_failure') and args[-1:] == [pointer]:
+        update_control(pointer_publish_failure=False, pointer_publish_failure_consumed=True)
+        log('pointer_publish_failure')
+        raise SystemExit(1)
+    os.execv(os.environ['KPI_MV'], [os.environ['KPI_MV'], *args])
+elif mode == 'cmp':
+    identity_restore = any('knowledge-restore-old-editable.' in item for item in args) \
+        and any('knowledge-restore-live-editable.' in item for item in args)
+    identity_live = any('materials-editable-current.' in item for item in args)
+    if control.get('cmp_restore_identity_failure') and identity_restore:
+        update_control(cmp_restore_identity_failure=False,
+                       cmp_restore_identity_failure_consumed=True)
+        log('cmp_restore_identity_failure')
+        raise SystemExit(2)
+    if control.get('cmp_live_identity_failure') and identity_live:
+        update_control(cmp_live_identity_failure=False,
+                       cmp_live_identity_failure_consumed=True)
+        log('cmp_live_identity_failure')
+        raise SystemExit(2)
+    os.execv(os.environ['KPI_CMP'], [os.environ['KPI_CMP'], *args])
 elif mode == 'curl':
     if args != ['-q', '--fail', '--silent', '--connect-timeout', '3', '--max-time', '5',
                 'http://127.0.0.1:3001/api/ping']: reject()
@@ -274,6 +353,7 @@ elif mode == 'docker':
                 raise SystemExit(1)
             state.update(chunk_size=int(args[7]), chunk_overlap=int(args[8]), explicit_chunk_size=True)
             save(S, state)
+            mutate_editable('before_sync')
             print(json.dumps(observed(state)))
         else: reject()
     elif args[:5] == ['exec', '-T', 'n8n', 'node', '-e'] and len(args) == 6:
@@ -338,6 +418,7 @@ elif mode == 'sync':
         if current['profile'] != 'applying' or current['materials'] != 'applying' or not current['complete'] or not current['running']:
             reject()
         log('forced_sync', force=1)
+    mutate_editable('during_sync')
     control = update_control(syncs=control.get('syncs', 0) + 1, clock=2000)
     if control.get('concurrent'):
         expected = {}
@@ -377,13 +458,22 @@ elif mode == 'sync':
     if control.get('fault') == 'sync' and not control.get('fault_consumed'):
         update_control(fault_consumed=True)
         raise SystemExit(1)
+elif mode == 'mutate-editable':
+    if args != ['manual']: reject()
+    mutate_editable('manual')
+elif mode == 'initialize-call':
+    if args: reject()
+    log('materials_initialize_call')
+elif mode == 'external-readback-call':
+    if args: reject()
+    log('materials_external_readback_call')
 else:
     reject()
 ''')
 
 BIN = WORK / 'bin'
 BIN.mkdir(mode=0o700)
-for program in ('docker', 'curl', 'awk', 'date', 'python3'):
+for program in ('docker', 'curl', 'awk', 'date', 'mv', 'cmp', 'python3'):
     write(BIN / program, '#!/usr/bin/env bash\nset -euo pipefail\n'
           'exec "$KPI_PYTHON" "$KPI_HELPER" ' + program + ' "$@"\n', 0o700)
 DRIVER = WORK / 'driver.sh'
@@ -391,6 +481,16 @@ write(DRIVER, r'''#!/usr/bin/env bash
 set -euo pipefail
 # shellcheck disable=SC1090
 source "$KPI_SOURCE/scripts/knowledge-profile.sh"
+eval "$(declare -f materials_initialize | sed '1s/materials_initialize/materials_initialize_production/')"
+materials_initialize() {
+  "$KPI_PYTHON" "$KPI_HELPER" initialize-call
+  materials_initialize_production "$@"
+}
+eval "$(declare -f materials_applied_external_readback | sed '1s/materials_applied_external_readback/materials_applied_external_readback_production/')"
+materials_applied_external_readback() {
+  "$KPI_PYTHON" "$KPI_HELPER" external-readback-call
+  materials_applied_external_readback_production "$@"
+}
 configuration_query() { "$KPI_PYTHON" "$KPI_HELPER" admin-query "$@"; }
 anythingllm_connection() {
   ANYTHING_DEPLOY_DIR=$1
@@ -441,6 +541,8 @@ case "$1" in
   prepare)
     materials_prepare_candidate "$KPI_DEPLOY" "$KPI_DEPLOY/tmp/candidate" 9 applied
     ;;
+  materials-status) materials_status "$KPI_DEPLOY" ;;
+  mutate-editable) "$KPI_PYTHON" "$KPI_HELPER" mutate-editable manual ;;
   *) exit 64 ;;
 esac
 ''', 0o700)
@@ -504,7 +606,8 @@ class Integration(unittest.TestCase):
                                            'CRISP_AI_MAINTENANCE_LOCK_PATH')}
         self.environment.update(PATH=str(BIN) + ':' + os.environ['PATH'], KPI_SOURCE=str(SOURCE),
                                 KPI_DEPLOY=str(self.deploy), KPI_HELPER=str(HELPER), KPI_PYTHON=sys.executable,
-                                KPI_AWK=shutil.which('awk'), KPI_DATE=shutil.which('date'), KPI_LIBRARY=LIBRARY)
+                                KPI_AWK=shutil.which('awk'), KPI_DATE=shutil.which('date'),
+                                KPI_MV=shutil.which('mv'), KPI_CMP=shutil.which('cmp'), KPI_LIBRARY=LIBRARY)
         self.call_sequence = 0
         self.ok('initialize')
         self.initial_protected = {relative: (self.deploy / relative).read_text() for relative in PROTECTED}
@@ -541,6 +644,39 @@ class Integration(unittest.TestCase):
 
     def backups(self):
         return sorted((self.deploy / 'backups/knowledge-profiles').glob('generation.*'))
+
+    def migration_backup(self):
+        pointer = load(self.deploy / 'data/runtime/knowledge-migration.json')
+        return Path(pointer['backup'])
+
+    def rewrite_backup_record(self, backup, relative, value):
+        target = backup / 'metadata' / relative
+        mode = stat.S_IMODE(target.stat().st_mode)
+        save(target, value, mode)
+        info = target.stat()
+        complete_path = backup / 'complete.json'
+        complete = load(complete_path)
+        complete['metadata_records'][relative] = {
+            'size': info.st_size, 'sha256': sha(target), 'mode': stat.S_IMODE(info.st_mode),
+            'uid': info.st_uid, 'gid': info.st_gid,
+        }
+        save(complete_path, complete)
+
+    def make_backup_projection_only(self, backup):
+        relative = 'backups/config-history/materials.applied.tar.gz'
+        complete_path = backup / 'complete.json'
+        complete = load(complete_path)
+        complete['metadata'].remove(relative)
+        complete['metadata_records'].pop(relative)
+        save(complete_path, complete)
+        (backup / 'metadata' / relative).unlink()
+
+    def interrupt_profile_migration(self):
+        self.environment['KPI_INTERRUPT_SYNC'] = '1'
+        result = self.call('ensure')
+        self.environment.pop('KPI_INTERRUPT_SYNC')
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        return self.migration_backup()
 
     def prepare_query(self, sources, question='请根据现有知识库回答：虚构灯塔周三开放吗？'):
         write(self.fixture / 'question.txt', question)
@@ -590,11 +726,34 @@ class Integration(unittest.TestCase):
             self.assertEqual(projection['knowledge']['profile_sha256'], '')
             self.assertEqual(projection['knowledge']['enabled_document_count'], 0)
 
+    def assert_editable_pending(self, before, phase):
+        expected = load(self.fixture / 'expected-editable.json')
+        self.assertEqual(expected['phase'], phase)
+        self.assertEqual(json_digest(load(self.deploy / 'config/handoff.yaml')),
+                         expected['handoff_sha256'])
+        self.assertEqual(sha(self.deploy / 'config/prompt.md'), expected['prompt_sha256'])
+        catalog_path = self.deploy / 'knowledge/catalog.json'
+        catalog = load(catalog_path)
+        document = catalog['libraries'][0]['documents'][0]
+        source = self.deploy / 'knowledge' / catalog['libraries'][0]['id'] / document['source']
+        self.assertEqual(sha(source), expected['source_sha256'])
+        self.assertEqual(sha(source), document['sha256'])
+        self.assertEqual(json_digest(catalog), expected['catalog_sha256'])
+        status = self.call('materials-status')
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        value = json.loads(status.stdout)
+        self.assertTrue(value['source_valid'])
+        self.assertTrue(value['projection_valid'])
+        self.assertTrue(value['pending'])
+        self.assertNotEqual(value['source_sha256'], value['applied_sha256'])
+        self.assert_restored(before)
+
     def baseline(self):
         return {'storage': inventory(self.deploy / 'data/anythingllm'),
                 'settings': (self.deploy / SETTINGS).read_bytes(),
                 'lexical': (self.deploy / LEXICAL).read_bytes(),
                 'profile': (self.deploy / PROFILE).read_bytes(),
+                'canonical': (self.deploy / 'backups/config-history/materials.applied.tar.gz').read_bytes(),
                 'projection': load(self.deploy / 'config/materials-applied.json')}
 
     def assert_restored(self, before, concurrent=False):
@@ -602,6 +761,8 @@ class Integration(unittest.TestCase):
         self.assertEqual((self.deploy / SETTINGS).read_bytes(), before['settings'])
         self.assertEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
         self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
+        self.assertEqual((self.deploy / 'backups/config-history/materials.applied.tar.gz').read_bytes(),
+                         before['canonical'])
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
         current = load(self.deploy / 'config/materials-applied.json')
         for key in ('prompt', 'knowledge', 'source_components', 'source_sha256'):
@@ -649,6 +810,53 @@ class Integration(unittest.TestCase):
                                      ['--allow-migration'], ['--allow-migration']])
         self.assert_hashes()
         self.assert_protected()
+
+    def test_pending_editable_materials_block_profile_migration_before_service_stop(self):
+        before = self.baseline()
+        pending = '# 尚未明确应用的合成 Prompt\n不得由知识模型迁移隐式发布。\n'
+        write(self.deploy / 'config/prompt.md', pending, 0o640)
+        result = self.call('ensure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('存在尚未应用的 Prompt、知识或业务配置', result.stderr)
+        self.assertFalse(any(event['event'] in ('stop', 'python_backup_before', 'python_activate_before',
+                                                'configure', 'forced_sync') for event in self.events()))
+        self.assertEqual(self.baseline(), before)
+        self.assertEqual((self.deploy / 'config/prompt.md').read_text(), pending)
+        self.assert_protected()
+
+    def check_concurrent_editable_generation_is_preserved_pending(self, phase):
+        before = self.baseline()
+        self.set_control(editable_edit_phase=phase, editable_edit_consumed=False)
+        result = self.call('ensure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('新编辑保留为待应用', result.stderr)
+        self.assertEqual([event['edit_phase'] for event in self.events()
+                          if event['event'] == 'editable_edit'], [phase])
+        names = [event['event'] for event in self.events()]
+        edit = names.index('editable_edit')
+        if phase == 'before_sync':
+            self.assertLess(names.index('configure'), edit)
+            self.assertNotIn('forced_sync', names)
+        elif phase == 'during_sync':
+            self.assertLess(names.index('forced_sync'), edit)
+        elif phase == 'after_commit':
+            self.assertLess(names.index('python_commit_before'), edit)
+            self.assertLess(edit, names.index('python_commit_after'))
+        elif phase == 'before_publish':
+            self.assertLess(names.index('python_commit_after'), edit)
+        self.assert_editable_pending(before, phase)
+
+    def test_edit_before_sync_restores_runtime_a_and_preserves_editable_b(self):
+        self.check_concurrent_editable_generation_is_preserved_pending('before_sync')
+
+    def test_edit_during_sync_restores_runtime_a_and_preserves_editable_b(self):
+        self.check_concurrent_editable_generation_is_preserved_pending('during_sync')
+
+    def test_edit_after_commit_restores_runtime_a_and_preserves_editable_b(self):
+        self.check_concurrent_editable_generation_is_preserved_pending('after_commit')
+
+    def test_edit_before_final_publish_restores_runtime_a_and_preserves_editable_b(self):
+        self.check_concurrent_editable_generation_is_preserved_pending('before_publish')
 
     def test_materials_schema_v1_migrates_once_and_preserves_exact_legacy_input(self):
         projection_path = self.deploy / 'config/materials-applied.json'
@@ -1019,6 +1227,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.baseline(), applying)
         self.assertTrue((self.deploy / 'data/runtime/knowledge-migration.json').exists())
         self.assertEqual(load(self.deploy / PROFILE)['state'], 'applying')
+        self.assertFalse(load(self.fixture / 'running.json'))
         self.assert_protected(concurrent=True)
 
     def test_restore_changed_verified_projection_rejects_before_component_swap(self):
@@ -1068,16 +1277,202 @@ class Integration(unittest.TestCase):
         self.assertEqual(load(self.control)['syncs'], 2)
         self.assert_protected(concurrent=True)
 
-    def test_backup_failure_does_not_publish_applying_or_stop_old_service(self):
+    def test_backup_failure_restores_old_service_without_publishing_applying(self):
         os.link(self.deploy / 'data/anythingllm/anythingllm.db', self.deploy / 'data/anythingllm/unsafe-hardlink')
         before = self.baseline()
         self.assertNotEqual(self.call('ensure').returncode, 0)
+        events = self.events()
+        names = [event['event'] for event in events]
+        failure = next(event for event in events if event['event'] == 'python_backup_after')
+        self.assertNotEqual(failure['code'], 0)
+        self.assertLess(names.index('stop'), names.index('python_backup_after'))
+        self.assertLess(names.index('python_backup_after'), names.index('up'))
         self.assertEqual(self.baseline(), before)
         self.assertTrue(load(self.fixture / 'running.json'))
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertEqual(self.backups(), [])
         self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
         self.assertFalse(any(event['event'] in ('configure', 'forced_sync', 'python_activate_before') for event in self.events()))
         self.assert_protected()
+
+    def test_pointer_publish_failure_does_not_stop_service_or_leave_migration(self):
+        before = self.baseline()
+        self.set_control(pointer_publish_failure=True, pointer_publish_failure_consumed=False)
+        result = self.call('ensure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(load(self.control)['pointer_publish_failure_consumed'])
+        self.assertEqual([event['event'] for event in self.events()
+                          if event['event'] == 'pointer_publish_failure'], ['pointer_publish_failure'])
+        self.assertFalse(any(event['event'] == 'stop' for event in self.events()))
+        self.assertEqual(self.baseline(), before)
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertEqual(self.backups(), [])
+        self.assert_protected()
+
+    def test_incomplete_pointer_restarts_unchanged_service_before_new_migration(self):
+        backup = self.deploy / 'backups/knowledge-profiles/generation.interrupted-before-backup'
+        backup.mkdir(parents=True, mode=0o700)
+        save(self.deploy / 'data/runtime/knowledge-migration.json',
+             {'schema_version': 1, 'backup': str(backup)})
+        save(self.fixture / 'running.json', False)
+        self.ok('ensure')
+        names = [event['event'] for event in self.events()]
+        self.assertLess(names.index('up'), names.index('observe'))
+        self.assertFalse(backup.exists())
+        self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assert_protected()
+
+    def test_restore_revision_is_strictly_newer_than_live_and_verified_old_projection(self):
+        before = self.baseline()
+        backup = self.interrupt_profile_migration()
+        relative = 'config/materials-applied.json'
+        old = load(backup / 'metadata' / relative)
+        old['revision'] = 9
+        old['configuration']['runtime']['revision'] = 9
+        old['configuration']['runtime']['applied_revision'] = 9
+        self.rewrite_backup_record(backup, relative, old)
+        self.ok('restore')
+        self.assertEqual(load(self.deploy / 'config/materials-applied.json')['revision'], 10)
+        self.assert_restored(before)
+
+    def test_legacy_projection_only_restore_accepts_matching_live_canonical(self):
+        before = self.baseline()
+        backup = self.interrupt_profile_migration()
+        self.make_backup_projection_only(backup)
+        self.ok('restore')
+        self.assert_restored(before)
+
+    def test_legacy_projection_only_restore_rejects_mismatched_live_canonical(self):
+        before = self.baseline()
+        backup = self.interrupt_profile_migration()
+        self.make_backup_projection_only(backup)
+        mismatch = b'synthetic-mismatched-live-canonical\0'
+        canonical = self.deploy / 'backups/config-history/materials.applied.tar.gz'
+        canonical.write_bytes(mismatch)
+        write(self.fixture / 'events.jsonl', '')
+        result = self.call('restore')
+        self.assertNotEqual(result.returncode, 0)
+        events = self.events()
+        names = [event['event'] for event in events]
+        restore = next(event for event in events if event['event'] == 'python_restore_after')
+        self.assertEqual(restore['code'], 0)
+        self.assertLess(names.index('stop'), names.index('python_restore_after'))
+        self.assertLess(names.index('python_restore_after'), names.index('up'))
+        self.assertLess(names.index('up'), names.index('materials_external_readback_call'))
+        self.assertFalse(any(event['event'] == 'projection_readback' for event in events),
+                         '错代 canonical 必须在运行容器投影读回前由归档代次门禁拒绝')
+        self.assertEqual(canonical.read_bytes(), mismatch)
+        self.assertTrue((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertEqual(load(self.deploy / 'config/materials-applied.json')['state'], 'applied')
+        self.assertEqual(inventory(self.deploy / 'data/anythingllm'), before['storage'])
+        self.assertEqual((self.deploy / SETTINGS).read_bytes(), before['settings'])
+        self.assertEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
+        self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
+        restored = load(self.deploy / 'config/materials-applied.json')
+        for key in ('prompt', 'knowledge', 'source_components', 'source_sha256'):
+            self.assertEqual(restored[key], before['projection'][key], key)
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assert_protected()
+
+    def test_schema_v1_restore_with_editable_b_preserves_b_and_keeps_pointer(self):
+        before = self.baseline()
+        backup = self.interrupt_profile_migration()
+        relative = 'config/materials-applied.json'
+        legacy = load(backup / 'metadata' / relative)
+        legacy['schema_version'] = 1
+        self.rewrite_backup_record(backup, relative, legacy)
+        self.set_control(editable_edit_phase='manual', editable_edit_consumed=False)
+        self.ok('mutate-editable')
+        write(self.fixture / 'events.jsonl', '')
+        result = self.call('restore')
+        self.assertNotEqual(result.returncode, 0)
+        events = self.events()
+        names = [event['event'] for event in events]
+        restore = next(event for event in events if event['event'] == 'python_restore_after')
+        self.assertEqual(restore['code'], 0)
+        self.assertLess(names.index('stop'), names.index('python_restore_after'))
+        self.assertLess(names.index('python_restore_after'), names.index('up'))
+        expected = load(self.fixture / 'expected-editable.json')
+        self.assertEqual(json_digest(load(self.deploy / 'config/handoff.yaml')),
+                         expected['handoff_sha256'])
+        self.assertEqual(sha(self.deploy / 'config/prompt.md'), expected['prompt_sha256'])
+        catalog_path = self.deploy / 'knowledge/catalog.json'
+        catalog = load(catalog_path)
+        document = catalog['libraries'][0]['documents'][0]
+        source = self.deploy / 'knowledge' / catalog['libraries'][0]['id'] / document['source']
+        self.assertEqual(sha(source), expected['source_sha256'])
+        self.assertEqual(document['sha256'], expected['source_sha256'])
+        self.assertEqual(json_digest(catalog), expected['catalog_sha256'])
+        self.assertTrue((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        restored = load(self.deploy / 'config/materials-applied.json')
+        self.assertEqual(restored['schema_version'], 1)
+        for key in ('prompt', 'knowledge', 'source_components', 'source_sha256'):
+            self.assertEqual(restored[key], before['projection'][key], key)
+        self.assertEqual(inventory(self.deploy / 'data/anythingllm'), before['storage'])
+        self.assertEqual((self.deploy / SETTINGS).read_bytes(), before['settings'])
+        self.assertEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
+        self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
+        self.assertEqual((self.deploy / 'backups/config-history/materials.applied.tar.gz').read_bytes(),
+                         before['canonical'])
+        self.assertEqual([event['event'] for event in events
+                          if event['event'] == 'materials_initialize_call'], [])
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assert_protected()
+
+    def test_restore_env_write_failure_keeps_pointer_and_service_blocked_then_recovers(self):
+        self.set_control(fault='configure', env_set_move_count=0, env_set_failure_at=2)
+        result = self.call('ensure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([event['move_count'] for event in self.events()
+                          if event['event'] == 'env_set_failure'], [2])
+        self.assertTrue((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertFalse(load(self.fixture / 'running.json'))
+        self.assertEqual(list(self.deploy.glob('.env.source.*')), [])
+        self.assertEqual(list(self.deploy.glob('.env.tmp.*')), [])
+        self.assertFalse((self.deploy / '.env.crispai-atomic.json').exists())
+        self.assertFalse((self.deploy / '.env.crispai-atomic.next').exists())
+        self.set_control(fault='', env_set_failure_at=0)
+        self.ok('ensure')
+        self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assertEqual(list(self.deploy.glob('.env.source.*')), [])
+        self.assertEqual(list(self.deploy.glob('.env.tmp.*')), [])
+        self.assertFalse((self.deploy / '.env.crispai-atomic.json').exists())
+        self.assertFalse((self.deploy / '.env.crispai-atomic.next').exists())
+        self.assert_protected()
+
+    def test_restore_identity_cmp_io_failure_keeps_pointer_and_never_accepts_b(self):
+        before = self.baseline()
+        self.interrupt_profile_migration()
+        self.set_control(cmp_restore_identity_failure=True,
+                         cmp_restore_identity_failure_consumed=False)
+        write(self.fixture / 'events.jsonl', '')
+        result = self.call('restore')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(load(self.control)['cmp_restore_identity_failure_consumed'])
+        events = self.events()
+        self.assertEqual([event['event'] for event in events
+                          if event['event'] == 'cmp_restore_identity_failure'],
+                         ['cmp_restore_identity_failure'])
+        self.assertTrue((self.deploy / 'data/runtime/knowledge-migration.json').exists())
+        self.assertTrue(load(self.fixture / 'running.json'))
+        self.assertEqual(inventory(self.deploy / 'data/anythingllm'), before['storage'])
+        self.assertEqual((self.deploy / SETTINGS).read_bytes(), before['settings'])
+        self.assertEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
+        self.assertEqual((self.deploy / PROFILE).read_bytes(), before['profile'])
+        self.assert_protected()
+
+    def test_live_identity_cmp_io_failure_is_not_reported_as_concurrent_edit(self):
+        before = self.baseline()
+        self.set_control(cmp_live_identity_failure=True,
+                         cmp_live_identity_failure_consumed=False)
+        result = self.call('ensure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(load(self.control)['cmp_live_identity_failure_consumed'])
+        self.assertNotIn('新编辑保留为待应用', result.stderr)
+        self.assert_restored(before)
 
     def test_workspace_settings_invalid_readback_is_atomic_and_keeps_old_value(self):
         original = (self.deploy / SETTINGS).read_bytes()

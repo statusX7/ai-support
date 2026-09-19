@@ -65,7 +65,8 @@ class ProfileFixture(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix=self._testMethodName + "-", dir=EVIDENCE))
         self.storage = self.root / "data/anythingllm"
         for relative in ("data/anythingllm/documents/custom-documents", "data/anythingllm/vector-cache",
-                         "data/anythingllm/lancedb", "data/runtime", "knowledge", "config", "tmp"):
+                         "data/anythingllm/lancedb", "data/runtime", "knowledge", "config", "tmp",
+                         "backups/config-history"):
             (self.root / relative).mkdir(parents=True, exist_ok=True)
         (self.storage / "anythingllm.db").write_bytes(b"synthetic-component-database-before\0")
         (self.storage / ".env").write_text("SYNTHETIC_INTERNAL_KEY=fixture-only-not-real\n")
@@ -92,6 +93,9 @@ class ProfileFixture(unittest.TestCase):
             "projection": self.projection, "location": self.location}]})
         save(self.root / "knowledge/catalog.json", {"schema_version": 2, "libraries": []})
         save(self.root / "config/materials-applied.json", {"revision": 3, "state": "applied", "fixture": "before"})
+        self.canonical_path = self.root / "backups/config-history/materials.applied.tar.gz"
+        self.canonical_path.write_bytes(b"synthetic-canonical-materials-before\0")
+        self.canonical_path.chmod(0o600)
         self.cache(self.location).write_bytes(b'{"fixture":"old-cache"}\n')
         self.observed_file = self.root / "tmp/observed.json"
         self.plan_file = self.root / "tmp/plan.json"
@@ -676,23 +680,53 @@ class ProfileFixture(unittest.TestCase):
     def test_restore_preserves_concurrent_human_jobs_owned_and_material_revision(self):
         original_storage = tree(self.storage)
         original_manifest = self.manifest_path.read_bytes()
+        original_canonical = self.canonical_path.read_bytes()
         self.activate()
         (self.storage / "anythingllm.db").write_bytes(b"synthetic-new-component-database")
         (self.storage / "only-new-generation.bin").write_bytes(b"new")
         save(self.manifest_path, {"version": 1, "files": {}, "embedding_profile": "new"})
+        self.canonical_path.write_bytes(b"synthetic-canonical-new-generation\0")
+        concurrent_catalog = {"schema_version": 2, "revision": 9, "libraries": [{
+            "id": "kb_3333333333333333", "name": "迁移期间待应用的合成库", "enabled": True,
+            "revision": 4, "documents": []}]}
+        save(self.root / "knowledge/catalog.json", concurrent_catalog, 0o640)
+        concurrent_catalog_bytes = (self.root / "knowledge/catalog.json").read_bytes()
         for name in self.controls + ["config/materials-applied.json"]:
             save(self.root / name, {"fixture": "concurrent-after-backup", "mode": "human", "jobs": ["new", "old"], "generation": 7})
         protected = {name: (self.root / name).read_bytes() for name in self.controls + ["config/materials-applied.json"]}
         self.succeeds("restore", "--backup", self.backup)
         self.assertEqual(tree(self.storage), original_storage)
         self.assertEqual(self.manifest_path.read_bytes(), original_manifest)
+        self.assertEqual(self.canonical_path.read_bytes(), original_canonical)
         self.assertFalse(self.profile_path.exists(), "首次迁移回滚不能遗留新profile")
+        self.assertEqual((self.root / "knowledge/catalog.json").read_bytes(), concurrent_catalog_bytes,
+                         "恢复运行索引不得覆盖迁移期间的用户 catalog 编辑")
         for name, value in protected.items():
             self.assertEqual((self.root / name).read_bytes(), value, name)
+
+    def test_restore_legacy_projection_only_backup_preserves_live_canonical_for_shell_readback(self):
+        self.activate()
+        complete_path = self.backup / "complete.json"
+        complete = load(complete_path)
+        relative = "backups/config-history/materials.applied.tar.gz"
+        complete["metadata"].remove(relative)
+        complete["metadata_records"].pop(relative)
+        save(complete_path, complete)
+        (self.backup / "metadata" / relative).unlink()
+        live = b"synthetic-live-canonical-awaiting-shell-readback\0"
+        self.canonical_path.write_bytes(live)
+        self.succeeds("restore", "--backup", self.backup)
+        self.assertEqual(self.canonical_path.read_bytes(), live)
 
     def test_backup_rejects_symlink_before_complete(self):
         self.make_plan()
         (self.storage / "unsafe-link").symlink_to(self.root / "config/runtime.yaml")
+        self.rejects("backup", "--plan", self.plan_file, "--backup", self.backup)
+        self.assertFalse((self.backup / "complete.json").exists())
+
+    def test_backup_rejects_projection_without_canonical_before_copy(self):
+        self.make_plan()
+        self.canonical_path.unlink()
         self.rejects("backup", "--plan", self.plan_file, "--backup", self.backup)
         self.assertFalse((self.backup / "complete.json").exists())
 

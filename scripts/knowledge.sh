@@ -401,44 +401,84 @@ knowledge_catalog_migrate() {
   chmod 750 "${deploy_dir}/knowledge/kb_default" "${deploy_dir}/knowledge/kb_default/sources"
 }
 
-knowledge_catalog_project() {
-  local deploy_dir=$1 catalog="${1}/knowledge/catalog.json" old_list="${1}/data/knowledge-projection.json" next_list temporary row library source projection
+knowledge_catalog_project() (
+  local deploy_dir=$1 catalog="${1}/knowledge/catalog.json" old_list="${1}/data/knowledge-projection.json"
+  local stage next_file rows_file removals_file row library source projection temporary
   knowledge_catalog_validate "$catalog" || return 1
-  next_list=$(jq -M -c '[.libraries[] | select(.enabled) | .documents[].projection] | unique' "$catalog")
-  if [[ -f "$old_list" ]]; then
-    jq -M -e 'type == "array" and all(type == "string" and (test("[\\x00-\\x1f\\\\/;,]") | not))' "$old_list" >/dev/null || return 1
-    while IFS= read -r projection; do
-      [[ -n "$projection" && "$projection" != README.md && ! -L "${deploy_dir}/knowledge/${projection}" ]] || return 1
-      rm -f -- "${deploy_dir}/knowledge/${projection}"
-    done < <(jq -M -rn --argjson previous "$(<"$old_list")" --argjson next "$next_list" '$previous - $next | .[]')
+  stage=$(mktemp -d "${deploy_dir}/tmp/knowledge-project.XXXXXXXX") || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  next_file="${stage}/next.json"
+  rows_file="${stage}/rows.jsonl"
+  removals_file="${stage}/removals.txt"
+  jq -M -c '[.libraries[] | select(.enabled) | .documents[].projection] | unique' "$catalog" > "$next_file" \
+    || return 1
+  jq -M -c '.libraries[] | select(.enabled) | .id as $library | .documents[] | . + {library:$library}' \
+    "$catalog" > "$rows_file" || return 1
+  if [[ -e "$old_list" || -L "$old_list" ]]; then
+    [[ -f "$old_list" && ! -L "$old_list" ]] || return 1
+    jq -M -e 'type == "array" and all(type == "string" and (test("[\\x00-\\x1f\\\\/;,]") | not))' \
+      "$old_list" >/dev/null || return 1
+    jq -M -r --slurpfile next "$next_file" '. - $next[0] | .[]' "$old_list" > "$removals_file" \
+      || return 1
   else
-    while IFS= read -r projection; do
-      [[ -n "$projection" && "$projection" != README.md && ! -L "${deploy_dir}/knowledge/${projection}" ]] || return 1
-      rm -f -- "${deploy_dir}/knowledge/${projection}"
-    done < <(jq -M -r '.libraries[] | select(.enabled == false) | .documents[].projection' "$catalog")
+    jq -M -r '.libraries[] | select(.enabled == false) | .documents[].projection' "$catalog" > "$removals_file" \
+      || return 1
   fi
+
+  # 先在受限目录完整准备所有新投影，任一源文失败时不改动当前投影。
+  mkdir -m 700 -- "${stage}/projected" || return 1
   while IFS= read -r row; do
-    library=$(jq -M -r '.library' <<< "$row")
-    source=$(jq -M -r '.source' <<< "$row")
-    projection=$(jq -M -r '.projection' <<< "$row")
+    library=$(jq -M -er '.library' <<< "$row") || return 1
+    source=$(jq -M -er '.source' <<< "$row") || return 1
+    projection=$(jq -M -er '.projection' <<< "$row") || return 1
+    [[ -n "$projection" && "$projection" != README.md && "$projection" != */* \
+      && "$projection" != *\\* && "$projection" != *';'* && "$projection" != *','* \
+      && "$projection" != *$'\n'* && "$projection" != *$'\r'* ]] || return 1
     [[ -f "${deploy_dir}/knowledge/${library}/${source}" && ! -L "${deploy_dir}/knowledge/${library}/${source}" ]] || return 1
-    [[ $(realpath -e "${deploy_dir}/knowledge/${library}/${source}") == "${deploy_dir}/knowledge/${library}/"* ]] || return 1
+    [[ $(realpath -e -- "${deploy_dir}/knowledge/${library}/${source}") == "${deploy_dir}/knowledge/${library}/"* ]] || return 1
+    install -m 640 -- "${deploy_dir}/knowledge/${library}/${source}" "${stage}/projected/${projection}" \
+      || return 1
+  done < "$rows_file"
+
+  while IFS= read -r projection; do
+    [[ -n "$projection" ]] || continue
+    [[ "$projection" != README.md && "$projection" != */* && "$projection" != *\\* \
+      && "$projection" != *$'\n'* && "$projection" != *$'\r'* \
+      && ! -L "${deploy_dir}/knowledge/${projection}" ]] || return 1
+    rm -f -- "${deploy_dir}/knowledge/${projection}" || return 1
+  done < "$removals_file"
+  while IFS= read -r row; do
+    projection=$(jq -M -er '.projection' <<< "$row") || return 1
     [[ ! -L "${deploy_dir}/knowledge/${projection}" ]] || return 1
-    temporary=$(mktemp "${deploy_dir}/knowledge/.projection.XXXXXX")
-    install -m 640 -- "${deploy_dir}/knowledge/${library}/${source}" "$temporary"
+    temporary=$(mktemp "${deploy_dir}/knowledge/.projection.XXXXXX") || return 1
+    if ! install -m 640 -- "${stage}/projected/${projection}" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
     chown root:1000 "$temporary" 2>/dev/null || true
-    mv -f -- "$temporary" "${deploy_dir}/knowledge/${projection}"
-  done < <(jq -M -c '.libraries[] | select(.enabled) | .id as $library | .documents[] | . + {library:$library}' "$catalog")
-  temporary=$(mktemp "${old_list}.tmp.XXXXXX")
-  printf '%s\n' "$next_list" > "$temporary"
-  chmod 600 "$temporary"
-  mv -f -- "$temporary" "$old_list"
-}
+    if ! mv -f -- "$temporary" "${deploy_dir}/knowledge/${projection}"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+  done < "$rows_file"
+  temporary=$(mktemp "${old_list}.tmp.XXXXXX") || return 1
+  if ! install -m 600 -- "$next_file" "$temporary" || ! mv -f -- "$temporary" "$old_list"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+)
 
 knowledge_catalog_readback() {
   local deploy_dir=$1 scope=${2:-all} allow_profile_migration=${3:-false}
-  local manifest="${1}/data/knowledge-manifest.json" catalog="${1}/knowledge/catalog.json" locations temporary now
+  local catalog=${4:-${1}/knowledge/catalog.json} publish_catalog=${5:-true}
+  local manifest="${1}/data/knowledge-manifest.json" locations temporary now effective_catalog=''
   [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
+  [[ "$publish_catalog" == true || "$publish_catalog" == false ]] || return 1
+  [[ -f "$catalog" && ! -L "$catalog" ]] && knowledge_catalog_validate "$catalog" || return 1
+  if [[ "$catalog" != "${deploy_dir}/knowledge/catalog.json" ]]; then
+    [[ "$publish_catalog" == false && "$catalog" == "${deploy_dir}/tmp/"* ]] || return 1
+    [[ $(realpath -e -- "$catalog") == "$(realpath -e -- "${deploy_dir}/tmp")/"* ]] || return 1
+  fi
   anythingllm_connection "$deploy_dir"
   locations=$(anythingllm_workspace_locations) || return 1
   # 推理热路径只读取这份经管理 API 回读的最小投影，避免每条咨询下载整个工作区文档清单。
@@ -457,19 +497,41 @@ knowledge_catalog_readback() {
   # 普通菜单遇到遗留 pointer 时保持失败，不能把受阻止代次显示为已应用。
   knowledge_profile_refresh_bindings "$deploy_dir" "$allow_profile_migration" || return 1
   now=$(date +%s)
-  temporary=$(mktemp "${catalog}.tmp.XXXXXX")
-  jq -M --argjson now "$now" --arg scope "$scope" '.libraries |= map(if $scope == "all" or .id == $scope then . as $library | .status=(if .enabled then "indexed" else "disabled" end) | .last_sync=$now | .error=null |
-    .documents |= map(.index_status=(if $library.enabled then "indexed" else "disabled" end) | .last_error=null) else . end)' "$catalog" > "$temporary"
-  knowledge_catalog_write "$deploy_dir" "$temporary"
-  temporary=$(mktemp "${deploy_dir}/data/runtime/knowledge-map.json.tmp.XXXXXX")
-  jq -M -n --slurpfile catalog "$catalog" --slurpfile manifest "$manifest" '{schema_version:2,revision:$catalog[0].revision,documents:[
+  temporary=$(mktemp "${deploy_dir}/tmp/knowledge-readback-catalog.XXXXXXXX") || return 1
+  if ! jq -M --argjson now "$now" --arg scope "$scope" '.libraries |= map(if $scope == "all" or .id == $scope then . as $library | .status=(if .enabled then "indexed" else "disabled" end) | .last_sync=$now | .error=null |
+    .documents |= map(.index_status=(if $library.enabled then "indexed" else "disabled" end) | .last_error=null) else . end)' "$catalog" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if [[ "$publish_catalog" == true ]]; then
+    if ! knowledge_catalog_write "$deploy_dir" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    effective_catalog="${deploy_dir}/knowledge/catalog.json"
+  else
+    knowledge_catalog_validate "$temporary" || { rm -f -- "$temporary"; return 1; }
+    effective_catalog=$temporary
+  fi
+  temporary=$(mktemp "${deploy_dir}/data/runtime/knowledge-map.json.tmp.XXXXXX") \
+    || { [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"; return 1; }
+  if ! jq -M -n --slurpfile catalog "$effective_catalog" --slurpfile manifest "$manifest" '{schema_version:2,revision:$catalog[0].revision,documents:[
     $catalog[0].libraries[] | select(.enabled) | . as $library | .documents[] | . as $document |
     $manifest[0].files[$document.projection].locations[]? | {location:.,library_id:$library.id,library_name:$library.name,document_id:$document.id,projection:$document.projection}
-  ]}' > "$temporary"
-  chmod 640 "$temporary"
+  ]}' > "$temporary"; then
+    rm -f -- "$temporary"
+    [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"
+    return 1
+  fi
+  chmod 640 "$temporary" || { rm -f -- "$temporary"; [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"; return 1; }
   chown root:1000 "$temporary" 2>/dev/null || true
-  mv -f -- "$temporary" "${deploy_dir}/data/runtime/knowledge-map.json"
-  knowledge_lexical_build "$deploy_dir" || return 1
+  mv -f -- "$temporary" "${deploy_dir}/data/runtime/knowledge-map.json" \
+    || { rm -f -- "$temporary"; [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"; return 1; }
+  if ! knowledge_lexical_build "$deploy_dir"; then
+    [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"
+    return 1
+  fi
+  [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"
 }
 
 knowledge_sync_catalog() {
