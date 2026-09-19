@@ -155,8 +155,18 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
   const writeProfile=()=>{
     const value={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
       passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
+    const fingerprint=digest(canonical(value));
+    const manifestPath=path.join(deploy,'data/knowledge-manifest.json');
+    const manifest=JSON.parse(fs.readFileSync(manifestPath,'utf8'));
+    assert.equal(manifest.version,1);
+    assert.deepEqual(manifest.pending_files||{},{});
+    assert.deepEqual(manifest.garbage_locations||[],[]);
+    assert.deepEqual(manifest.files||{},{});
+    assert.deepEqual(locations,[]);
+    manifest.embedding_profile=fingerprint;
+    fs.writeFileSync(manifestPath,JSON.stringify(manifest)+'\n',{mode:0o600});
     fs.writeFileSync(path.join(deploy,'data/runtime/knowledge-profile.json'),JSON.stringify({schema_version:1,state:'applied',
-      profile:value,fingerprint:digest(canonical(value)),applied_at:Date.now()})+'\n',{mode:0o640});
+      profile:value,fingerprint,applied_at:Date.now()})+'\n',{mode:0o640});
   };
   try {
     prompt='## 尚未同步的远端 Prompt\n';
