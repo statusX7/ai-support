@@ -791,6 +791,193 @@ const abortablePending = (signal, started) => {
   await test('P0 processing 遇未确认 operator 后，确认真人才静默且另一会话继续', async () => {
     await processingOperatorBarrierCase('human', true);
   });
+  await test('P0 推理前出现未确认 operator 时保留同一问题，确认自动化后只回答一次', async () => {
+    const session = 'session_processing-operator-before-inference';
+    const modelCount = modelRequests.length;
+    const postCount = sendAttempts;
+    const visibleCount = sent.filter((entry) => entry.session_id === session).length;
+    let injected = false;
+    let control;
+    let ambiguousData;
+    const gatedRequest = async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (!injected && match && decodeURIComponent(match[1]) === session
+        && match[2] === '/messages') {
+        const before = state(session);
+        const claimed = before.jobs.find((job) => job.id === visitor.jobId); assert(claimed);
+        assert.equal(claimed.status, 'processing');
+        assert.equal(claimed.attempts, 1);
+        assert(claimed.data, '推理前屏障必须发生在原始问题仍已持久的窗口');
+        assert.equal(claimed.plan, undefined);
+        assert.equal(claimed.inference, undefined);
+        assert.equal(Object.values(before.outgoing || {})
+          .some((record) => record?.job_id === visitor.jobId), false);
+        now += 1;
+        ambiguousData = {
+          session_id: session, from: 'operator', type: 'text',
+          content: '推理前待确认归属的公开 operator 事件',
+          fingerprint: ++sequence, timestamp: now,
+          user: { type: 'website', nickname: '受控待确认来源' },
+        };
+        control = await runtime.receive({
+          body: { website_id: env.CRISP_WEBSITE_ID, event: 'message:received',
+            timestamp: now, data: ambiguousData },
+          query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+        });
+        assert.equal(control.route, 'process');
+        assert(state(session).uncertain_events.includes(control.jobId));
+        injected = true;
+      }
+      return request(url, options);
+    };
+    runtime = createRuntime(env, { ...runtimeOptions, request: gatedRequest });
+    let visitor;
+    try {
+      visitor = await receive(message(session, '推理前人工归属确认窗口里的普通问题'));
+      const interrupted = await runtime.process(visitor.key, visitor.jobId);
+      assert.equal(injected, true);
+      assert.equal(interrupted.status, 'deferred');
+      assert(['operator_identity_pending', 'operator_identity_resolved'].includes(interrupted.reason));
+      let preserved = state(session).jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(preserved.status, 'received');
+      assert.equal(preserved.responsibility_status, 'pending');
+      assert.equal(preserved.attempts, 1);
+      assert(preserved.data, '未确认身份不得删除原始访客问题');
+      assert.equal(preserved.plan, undefined);
+      assert.equal(preserved.inference, undefined);
+      assert.equal(modelRequests.length, modelCount);
+      assert.equal(sendAttempts, postCount);
+
+      histories.set(session, [{ ...ambiguousData, automated: true },
+        ...(histories.get(session) || [])]);
+      const controlResult = await runtime.process(control.key, control.jobId);
+      assert(!['failed', 'unresolved'].includes(controlResult.status));
+      const resolved = state(session);
+      assert.equal(resolved.uncertain_events.length, 0);
+      assert.equal(resolved.jobs.find((job) => job.id === control.jobId)
+        .operator_resolution.result, 'not-human');
+      preserved = resolved.jobs.find((job) => job.id === visitor.jobId); assert(preserved);
+      assert.equal(preserved.status, 'received');
+      assert.equal(preserved.deferred_control, undefined);
+
+      const completed = await runtime.process(visitor.key, visitor.jobId);
+      assert.equal(completed.status, 'sent');
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(sendAttempts, postCount + 1);
+      assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount + 1);
+      assert.equal(state(session).jobs.find((job) => job.id === visitor.jobId)
+        .responsibility_status, 'answered_confirmed');
+      assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'idle');
+      assert.equal(sendAttempts, postCount + 1);
+    } finally {
+      runtime = createRuntime(env, runtimeOptions);
+    }
+  });
+  await test('P0 历史 operator 缺失或超前时间必须先持久回查，不得冒充当前真人', async () => {
+    const cases = [
+      { suffix: 'not-human', raw: {}, firstExact: { automated: true }, human: false },
+      { suffix: 'pending', raw: {}, firstExact: {}, resolveLater: true, human: false },
+      { suffix: 'human-future', raw: { automated: false, timestamp: now + 120000 },
+        firstExact: { automated: false }, human: true },
+    ];
+    for (const item of cases) {
+      const session = 'session_history-operator-time-' + item.suffix;
+      const modelCount = modelRequests.length;
+      const postCount = sendAttempts;
+      const visibleCount = sent.filter((entry) => entry.session_id === session).length;
+      const operatorFingerprint = ++sequence;
+      const ambiguous = {
+        session_id: session, from: 'operator', type: 'text',
+        content: '历史中待核验的公开 operator 消息', fingerprint: operatorFingerprint,
+        user: { type: 'website', nickname: '受控待确认来源' }, ...item.raw,
+      };
+      let exact = { ...ambiguous, ...item.firstExact };
+      delete exact.timestamp;
+      let exactAt = now + 1;
+      exact.timestamp = exactAt;
+      const historyRuntime = createRuntime(env, { ...runtimeOptions,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (match && decodeURIComponent(match[1]) === session
+            && match[2] === '/message/' + operatorFingerprint) {
+            return { status: 200, body: { error: false, data: structuredClone(exact) } };
+          }
+          return request(url, options);
+        } });
+      runtime = historyRuntime;
+      try {
+        const visitor = await receive(message(session, '历史 operator 时间待核验时的普通问题'));
+        const history = histories.get(session) || [];
+        history.push(structuredClone(ambiguous)); histories.set(session, history);
+        const deferred = await runtime.process(visitor.key, visitor.jobId);
+        assert.equal(deferred.status, 'deferred');
+        assert.equal(deferred.reason, 'operator_identity_pending');
+        let snapshot = state(session);
+        const visitorJob = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(visitorJob);
+        const control = snapshot.jobs.find((job) => job.control === true
+          && job.action === 'resolve_operator' && String(job.data?.fingerprint) === String(operatorFingerprint));
+        assert(control, '未知原始时间的 operator 必须建立持久 control 责任');
+        assert.equal(control.event_time_unverified, true);
+        assert(snapshot.uncertain_events.includes(control.id));
+        assert.equal(visitorJob.status, 'received');
+        assert(visitorJob.data, '时间回查前不得删除原访客问题');
+        assert.equal(modelRequests.length, modelCount);
+        assert.equal(sendAttempts, postCount);
+
+        now = exactAt + 1;
+        let controlResult = await runtime.process(visitor.key, control.id);
+        if (item.resolveLater) {
+          snapshot = state(session);
+          const pending = snapshot.jobs.find((job) => job.id === control.id); assert(pending);
+          assert.equal(pending.status, 'received');
+          assert.equal(pending.failure_code, 'operator_identity_pending');
+          assert(snapshot.uncertain_events.includes(control.id));
+          assert.equal(snapshot.mode, 'ai');
+          exactAt = now + 1;
+          exact = { ...ambiguous, timestamp: exactAt, automated: true };
+          now = exactAt + 1;
+          await runtime.transaction(visitor.key, (current) => {
+            const stored = current.jobs.find((job) => job.id === control.id); assert(stored);
+            stored.retry_at = 0;
+          });
+          controlResult = await runtime.process(visitor.key, control.id);
+        }
+        assert(!['failed', 'unresolved'].includes(controlResult.status));
+        snapshot = state(session);
+        const resolved = snapshot.jobs.find((job) => job.id === control.id); assert(resolved);
+        assert.equal(resolved.operator_resolution.result, item.human ? 'human' : 'not-human');
+        assert.equal(resolved.event_time, exactAt,
+          '控制时间必须来自 Crisp 精确消息，不得用本机收件时间冒充');
+        assert.equal(resolved.responsibility_status, 'control_handled');
+        assert.equal(snapshot.uncertain_events.includes(control.id), false);
+
+        if (item.human) {
+          const cancelled = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(cancelled);
+          assert.equal(snapshot.mode, 'human');
+          assert.equal(snapshot.last_human_at, exactAt);
+          assert.equal(cancelled.status, 'cancelled');
+          assert.equal(cancelled.responsibility_status, 'intentional_silence');
+          assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
+          assert.equal(modelRequests.length, modelCount);
+          assert.equal(sendAttempts, postCount);
+        } else {
+          const ready = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(ready);
+          assert.equal(snapshot.mode, 'ai');
+          assert.equal(ready.status, 'received');
+          assert.equal(ready.deferred_control, undefined);
+          const completed = await runtime.process(visitor.key, visitor.jobId);
+          assert.equal(completed.status, 'sent');
+          assert.equal(modelRequests.length, modelCount + 1);
+          assert.equal(sendAttempts, postCount + 1);
+          assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount + 1);
+        }
+      } finally {
+        runtime = createRuntime(env, runtimeOptions);
+      }
+    }
+  });
   await test('P0 不确定 operator 回查为自动消息后，期间访客任务继续调度', async () => {
     const before = sent.length;
     const item = await deferredOperatorCase('automated', { automated: true });
@@ -1060,6 +1247,333 @@ const abortablePending = (signal, started) => {
       } finally {
         sendRejection = 0;
       }
+    }
+  });
+  await test('P0 已冻结 rejected/rate-limited/unknown 答案遇待确认 operator 只延后不删除', async () => {
+    const cases = [
+      { suffix: 'rejected', rejection: 403, expected: 'rejected' },
+      { suffix: 'rate-limited', rejection: 429, expected: 'rate_limited' },
+      { suffix: 'unknown', rejection: 403, expected: 'unknown' },
+    ];
+    for (const item of cases) {
+      const session = 'session_frozen-outgoing-operator-' + item.suffix;
+      runtime = createRuntime(env, runtimeOptions);
+      const modelCount = modelRequests.length;
+      const postCount = sendAttempts;
+      let initial;
+      try {
+        sendRejection = item.rejection;
+        initial = await deliver(message(session, '已冻结答案遇到待确认 operator'));
+      } finally { sendRejection = 0; }
+      assert.equal(initial.status, item.expected === 'rate_limited' ? 'rate_limited' : 'rejected');
+      let snapshot = state(session);
+      let stored = snapshot.jobs.find((job) => job.id === initial.jobId); assert(stored);
+      let pair = Object.entries(snapshot.outgoing).find(([, record]) => record.job_id === initial.jobId);
+      assert(pair);
+      const [fingerprint] = pair;
+      if (item.expected === 'unknown') {
+        await runtime.transaction(initial.key, (current) => {
+          const record = current.outgoing[fingerprint]; assert(record);
+          record.status = 'unknown';
+          record.delivery_uncertain = true;
+          record.resend_forbidden = true;
+          record.recovery_deferred = true;
+          record.next_action_at = 0;
+          record.created_at = now - 20000;
+          record.reconcile_misses = 1;
+          record.reconcile_checked_at = now - 5001;
+          delete record.failure;
+          const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job);
+          job.retry_at = 0;
+        });
+      } else {
+        now = Math.max(now + 1, pair[1].next_action_at + 1);
+        await runtime.transaction(initial.key, (current) => {
+          const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job);
+          job.retry_at = 0;
+        });
+      }
+      snapshot = state(session);
+      stored = snapshot.jobs.find((job) => job.id === initial.jobId); assert(stored);
+      pair = Object.entries(snapshot.outgoing).find(([, record]) => record.job_id === initial.jobId);
+      assert(pair);
+      const frozenRecord = structuredClone(pair[1]);
+      const frozenPlan = structuredClone(stored.plan);
+      const frozenData = structuredClone(stored.data);
+      const ambiguous = {
+        session_id: session, from: 'operator', type: 'text',
+        content: '冻结出站恢复期间的待确认 operator', fingerprint: ++sequence,
+        timestamp: now, user: { type: 'website', nickname: '受控待确认来源' },
+      };
+      const frozenRuntime = createRuntime(env, { ...runtimeOptions,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (item.expected === 'unknown' && match && decodeURIComponent(match[1]) === session
+            && match[2] === '/message/' + fingerprint) {
+            return { status: 404, body: { error: true, reason: 'not_found' } };
+          }
+          return request(url, options);
+        } });
+      runtime = frozenRuntime;
+      const running = runtime.process(initial.key, initial.jobId);
+      // process() 的领取事务在首个 await 前已持久；让它创建取消
+      // 监视后，在下一个恢复阶段之前插入未确认控制事件。
+      await Promise.resolve();
+      assert.equal(state(session).jobs.find((job) => job.id === initial.jobId).status, 'processing');
+      const control = await runtime.receive({
+        body: { website_id: env.CRISP_WEBSITE_ID, event: 'message:received',
+          timestamp: now, data: ambiguous },
+        query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      });
+      assert.equal(control.route, 'process');
+      const deferred = await running;
+      assert.equal(deferred.status, 'deferred');
+      assert.equal(deferred.reason, 'operator_identity_pending');
+      snapshot = state(session);
+      stored = snapshot.jobs.find((job) => job.id === initial.jobId); assert(stored);
+      const preserved = snapshot.outgoing[fingerprint]; assert(preserved);
+      assert.equal(stored.status, 'received');
+      assert.notEqual(stored.responsibility_status, 'intentional_silence');
+      assert.deepEqual(stored.data, frozenData);
+      assert.deepEqual(stored.plan, frozenPlan);
+      assert.equal(preserved.status, item.expected);
+      assert.deepEqual(preserved.body, frozenRecord.body,
+        '未确认 operator 不得删除已冻结待发正文');
+      assert.equal(preserved.job_id, frozenRecord.job_id);
+      assert.equal(preserved.content_sha256, frozenRecord.content_sha256);
+      assert.equal(preserved.response_generation, frozenRecord.response_generation);
+      if (item.expected === 'unknown') {
+        assert.equal(preserved.resend_forbidden, true);
+        assert.equal(preserved.delivery_uncertain, true);
+      }
+      assert.equal(modelRequests.length, modelCount + 1);
+      assert.equal(sendAttempts, postCount + 1);
+
+      const history = histories.get(session) || [];
+      history.push({ ...ambiguous, automated: true }); histories.set(session, history);
+      const controlResult = await runtime.process(control.key, control.jobId);
+      assert(!['failed', 'unresolved'].includes(controlResult.status));
+      if (item.expected === 'unknown') {
+        const currentRecord = state(session).outgoing[fingerprint]; assert(currentRecord?.body);
+        const updated = histories.get(session) || [];
+        updated.push({ ...currentRecord.body, timestamp: now }); histories.set(session, updated);
+      }
+      now = Math.max(now + 5001,
+        Number(state(session).outgoing[fingerprint]?.next_action_at || 0) + 1);
+      await runtime.transaction(initial.key, (current) => {
+        const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job);
+        job.retry_at = 0;
+      });
+      const recovered = await runtime.process(initial.key, initial.jobId);
+      assert.equal(recovered.status, 'sent');
+      snapshot = state(session);
+      assert.equal(snapshot.jobs.find((job) => job.id === initial.jobId).responsibility_status,
+        'answered_confirmed');
+      assert.equal(snapshot.outgoing[fingerprint].status, 'sent');
+      assert.equal(modelRequests.length, modelCount + 1,
+        '控制屏障恢复不得重新调用 Provider');
+      assert.equal(sendAttempts, postCount + (item.expected === 'unknown' ? 1 : 2),
+        '未知回执只读对账，明确拒绝/限流只重投原正文一次');
+    }
+    runtime = createRuntime(env, runtimeOptions);
+  });
+  await test('P0 operator 待确认窗口的 sent/null 回执解除屏障后严格重分类', async () => {
+    const session = 'session_operator-pending-null-receipt';
+    runtime = createRuntime(env, runtimeOptions);
+    const modelCount = modelRequests.length;
+    const postCount = sendAttempts;
+    let initial;
+    try {
+      sendRejection = 403;
+      initial = await deliver(message(session, '待确认 operator 窗口已收到的原答案'));
+    } finally { sendRejection = 0; }
+    assert.equal(initial.status, 'rejected');
+    let snapshot = state(session);
+    const [fingerprint, rejected] = Object.entries(snapshot.outgoing)
+      .find(([, record]) => record.job_id === initial.jobId);
+    assert(rejected?.body);
+    const expectedDigest = rejected.content_sha256;
+    await runtime.transaction(initial.key, (current) => {
+      const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job?.plan);
+      const record = current.outgoing[fingerprint]; assert(record);
+      record.status = 'sent';
+      record.semantic_status = 'valid_answer';
+      record.receipt_current = null;
+      record.receipt_state_change_reason = 'operator_identity_pending';
+      record.receipt_confirmed_at = now;
+      record.sent_at = now;
+      record.resend_forbidden = true;
+      delete record.body;
+      delete record.failure;
+      delete record.recovery_deferred;
+      delete record.next_action_at;
+      job.status = 'received';
+      job.retry_at = 0;
+      job.lease_until = 0;
+      job.responsibility_status = 'unresolved_failure';
+      job.failure_code = 'operator_identity_pending';
+    });
+    const result = await runtime.process(initial.key, initial.jobId);
+    assert.equal(result.status, 'sent');
+    snapshot = state(session);
+    const completed = snapshot.jobs.find((job) => job.id === initial.jobId); assert(completed);
+    const receipt = snapshot.outgoing[fingerprint]; assert(receipt);
+    assert.equal(completed.status, 'done');
+    assert.equal(completed.responsibility_status, 'answered_confirmed');
+    assert.equal(receipt.status, 'sent');
+    assert.equal(receipt.semantic_status, 'valid_answer');
+    assert.equal(receipt.content_sha256, expectedDigest);
+    assert.equal(receipt.receipt_current, true);
+    assert.equal(Object.hasOwn(receipt, 'receipt_state_change_reason'), false);
+    assert.equal(Object.hasOwn(receipt, 'state_changed_before_receipt'), false);
+    assert(Number.isFinite(receipt.receipt_reclassified_at));
+    assert.equal(modelRequests.length, modelCount + 1,
+      '收敛已有 sent 回执不得再次推理');
+    assert.equal(sendAttempts, postCount + 1,
+      '收敛已有 sent 回执不得再次 POST Crisp');
+  });
+  await test('P0 operator 待确认窗口的 sent/null 摘要错配必须拒绝重分类', async () => {
+    const session = 'session_operator-pending-null-receipt-mismatch';
+    runtime = createRuntime(env, runtimeOptions);
+    let initial;
+    try {
+      sendRejection = 403;
+      initial = await deliver(message(session, '待确认 operator 窗口摘要错配的原答案'));
+    } finally { sendRejection = 0; }
+    assert.equal(initial.status, 'rejected');
+    let snapshot = state(session);
+    const [fingerprint, rejected] = Object.entries(snapshot.outgoing)
+      .find(([, record]) => record.job_id === initial.jobId);
+    assert(rejected?.body);
+    const mismatchedDigest = rejected.content_sha256 === '0'.repeat(64)
+      ? '1'.repeat(64) : '0'.repeat(64);
+    await runtime.transaction(initial.key, (current) => {
+      const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job?.plan);
+      const record = current.outgoing[fingerprint]; assert(record);
+      record.status = 'sent';
+      record.semantic_status = 'valid_answer';
+      record.receipt_current = null;
+      record.receipt_state_change_reason = 'operator_identity_pending';
+      record.receipt_confirmed_at = now;
+      record.sent_at = now;
+      record.resend_forbidden = true;
+      record.content_sha256 = mismatchedDigest;
+      delete record.body;
+      delete record.failure;
+      delete record.recovery_deferred;
+      delete record.next_action_at;
+      job.status = 'received';
+      job.retry_at = 0;
+      job.lease_until = 0;
+      job.responsibility_status = 'unresolved_failure';
+      job.failure_code = 'operator_identity_pending';
+    });
+    const modelCount = modelRequests.length;
+    const postCount = sendAttempts;
+    const result = await runtime.process(initial.key, initial.jobId);
+    assert.equal(result.status, 'delivery_semantic_unknown');
+    snapshot = state(session);
+    const unresolved = snapshot.jobs.find((job) => job.id === initial.jobId); assert(unresolved);
+    const receipt = snapshot.outgoing[fingerprint]; assert(receipt);
+    assert.equal(unresolved.status, 'received');
+    assert.equal(unresolved.responsibility_status, 'unresolved_failure');
+    assert.notEqual(unresolved.responsibility_status, 'answered_confirmed');
+    assert.equal(receipt.status, 'sent');
+    assert.equal(receipt.receipt_current, null);
+    assert.equal(receipt.receipt_state_change_reason, 'operator_identity_pending');
+    assert.equal(receipt.content_sha256, mismatchedDigest);
+    assert.equal(Object.hasOwn(receipt, 'receipt_reclassified_at'), false);
+    assert.equal(modelRequests.length, modelCount,
+      '摘要错配的 sent 回执不得触发新的 Provider 请求');
+    assert.equal(sendAttempts, postCount,
+      '摘要错配的 sent 回执不得再次 POST Crisp');
+  });
+  await test('P0 Crisp POST 已开始时出现未确认 operator，只保留 unknown 对账且不重发', async () => {
+    const session = 'session_operator-pending-post-started';
+    const modelCount = modelRequests.length;
+    let startedResolve;
+    const started = new Promise((resolve) => { startedResolve = resolve; });
+    let postCalls = 0;
+    let frozenBody;
+    const postRuntime = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && decodeURIComponent(match[1]) === session
+          && match[2] === '/message' && options.method === 'POST') {
+          postCalls += 1;
+          frozenBody = structuredClone(options.body);
+          return abortablePending(options.signal, startedResolve);
+        }
+        return request(url, options);
+      } });
+    runtime = postRuntime;
+    try {
+      const visitor = await receive(message(session, 'POST 已开始时的 operator 归属窗口'));
+      const running = runtime.process(visitor.key, visitor.jobId);
+      await awaitNamedGate(started, 'Crisp POST 进入未确认 operator 窗口');
+      assert.equal(postCalls, 1);
+      assert(frozenBody && typeof frozenBody.content === 'string');
+      now += 1;
+      const ambiguous = {
+        session_id: session, from: 'operator', type: 'text',
+        content: 'POST 期间的待确认 operator', fingerprint: ++sequence,
+        timestamp: now, user: { type: 'website', nickname: '受控待确认来源' },
+      };
+      const history = histories.get(session) || [];
+      history.push(structuredClone(ambiguous)); histories.set(session, history);
+      const control = await runtime.receive({
+        body: { website_id: env.CRISP_WEBSITE_ID, event: 'message:received',
+          timestamp: now, data: ambiguous },
+        query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      });
+      assert.equal(control.route, 'process');
+      const deferred = await running;
+      assert.equal(deferred.status, 'deferred');
+      assert.equal(deferred.reason, 'operator_identity_pending');
+      let snapshot = state(session);
+      const pendingJob = snapshot.jobs.find((job) => job.id === visitor.jobId); assert(pendingJob);
+      const [fingerprint, unknown] = Object.entries(snapshot.outgoing)
+        .find(([, record]) => record.job_id === visitor.jobId);
+      assert.equal(pendingJob.status, 'received');
+      assert(pendingJob.data && pendingJob.plan,
+        '未确认 operator 不得丢失原问题或已持久答案');
+      assert.equal(unknown.status, 'unknown');
+      assert.equal(unknown.delivery_uncertain, true);
+      assert.equal(unknown.resend_forbidden, true);
+      assert.equal(unknown.recovery_deferred, true);
+      assert.equal(unknown.cancellation_reason, 'operator_identity_pending');
+      assert.deepEqual(unknown.body, frozenBody);
+      assert(Number.isFinite(unknown.next_action_at));
+      assert.equal(modelRequests.length, modelCount + 1);
+
+      histories.set(session, [{ ...ambiguous, automated: true },
+        ...(histories.get(session) || []).filter((entry) =>
+          String(entry.fingerprint) !== String(ambiguous.fingerprint))]);
+      const controlResult = await runtime.process(control.key, control.jobId);
+      assert(!['failed', 'unresolved'].includes(controlResult.status));
+      snapshot = state(session);
+      assert.equal(snapshot.uncertain_events.includes(control.jobId), false);
+      const remoteHistory = histories.get(session) || [];
+      remoteHistory.push({ ...frozenBody, timestamp: now }); histories.set(session, remoteHistory);
+      now = Math.max(now + 5001, Number(unknown.next_action_at || 0) + 1);
+      await runtime.transaction(visitor.key, (current) => {
+        const job = current.jobs.find((entry) => entry.id === visitor.jobId); assert(job);
+        job.retry_at = 0;
+      });
+      const recovered = await runtime.process(visitor.key, visitor.jobId);
+      assert.equal(recovered.status, 'sent');
+      snapshot = state(session);
+      assert.equal(snapshot.jobs.find((job) => job.id === visitor.jobId).responsibility_status,
+        'answered_confirmed');
+      assert.equal(snapshot.outgoing[fingerprint].status, 'sent');
+      assert.equal(snapshot.outgoing[fingerprint].receipt_current, true);
+      assert.equal(postCalls, 1, '同一 fingerprint 的未知回执确认后不得二次 POST');
+      assert.equal(modelRequests.length, modelCount + 1,
+        '未知回执对账不得重新推理');
+    } finally {
+      runtime = createRuntime(env, runtimeOptions);
     }
   });
   await test('T19/T21 真点击缺少from/type、原fingerprint已见也只暂停A', async () => {

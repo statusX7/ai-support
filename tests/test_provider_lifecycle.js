@@ -44,6 +44,28 @@ const checked = async (program, args, options) => { const result=await command(p
 const files = directory => fs.readdirSync(directory,{withFileTypes:true}).flatMap(entry => {
   const file=path.join(directory,entry.name); return entry.isDirectory() ? files(file) : [file];
 });
+const regularIdentity = file => {
+  const stat=fs.lstatSync(file);
+  if(!stat.isFile() || stat.isSymbolicLink())throw new Error('PL08A 资料成员类型不安全');
+  return {mode:stat.mode&0o777,size:stat.size,sha256:digest(fs.readFileSync(file))};
+};
+const materialsSnapshotMembers = [
+  '.env','backups/config-history/materials.applied.tar.gz','config/materials-applied.json',
+  'data/knowledge-manifest.json','data/knowledge-projection.json',
+  'data/runtime/knowledge-map.json','data/runtime/knowledge-settings.json',
+  'data/runtime/knowledge-lexical.json',
+];
+const materialsSnapshotIdentity = payload => Object.fromEntries(materialsSnapshotMembers
+  .concat(fs.existsSync(path.join(payload,'data/runtime/knowledge-profile.json'))
+    ? ['data/runtime/knowledge-profile.json'] : [])
+  .map(name=>[name,regularIdentity(path.join(payload,name))]));
+const assertSameIdentity = (expected,actual,label) => {
+  const names=Object.keys(expected).sort();
+  if(JSON.stringify(names)!==JSON.stringify(Object.keys(actual).sort()))throw new Error(label+'成员集合变化');
+  for(const name of names)if(JSON.stringify(expected[name])!==JSON.stringify(actual[name])) {
+    throw new Error(label+'成员内容、类型或权限变化：'+name);
+  }
+};
 async function repack(archive, name, mutate) {
   const directory=path.join(work,name); fs.mkdirSync(directory);
   await checked('tar',['-xzf',archive,'-C',directory]);
@@ -329,6 +351,22 @@ async function main(){
       const stage=path.join(work,'stale-readback-snapshot');fs.mkdirSync(stage);
       await checked('tar',['-xzf',path.join(fullSnapshot,'snapshot.tar.gz'),'-C',stage]);
       const payload=path.join(stage,'payload'),poolFile=path.join(payload,'config/provider-pool-applied.json'),pool=read(poolFile);
+      const originalFiles=files(payload).map(file=>path.relative(payload,file)).sort();
+      const originalMaterials=materialsSnapshotIdentity(payload);
+      const validateMaterials=async(candidate,label)=>{
+        const result=await command('bash',['-c',[
+          'set -euo pipefail',
+          'source "$1/scripts/materials.sh"',
+          'candidate_tmp="$2/tmp"',
+          '[[ ! -e "$candidate_tmp" && ! -L "$candidate_tmp" ]]',
+          'mkdir -m 0700 -- "$candidate_tmp"',
+          'cleanup_candidate_tmp(){ status=$?; trap - EXIT; rmdir -- "$candidate_tmp" || status=92; exit "$status"; }',
+          'trap cleanup_candidate_tmp EXIT',
+          'materials_snapshot_validate_generation "$2" "$2/backups/config-history/materials.applied.tar.gz" "$2/config/materials-applied.json"',
+        ].join('\n'),'--',project,candidate],{env:f.snapshotEnv});
+        assert.equal(result.code,0,label+'资料同代校验失败');
+      };
+      await validateMaterials(payload,'PL08A 原始正式快照');
       const archivedReadback=path.join(payload,'config/provider-pool-readback.json');
       write(archivedReadback,{schema_version:1,readback_contract_version:1,revision:pool.revision,
         secrets_generation:pool.secrets_generation,pool_sha256:digest(fs.readFileSync(poolFile)),verified_at:1});
@@ -336,7 +374,15 @@ async function main(){
       fs.mkdirSync(directory);const archive=path.join(directory,'snapshot.tar.gz');
       await checked('tar',['-czf',archive,'-C',stage,'payload']);
       write(path.join(directory,'manifest.json'),{...read(path.join(fullSnapshot,'manifest.json')),id,archive_sha256:digest(fs.readFileSync(archive))});
-      const expectedMaterials=fs.readFileSync(path.join(payload,'backups/config-history/materials.applied.tar.gz'));
+      const repacked=path.join(work,'stale-readback-repacked');fs.mkdirSync(repacked);
+      await checked('tar',['-xzf',archive,'-C',repacked]);
+      const repackedPayload=path.join(repacked,'payload');
+      const expectedFiles=[...originalFiles,'config/provider-pool-readback.json'].sort();
+      if(JSON.stringify(files(repackedPayload).map(file=>path.relative(repackedPayload,file)).sort())
+        !==JSON.stringify(expectedFiles))throw new Error('PL08A 重封装改变了预期文件集合');
+      assertSameIdentity(originalMaterials,materialsSnapshotIdentity(repackedPayload),'PL08A 重封装资料');
+      await validateMaterials(repackedPayload,'PL08A 重封装快照');
+      const expectedMaterials=fs.readFileSync(path.join(repackedPayload,'backups/config-history/materials.applied.tar.gz'));
       fs.writeFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz'),'synthetic-invalid-current-canonical',{mode:0o600});
 
       const guardBin=path.join(work,'readback-guard-bin'),guardLog=path.join(work,'readback-guard.log');

@@ -1377,10 +1377,11 @@ function createRuntime(env = {}, options = {}) {
     configurationFrozen = false) => {
     try {
       const state = readState(key);
-      if (state.generation !== job.generation || (ordinary && state.mode !== 'ai') || operatorBarrier(state)) return 'conversation_state_changed';
+      if (state.generation !== job.generation || (ordinary && state.mode !== 'ai')) return 'conversation_state_changed';
       const global = settings();
       if (ordinary && globalDisableCrossed(job, global)) return 'global_disabled';
       if (configuredSettings().enabled !== true) return 'global_disabled';
+      if (ordinary && operatorBarrier(state)) return 'operator_identity_pending';
       if (!configurationFrozen && (!global.enabled || global.revision !== job.revision
         || providerRequired && !providerGenerationCurrent(job))) return 'configuration_changed';
       return '';
@@ -1391,11 +1392,15 @@ function createRuntime(env = {}, options = {}) {
     const providerRequired = providerDependentPlan(plan);
     const key = stateKey(state.website_id, state.session_id);
     const configurationFrozen = frozenDeliveryOnlyDisposition(key, state, job) === 'ready';
-    if (state.generation !== job.generation || ordinary && state.mode !== 'ai'
-      || operatorBarrier(state)) return { current: false, reason: 'conversation_state_changed' };
+    if (state.generation !== job.generation || ordinary && state.mode !== 'ai') {
+      return { current: false, reason: 'conversation_state_changed' };
+    }
     const global = settings();
     if (ordinary && globalDisableCrossed(job, global)
       || configuredSettings().enabled !== true) return { current: false, reason: 'global_disabled' };
+    if (ordinary && operatorBarrier(state)) {
+      return { current: null, reason: 'operator_identity_pending' };
+    }
     if (!configurationFrozen && (!global.enabled || global.revision !== job.revision
       || providerRequired && !providerGenerationCurrent(job))) {
       return { current: false, reason: 'configuration_changed' };
@@ -1435,13 +1440,14 @@ function createRuntime(env = {}, options = {}) {
     try {
       const state = readState(key);
       const stored = state.jobs.find((entry) => entry?.id === job?.id);
-      if (state.generation !== job.generation || state.mode !== 'ai' || operatorBarrier(state)
+      if (state.generation !== job.generation || state.mode !== 'ai'
         || stored?.status === 'cancelled') return 'conversation_state_changed';
       const global = configuredSettings();
       if (globalDisableCrossed(job, global) || global.enabled !== true) return 'global_disabled';
       if (!stored || stored.status !== 'processing' || stored.execution_token !== token) {
         return 'execution_superseded';
       }
+      if (operatorBarrier(state)) return 'operator_identity_pending';
       return '';
     } catch (_) { return 'execution_superseded'; }
   };
@@ -2967,6 +2973,33 @@ function createRuntime(env = {}, options = {}) {
     } catch (_) { return false; }
   };
   const operatorBarrier = (state) => Boolean(state?.uncertain_events?.length || catchupOperatorBarrier(state));
+  const deferOrdinaryForOperatorIdentity = (state, job, token, observed = false) => {
+    const stored = state?.jobs?.find((entry) => entry?.id === job?.id);
+    if (!stored || stored.control === true || state.generation !== job.generation
+      || state.mode !== 'ai' || stored.status === 'cancelled') {
+      return { deferred: false, reason: 'conversation_state_changed' };
+    }
+    const global = configuredSettings();
+    if (globalDisableCrossed(job, global) || global.enabled !== true) {
+      return { deferred: false, reason: 'global_disabled' };
+    }
+    if (stored.status !== 'processing' || stored.execution_token !== token) {
+      return { deferred: false, reason: 'execution_superseded' };
+    }
+    const pending = operatorBarrier(state);
+    if (!pending && !observed) return { deferred: false, reason: '' };
+    // 未确认 operator 只是本会话的身份栅栏，不是已确认人工接管。
+    // 保留同一访客责任和所有已持久产物，待 control 精确解析后续做。
+    stored.status = 'received';
+    stored.lease_until = 0;
+    stored.retry_at = clock();
+    if (pending) stored.deferred_control = true;
+    else delete stored.deferred_control;
+    delete stored.execution_token;
+    if (state.worker?.token === token) state.worker = null;
+    return { deferred: true, reason: pending
+      ? 'operator_identity_pending' : 'operator_identity_resolved' };
+  };
   const releaseCatchupOperatorBarrier = async (item) => {
     if (item?.from !== 'operator') return;
     await transaction(stateKey(env.CRISP_WEBSITE_ID, item.session_id), (current) => {
@@ -3582,7 +3615,8 @@ function createRuntime(env = {}, options = {}) {
     if (existing) return existing;
     const current = settings();
     if (!current.enabled || current.revision !== job.revision || globalDisableCrossed(job, current)
-      || state.mode !== 'ai' || state.generation !== job.generation || operatorBarrier(state)) return null;
+      || state.mode !== 'ai' || state.generation !== job.generation) return null;
+    if (operatorBarrier(state)) throw processingCancelledError('operator_identity_pending');
     if (kind === 'handoff' && state.jobs.some(priorityConfirmation)) return null;
     const id = 'crispai_' + crypto.randomBytes(16).toString('hex');
     const fingerprint = Number.parseInt(hash(id).slice(0, 12), 16);
@@ -3706,25 +3740,76 @@ function createRuntime(env = {}, options = {}) {
     if (!Array.isArray(result.data)) throw new Error('Crisp 历史格式无效');
     return result.data;
   };
+  const persistObservedOperator = async (state, message, observedAt = 0) => {
+    // 历史回读发现的 operator 必须先建立可恢复控制责任；不能仅凭
+    // 原始对象的可选字段就取消正在回答的访客问题。缺失、损坏
+    // 或超前的事件时间不得用本机 clock 冒充；留空交给 receive 的
+    // event_time_unverified -> Crisp 精确消息回查链路。
+    const durableMessage = { ...message, website_id: state.website_id,
+      session_id: state.session_id };
+    delete durableMessage.timestamp;
+    if (observedAt > 0) durableMessage.timestamp = observedAt;
+    const accepted = await receive({ internal: internalCatchupToken, body: {
+      website_id: state.website_id, event: 'message:received',
+      ...(observedAt > 0 ? { timestamp: observedAt } : {}),
+      data: durableMessage,
+    } });
+    if (accepted.statusCode !== 200) {
+      const failure = new Error('人工消息归属责任未能持久接收');
+      failure.code = 'OPERATOR_IDENTITY_PERSISTENCE_FAILED';
+      throw failure;
+    }
+    return readState(stateKey(state.website_id, state.session_id));
+  };
   const observeOperators = async (key, messages, execution) => {
     for (const message of messages.filter(publicOperator)) {
       assertProcessingPermit(execution);
       const state = readState(key);
-      if (timestamp(message.timestamp) <= Math.max(state.last_human_at || 0, state.control_watermark || 0)) continue;
-      if (await resolveOperator(state, message, execution) === 'human') await transaction(key, (current) => {
+      const observedAt = timestamp(message.timestamp);
+      const observedAtVerified = observedAt > 0 && observedAt <= clock() + 60000;
+      if (observedAtVerified
+        && observedAt <= Math.max(state.last_human_at || 0, state.control_watermark || 0)) continue;
+      if (!observedAtVerified) {
+        const current = await persistObservedOperator(state, message);
+        if (operatorBarrier(current)) throw processingCancelledError('operator_identity_pending');
+        if (current.mode !== 'ai' || current.generation !== execution?.job?.generation) {
+          throw processingCancelledError('conversation_state_changed');
+        }
+        continue;
+      }
+      let resolution;
+      try { resolution = await resolveOperator(state, message, execution); }
+      catch (error) {
+        if (processingInterrupted(error)) throw error;
+        if (error?.code !== 'OPERATOR_IDENTITY_PENDING') throw error;
+        const current = await persistObservedOperator(state, message, observedAt);
+        if (operatorBarrier(current)) throw processingCancelledError('operator_identity_pending');
+        if (current.mode !== 'ai' || current.generation !== execution?.job?.generation) {
+          throw processingCancelledError('conversation_state_changed');
+        }
+        continue;
+      }
+      if (resolution === 'human') await transaction(key, (current) => {
         assertJobExecution(current, execution?.job, execution);
-        return pause(current, hash('operator|' + message.fingerprint), timestamp(message.timestamp) || clock(), 'operator_reply');
+        return pause(current, hash('operator|' + message.fingerprint), observedAt, 'operator_reply');
       });
     }
   };
   const active = async (key, job, ordinary = true, providerRequired = true,
-    configurationFrozen = false) => transaction(key, (state) => {
+    configurationFrozen = false, execution = null) => transaction(key, (state) => {
+    if (execution) assertJobExecution(state, job, execution);
     const global = settings();
-    return (configurationFrozen ? configuredSettings().enabled === true : global.enabled)
+    const baseActive = (configurationFrozen ? configuredSettings().enabled === true : global.enabled)
       && (configurationFrozen || global.revision === job.revision) && state.generation === job.generation
       && (!ordinary || !globalDisableCrossed(job, global))
-      && (!ordinary || state.mode === 'ai') && !operatorBarrier(state)
+      && (!ordinary || state.mode === 'ai')
       && (!providerRequired || configurationFrozen || providerGenerationCurrent(job));
+    if (!baseActive) return false;
+    if (operatorBarrier(state)) {
+      if (ordinary && execution) throw processingCancelledError('operator_identity_pending');
+      return false;
+    }
+    return true;
   });
   const beginInference = async (key, job, execution) => {
     assertProcessingPermit(execution);
@@ -3736,7 +3821,8 @@ function createRuntime(env = {}, options = {}) {
       const global = settings();
       const stored = state.jobs.find((entry) => entry.id === job.id);
       if (!stored || !global.enabled || global.revision !== job.revision || globalDisableCrossed(job, global) || state.mode !== 'ai'
-        || state.generation !== job.generation || operatorBarrier(state) || stored.status === 'cancelled') return null;
+        || state.generation !== job.generation || stored.status === 'cancelled') return null;
+      if (operatorBarrier(state)) throw processingCancelledError('operator_identity_pending');
       if (providerRetirementOutstanding(stored)) return null;
       if (providerRetirementFinishedFor(stored)) {
         delete stored.provider_retirement;
@@ -3852,6 +3938,20 @@ function createRuntime(env = {}, options = {}) {
     if (['requesting', 'unknown', 'available'].includes(receipt.state)) return 'uncertain';
     if (receipt.state === 'absent') return 'definitely_absent';
     return 'invalid_identity';
+  };
+  const confirmedAnswerResultAbsent = (job, plan) => {
+    const receipt = job?.provider_result_receipt;
+    return Boolean(job && job.control !== true && job.status !== 'cancelled'
+      && plan?.type === 'internal' && plan.ordinary === true
+      && plan.purpose === 'technical_unresolved' && plan.content === ''
+      && plan.answer_responsibility === 'unresolved_failure'
+      && plan.diagnostic_code === 'question_result_absent'
+      && !hasLegacyV121PendingOrigin(job)
+      && !job.provider_settlement && !job.provider_settlement_failure_code
+      && !job.provider_retirement && !job.provider_retirement_failure_code
+      && receipt?.state === 'absent' && receipt.reason === 'question_result_absent'
+      && receipt.stage === 'answer' && providerReceiptMatches(job, receipt, 'answer')
+      && providerResultDisposition(job, 'answer') === 'definitely_absent');
   };
   const writeProviderReceipt = async (key, job, execution, receipt) => {
     if (job.administrator === true) {
@@ -4376,11 +4476,11 @@ function createRuntime(env = {}, options = {}) {
     // 固定回复、人工确认和菜单等本地动作仍可使用当前已应用投影及时完成。
     const unresolvedLegacyInference = hasLegacyV121PendingOrigin(job)
       || job?.inference && job.inference.provider_receipt_protocol_version !== 1;
-    if (!await active(key, job, true, !unresolvedLegacyInference)) return null;
+    if (!await active(key, job, true, !unresolvedLegacyInference, false, execution)) return null;
     const state = readState(key);
     const history = await messagesFor(state, execution);
     await observeOperators(key, history, execution);
-    if (!await active(key, job, true, !unresolvedLegacyInference)) return null;
+    if (!await active(key, job, true, !unresolvedLegacyInference, false, execution)) return null;
     if (!await beginInference(key, job, execution)) return null;
     const prompt = appliedMaterials()?.prompt.text ?? fs.readFileSync(root + '/config/prompt.md', 'utf8');
     const prior = transcript(history, job, readState(key));
@@ -4408,7 +4508,7 @@ function createRuntime(env = {}, options = {}) {
         const hasReplay = providerReceiptMatches(job, job.provider_result_receipt, 'vision')
           && ['requesting', 'unknown', 'available'].includes(job.provider_result_receipt.state);
         const image = hasReplay ? null : await imageContent(content, execution);
-        if (!await active(key, job)) return null;
+        if (!await active(key, job, true, true, false, execution)) return null;
         const configProvider = provider();
         const base = String(pool ? (env.PROVIDER_ADAPTER_URL || 'http://provider-adapter:8787/v1') : configProvider.base_url || env.AI_API_BASE_URL || '').replace(/\/+$/, '');
         const model = String(pool ? pool.entries.find((entry) => entry.id === pool.primary_id)?.model : configProvider.model || env.AI_MODEL || '');
@@ -4443,7 +4543,8 @@ function createRuntime(env = {}, options = {}) {
           const global = settings();
           if (!global.enabled || global.revision !== job.revision || globalDisableCrossed(job, global)
             || current.mode !== 'ai' || current.generation !== job.generation
-            || operatorBarrier(current) || !providerGenerationCurrent(job)) return false;
+            || !providerGenerationCurrent(job)) return false;
+          if (operatorBarrier(current)) throw processingCancelledError('operator_identity_pending');
           current.image_context = [...retainedImages(current).filter((entry) => entry.job_id !== job.id), {
             job_id: job.id, fingerprint: String(job.data.fingerprint || '').slice(0, 160), summary: visitorAnswer.slice(0, 2000), created_at: clock(), event_time: job.event_time,
           }].slice(-3);
@@ -4463,7 +4564,7 @@ function createRuntime(env = {}, options = {}) {
     const administrator = options.allowAdmin === true && job.administrator === true;
     const current = async () => {
       assertProcessingPermit(execution);
-      if (!administrator) return active(key, job);
+      if (!administrator) return active(key, job, true, true, false, execution);
       const applied = appliedMaterials();
       return applied !== null && knowledgeRuntimeReady(applied)
         && settings().revision === job.revision && providerGenerationCurrent(job);
@@ -4766,7 +4867,7 @@ function createRuntime(env = {}, options = {}) {
     if (job.action === 'confirm_handoff') return { type: 'text', content: handoff().notify_user?.enabled === false ? '' : job.confirm_message, ordinary: false, purpose: 'handoff_ack', tags: ['human_required'] };
     // 规则、菜单、欢迎和人工 offer 不依赖 Provider 代次；先按当前已应用
     // 业务配置规划。只有进入 knowledgePlan 后才要求 Provider 事务完成。
-    if (!await active(key, job, true, false)) return null;
+    if (!await active(key, job, true, false, false, execution)) return null;
     if (job.action === 'menu_action') {
       job.data = { ...job.data, type: 'text', from: 'user', content: job.choice_action.label || '菜单选择' };
       return actionPlan(key, job, job.choice_action.action, execution);
@@ -4922,7 +5023,7 @@ function createRuntime(env = {}, options = {}) {
       if (stateChangeReason) record.receipt_state_change_reason = stateChangeReason;
       else delete record.receipt_state_change_reason;
       record.receipt_confirmed_at = clock();
-      if (!current) record.state_changed_before_receipt = true;
+      if (current === false) record.state_changed_before_receipt = true;
     }
     if (!record.content_sha256 && record.body) {
       record.content_sha256 = outboundContentSha256(record.body.type || 'text', record.body.content);
@@ -4972,6 +5073,40 @@ function createRuntime(env = {}, options = {}) {
     }
     return { recorded: true, current, state_change_reason: stateChangeReason, semantic_status: semanticStatus,
       answer_valid: semanticStatus === 'valid_answer' };
+  });
+  const reclassifyOperatorPendingReceipt = async (key, job, execution) => transaction(key, (state) => {
+    assertJobExecution(state, job, execution);
+    const stored = state.jobs.find((entry) => entry.id === job.id);
+    if (!stored || stored.control === true) return false;
+    const records = Object.entries(state.outgoing || {}).filter(([, record]) =>
+      record?.job_id === stored.id && record.status === 'sent'
+      && responseGeneration(record) === responseGeneration(stored));
+    if (records.length !== 1) return false;
+    const [fingerprint, record] = records[0];
+    if (record.receipt_current !== null
+      || record.receipt_state_change_reason !== 'operator_identity_pending') return false;
+    const plan = matchingOutgoingPlan(key, stored, record, fingerprint);
+    const expectedType = String(plan?.type || 'text');
+    const expectedIntent = planSemanticIntent(stored, plan);
+    if (!plan || record.generation !== stored.generation
+      || String(record.purpose || '') !== String(plan.purpose || '')
+      || String(record.message_type || '') !== expectedType
+      || record.semantic_intent !== expectedIntent
+      || !['answer', 'non_answer'].includes(expectedIntent)
+      || !record.content_sha256
+      || record.content_sha256 !== outboundContentSha256(expectedType, plan.content)) return false;
+    const applicability = receiptApplicability(state, stored, plan);
+    if (applicability.reason === 'operator_identity_pending') {
+      throw processingCancelledError('operator_identity_pending');
+    }
+    if (typeof applicability.current !== 'boolean') return false;
+    record.receipt_current = applicability.current;
+    if (applicability.reason) record.receipt_state_change_reason = applicability.reason;
+    else delete record.receipt_state_change_reason;
+    if (applicability.current === false) record.state_changed_before_receipt = true;
+    else delete record.state_changed_before_receipt;
+    record.receipt_reclassified_at = clock();
+    return true;
   });
   const receiptDelivery = (receipt, retired = false) => retired ? 'cancelled'
     : receipt?.semantic_status === 'semantic_unknown' ? 'delivery_semantic_unknown'
@@ -5088,7 +5223,7 @@ function createRuntime(env = {}, options = {}) {
             record.receipt_current = applicability.current;
             if (applicability.reason) record.receipt_state_change_reason = applicability.reason;
             else delete record.receipt_state_change_reason;
-            if (!applicability.current) record.state_changed_before_receipt = true;
+            if (applicability.current === false) record.state_changed_before_receipt = true;
           }
           record.status = 'sent';
           record.sent_at = Number.isFinite(record.sent_at) ? record.sent_at : clock();
@@ -5153,6 +5288,9 @@ function createRuntime(env = {}, options = {}) {
       const reason = outboundCancellationReason(key, job, providerRequired,
         plan.ordinary !== false, configurationFrozen);
       if (reason) {
+        if (reason === 'operator_identity_pending') {
+          throw processingCancelledError(reason);
+        }
         await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
           const record = current.outgoing[String(fingerprint)];
@@ -5170,6 +5308,9 @@ function createRuntime(env = {}, options = {}) {
       const reason = outboundCancellationReason(key, job, providerRequired,
         plan.ordinary !== false, configurationFrozen);
       if (reason) {
+        if (reason === 'operator_identity_pending') {
+          throw processingCancelledError(reason);
+        }
         await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
           const record = current.outgoing[String(fingerprint)];
@@ -5250,6 +5391,22 @@ function createRuntime(env = {}, options = {}) {
         });
         return 'deferred';
       }
+      if (cancellationReason === 'operator_identity_pending') {
+        await transaction(key, (current) => {
+          assertJobExecution(current, job, execution);
+          const record = current.outgoing[String(fingerprint)];
+          if (!record || !['unknown', 'sending'].includes(record.status)) return;
+          // POST 可能已经交出字节；未确认 operator 只暂停责任，绝不能把
+          // 同一正文改成可重发或永久取消。解除屏障后继续精确只读对账。
+          record.status = 'unknown';
+          record.delivery_uncertain = true;
+          record.resend_forbidden = true;
+          record.recovery_deferred = true;
+          record.cancellation_reason = cancellationReason;
+          record.next_action_at = clock() + 5000;
+        });
+        throw processingCancelledError(cancellationReason);
+      }
       if (cancellationReason) {
         await transaction(key, (current) => {
           assertJobExecution(current, job, execution);
@@ -5313,7 +5470,7 @@ function createRuntime(env = {}, options = {}) {
     else if (!outgoing) fingerprint = responseFingerprint(key, job, plan.purpose);
     outgoing = state.outgoing[String(fingerprint)];
     if (retired || !await active(key, job, plan.ordinary !== false, providerRequired,
-      configurationFrozen)) return 'cancelled';
+      configurationFrozen, execution)) return 'cancelled';
     if (plan.ordinary !== false) {
       let history;
       try { history = await messagesFor(readState(key), execution); } catch (error) {
@@ -5322,9 +5479,8 @@ function createRuntime(env = {}, options = {}) {
         return 'retry';
       }
       await observeOperators(key, history, execution);
-      const unresolved = history.filter(publicOperator).some((message) => timestamp(message.timestamp) > job.event_time && automation(message, readState(key)) === null);
-      if (unresolved || !await active(key, job, true, providerRequired,
-        configurationFrozen)) return 'cancelled';
+      if (!await active(key, job, true, providerRequired,
+        configurationFrozen, execution)) return 'cancelled';
     }
     // 使用官方可选昵称，不请求自动消息徽标；自回流识别在POST前持久登记，
     // 不伪造真人账号，也不依赖昵称或可见标签判断是否为本项目出站。
@@ -5341,9 +5497,12 @@ function createRuntime(env = {}, options = {}) {
         const global = settings();
         if ((configurationFrozen ? configuredSettings().enabled !== true
           : !global.enabled || global.revision !== job.revision) || globalDisableCrossed(job, global)
-          || current.generation !== job.generation || operatorBarrier(current)
+          || current.generation !== job.generation
           || plan.ordinary !== false && current.mode !== 'ai'
           || !configurationFrozen && providerRequired && !providerGenerationCurrent(job)) return false;
+        if (plan.ordinary !== false && operatorBarrier(current)) {
+          throw processingCancelledError('operator_identity_pending');
+        }
         registerOwnedMessage(current, fingerprint);
         const previous = current.outgoing[String(fingerprint)];
         const contentSha256 = outboundContentSha256(body.type, body.content);
@@ -5376,16 +5535,22 @@ function createRuntime(env = {}, options = {}) {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
           // 尚未调用 Crisp POST，配置换代可以安全删除本次登记并按新代重规划；
-          // 真人介入或总开关关闭则必须留下永久取消栅栏。
-          if (reason === 'configuration_changed') delete current.outgoing[String(fingerprint)];
+          // 未确认 operator 同样只延后原责任；真人介入或总开关关闭才留下
+          // 永久取消栅栏。
+          if (['configuration_changed', 'operator_identity_pending'].includes(reason)) {
+            delete current.outgoing[String(fingerprint)];
+          }
           else { record.status = 'cancelled'; record.cancelled_at = clock(); record.cancellation_reason = reason || 'conversation_state_changed'; delete record.body; }
         });
+        if (reason === 'operator_identity_pending') {
+          throw processingCancelledError(reason);
+        }
         return reason === 'configuration_changed' ? 'deferred' : 'cancelled';
       }
       // 登记出站后再次核对，再把字节交给 HTTP 层；之后的真人事件通过 signal
       // 中止仍挂起的请求。远端若已收到字节，最终回执仍会如实标记。
       if (plan.ordinary !== false && !await active(key, job, true, providerRequired,
-        configurationFrozen)) {
+        configurationFrozen, execution)) {
         const reason = outboundCancellationReason(key, job, providerRequired, true,
           configurationFrozen);
         await transaction(key, (current) => {
@@ -5408,6 +5573,7 @@ function createRuntime(env = {}, options = {}) {
         // abort 发生前 HTTP 层可能已经写出部分字节；保留未知回执供指纹对账，
         // 但人工状态已取消该任务，绝不再次推理或补发。
         const configurationChanged = outbound.cancellation_reason === 'configuration_changed';
+        const operatorPending = outbound.cancellation_reason === 'operator_identity_pending';
         await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status === 'sending' && record.attempt_token === attemptToken) {
@@ -5420,11 +5586,14 @@ function createRuntime(env = {}, options = {}) {
             if (!configurationChanged) record.resend_forbidden = true;
           }
         });
+        if (operatorPending) throw processingCancelledError('operator_identity_pending');
         return configurationChanged ? 'deferred' : 'cancelled';
       }
       if (processingInterrupted(error)) {
         // POST 之前失去许可可以删除本次登记；一旦可能已交出字节，
         // 必须保留原 fingerprint 作 unknown 对账，绝不重新推理或换一份答案。
+        const operatorPending = processingCancelled(error)
+          && error.reason === 'operator_identity_pending';
         await transaction(key, (current) => {
           const record = current.outgoing[String(fingerprint)];
           if (record?.status !== 'sending' || record.attempt_token !== attemptToken) return;
@@ -5432,7 +5601,13 @@ function createRuntime(env = {}, options = {}) {
           else {
             record.status = 'unknown';
             record.delivery_uncertain = true;
-            record.cancellation_reason = 'processing_permit_lost';
+            record.cancellation_reason = operatorPending
+              ? 'operator_identity_pending' : 'processing_permit_lost';
+            if (operatorPending) {
+              record.resend_forbidden = true;
+              record.recovery_deferred = true;
+              record.next_action_at = clock() + 5000;
+            }
           }
         });
         throw error;
@@ -5897,6 +6072,9 @@ function createRuntime(env = {}, options = {}) {
       const eventTimeTerminal = ['stale', 'non-visitor'].includes(eventTimeResolution);
       const reconciliation = eventTimeTerminal || job.control
         ? 'none' : await reconcileOrphanedDeliveries(key, job, execution);
+      if (!eventTimeTerminal && !job.control) {
+        await reclassifyOperatorPendingReceipt(key, job, execution);
+      }
       const frozenReceipt = eventTimeTerminal ? { semantic_status: 'none', current: null }
         : frozenDeliveryReceiptFor(readState(key), job);
       if (eventTimeTerminal) delivery = 'discarded';
@@ -5935,6 +6113,12 @@ function createRuntime(env = {}, options = {}) {
         delivery = technicalFailure(plan) ? 'unresolved' : plan ? await send(key, job, plan, execution) : 'cancelled';
       }
       if (delivery === 'cancelled' && !job.control) {
+        const operatorDeferral = await transaction(key, (current) =>
+          deferOrdinaryForOperatorIdentity(current, job, token, false));
+        if (operatorDeferral.deferred) {
+          appendEvent('processing_deferred', { reason: operatorDeferral.reason, kind: 'ordinary' });
+          return { status: 'deferred', reason: operatorDeferral.reason, key, jobId: job.id };
+        }
         try {
           const current = readState(key);
           const global = settings();
@@ -5973,13 +6157,31 @@ function createRuntime(env = {}, options = {}) {
             delete stored.reconciliation_only;
           } else if (delivery === 'unresolved' && stored.status !== 'cancelled') {
             const code = plan?.diagnostic_code || stored.failure_code || 'runtime_unavailable';
-            markUnresolved(stored, code);
+            const exactAnswerAbsent = confirmedAnswerResultAbsent(stored, plan);
+            const at = clock();
+            if (exactAnswerAbsent) {
+              // router 对同一 answer 代的精确阴性回执只是完成只读对账，并非
+              // 新一次 Provider 故障。保留此前真实失败审计，让下一调度 tick
+              // 使用同一访客责任建立单调 successor；本调用栈不递归推理。
+              stored.status = 'received';
+              stored.responsibility_status = 'unresolved_failure';
+              stored.failure_code = 'question_result_absent';
+              stored.failure_since = Number.isFinite(stored.failure_since)
+                ? stored.failure_since : at;
+              stored.retry_at = at;
+              stored.lease_until = 0;
+              delete stored.deferred_configuration;
+              delete stored.runtime_fallback;
+            } else {
+              markUnresolved(stored, code, at);
+            }
             // 还没有形成可见答案时保留原始责任。adapter 回程不确定时
             // 必须保留同代信封先做只读 replay；已确认无结果才能释放本轮。
             if (technicalFailure(plan)) {
               delete stored.plan;
               const receipt = stored.provider_result_receipt;
-              const disposition = providerResultDisposition(stored);
+              const disposition = providerResultDisposition(stored,
+                code === 'question_result_absent' ? 'answer' : null);
               if (disposition === 'definitely_absent') {
                 // 只有 receipt-before-network 协议证明尚未请求，或 router 已用
                 // 当前完整身份明确返回 absent，才可开启新的有界恢复代。
@@ -6087,8 +6289,29 @@ function createRuntime(env = {}, options = {}) {
       return { status: delivery, key, jobId: job.id };
     } catch (error) {
       if (processingCancelled(error)) {
-        const reason = error.reason === 'global_disabled'
+        let reason = error.reason === 'global_disabled'
           ? 'global_disabled' : 'conversation_state_changed';
+        if (error.reason === 'operator_identity_pending' && job) {
+          try {
+            const operatorDeferral = await transaction(key, (state) =>
+              deferOrdinaryForOperatorIdentity(state, job, token, true));
+            if (operatorDeferral.deferred) {
+              appendEvent('processing_deferred', { reason: operatorDeferral.reason,
+                kind: job.control ? 'control' : 'ordinary' });
+              return { status: 'deferred', reason: operatorDeferral.reason,
+                key, jobId: job.id };
+            }
+            if (['global_disabled', 'conversation_state_changed'].includes(operatorDeferral.reason)) {
+              reason = operatorDeferral.reason;
+            }
+            if (operatorDeferral.reason === 'execution_superseded') {
+              appendEvent('processing_deferred', { reason: 'execution_superseded',
+                kind: job.control ? 'control' : 'ordinary' });
+              return { status: 'deferred', reason: 'execution_superseded',
+                key, jobId: job.id };
+            }
+          } catch (_) {}
+        }
         if (job) {
           try { await transaction(key, (state) => {
             const stored = state.jobs.find((entry) => entry.id === job.id);
