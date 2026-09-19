@@ -251,7 +251,7 @@ async function main(){
             write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
             const result=await f.invoke('snapshot.sh',args,f.snapshotEnv);
             write(path.join(work,`pending-knowledge-${kind}-${args.length}.log`),result.stdout+result.stderr);
-            assert.notEqual(result.code,0);assert.match(result.stderr,/知识迁移/);
+            assert.notEqual(result.code,0);assert.match(result.stderr,/知识索引存在未完成迁移/);
             assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
             assert.deepEqual(f.capture(),before);assert.equal(f.calls.length,callCount);assert(fs.lstatSync(marker));
           }
