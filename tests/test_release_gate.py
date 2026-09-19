@@ -51,8 +51,7 @@ def main():
             lines = [line for line in manifest.read_text(encoding="utf-8").splitlines()
                      if line != required]
             manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            assert run(["git", "add", gate.MANIFEST_PATH], broken).returncode == 0
-            assert run(["git", "commit", "-m", "fixture missing required helper"], broken).returncode == 0
+            identity.commit(broken, "fixture missing required helper")
             broken_commit = run(["git", "rev-parse", "HEAD"], broken).stdout.strip()
             try:
                 gate.release_manifest(broken, broken_commit, "v1.3.0")
