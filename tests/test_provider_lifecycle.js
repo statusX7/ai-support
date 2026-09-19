@@ -140,7 +140,14 @@ async function main(){
       assert.equal(exported.entries.length,3);assert.equal(exported.entries[2].enabled,false);
       const all=files(directory).map(file=>fs.readFileSync(file,'utf8')).join('\n');
       for(const secret of [f.secret,f.header,'synthetic-backup-key-1','synthetic-backup-key-2','synthetic-backup-header-1','synthetic-backup-header-2'])assert(!all.includes(secret));
-      assert(!all.includes('secrets_generation'));assert(!fs.existsSync(path.join(directory,'.env')));assert(!fs.existsSync(path.join(directory,'secrets')));
+      const privatePoolFields=new Set(['secrets_generation','draft_secrets_generation','api_key','custom_headers','secret_ref','headers_ref','key_status']);
+      const assertPublicPool=value=>{
+        if(Array.isArray(value)){for(const item of value)assertPublicPool(item);return;}
+        if(!value || typeof value!=='object')return;
+        for(const [key,item] of Object.entries(value)){assert(!privatePoolFields.has(key),`业务接口池不得导出秘密字段或本机秘密引用：${key}`);assertPublicPool(item);}
+      };
+      assertPublicPool(exported);
+      assert(!fs.existsSync(path.join(directory,'.env')));assert(!fs.existsSync(path.join(directory,'secrets')));
       const preview=JSON.parse((await f.ok('migration.sh',['import-preview',bundle])).stdout);assert.equal(preview.provider_pool.entries.length,3);assert.equal(preview.manifest.contains_secrets,false);
     });
     await test('PL03 旧版无pool的启用评价业务包可导入，评价开关强制停用且保留原文',async()=>{
