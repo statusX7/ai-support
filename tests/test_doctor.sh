@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 DOCTOR="${PROJECT_ROOT}/scripts/doctor.sh"
 FIXTURE_BIN="${SCRIPT_DIR}/fixtures/doctor"
 ORIGINAL_PATH=$PATH
+REAL_RM=$(command -v rm)
 PASSED=0
 LAST_RC=0
 TEST_WORK_ROOT="${PROJECT_ROOT}/.work/v1.3.0"
@@ -44,7 +45,7 @@ assert_result() {
 }
 
 fixture_env() {
-  env PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}" \
+  env PATH="${DOCTOR_FIXTURE_EXTRA_PATH:+${DOCTOR_FIXTURE_EXTRA_PATH}:}${FIXTURE_BIN}:${ORIGINAL_PATH}" \
     DOCTOR_FIXTURE_DEPLOY="$DEPLOY" DOCTOR_FIXTURE_LOG="$FIXTURE_LOG" \
     DOCTOR_FIXTURE_STOPPED_FILE="$STOPPED_FILE" \
     DOCTOR_FIXTURE_DB_PASSWORD_FILE="$DB_PASSWORD_FILE" \
@@ -1030,6 +1031,71 @@ cp -p -- "$prompt_saved" "${DEPLOY}/config/prompt.md"
 
 projection_saved="${TEST_ROOT}/materials-applied.saved.json"
 cp -p -- "${DEPLOY}/config/materials-applied.json" "$projection_saved"
+
+for projection_tamper in schema-v1 prompt-digest; do
+  case "$projection_tamper" in
+    schema-v1)
+      jq '.schema_version=1' "$projection_saved" > "${DEPLOY}/config/materials-applied.json"
+      ;;
+    prompt-digest)
+      jq '.prompt.sha256=("0" * 64)' "$projection_saved" > "${DEPLOY}/config/materials-applied.json"
+      ;;
+  esac
+  chmod 0640 "${DEPLOY}/config/materials-applied.json"
+  invoke --local
+  (( LAST_RC == 1 )) || fail "资料投影 ${projection_tamper} 损坏时应退出 1"
+  assert_result anything.workspace FAIL
+  assert_result materials.applied FAIL
+  assert_result business.settings FAIL
+  cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+done
+
+projection_hardlink_source="${TEST_ROOT}/materials-applied.hardlink-source.json"
+cp -p -- "$projection_saved" "$projection_hardlink_source"
+rm -f -- "${DEPLOY}/config/materials-applied.json"
+ln -- "$projection_hardlink_source" "${DEPLOY}/config/materials-applied.json"
+invoke --local
+(( LAST_RC == 1 )) || fail '资料投影硬链接不得通过工作区、资料或业务运行门禁'
+assert_result anything.workspace FAIL
+assert_result materials.applied FAIL
+assert_result business.settings FAIL
+rm -f -- "${DEPLOY}/config/materials-applied.json" "$projection_hardlink_source"
+cp -p -- "$projection_saved" "${DEPLOY}/config/materials-applied.json"
+pass 'AnythingLLM Prompt 只读取完整验证后的 schema v2 私有投影，并拒绝旧 schema、坏摘要与硬链接'
+
+rm_failure_bin="${TEST_ROOT}/rm-failure-bin"
+rm_failure_count="${TEST_ROOT}/rm-failure-count"
+mkdir -m 0700 -- "$rm_failure_bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'matched=0' \
+  'for argument in "$@"; do' \
+  '  [[ "$argument" != */applied-business ]] || matched=1' \
+  'done' \
+  'if (( matched )); then' \
+  '  count=0' \
+  '  [[ ! -f "${DOCTOR_TEST_RM_COUNT:?}" ]] || IFS= read -r count < "${DOCTOR_TEST_RM_COUNT}"' \
+  '  [[ "$count" =~ ^[0-9]+$ ]] || exit 87' \
+  '  count=$((count + 1))' \
+  '  printf "%s\\n" "$count" > "${DOCTOR_TEST_RM_COUNT}"' \
+  '  if (( count == 2 )); then exit 86; fi' \
+  'fi' \
+  'exec "${DOCTOR_TEST_REAL_RM:?}" "$@"' \
+  > "${rm_failure_bin}/rm"
+chmod 0700 "${rm_failure_bin}/rm"
+export DOCTOR_FIXTURE_EXTRA_PATH="$rm_failure_bin"
+export DOCTOR_TEST_REAL_RM="$REAL_RM"
+export DOCTOR_TEST_RM_COUNT="$rm_failure_count"
+invoke --local --fix
+unset DOCTOR_FIXTURE_EXTRA_PATH DOCTOR_TEST_REAL_RM DOCTOR_TEST_RM_COUNT
+(( LAST_RC == 1 )) || fail 'doctor --fix 第二轮无法删除私有投影时必须退出 1'
+[[ $(<"$rm_failure_count") == 2 ]] || fail 'doctor --fix 未命中私有投影的第二轮清理故障'
+assert_result anything.workspace FAIL
+assert_result business.settings FAIL
+rm -rf -- "$rm_failure_bin" "$rm_failure_count"
+pass 'doctor --fix 复查清理失败时不复用上一轮私有投影的绿灯'
+
 jq '.state="applying"' "$projection_saved" > "${DEPLOY}/config/materials-applied.json"
 chmod 0640 "${DEPLOY}/config/materials-applied.json"
 invoke --local

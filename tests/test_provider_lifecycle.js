@@ -19,6 +19,19 @@ const work = fs.mkdtempSync(path.join(baseWork, 'provider-lifecycle-'));
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
 const write = (file, value) => fs.writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value), {mode:0o600});
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const urlNamespace = Buffer.from('6ba7b8119dad11d180b400c04fd430c8','hex');
+const cacheName = location => {
+  const bytes=crypto.createHash('sha1').update(urlNamespace).update(location).digest().subarray(0,16);
+  bytes[6]=(bytes[6]&0x0f)|0x50;bytes[8]=(bytes[8]&0x3f)|0x80;
+  const hex=bytes.toString('hex');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}.json`;
+};
+const cachePath = (root,location) => path.join(root,'data/anythingllm/vector-cache',cacheName(location));
+const writeAtomic = (file,value) => {
+  const temporary=file+'.tmp-'+crypto.randomBytes(8).toString('hex');
+  fs.writeFileSync(temporary,typeof value==='string'?value:JSON.stringify(value),{mode:0o600,flag:'wx'});
+  fs.renameSync(temporary,file);
+};
 const command = (program, args, options = {}) => new Promise((resolve, reject) => {
   const child = spawn(program, args, {cwd:work, env:{...process.env,...options.env}, stdio:['pipe','pipe','pipe']});
   let stdout='', stderr='', finished=false, forced=null, timedOut=false, deadline=null;
@@ -86,22 +99,105 @@ async function fixture() {
   }
   fs.copyFileSync(path.join(project,'config/prompt.md.example'),path.join(deploy,'config/prompt.md'));
   fs.chmodSync(path.join(deploy,'config/prompt.md'),0o640);
+  // 通过生产 knowledge.sh 迁移、上传、回读及词法构建链建立最小知识代；
+  // 不能预写 manifest/map/profile/lexical 或把空知识冒充为 ready。
+  fs.writeFileSync(path.join(deploy,'knowledge/lifecycle-faq.md'),
+    '问题：合成设备的测试灯是什么颜色？\n回答：测试灯为蓝色，仅用于生命周期契约验证。\n',{mode:0o640});
   fs.copyFileSync(path.join(project,'tests/mocks/configuration_docker'),path.join(deploy,'bin/docker')); fs.chmodSync(path.join(deploy,'bin/docker'),0o755);
   write(path.join(deploy,'VERSION'),currentVersion+'\n');
   write(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+project+'\ninstalled_version='+currentVersion+'\n');
   write(path.join(deploy,'config/.crispai-launcher'),path.join(work,'crispai')+'\n');
-  let prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8');
-  const f={deploy,calls:[],workspaceReads:0,rejectModel:'',adapter:null,adapterBase:'',secret:'synthetic-lifecycle-primary-key',header:'synthetic-lifecycle-header-value'};
+  const crispIdentifier='synthetic-lifecycle-identifier',crispToken='synthetic-lifecycle-token';
+  const crispWebsite='synthetic-lifecycle-website',crispAuth=Buffer.from(`${crispIdentifier}:${crispToken}`).toString('base64');
+  const workspaceState=path.join(deploy,'data/anythingllm/lifecycle-workspace.json');
+  const anythingState=path.join(deploy,'data/anythingllm/lifecycle-runtime.json');
+  const serviceState=path.join(work,'snapshot-services');
+  const workflowMarker=path.join(deploy,'tmp/mock-workflow-active');
+  const externalCurlLog=path.join(work,'snapshot-external-curl.log');
+  write(workspaceState,{slug:'crisp-support',openAiPrompt:'尚未由生产资料入口应用的合成 Prompt',openAiTemp:0.7,documents:[]});
+  const f={deploy,calls:[],workspaceReads:0,rejectModel:'',adapter:null,adapterBase:'',secret:'synthetic-lifecycle-primary-key',header:'synthetic-lifecycle-header-value',
+    crispWebsite,workspaceState,anythingState,serviceState,workflowMarker,externalCurlLog};
+  const workspaceRead=()=>read(workspaceState);
+  const workspaceWrite=value=>write(workspaceState,value);
+  const serviceRunning=name=>fs.existsSync(serviceState) && fs.readFileSync(serviceState,'utf8').split(/\r?\n/).includes(name);
+  const anythingAuthorized=request=>request.headers.authorization==='Bearer synthetic-lifecycle-anything-key';
   f.service=http.createServer(async(request,response)=>{
-    let raw='';for await(const chunk of request)raw+=chunk;
-    const body=JSON.parse(raw || '{}');
+    const chunks=[];for await(const chunk of request)chunks.push(chunk);
+    const raw=Buffer.concat(chunks);
+    let body={};
+    if(raw.length && String(request.headers['content-type']||'').startsWith('application/json')) {
+      try { body=JSON.parse(raw.toString('utf8')); } catch { response.writeHead(400);response.end();return; }
+    }
     const send=(status,value)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(value));};
-    if(request.url==='/api/v1/auth'){send(200,{authenticated:true});return;}
-    if(request.url==='/healthz' || request.url==='/api/ping'){send(200,{ok:true});return;}
-    if(request.url.startsWith('/webhook/crisp-webhook?')){send(401,{accepted:false,reason:'Webhook 校验失败'});return;}
-    if(request.url==='/api/v1/workspace/crisp-support'){f.workspaceReads++;send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:[]}]});return;}
-    if(request.url==='/api/v1/workspace/crisp-support/update'){prompt=body.openAiPrompt;send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;}
-    if(request.url==='/api/v1/workspace/crisp-support/update-embeddings' || request.url==='/api/v1/system/remove-documents'){send(200,{success:true});return;}
+    if(request.url==='/healthz'){send(serviceRunning('n8n')?200:503,{ok:serviceRunning('n8n')});return;}
+    if(request.url==='/healthz/readiness'){
+      const ready=serviceRunning('n8n')&&fs.existsSync(workflowMarker);send(ready?200:503,{status:ready?'ok':'starting'});return;
+    }
+    if(request.url==='/api/ping'){send(serviceRunning('anythingllm')?200:503,{online:serviceRunning('anythingllm')});return;}
+    if(request.url.startsWith('/webhook/crisp-webhook?')){
+      if(!serviceRunning('n8n')||!fs.existsSync(workflowMarker)){send(503,{accepted:false,reason:'工作流尚未激活'});return;}
+      send(401,{accepted:false,reason:'Webhook 校验失败'});return;
+    }
+    if(request.url==='/api/v1/auth'){
+      send(anythingAuthorized(request)?200:401,{authenticated:anythingAuthorized(request)});return;
+    }
+    if(request.url==='/api/v1/system'){
+      if(!anythingAuthorized(request)){send(401,{error:'unauthorized'});return;}
+      try {
+        const state=read(anythingState),instance=state.rag_instances?.[deploy];
+        if(!instance||!Number.isSafeInteger(instance.context_window))throw new Error('missing runtime state');
+        send(200,{settings:{GenericOpenAiTokenLimit:instance.context_window}});
+      } catch { send(503,{error:'runtime-state-unavailable'}); }
+      return;
+    }
+    if(request.url==='/api/v1/workspace/crisp-support'){
+      if(!anythingAuthorized(request)){send(401,{error:'unauthorized'});return;}
+      f.workspaceReads++;send(200,{workspace:[workspaceRead()]});return;
+    }
+    if(request.url==='/api/v1/workspace/crisp-support/update'){
+      if(!anythingAuthorized(request)||typeof body.openAiPrompt!=='string'){send(400,{error:'invalid'});return;}
+      const state=workspaceRead();state.openAiPrompt=body.openAiPrompt;workspaceWrite(state);
+      send(200,{workspace:state});return;
+    }
+    if(request.url==='/api/v1/document/upload'){
+      if(!anythingAuthorized(request)){send(401,{error:'unauthorized'});return;}
+      const contentType=String(request.headers['content-type']||''),boundary=/boundary=([^;]+)/i.exec(contentType)?.[1];
+      const headerEnd=raw.indexOf(Buffer.from('\r\n\r\n'));
+      const tail=boundary?raw.lastIndexOf(Buffer.from(`\r\n--${boundary}`)):-1;
+      if(!boundary||headerEnd<0||tail<=headerEnd+4){send(400,{success:false});return;}
+      const pageContent=raw.subarray(headerEnd+4,tail).toString('utf8');
+      if(!pageContent.trim()||pageContent.includes('\0')){send(400,{success:false});return;}
+      const location=`custom-documents/lifecycle-${digest(Buffer.from(pageContent)).slice(0,24)}.json`;
+      const parsed=path.join(deploy,'data/anythingllm/documents',location);
+      const cached=cachePath(deploy,location);
+      fs.mkdirSync(path.dirname(parsed),{recursive:true});fs.mkdirSync(path.dirname(cached),{recursive:true});
+      writeAtomic(parsed,{pageContent});
+      writeAtomic(cached,JSON.stringify({synthetic_embedding_cache:true,location})+'\n');
+      send(200,{success:true,documents:[{location}]});return;
+    }
+    if(request.url==='/api/v1/workspace/crisp-support/update-embeddings'){
+      if(!anythingAuthorized(request)||!Array.isArray(body.adds)||!Array.isArray(body.deletes)){send(400,{error:true});return;}
+      const state=workspaceRead(),locations=new Set(state.documents.map(item=>item.docpath));
+      for(const location of body.deletes)locations.delete(location);
+      for(const location of body.adds)locations.add(location);
+      state.documents=[...locations].sort().map(docpath=>({docpath}));workspaceWrite(state);
+      send(200,{success:true});return;
+    }
+    if(request.url==='/api/v1/system/remove-documents'){
+      if(!anythingAuthorized(request)||!Array.isArray(body.names)){send(400,{success:false});return;}
+      const state=workspaceRead(),removed=new Set(body.names),removals=[];
+      for(const location of removed){
+        for(const file of [path.join(deploy,'data/anythingllm/documents',location),cachePath(deploy,location)]){
+          if(!fs.existsSync(file))continue;
+          const metadata=fs.lstatSync(file);
+          if(!metadata.isFile()||metadata.isSymbolicLink()||metadata.nlink!==1){send(500,{success:false});return;}
+          removals.push(file);
+        }
+      }
+      state.documents=state.documents.filter(item=>!removed.has(item.docpath));workspaceWrite(state);
+      for(const file of removals)fs.unlinkSync(file);
+      send(200,{success:true});return;
+    }
     if(request.url.startsWith('/upstream/')){
       f.calls.push({path:request.url,headers:request.headers,body});
       if(body.model===f.rejectModel){send(404,{error:{code:'model_not_found'}});return;}
@@ -111,7 +207,7 @@ async function fixture() {
   });
   await new Promise(resolve=>f.service.listen(0,'127.0.0.1',resolve));
   f.port=f.service.address().port; f.base=`http://127.0.0.1:${f.port}/upstream/primary/v1`;
-  f.initialEnv=`ANYTHINGLLM_API_KEY=synthetic-lifecycle-anything-key\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${f.port}\nN8N_PORT=${f.port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=2\nLOCAL_HEALTH_INTERVAL_SECONDS=1\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=2\nAI_API_BASE_URL=${f.base}\nAI_API_PROBE_BASE_URL=${f.base}\nAI_API_KEY=${f.secret}\nAI_MODEL=synthetic-primary-model\nAI_API_MODE=chat_completions\nAI_CUSTOM_HEADERS_JSON='{"X-Original":"${f.header}"}'\nPOSTGRES_PASSWORD=synthetic-lifecycle-database-password\nPOSTGRES_USER=crisp_ai\nPOSTGRES_DB=n8n\nN8N_IMAGE=docker.n8n.io/n8nio/n8n:2.33.0\nPOSTGRES_IMAGE=postgres:16.10-alpine\nANYTHINGLLM_IMAGE=mintplexlabs/anythingllm:1.16.1\nCADDY_IMAGE=caddy:2.10.2-alpine\nSNAPSHOT_MIN_FREE_MB=0\nSNAPSHOT_RETENTION_COUNT=0\n`;
+  f.initialEnv=`PUBLIC_WEBHOOK_URL=https://lifecycle.invalid/\nWEBHOOK_PRODUCTION_URL=https://lifecycle.invalid/webhook/crisp-webhook\nWEBHOOK_ACCESS_MODE=external_proxy\nN8N_ENCRYPTION_KEY=synthetic-lifecycle-n8n-encryption-key\nANYTHINGLLM_AUTH_TOKEN=synthetic-lifecycle-login-password\nANYTHINGLLM_JWT_SECRET=synthetic-lifecycle-jwt-secret\nANYTHINGLLM_SIG_KEY=synthetic-lifecycle-signing-key\nANYTHINGLLM_SIG_SALT=synthetic-lifecycle-signing-salt\nANYTHINGLLM_API_KEY=synthetic-lifecycle-anything-key\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${f.port}\nN8N_PORT=${f.port}\nLOCAL_HEALTH_TIMEOUT_SECONDS=2\nLOCAL_HEALTH_INTERVAL_SECONDS=1\nN8N_WORKFLOW_READY_TIMEOUT_SECONDS=2\nKNOWLEDGE_ACTIVE_EMBEDDING_MODEL=Xenova/all-MiniLM-L6-v2\nKNOWLEDGE_EMBEDDING_MODEL=MintplexLabs/multilingual-e5-small\nCRISP_WEBSITE_ID=${crispWebsite}\nCRISP_API_BASE_URL=https://api.crisp.chat/v1\nCRISP_TOKEN_TIER=website\nCRISP_TOKEN_IDENTIFIER=${crispIdentifier}\nCRISP_TOKEN_KEY=${crispToken}\nCRISP_AUTH_B64=${crispAuth}\nCRISP_HOOK_MODE=website\nCRISP_WEBSITE_HOOK_SECRET=synthetic-lifecycle-website-hook-secret\nAI_API_BASE_URL=${f.base}\nAI_API_PROBE_BASE_URL=${f.base}\nAI_API_KEY=${f.secret}\nAI_MODEL=synthetic-primary-model\nAI_API_MODE=chat_completions\nAI_CUSTOM_HEADERS_JSON='{"X-Original":"${f.header}"}'\nPOSTGRES_PASSWORD=synthetic-lifecycle-database-password\nPOSTGRES_USER=crisp_ai\nPOSTGRES_DB=n8n\nN8N_IMAGE=docker.n8n.io/n8nio/n8n:2.33.0\nPOSTGRES_IMAGE=postgres:16.10-alpine\nANYTHINGLLM_IMAGE=mintplexlabs/anythingllm:1.16.1\nCADDY_IMAGE=caddy:2.10.2-alpine\nSNAPSHOT_MIN_FREE_MB=0\nSNAPSHOT_RETENTION_COUNT=0\n`;
   write(path.join(deploy,'.env'),f.initialEnv);
   write(path.join(deploy,'config/provider.yaml'),{schema_version:2,provider:{base_url:f.base,model:'synthetic-primary-model',api_mode:'chat_completions',api_key_env:'AI_API_KEY'}});
   f.invoke=(script,args=[],overrides={})=>command('bash',[path.join(project,'scripts',script),'--deploy-dir',deploy,...args],{env:{PATH:deploy+'/bin:'+process.env.PATH,CONFIGURATION_FIXTURE_DEPLOY:deploy,PROVIDER_ADAPTER_MANAGEMENT_URL:f.adapterBase,...overrides}});
@@ -134,12 +230,54 @@ async function fixture() {
   // 访问本测试自有的本地 HTTP 服务。若把 tests/mocks 整目录加入 PATH，
   // 通用 curl 桩会悄悄替换真实本地请求并制造与本 fixture 无关的工作区状态。
   const snapshotBin=path.join(work,'snapshot-bin');fs.mkdirSync(snapshotBin);
-  for(const name of ['docker','systemctl']){
-    fs.copyFileSync(path.join(project,'tests/mocks',name),path.join(snapshotBin,name));
-    fs.chmodSync(path.join(snapshotBin,name),0o700);
-  }
-  f.snapshotEnv={PATH:snapshotBin+':'+process.env.PATH,MOCK_DOCKER_LOG:path.join(work,'snapshot-docker.log'),MOCK_DOCKER_SERVICE_STATE:path.join(work,'snapshot-services'),CRISPAI_LOGS_SYSTEMD_TEST:'1',CRISPAI_LOGS_SYSTEMD_DIR:path.join(deploy,'systemd'),MOCK_SYSTEMD_STATE:path.join(work,'systemd-state')};
+  fs.copyFileSync(path.join(project,'tests/mocks/systemctl'),path.join(snapshotBin,'systemctl'));
+  fs.chmodSync(path.join(snapshotBin,'systemctl'),0o700);
+  const sharedDocker=path.join(project,'tests/mocks/docker'),snapshotDocker=path.join(snapshotBin,'docker');
+  fs.writeFileSync(snapshotDocker,[
+    '#!/usr/bin/env bash','set -euo pipefail',
+    `deploy=${JSON.stringify(deploy)}`,
+    `shared=${JSON.stringify(sharedDocker)}`,
+    'if [[ " $* " == *" --project-directory ${deploy} "* && " $* " == *" anythingllm "* && " $* " == *"/internal/provider/status"* ]]; then',
+    '  node - "$deploy" <<\'NODE\'',
+    "'use strict';",
+    "const crypto=require('crypto'),fs=require('fs'),path=require('path');",
+    "const root=process.argv[2],poolFile=path.join(root,'config/provider-pool-applied.json'),receiptFile=path.join(root,'config/provider-pool-readback.json');",
+    "const raw=fs.readFileSync(poolFile),pool=JSON.parse(raw),receipt=JSON.parse(fs.readFileSync(receiptFile));",
+    "const sha=crypto.createHash('sha256').update(raw).digest('hex');",
+    "const exact=receipt&&Object.keys(receipt).sort().join(',')==='pool_sha256,readback_contract_version,revision,schema_version,secrets_generation,verified_at'",
+    "  &&receipt.schema_version===1&&receipt.readback_contract_version===1&&receipt.revision===pool.revision",
+    "  &&receipt.secrets_generation===pool.secrets_generation&&receipt.pool_sha256===sha",
+    "  &&Number.isSafeInteger(receipt.verified_at)&&receipt.verified_at>0;",
+    "if(!exact)process.exit(1);",
+    "const applying=fs.existsSync(path.join(root,'config/provider-pool-transaction.json'));",
+    "process.stdout.write(JSON.stringify({ok:true,readback_contract_version:1,revision:pool.revision,secrets_generation:pool.secrets_generation,pool_sha256:sha,configuration_state:applying?'applying':'applied',pool_cooldown_until:0,entries:pool.entries.map(entry=>({id:entry.id,enabled:entry.enabled,health:entry.enabled?'unknown':'disabled',cooldown_until:0,last_error:'',vision_health:entry.enabled&&entry.capabilities?.vision?'unknown':'disabled',vision_cooldown_until:0,vision_last_error:''}))}));",
+    'NODE','  exit','fi','exec "$shared" "$@"','',
+  ].join('\n'),{mode:0o700});
+  f.snapshotDocker=snapshotDocker;
+  const systemCurl=['/usr/bin/curl','/usr/local/bin/curl'].find(file=>fs.existsSync(file));
+  assert.ok(systemCurl,'生命周期夹具需要系统 curl 访问自有 loopback 服务');
+  const snapshotCurl=path.join(snapshotBin,'curl');
+  fs.writeFileSync(snapshotCurl,[
+    '#!/usr/bin/env node',"'use strict';",
+    "const fs=require('fs'),child=require('child_process');",
+    `const real=${JSON.stringify(systemCurl)},log=${JSON.stringify(externalCurlLog)};`,
+    `const localPrefix=${JSON.stringify(`http://127.0.0.1:${f.port}/`)};`,
+    `const webhook=${JSON.stringify('https://lifecycle.invalid/webhook/crisp-webhook')};`,
+    `const crisp=${JSON.stringify(`https://api.crisp.chat/v1/website/${crispWebsite}`)};`,
+    'const args=process.argv.slice(2),urls=args.filter(value=>/^https?:\\/\\//.test(value));',
+    'if(urls.length>0&&urls.every(value=>value.startsWith(localPrefix))){const result=child.spawnSync(real,args,{stdio:"inherit"});process.exit(result.status===null?1:result.status);}',
+    'const outputIndex=args.findIndex(value=>value==="--output"||value==="-o");',
+    'const outputArg=args.find(value=>value.startsWith("--output="));',
+    'const output=outputIndex>=0?args[outputIndex+1]:(outputArg?outputArg.slice(9):"");',
+    'const finish=(label,status,value)=>{fs.appendFileSync(log,label+"\\n");if(output)fs.writeFileSync(output,JSON.stringify(value),{mode:0o600});else process.stdout.write(JSON.stringify(value));if(args.includes("--write-out")||args.some(item=>item.startsWith("--write-out=")))process.stdout.write(String(status));process.exit(0);};',
+    'if(urls.length===1&&urls[0]===webhook)finish("webhook",401,{accepted:false,reason:"Webhook 校验失败"});',
+    `if(urls.length===1&&urls[0]===crisp)finish("crisp",200,{error:false,data:{website_id:${JSON.stringify(crispWebsite)}}});`,
+    'fs.appendFileSync(log,"denied\\n");process.exit(88);','',
+  ].join('\n'),{mode:0o700});
+  f.snapshotCurl=snapshotCurl;
+  f.snapshotEnv={PATH:snapshotBin+':'+process.env.PATH,MOCK_DOCKER_LOG:path.join(work,'snapshot-docker.log'),MOCK_DOCKER_SERVICE_STATE:serviceState,MOCK_ANYTHING_STATE:anythingState,CRISPAI_LOGS_SYSTEMD_TEST:'1',CRISPAI_LOGS_SYSTEMD_DIR:path.join(deploy,'systemd'),MOCK_SYSTEMD_STATE:path.join(work,'systemd-state')};
   write(f.snapshotEnv.MOCK_DOCKER_LOG,'');write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\nprovider-adapter\n');fs.mkdirSync(f.snapshotEnv.MOCK_SYSTEMD_STATE,{recursive:true});
+  write(externalCurlLog,'');
   return f;
 }
 
@@ -158,7 +296,29 @@ async function main(){
       assert.equal(secret.api_key,f.secret);assert.equal(secret.custom_headers['x-original'],f.header);assert.equal(f.calls.length,0);
       const before=f.capture();await f.ok('provider.sh',['migrate']);assert.deepEqual(f.capture(),before);
       const observed=JSON.parse((await f.ok('provider.sh',['status'])).stdout);assert.equal(observed.revision,current.revision);
-      await f.ok('configuration.sh',['migrate']);await f.ok('knowledge.sh',['sync']);await f.ok('materials.sh',['initialize']);await f.ok('configuration.sh',['materials-apply']);
+      await f.ok('configuration.sh',['migrate']);
+      await f.ok('knowledge-profile.sh',['capture'],f.snapshotEnv);
+      const started=await command('bash',['-c',[
+        'set -euo pipefail','source "$1/scripts/common.sh"','docker_compose "$1" up -d --no-deps anythingllm',
+      ].join('\n'),'--',f.deploy],{env:f.snapshotEnv});
+      assert.equal(started.code,0,started.stderr+started.stdout);
+      await f.ok('knowledge-profile.sh',['ensure'],f.snapshotEnv);
+      await f.ok('knowledge.sh',['sync'],f.snapshotEnv);
+      const recaptured=await command('bash',['-c',[
+        'set -euo pipefail','source "$1/scripts/common.sh"','docker_compose "$1" up -d --no-deps anythingllm',
+      ].join('\n'),'--',f.deploy],{env:f.snapshotEnv});
+      assert.equal(recaptured.code,0,recaptured.stderr+recaptured.stdout);
+      await f.ok('materials.sh',['initialize']);await f.ok('configuration.sh',['materials-apply']);
+      const knowledgeMap=read(path.join(f.deploy,'data/runtime/knowledge-map.json'));
+      assert.equal(knowledgeMap.documents.length,1);
+      assert.equal(read(f.workspaceState).documents[0].docpath,knowledgeMap.documents[0].location);
+      assert.equal(read(path.join(f.deploy,'data/runtime/knowledge-profile.json')).state,'applied');
+      const manifest=read(path.join(f.deploy,'data/knowledge-manifest.json'));
+      const cacheBindings=Object.values(manifest.files).flatMap(record=>record.cache_bindings||[]);
+      const expectedCache=cachePath(f.deploy,knowledgeMap.documents[0].location);
+      assert.equal(cacheBindings.length,1);
+      assert.deepEqual(cacheBindings[0],{location:knowledgeMap.documents[0].location,
+        sha256:digest(fs.readFileSync(expectedCache))});
       assert.notEqual(/^PROVIDER_ADAPTER_KEY=(.*)$/m.exec(fs.readFileSync(path.join(f.deploy,'.env'),'utf8'))[1],f.secret);
     });
     await test('PL02 业务导出包含全部非敏感池原文，排除全部Key、Header值和运行秘密引用',async()=>{
@@ -310,6 +470,27 @@ async function main(){
       assert.equal(liveReadback.revision,livePool.revision);
       assert.equal(liveReadback.secrets_generation,livePool.secrets_generation);
       assert.equal(liveReadback.pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
+      const denied=await command(f.snapshotCurl,['--silent','https://unlisted-lifecycle.invalid/'],{env:f.snapshotEnv});
+      assert.equal(denied.code,88);assert.equal(fs.readFileSync(f.externalCurlLog,'utf8'),'denied\n');write(f.externalCurlLog,'');
+      const prepared=await command('bash',['-c',[
+        'set -euo pipefail','source "$1/scripts/common.sh"','docker_compose "$1" up -d --remove-orphans',
+        'import_and_publish_workflow "$1"',
+      ].join('\n'),'--',f.deploy],{env:f.snapshotEnv});
+      assert.equal(prepared.code,0,prepared.stderr+prepared.stdout);
+      assert(fs.existsSync(f.workflowMarker),'workflow active marker只能由真实 import/publish 入口建立');
+      const lexical=await command('python3',['-B',path.join(f.deploy,'scripts/knowledge-lexical.py'),'verify','--deploy-dir',f.deploy]);
+      assert.equal(lexical.code,0,lexical.stderr);
+      const lexicalReport=JSON.parse(lexical.stdout);assert.equal(lexicalReport.ok,true);assert.equal(lexicalReport.complete,true);
+      const modelCallsBeforeHealth=f.calls.length;
+      const health=await f.invoke('healthcheck.sh',['--application','--installation-in-progress','--json'],f.snapshotEnv);
+      assert.equal(health.code,0,health.stderr+health.stdout);
+      const healthReport=JSON.parse(health.stdout);assert.equal(healthReport.summary.fail,0);
+      for(const id of ['config.secrets','config.crisp_mode','anything.workspace','knowledge.catalog','n8n.health','n8n.workflow',
+        'anything.rag_context','provider.adapter','knowledge.lexical']){
+        assert.equal(healthReport.results.find(item=>item.id===id)?.status,'PASS',id);
+      }
+      assert.equal(f.calls.length,modelCallsBeforeHealth,'本地健康门禁不得调用付费模型');
+      assert.equal(fs.readFileSync(f.externalCurlLog,'utf8'),'','本地健康门禁不得访问外部 URL');
       const adapter=path.join(f.deploy,'scripts/provider-adapter.js'),held=adapter+'.held';
       fs.renameSync(adapter,held);write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
       try {
@@ -324,6 +505,13 @@ async function main(){
       assert.deepEqual(pool,f.pool());assert.deepEqual(read(path.join(payload,'secrets/provider/generations',pool.secrets_generation+'.json')).entries,f.secretEntries());
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/provider-router/synthetic-preserved.json')),fs.readFileSync(path.join(f.deploy,'data/provider-router/synthetic-preserved.json')));
       assert(!fs.existsSync(path.join(payload,'config/provider-pool-readback.json')));
+      const snapshotWorkspace=read(path.join(payload,'data/anythingllm/lifecycle-workspace.json'));
+      const snapshotRuntime=read(path.join(payload,'data/anythingllm/lifecycle-runtime.json'));
+      assert.equal(snapshotWorkspace.openAiPrompt,read(path.join(payload,'config/materials-applied.json')).prompt.text);
+      assert.deepEqual(snapshotWorkspace.documents.map(item=>item.docpath),
+        read(path.join(payload,'data/runtime/knowledge-map.json')).documents.map(item=>item.location));
+      assert.equal(snapshotRuntime.rag_instances?.[f.deploy]?.context_window,
+        Number(/^PROVIDER_RAG_CONTEXT_WINDOW=(.*)$/m.exec(fs.readFileSync(path.join(payload,'.env'),'utf8'))[1]));
       for(const name of ['provider-adapter.js','visitor-output.js','provider-router.js','provider-envelope.js','provider-pool.py','provider.sh','configuration.sh','materials-recovery.py','atomic-config.py'])assert.deepEqual(fs.readFileSync(path.join(payload,'scripts',name)),fs.readFileSync(path.join(f.deploy,'scripts',name)));
       for(const name of [...knowledgeModules,'n8n/runtime.js'])assert.deepEqual(fs.readFileSync(path.join(payload,name)),fs.readFileSync(path.join(f.deploy,name)));
       assert.deepEqual(fs.readFileSync(path.join(payload,'data/knowledge-projection.json')),fs.readFileSync(path.join(f.deploy,'data/knowledge-projection.json')));
@@ -383,7 +571,17 @@ async function main(){
       assertSameIdentity(originalMaterials,materialsSnapshotIdentity(repackedPayload),'PL08A 重封装资料');
       await validateMaterials(repackedPayload,'PL08A 重封装快照');
       const expectedMaterials=fs.readFileSync(path.join(repackedPayload,'backups/config-history/materials.applied.tar.gz'));
+      const expectedWorkspace=fs.readFileSync(path.join(repackedPayload,'data/anythingllm/lifecycle-workspace.json'));
+      const expectedRuntime=fs.readFileSync(path.join(repackedPayload,'data/anythingllm/lifecycle-runtime.json'));
       fs.writeFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz'),'synthetic-invalid-current-canonical',{mode:0o600});
+      write(f.workspaceState,{slug:'crisp-support',openAiPrompt:'待快照恢复的合成运行态',openAiTemp:0.7,documents:[]});
+      write(f.anythingState,{rag_instances:{[f.deploy]:{context_window:777,documents:['custom-documents/not-from-snapshot.json']}}});
+      for(const marker of [f.workflowMarker,path.join(f.deploy,'tmp/mock-workflow-imported')]){
+        if(fs.existsSync(marker))fs.unlinkSync(marker);
+      }
+      assert(!fs.existsSync(f.workflowMarker),'回滚前必须移除活动工作流标记，由生产 import/publish 重建');
+      write(f.externalCurlLog,'');
+      const modelCallsBeforeRollback=f.calls.length;
 
       const guardBin=path.join(work,'readback-guard-bin'),guardLog=path.join(work,'readback-guard.log');
       fs.mkdirSync(guardBin);write(guardLog,'');
@@ -395,7 +593,7 @@ async function main(){
         '  [[ ! -e "${MOCK_READBACK_GUARD_DEPLOY:?}/config/provider-pool-readback.json" && ! -L "${MOCK_READBACK_GUARD_DEPLOY}/config/provider-pool-readback.json" ]] || { printf "%s\\n" "旧回读在组件启动前仍存在" >&2; exit 86; }',
         '  printf "%s\\n" "checked-before-up" >> "${MOCK_READBACK_GUARD_LOG:?}"',
         'fi',
-        `exec ${JSON.stringify(path.join(project,'tests/mocks/docker'))} "$@"`,
+        `exec ${JSON.stringify(f.snapshotDocker)} "$@"`,
         '',
       ].join('\n'),{mode:0o700});
       write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
@@ -410,6 +608,14 @@ async function main(){
       assert.equal(receipt.secrets_generation,current.secrets_generation);
       assert.equal(receipt.pool_sha256,digest(fs.readFileSync(path.join(f.deploy,'config/provider-pool-applied.json'))));
       assert.deepEqual(fs.readFileSync(path.join(f.deploy,'backups/config-history/materials.applied.tar.gz')),expectedMaterials);
+      assert.deepEqual(fs.readFileSync(f.workspaceState),expectedWorkspace,'AnythingLLM Prompt/文档运行态必须来自同一快照');
+      assert.deepEqual(fs.readFileSync(f.anythingState),expectedRuntime,'RAG 上下文运行代必须来自同一快照');
+      assert(fs.existsSync(f.workflowMarker),'回滚后必须由生产 import/publish 恢复活动 workflow');
+      assert(fs.existsSync(path.join(f.deploy,'tmp/mock-workflow-imported')),
+        '回滚后必须先完成真实 workflow import 再 publish');
+      assert.equal(f.calls.length,modelCallsBeforeRollback,'快照恢复、读回和 doctor 不得调用付费模型');
+      assert.deepEqual(fs.readFileSync(f.externalCurlLog,'utf8').trim().split(/\r?\n/).sort(),['crisp','webhook'],
+        '回滚只能访问本地端点及两个显式授权的合成外部检查');
       await f.ok('provider.sh',['readback']);
     });
     await test('PL09 缺秘密代次的自洽快照在停服务前拒绝，不留下混合恢复',async()=>{

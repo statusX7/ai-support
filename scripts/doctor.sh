@@ -114,6 +114,7 @@ DOCTOR_PREBOOTSTRAP_JQ_FIXED=0
 DOCTOR_POOL_ENABLED=0
 DOCTOR_POOL_READY=0
 DOCTOR_PROVIDER_INFERENCE_STATUS=not_checked
+DOCTOR_APPLIED_BUSINESS_STATE=invalid
 DOCTOR_EXPECTED_SERVICES=(postgres anythingllm n8n provider-adapter)
 
 # shellcheck disable=SC2317
@@ -259,14 +260,22 @@ doctor_prepare_applied_business_configs() {
   local projection="${target_root}/materials-applied.json"
   local name
 
-  rm -rf -- "$target_root"
+  DOCTOR_APPLIED_BUSINESS_STATE=invalid
+  if ! rm -rf -- "$target_root" || [[ -e "$target_root" || -L "$target_root" ]]; then
+    return 1
+  fi
   if [[ ! -e "$source" && ! -L "$source" ]]; then
+    DOCTOR_APPLIED_BUSINESS_STATE=absent
     return 2
   fi
   [[ -f "$source" && ! -L "$source" ]] || return 1
+  [[ $(stat -c '%h' -- "$source" 2>/dev/null || printf 0) == 1 ]] || return 1
   [[ $(stat -c '%s' -- "$source" 2>/dev/null || printf 0) -le 16777216 ]] || return 1
   mkdir -m 0700 -- "$target_root"
-  install -m 0600 -- "$source" "$projection" || return 1
+  if ! install -m 0600 -- "$source" "$projection"; then
+    rm -rf -- "$target_root"
+    return 1
+  fi
 
   # 在 doctor 私有副本上复用生产投影校验器。该校验器会建立临时目录，
   # 因此不能直接指向 config/，否则只读自检也会短暂写入管理员配置目录。
@@ -277,14 +286,21 @@ doctor_prepare_applied_business_configs() {
     materials_projection_validate "$2"
   ' doctor-materials "$DOCTOR_DIR" "$projection" >/dev/null 2>&1 \
     || ! jq -e '.state == "applied"' "$projection" >/dev/null 2>&1; then
+    rm -rf -- "$target_root"
     return 1
   fi
 
   for name in runtime menu handoff; do
-    jq -M ".configuration.${name}" "$projection" > "${target_root}/${name}.json" \
-      || return 1
-    chmod 0600 "${target_root}/${name}.json"
+    if ! jq -M ".configuration.${name}" "$projection" > "${target_root}/${name}.json"; then
+      rm -rf -- "$target_root"
+      return 1
+    fi
+    if ! chmod 0600 "${target_root}/${name}.json"; then
+      rm -rf -- "$target_root"
+      return 1
+    fi
   done
+  DOCTOR_APPLIED_BUSINESS_STATE=ready
 }
 
 # coreutils timeout 不能直接执行当前 shell 的函数；在受限子 shell 中重新加载
@@ -1014,8 +1030,12 @@ try:
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16_777_216:
         raise ValueError("unsafe projection")
     value = json.loads(source.read_text(encoding="utf-8"))
+    schema = value.get("schema_version")
     prompt = value.get("prompt")
-    if value.get("schema_version") != 1 or value.get("state") != "applied" or not isinstance(prompt, dict):
+    components = value.get("source_components")
+    if type(schema) is not int or schema != 2 or value.get("state") != "applied" \
+            or not isinstance(prompt, dict) or set(prompt) != {"text", "sha256", "bytes"} \
+            or not isinstance(components, dict):
         raise ValueError("invalid projection")
     text = prompt.get("text")
     if not isinstance(text, str) or not text.strip() or "\x00" in text:
@@ -1023,7 +1043,8 @@ try:
     encoded = text.encode("utf-8")
     if len(encoded) != prompt.get("bytes"):
         raise ValueError("invalid prompt")
-    if len(encoded) > 262_144 or hashlib.sha256(encoded).hexdigest() != prompt.get("sha256"):
+    if len(encoded) > 262_144 or hashlib.sha256(encoded).hexdigest() != prompt.get("sha256") \
+            or components.get("prompt") != prompt.get("sha256"):
         raise ValueError("invalid prompt digest")
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -1086,17 +1107,32 @@ doctor_anything_check() {
   key=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_API_KEY 2>/dev/null || true)
   workspace=$(env_get "${DOCTOR_DEPLOY_DIR}/.env" ANYTHINGLLM_WORKSPACE 2>/dev/null || true)
   response="${DOCTOR_TEMP_ROOT}/anything-workspace.json"
-  projection="${DOCTOR_DEPLOY_DIR}/config/materials-applied.json"
+  # files/config 检查已把权威投影复制到 doctor 私有目录，并通过生产
+  # materials_projection_validate 完整核验。AnythingLLM 必须从同一次冻结的
+  # schema v2 投影读取 Prompt，不能重新读取可能并发变化的原文件，也不能在
+  # 权威投影损坏时回退到可编辑草稿。
+  projection="${DOCTOR_TEMP_ROOT}/applied-business/materials-applied.json"
   expected_prompt="${DOCTOR_TEMP_ROOT}/anything-expected-prompt"
   # --fix 会在同一进程内复查一次；只删除本次 doctor 私有临时文件，
   # 避免第二轮因 O_EXCL 将有效投影误报为损坏。
   rm -f -- "$expected_prompt"
-  if [[ -e "$projection" || -L "$projection" ]]; then
-    if doctor_projection_prompt_extract "$projection" "$expected_prompt" >/dev/null 2>&1; then prompt_valid=1; fi
-  else
-    prompt_source=legacy
-    if doctor_legacy_prompt_extract "${DOCTOR_DEPLOY_DIR}/config/prompt.md" "$expected_prompt" >/dev/null 2>&1; then prompt_valid=1; fi
-  fi
+  case "$DOCTOR_APPLIED_BUSINESS_STATE" in
+    ready)
+      if [[ -f "$projection" && ! -L "$projection" ]] \
+        && doctor_projection_prompt_extract "$projection" "$expected_prompt" >/dev/null 2>&1; then
+        prompt_valid=1
+      fi
+      ;;
+    absent)
+      prompt_source=legacy
+      if doctor_legacy_prompt_extract "${DOCTOR_DEPLOY_DIR}/config/prompt.md" "$expected_prompt" >/dev/null 2>&1; then prompt_valid=1; fi
+      ;;
+    *)
+      # 当前轮次未完成私有投影的清理、复制与完整验证；即使同进程
+      # --fix 复查留有上轮文件，也不得消费它或回退到可编辑原文。
+      :
+      ;;
+  esac
   if (( DOCTOR_ANYTHING_READY )) && ! is_placeholder "$key" && [[ "$workspace" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
     status=$(doctor_anything_workspace_probe "$port" "$key" "$workspace" "$response")
   else status=000; fi

@@ -417,7 +417,9 @@ materials_projection_validate_configuration() {
 
 materials_projection_validate_legacy() {
   local file=$1
-  [[ -f "$file" && ! -L "$file" && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
+  [[ -f "$file" && ! -L "$file" \
+    && $(stat -c '%h' -- "$file" 2>/dev/null || printf 0) == 1 \
+    && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
   jq -M -e '
     .schema_version == 1 and (.revision | type == "number" and floor == . and . >= 1) and
     (.state == "applied" or .state == "applying") and
@@ -451,7 +453,9 @@ PY
 
 materials_projection_validate() {
   local file=$1
-  [[ -f "$file" && ! -L "$file" && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
+  [[ -f "$file" && ! -L "$file" \
+    && $(stat -c '%h' -- "$file" 2>/dev/null || printf 0) == 1 \
+    && $(stat -c '%s' -- "$file") -le $MATERIALS_PROJECTION_MAX_BYTES ]] || return 1
   jq -M -e --argjson schema "$MATERIALS_SCHEMA_VERSION" '
     .schema_version == $schema and (.revision | type == "number" and floor == . and . >= 1) and
     (.state == "applied" or .state == "applying") and
