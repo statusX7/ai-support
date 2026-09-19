@@ -238,8 +238,18 @@ async function main(){
       assert.equal(result.code,0,result.stderr+result.stdout);assert.deepEqual(layout(f.pool()),expectedLayout);
     });
     await test('PL11 任何知识迁移标记在容量及完整快照停服务前拒绝，不改池或调用模型',async()=>{
-      const marker=path.join(f.deploy,'data/runtime/knowledge-migration.json'),before=f.capture(),callCount=f.calls.length;
+      const marker=path.join(f.deploy,'data/runtime/knowledge-migration.json');
       assert(!fs.existsSync(marker));
+      const applied=JSON.parse((await f.ok('configuration.sh',['materials-apply'])).stdout);
+      assert.equal(applied.applied,true);assert.equal(applied.provider_pool.applied,true);
+      const baselineBefore=f.capture(),baselineCalls=f.calls.length;
+      write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+      const baseline=await f.invoke('snapshot.sh',['--quiet','--check-capacity'],f.snapshotEnv);
+      write(path.join(work,'knowledge-migration-snapshot-ready.log'),baseline.stdout+baseline.stderr);
+      assert.equal(baseline.code,0,baseline.stderr+baseline.stdout);
+      assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
+      assert.deepEqual(f.capture(),baselineBefore);assert.equal(f.calls.length,baselineCalls);assert(!fs.existsSync(marker));
+      const before=f.capture(),callCount=f.calls.length;
       for(const kind of ['file','malformed','dangling','fifo','directory']){
         if(kind==='file')write(marker,{state:'applying',synthetic:true});
         else if(kind==='malformed')write(marker,'{');
