@@ -287,7 +287,8 @@ materials_projection_validate() {
     (.knowledge.library_count | type == "number" and floor == . and . >= 0 and . <= 100) and
     ((.knowledge.enabled_library_ids | length) <= .knowledge.library_count) and
     (.knowledge.document_count | type == "number" and floor == . and . >= 0 and . <= 1000000) and
-    (.knowledge.enabled_document_count | type == "number" and floor == . and . >= 0 and . <= .knowledge.document_count) and
+    (.knowledge.document_count as $document_count |
+      .knowledge.enabled_document_count | type == "number" and floor == . and . >= 0 and . <= $document_count) and
     (if .knowledge.enabled_document_count > 0 then (.knowledge.profile_sha256 | test("^[a-f0-9]{64}$")) else true end) and
     (if .state == "applied" then
        .configuration.runtime.revision == .revision and .configuration.runtime.applied_revision == .revision
