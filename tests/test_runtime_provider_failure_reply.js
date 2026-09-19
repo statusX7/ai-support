@@ -860,6 +860,11 @@ async function fixture(label, behavior) {
 
 const pendingJob = (fixture, event, jobId) => fixture.state(event.data.session_id).jobs
   .find((entry) => entry.id === jobId);
+const failureAudit = (job) => ({
+  failure_rounds: job?.failure_rounds,
+  failure_since: job?.failure_since,
+  last_failure_at: job?.last_failure_at,
+});
 const advancePastRetry = (fixture, event, jobId) => {
   const job = pendingJob(fixture, event, jobId);
   assert(job && Number.isFinite(job.retry_at), '未完成责任必须登记下一次恢复时间');
@@ -975,6 +980,11 @@ async function test(name, action) {
       assert.equal(stored.inference?.provider_receipt_protocol_version, 1);
       assert.equal(stored.provider_result_receipt?.state, 'unknown');
       assert.equal(Number(stored.response_generation || 0), 0);
+      const firstFailureAudit = failureAudit(stored);
+      assert.equal(Number.isSafeInteger(firstFailureAudit.failure_rounds)
+        && firstFailureAudit.failure_rounds >= 1, true);
+      assert.equal(Number.isFinite(firstFailureAudit.failure_since), true);
+      assert.equal(Number.isFinite(firstFailureAudit.last_failure_at), true);
       const firstQuestion = f.question(result.jobId);
       assert.equal(firstQuestion.attempt_generation, 1);
       assert.equal(firstQuestion.attempts, 2, '累计审计必须记录本轮两个真实上游调用');
@@ -998,13 +1008,21 @@ async function test(name, action) {
         '首次恢复只能只读 replay，不能在确认旧结果前再次调用第三方接口');
       stored = pendingJob(f, event, result.jobId);
       assert.equal(stored.failure_code, 'question_result_absent');
+      assert.deepEqual(failureAudit(stored), firstFailureAudit,
+        '精确 question_result_absent 只是阴性对账，不得重复累计故障轮次或刷新失败时间');
+      assert.equal(stored.retry_at, f.now(),
+        '精确阴性对账必须在同一事务时钟立即到期，不能继承新的指数退避');
       assert.equal(stored.inference, undefined,
         '只有 router 以完整身份确认 absent 后才释放旧推理信封');
       assert.equal(stored.provider_result_receipt, undefined);
+      assert.equal(stored.provider_migration_from, undefined);
+      assert.equal(stored.plan, undefined);
       assert.equal(stored.data?.content, event.data.content);
+      assert.equal(stored.id, result.jobId);
+      assert.equal(f.crispPostAttempts.length, 0);
       assertNoVisibleFailureReply(f);
 
-      advancePastRetry(f, event, result.jobId);
+      f.advance(1);
       const recovered = await f.process(result.key, result.jobId);
       stored = pendingJob(f, event, result.jobId);
       const recoveryQuestionState = fs.existsSync(f.questionPath(result.jobId))
@@ -1124,6 +1142,8 @@ async function test(name, action) {
         first_unknown_at: f.now(), last_checked_at: f.now(), next_action_at: 0, checks: 1,
       };
     });
+    const wrongIdentityBefore = pendingJob(f, event, accepted.jobId);
+    const wrongIdentityRoundsBefore = Number(wrongIdentityBefore.failure_rounds || 0);
     const first = await f.process(accepted.key, accepted.jobId);
     assert.equal(first.status, 'unresolved');
     assert.equal(f.calls.length, 0, '错代回执不得取得任何 Provider route 权限');
@@ -1137,7 +1157,13 @@ async function test(name, action) {
     assert.equal(stored.inference?.attempt_generation, 1);
     assert.equal(stored.provider_result_receipt?.attempt_generation, 2);
     assert.equal(stored.data?.content, event.data.content);
+    assert.equal(stored.failure_rounds, wrongIdentityRoundsBefore + 1,
+      '错代回执是新的身份故障，必须增加一轮而不能套用精确阴性快速路径');
+    assert.equal(stored.failure_since, f.now());
+    assert.equal(stored.last_failure_at, f.now());
+    assert.equal(stored.retry_at, f.now() + 300000);
 
+    const firstWrongIdentityAudit = failureAudit(stored);
     advancePastRetry(f, event, accepted.jobId);
     const repeated = await f.process(accepted.key, accepted.jobId);
     assert.equal(repeated.status, 'unresolved');
@@ -1150,6 +1176,134 @@ async function test(name, action) {
     assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
     assert.equal(stored.inference?.attempt_generation, 1);
     assert.equal(stored.provider_result_receipt?.attempt_generation, 2);
+    assert.equal(stored.failure_rounds, firstWrongIdentityAudit.failure_rounds + 1);
+    assert.equal(stored.failure_since, firstWrongIdentityAudit.failure_since);
+    assert.equal(stored.last_failure_at, f.now());
+    assert.equal(stored.retry_at, f.now() + 300000);
+  });
+
+  for (const variant of [
+    { name: 'router拒绝缓存结果', reason: 'question_result_rejected' },
+    { name: '先前执行已中断', reason: 'question_interrupted' },
+  ]) {
+    await test(`${variant.name}仍增加故障轮次并退避，不能借阴性回执立即重试`, async (f) => {
+      const event = f.event(`definite-${variant.reason.replace(/_/g, '-')}`);
+      const accepted = await f.receive(event);
+      assert.equal(accepted.accepted, true);
+      await f.mutateState(event.data.session_id, (state) => {
+        const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+        job.inference_generation = 1;
+        job.inference = { ...f.providerConfiguration, deadline_at: f.now() + 7000,
+          attempt_generation: 1, provider_receipt_protocol_version: 1 };
+        job.provider_result_receipt = {
+          state: 'absent', stage: 'answer', reason: variant.reason, attempt_generation: 1,
+          configuration_binding: f.providerConfiguration.configuration_binding,
+          request_contract_version: 1, request_sha256: 'b'.repeat(64),
+          plan_context_sha256: digest(canonical(null)), plan_context: null,
+          first_unknown_at: f.now(), last_checked_at: f.now(), next_action_at: 0, checks: 1,
+        };
+      });
+      const roundsBefore = Number(pendingJob(f, event, accepted.jobId).failure_rounds || 0);
+      const result = await f.process(accepted.key, accepted.jobId);
+      assert.equal(result.status, 'unresolved');
+      const stored = pendingJob(f, event, accepted.jobId);
+      assert.equal(stored.status, 'received');
+      assert.equal(stored.responsibility_status, 'unresolved_failure');
+      assert.equal(stored.failure_code, variant.reason);
+      assert.equal(stored.failure_rounds, roundsBefore + 1,
+        'rejected/interrupted 是新的终态失败，不能获得 question_result_absent 的 +0 轮特权');
+      assert.equal(stored.failure_since, f.now());
+      assert.equal(stored.last_failure_at, f.now());
+      assert.equal(stored.retry_at > f.now(), true);
+      assert.equal(stored.data?.content, event.data.content);
+      assert.equal(f.calls.length, 0);
+      assert.equal(f.signedProviderPayloads.filter((entry) =>
+        ['/v1/chat/completions', '/internal/provider/replay'].includes(entry.path)).length, 0);
+      assert.equal(f.crispPostAttempts.length, 0);
+      assertNoVisibleFailureReply(f);
+    });
+  }
+
+  await test('错stage的question_result_absent回执必须按身份故障退避且零上游与出站', async (f) => {
+    const event = f.event('absent-wrong-stage');
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.inference_generation = 1;
+      job.inference = { ...f.providerConfiguration, deadline_at: f.now() + 7000,
+        attempt_generation: 1, provider_receipt_protocol_version: 1 };
+      job.provider_result_receipt = {
+        state: 'absent', stage: 'vision', reason: 'question_result_absent', attempt_generation: 1,
+        configuration_binding: f.providerConfiguration.configuration_binding,
+        request_contract_version: 1, request_sha256: 'c'.repeat(64),
+        plan_context_sha256: digest(canonical(null)), plan_context: null,
+        first_unknown_at: f.now(), last_checked_at: f.now(), next_action_at: 0, checks: 1,
+      };
+    });
+    const roundsBefore = Number(pendingJob(f, event, accepted.jobId).failure_rounds || 0);
+    const result = await f.process(accepted.key, accepted.jobId);
+    assert.equal(result.status, 'unresolved');
+    const stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
+    assert.equal(stored.failure_rounds, roundsBefore + 1);
+    assert.equal(stored.retry_at, f.now() + 300000);
+    assert.equal(stored.inference?.attempt_generation, 1,
+      '错stage回执必须保留原推理身份，不能被当作可释放的精确阴性结果');
+    assert.equal(stored.provider_result_receipt?.stage, 'vision');
+    assert.equal(stored.provider_result_receipt?.reason, 'question_result_absent');
+    assert.equal(stored.data?.content, event.data.content);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      ['/v1/chat/completions', '/internal/provider/replay'].includes(entry.path)).length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+
+    advancePastRetry(f, event, accepted.jobId);
+    const repeated = await f.process(accepted.key, accepted.jobId);
+    assert.equal(repeated.status, 'unresolved');
+    const repeatedStored = pendingJob(f, event, accepted.jobId);
+    assert.equal(repeatedStored.failure_code, 'provider_receipt_identity_unresolved');
+    assert.equal(repeatedStored.failure_rounds, roundsBefore + 2);
+    assert.equal(repeatedStored.retry_at, f.now() + 300000);
+    assert.equal(repeatedStored.inference?.attempt_generation, 1);
+    assert.equal(repeatedStored.provider_result_receipt?.stage, 'vision');
+    assert.equal(f.calls.length, 0,
+      '错stage身份即使到达下一诊断轮也不得取得新的Provider调用权');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      ['/v1/chat/completions', '/internal/provider/replay'].includes(entry.path)).length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+  });
+
+  await test('现代推理无回执时的检索故障必须增加一轮并退避，不能被当作router阴性对账', async (f) => {
+    f.queueRagVectorClientFailures(2);
+    const event = f.event('no-receipt-retrieval-failure');
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.inference_generation = 1;
+      job.inference = { ...f.providerConfiguration, deadline_at: f.now() + 7000,
+        attempt_generation: 1, provider_receipt_protocol_version: 1 };
+      delete job.provider_result_receipt;
+    });
+    const roundsBefore = Number(pendingJob(f, event, accepted.jobId).failure_rounds || 0);
+    const result = await f.process(accepted.key, accepted.jobId);
+    assert.equal(result.status, 'unresolved');
+    const stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'retrieval_unavailable');
+    assert.equal(stored.failure_rounds, roundsBefore + 1,
+      '无receipt只能证明尚无可重放结果，不能抹掉本轮真实检索故障');
+    assert.equal(stored.failure_since, f.now());
+    assert.equal(stored.last_failure_at, f.now());
+    assert.equal(stored.retry_at > f.now(), true);
+    assert.equal(stored.data?.content, event.data.content);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
   });
 
   for (const variant of [
@@ -1172,6 +1326,7 @@ async function test(name, action) {
         job.inference = variant.value(f);
         delete job.provider_result_receipt;
       });
+      const roundsBefore = Number(pendingJob(f, event, accepted.jobId).failure_rounds || 0);
       const result = await f.process(accepted.key, accepted.jobId);
       assert.equal(result.status, 'unresolved');
       assert.equal(f.calls.length, 0);
@@ -1183,6 +1338,11 @@ async function test(name, action) {
       assert.equal(stored.status, 'received');
       assert.equal(stored.responsibility_status, 'unresolved_failure');
       assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
+      assert.equal(stored.failure_rounds, roundsBefore + 1,
+        '缺失receipt的未知旧身份必须增加诊断轮次，不能命中精确阴性快速路径');
+      assert.equal(stored.failure_since, f.now());
+      assert.equal(stored.last_failure_at, f.now());
+      assert.equal(stored.retry_at, f.now() + 300000);
       assert.equal(stored.data?.content, event.data.content);
       assert.deepEqual(stored.inference, variant.value(f));
     });
@@ -2912,6 +3072,8 @@ async function test(name, action) {
     assert.equal(interrupted.resolved, false, '强制终止适配器必须中断原上游请求');
     f.setBehavior('normal');
     await f.restartAdapter();
+    const interruptedRoundsBefore = Number(
+      pendingJob(f, event, accepted.jobId).failure_rounds || 0);
     let result = await f.process(accepted.key, accepted.jobId);
     assert.equal(result.status, 'unresolved');
     assertNoVisibleFailureReply(f);
@@ -2919,6 +3081,12 @@ async function test(name, action) {
     assert.equal(stored.status, 'received');
     assert.equal(stored.responsibility_status, 'unresolved_failure');
     assert.equal(stored.data?.content, event.data.content);
+    assert.equal(stored.failure_code, 'question_interrupted');
+    assert.equal(stored.failure_rounds, interruptedRoundsBefore + 1,
+      '真实中断必须登记一轮故障，不能当作无成本阴性对账');
+    assert.equal(stored.failure_since, f.now());
+    assert.equal(stored.last_failure_at, f.now());
+    assert.equal(stored.retry_at > f.now(), true);
     assert.equal(stored.inference_generation, 1);
     assert.equal(stored.inference, undefined);
     assert.equal(Number(stored.response_generation || 0), 0);
@@ -2962,6 +3130,9 @@ async function test(name, action) {
     assert.equal(Number(stored.response_generation || 0), 0);
     assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts], [1, 2, 2]);
     const firstDeadline = question.deadline;
+    const firstFailureAudit = failureAudit(stored);
+    assert.equal(Number.isSafeInteger(firstFailureAudit.failure_rounds)
+      && firstFailureAudit.failure_rounds >= 1, true);
     assertNoVisibleFailureReply(f);
 
     advancePastRetry(f, event, first.jobId);
@@ -2972,10 +3143,15 @@ async function test(name, action) {
       '第一代收敛只能 replay 并确认没有缓存结果');
     stored = pendingJob(f, event, first.jobId);
     assert.equal(stored.failure_code, 'question_result_absent');
+    assert.deepEqual(failureAudit(stored), firstFailureAudit,
+      '第一代精确阴性对账不得重复增加故障轮次');
+    assert.equal(stored.retry_at, f.now());
     assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_migration_from, undefined);
     assertNoVisibleFailureReply(f);
 
-    advancePastRetry(f, event, first.jobId);
+    f.advance(1);
     const second = await f.process(first.key, first.jobId);
     assert.equal(second.status, 'unresolved');
     assert.deepEqual(f.calls.map((call) => call.index), [0, 1, 0, 1],
@@ -2989,6 +3165,13 @@ async function test(name, action) {
     assert.equal(Number(stored.response_generation || 0), 0);
     assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts], [2, 2, 4]);
     assert.equal(question.deadline > firstDeadline, true);
+    const secondFailureAudit = failureAudit(stored);
+    assert.equal(secondFailureAudit.failure_rounds, firstFailureAudit.failure_rounds + 1,
+      '只有第二轮真实上游失败可以增加一轮故障审计');
+    assert.equal(secondFailureAudit.failure_since, firstFailureAudit.failure_since,
+      '连续恢复不得重置首个未解决故障时间');
+    assert.equal(secondFailureAudit.last_failure_at > firstFailureAudit.last_failure_at, true,
+      '第二轮真实失败必须刷新最后失败时间');
     assertNoVisibleFailureReply(f);
 
     f.setBehavior('normal');
@@ -3001,10 +3184,15 @@ async function test(name, action) {
       '第二代收敛仍只能 replay，累计调用数不得增加');
     stored = pendingJob(f, event, first.jobId);
     assert.equal(stored.failure_code, 'question_result_absent');
+    assert.deepEqual(failureAudit(stored), secondFailureAudit,
+      '第二代精确阴性对账同样不得重复增加故障轮次');
+    assert.equal(stored.retry_at, f.now());
     assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_migration_from, undefined);
     assertNoVisibleFailureReply(f);
 
-    advancePastRetry(f, event, first.jobId);
+    f.advance(1);
     const recovered = await f.process(first.key, first.jobId);
     assert.equal(recovered.status, 'sent');
     stored = pendingJob(f, event, first.jobId);
