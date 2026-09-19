@@ -69,7 +69,7 @@ async function fixture() {
   write(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+project+'\ninstalled_version='+currentVersion+'\n');
   write(path.join(deploy,'config/.crispai-launcher'),path.join(work,'crispai')+'\n');
   let prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8');
-  const f={deploy,calls:[],rejectModel:'',adapter:null,adapterBase:'',secret:'synthetic-lifecycle-primary-key',header:'synthetic-lifecycle-header-value'};
+  const f={deploy,calls:[],workspaceReads:0,rejectModel:'',adapter:null,adapterBase:'',secret:'synthetic-lifecycle-primary-key',header:'synthetic-lifecycle-header-value'};
   f.service=http.createServer(async(request,response)=>{
     let raw='';for await(const chunk of request)raw+=chunk;
     const body=JSON.parse(raw || '{}');
@@ -77,7 +77,7 @@ async function fixture() {
     if(request.url==='/api/v1/auth'){send(200,{authenticated:true});return;}
     if(request.url==='/healthz' || request.url==='/api/ping'){send(200,{ok:true});return;}
     if(request.url.startsWith('/webhook/crisp-webhook?')){send(401,{accepted:false,reason:'Webhook 校验失败'});return;}
-    if(request.url==='/api/v1/workspace/crisp-support'){send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:[]}]});return;}
+    if(request.url==='/api/v1/workspace/crisp-support'){f.workspaceReads++;send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:[]}]});return;}
     if(request.url==='/api/v1/workspace/crisp-support/update'){prompt=body.openAiPrompt;send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;}
     if(request.url==='/api/v1/workspace/crisp-support/update-embeddings' || request.url==='/api/v1/system/remove-documents'){send(200,{success:true});return;}
     if(request.url.startsWith('/upstream/')){
@@ -108,7 +108,15 @@ async function fixture() {
     await new Promise(resolve=>f.adapter.listen(0,'127.0.0.1',resolve));f.adapterBase=`http://127.0.0.1:${f.adapter.address().port}`;
   };
   f.close=async()=>{if(f.adapter){f.adapter.closeAllConnections();await new Promise(resolve=>f.adapter.close(resolve));}f.service.closeAllConnections();await new Promise(resolve=>f.service.close(resolve));};
-  f.snapshotEnv={PATH:path.join(project,'tests/mocks')+':'+process.env.PATH,MOCK_DOCKER_LOG:path.join(work,'snapshot-docker.log'),MOCK_DOCKER_SERVICE_STATE:path.join(work,'snapshot-services'),CRISPAI_LOGS_SYSTEMD_TEST:'1',CRISPAI_LOGS_SYSTEMD_DIR:path.join(deploy,'systemd'),MOCK_SYSTEMD_STATE:path.join(work,'systemd-state')};
+  // 快照/回滚需要通用 Docker 与 systemd 桩，但 AnythingLLM 读回必须继续
+  // 访问本测试自有的本地 HTTP 服务。若把 tests/mocks 整目录加入 PATH，
+  // 通用 curl 桩会悄悄替换真实本地请求并制造与本 fixture 无关的工作区状态。
+  const snapshotBin=path.join(work,'snapshot-bin');fs.mkdirSync(snapshotBin);
+  for(const name of ['docker','systemctl']){
+    fs.copyFileSync(path.join(project,'tests/mocks',name),path.join(snapshotBin,name));
+    fs.chmodSync(path.join(snapshotBin,name),0o700);
+  }
+  f.snapshotEnv={PATH:snapshotBin+':'+process.env.PATH,MOCK_DOCKER_LOG:path.join(work,'snapshot-docker.log'),MOCK_DOCKER_SERVICE_STATE:path.join(work,'snapshot-services'),CRISPAI_LOGS_SYSTEMD_TEST:'1',CRISPAI_LOGS_SYSTEMD_DIR:path.join(deploy,'systemd'),MOCK_SYSTEMD_STATE:path.join(work,'systemd-state')};
   write(f.snapshotEnv.MOCK_DOCKER_LOG,'');write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\nprovider-adapter\n');fs.mkdirSync(f.snapshotEnv.MOCK_SYSTEMD_STATE,{recursive:true});
   return f;
 }
@@ -242,13 +250,16 @@ async function main(){
       assert(!fs.existsSync(marker));
       const applied=JSON.parse((await f.ok('configuration.sh',['materials-apply'])).stdout);
       assert.equal(applied.applied,true);assert.equal(applied.provider_pool.applied,true);
-      const baselineBefore=f.capture(),baselineCalls=f.calls.length;
+      const baselineBefore=f.capture(),baselineCalls=f.calls.length,baselineWorkspaceReads=f.workspaceReads;
       write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
       const baseline=await f.invoke('snapshot.sh',['--quiet','--check-capacity'],f.snapshotEnv);
       write(path.join(work,'knowledge-migration-snapshot-ready.log'),baseline.stdout+baseline.stderr);
       assert.equal(baseline.code,0,baseline.stderr+baseline.stdout);
       assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
       assert.deepEqual(f.capture(),baselineBefore);assert.equal(f.calls.length,baselineCalls);assert(!fs.existsSync(marker));
+      assert(f.workspaceReads>baselineWorkspaceReads,'无迁移标记的快照容量检查必须命中本场景自有的 AnythingLLM 工作区 GET');
+      assert.equal(fs.readdirSync(path.join(f.deploy,'tmp')).filter(name=>name.startsWith('materials-applied-readback.')).length,0,
+        '成功读回后不得遗留 materials-applied-readback 临时目录');
       const before=f.capture(),callCount=f.calls.length;
       for(const kind of ['file','malformed','dangling','fifo','directory']){
         if(kind==='file')write(marker,{state:'applying',synthetic:true});
@@ -470,7 +481,11 @@ async function main(){
       write(path.join(legacy,'.env'),f.initialEnv);write(path.join(legacy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+legacy+'\ninstalled_version=v1.1.0\n');
       write(path.join(legacy,'data/runtime/synthetic-legacy.json'),{synthetic:true,mode:'human',generation:7});
       write(path.join(legacy,'data/anythingllm/synthetic-legacy.json'),{synthetic:true,version:'v1.1.0'});
-      const legacyEnv={...f.snapshotEnv,MOCK_ANYTHING_STATE:path.join(work,'legacy-anything-state.json'),MOCK_POSTGRES_PASSWORD_DIGEST_FILE:path.join(work,'legacy-postgres-password.sha256')};
+      // v1.1.0 冷恢复专项保留独立 Docker 运行状态，但 HTTP 仍访问本场景
+      // 自有服务。通用 curl 桩既会掩盖实际 Prompt 同步，也会污染降级前
+      // 当前代安全快照的只读回读。
+      const legacyEnv={...f.snapshotEnv,MOCK_ANYTHING_STATE:path.join(work,'legacy-anything-state.json'),
+        MOCK_POSTGRES_PASSWORD_DIGEST_FILE:path.join(work,'legacy-postgres-password.sha256')};
       write(legacyEnv.MOCK_ANYTHING_STATE,{documents:[]});
       write(f.snapshotEnv.MOCK_DOCKER_SERVICE_STATE,'postgres\nanythingllm\nn8n\n');
       const snapshot=await checked('bash',[path.join(project,'scripts/snapshot.sh'),'--deploy-dir',legacy,'--quiet','--reason','synthetic-v110-restore'],{env:legacyEnv});const id=snapshot.stdout.trim();
