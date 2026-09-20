@@ -238,6 +238,7 @@ let modelAnswerOverride = null;
 let delayedVision;
 let delayedControlLookups;
 let abortSignalProbe;
+let m13RetrievalGate;
 const sent = [];
 const histories = new Map();
 const modelRequests = [];
@@ -315,6 +316,13 @@ const request = async (url, options = {}) => {
     assert.equal(parsed.pathname, workspacePath + '/vector-search'); assert.equal(options.method, 'POST');
     assert.deepEqual(Object.keys(options.body), ['query']);
     retrievalRequests.push(structuredClone(options.body));
+    if (m13RetrievalGate?.queries.has(options.body.query)) {
+      const gate = m13RetrievalGate;
+      gate.entered.add(options.body.query);
+      if (gate.entered.size === gate.queries.size) gate.resolveEntered();
+      await gate.release;
+      return { status: 503, body: { error: true } };
+    }
     return { status: 200, body: { results: miss ? [] : [{ id: 'synthetic-workflow-chunk', text: '问题：设置如何保存？\n回答：在设置页保存后重试。',
       ...(unknownSources ? {} : { metadata: { title: projection } }), distance: low ? 0.9 : 0.1, score: low ? 0.1 : 0.9 }] } };
   }
@@ -484,6 +492,171 @@ const abortablePending = (signal, started) => {
 };
 
 (async () => {
+  await test('M13 多个繁忙失败会话不阻止普通小流量沿同一责任完成唯一回答', async () => {
+    const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+    const busyQueries = Array.from({ length: 7 }, (_, index) => 'M13 繁忙队列受控问题 ' + index);
+    const busySessions = busyQueries.map((_, index) => 'session_m13-busy-' + index);
+    const smallQuery = 'M13 小流量受控问题';
+    const smallSession = 'session_m13-small';
+    const baseline = { models: modelRequests.length, posts: sendAttempts, sent: sent.length };
+    const pending = [];
+    const track = (promise) => {
+      pending.push(promise);
+      promise.catch(() => {});
+      return promise;
+    };
+    let resolveEntered;
+    let resolveRelease;
+    let released = false;
+    const entered = new Promise((resolve) => { resolveEntered = resolve; });
+    const release = new Promise((resolve) => { resolveRelease = resolve; });
+    const releaseBusy = () => {
+      if (released) return;
+      released = true;
+      resolveRelease();
+    };
+    const bounded = async (promise, label, timeout = 10000) => {
+      let timer;
+      try {
+        return await Promise.race([promise, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('等待' + label + '超过本地截止时间')), timeout);
+        })]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const permitCount = () => fs.existsSync(permitRoot)
+      ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length : 0;
+    const modelCallsFor = (question) => modelRequests.filter((body) =>
+      textOf(messagesOf(body).at(-1)) === question).length;
+    const jobFor = (session, jobId) => state(session).jobs.find((job) => job.id === jobId);
+    let busyEntries = [];
+    try {
+      m13RetrievalGate = {
+        queries: new Set(busyQueries), entered: new Set(), resolveEntered, release,
+      };
+      for (let index = 0; index < busySessions.length; index += 1) {
+        busyEntries.push(await bounded(track(receive(message(busySessions[index], busyQueries[index]))),
+          'M13 繁忙问题持久接收-' + index));
+        assert.equal(busyEntries.at(-1).route, 'process');
+      }
+      const workers = Array.from({ length: 7 }, () => createRuntime(env, runtimeOptions));
+      const firstBusyProcesses = busyEntries.map((entry, index) =>
+        track(workers[index].process(entry.key, entry.jobId)));
+      await bounded(entered, 'M13 七个繁忙任务进入向量门');
+      assert.equal(m13RetrievalGate.entered.size, 7);
+      assert.equal(permitCount(), 7, '七个繁忙会话必须真实占满普通处理许可');
+
+      const smallEntry = await bounded(track(receive(message(smallSession, smallQuery))), 'M13 小流量持久接收');
+      assert.equal(smallEntry.route, 'process');
+      const firstSelection = await bounded(track(runtime.scan()), 'M13 小流量首次扫描');
+      assert.equal(firstSelection.length, 1, '繁忙任务 processing 时扫描只能选择小流量责任');
+      assert.deepEqual(firstSelection[0], { key: smallEntry.key, jobId: smallEntry.jobId, control: false });
+      const smallBeforeCapacity = jobFor(smallSession, smallEntry.jobId); assert(smallBeforeCapacity);
+      const capacityAttempts = smallBeforeCapacity.attempts;
+      const capacityResult = await bounded(track(
+        runtime.process(firstSelection[0].key, firstSelection[0].jobId)), 'M13 小流量容量延期');
+      assert.deepEqual(capacityResult, { status: 'deferred', reason: 'processing_capacity' });
+      const capacityJob = jobFor(smallSession, smallEntry.jobId); assert(capacityJob);
+      assert.equal(capacityJob.status, 'received');
+      assert.equal(capacityJob.responsibility_status, 'pending');
+      assert.equal(capacityJob.attempts, capacityAttempts, '容量延期不得冒充一次业务尝试');
+      assert.equal(capacityJob.retry_at, now + 1000);
+      assert.equal(capacityJob.lease_until, 0);
+      assert(capacityJob.data, '容量延期必须保留同一访客责任');
+      assert.equal(state(smallSession).worker, null);
+      assert.equal(modelRequests.length, baseline.models);
+      assert.equal(sendAttempts, baseline.posts);
+      assert.equal(sent.length, baseline.sent);
+
+      releaseBusy();
+      const firstBusyResults = await bounded(Promise.all(firstBusyProcesses), 'M13 繁忙任务失败收口');
+      assert(firstBusyResults.every((result) => result.status === 'unresolved'));
+      m13RetrievalGate = null;
+      for (let index = 0; index < busyEntries.length; index += 1) {
+        const busyJob = jobFor(busySessions[index], busyEntries[index].jobId); assert(busyJob);
+        assert.equal(busyJob.status, 'received');
+        assert.equal(busyJob.responsibility_status, 'unresolved_failure');
+        assert.equal(busyJob.failure_code, 'retrieval_error');
+        assert(busyJob.retry_at > now);
+        assert(busyJob.data, '繁忙会话技术失败后必须保留原始应答责任');
+        assert.equal(state(busySessions[index]).worker, null);
+        assert.equal(Object.values(state(busySessions[index]).outgoing)
+          .filter((record) => record.job_id === busyEntries[index].jobId).length, 0);
+        assert.equal(modelCallsFor(busyQueries[index]), 0);
+        assert.equal(sent.filter((entry) => entry.session_id === busySessions[index]).length, 0);
+      }
+      assert.equal(permitCount(), 0, '繁忙任务技术失败后必须释放全部普通处理许可');
+
+      const smallRetryAt = jobFor(smallSession, smallEntry.jobId).retry_at;
+      assert(Number.isFinite(smallRetryAt) && smallRetryAt > now);
+      now = smallRetryAt;
+      const secondSelection = await bounded(track(runtime.scan()), 'M13 小流量恢复扫描');
+      assert.equal(secondSelection.length, 1);
+      assert.deepEqual(secondSelection[0], { key: smallEntry.key, jobId: smallEntry.jobId, control: false },
+        '必须消费 scanner 返回的同一小流量责任，不能绕过公平调度直接调用已知身份');
+      const smallResult = await bounded(track(
+        runtime.process(secondSelection[0].key, secondSelection[0].jobId)), 'M13 小流量完成回答');
+      assert.equal(smallResult.status, 'sent');
+      const completedSmall = jobFor(smallSession, smallEntry.jobId); assert(completedSmall);
+      assert.equal(completedSmall.status, 'done');
+      assert.equal(completedSmall.responsibility_status, 'answered_confirmed');
+      const smallOutgoing = Object.values(state(smallSession).outgoing)
+        .filter((record) => record.job_id === smallEntry.jobId);
+      assert.equal(smallOutgoing.length, 1);
+      assert.equal(smallOutgoing[0].status, 'sent');
+      assert.equal(modelCallsFor(smallQuery), 1);
+      assert.equal(modelRequests.length, baseline.models + 1);
+      assert.equal(sendAttempts, baseline.posts + 1, '小流量恢复阶段必须只有一次 Crisp POST');
+      assert.equal(sent.filter((entry) => entry.session_id === smallSession).length, 1);
+      assert.equal(sent.length, baseline.sent + 1);
+      for (let index = 0; index < busyEntries.length; index += 1) {
+        const busyJob = jobFor(busySessions[index], busyEntries[index].jobId); assert(busyJob);
+        assert.equal(busyJob.status, 'received');
+        assert.equal(busyJob.responsibility_status, 'unresolved_failure');
+        assert.equal(sent.filter((entry) => entry.session_id === busySessions[index]).length, 0);
+      }
+
+      const busyRetryAt = Math.max(...busyEntries.map((entry, index) => {
+        const retryAt = jobFor(busySessions[index], entry.jobId)?.retry_at;
+        assert(Number.isFinite(retryAt));
+        return retryAt;
+      }));
+      now = Math.max(now, busyRetryAt);
+      const thirdSelection = await bounded(track(runtime.scan()), 'M13 繁忙责任恢复扫描');
+      assert.equal(thirdSelection.length, 7);
+      assert.deepEqual(thirdSelection.map((entry) => entry.jobId).sort(),
+        busyEntries.map((entry) => entry.jobId).sort(),
+        '繁忙责任必须通过生产 scanner 自然恢复，不能手工改写 retry 或终态');
+      const recoveredProcesses = thirdSelection.map((entry) =>
+        track(runtime.process(entry.key, entry.jobId)));
+      const recoveredResults = await bounded(Promise.all(recoveredProcesses), 'M13 繁忙责任最终回答');
+      assert(recoveredResults.every((result) => result.status === 'sent'));
+      for (let index = 0; index < busyEntries.length; index += 1) {
+        const busyJob = jobFor(busySessions[index], busyEntries[index].jobId); assert(busyJob);
+        assert.equal(busyJob.status, 'done');
+        assert.equal(busyJob.responsibility_status, 'answered_confirmed');
+        const outgoing = Object.values(state(busySessions[index]).outgoing)
+          .filter((record) => record.job_id === busyEntries[index].jobId);
+        assert.equal(outgoing.length, 1);
+        assert.equal(outgoing[0].status, 'sent');
+        assert.equal(modelCallsFor(busyQueries[index]), 1);
+        assert.equal(sent.filter((entry) => entry.session_id === busySessions[index]).length, 1);
+      }
+      assert.equal(sendAttempts, baseline.posts + 8);
+      assert.equal(modelRequests.length, baseline.models + 8);
+      assert.equal(sent.length, baseline.sent + 8);
+      assert.deepEqual(await bounded(track(runtime.scan()), 'M13 最终空扫描'), []);
+      assert.equal(permitCount(), 0, '全部责任完成后不得残留普通处理许可');
+    } finally {
+      releaseBusy();
+      try {
+        await bounded(Promise.allSettled(pending), 'M13 已启动任务清理');
+      } finally {
+        m13RetrievalGate = null;
+      }
+    }
+  });
   await test('鉴权模式、网站、时间窗和不安全会话', async () => {
     assert.equal((await runtime.receive({ body: message('session_auth0001', '测试'), query: { key: 'wrong' } })).statusCode, 401);
     assert.equal((await receive({ ...message('session_auth0001', '测试'), website_id: 'wrong' })).statusCode, 403);
@@ -2702,8 +2875,25 @@ const abortablePending = (signal, started) => {
   });
   await test('旧版本持久人工迁移及永久模式保留', async () => {
     const session = 'session_legacy001'; const legacy = { aiEnabled: false, aiResumeAt: 0, handoffGeneration: 3, lastOperatorAt: now, welcomeSent: true, fingerprints: [] };
-    fs.writeFileSync(path.join(root, 'data', 'runtime', 'session-' + crypto.createHash('sha256').update(session).digest('hex') + '.json'), JSON.stringify(legacy));
-    await deliver(message(session, '迁移后不自动回复')); assert.equal(state(session).mode, 'human'); assert.equal(state(session).generation, 3); assert.equal(state(session).welcome_sent, true);
+    const legacyFile = path.join(root, 'data', 'runtime',
+      'session-' + crypto.createHash('sha256').update(session).digest('hex') + '.json');
+    const currentFile = path.join(root, 'data', 'runtime', 'session-' + key(session) + '.json');
+    fs.writeFileSync(legacyFile, JSON.stringify(legacy), { mode: 0o600 });
+    try {
+      await deliver(message(session, '迁移后不自动回复'));
+      assert.equal(state(session).mode, 'human'); assert.equal(state(session).generation, 3);
+      assert.equal(state(session).welcome_sent, true);
+      assert.equal(fs.existsSync(currentFile), true, '迁移结果必须使用当前正式 stateKey');
+    } finally {
+      assert.notEqual(path.resolve(legacyFile), path.resolve(currentFile),
+        'fixture teardown 绝不能删除正式状态文件');
+      const legacyIdentity = fs.lstatSync(legacyFile);
+      assert(legacyIdentity.isFile() && !legacyIdentity.isSymbolicLink());
+      assert.equal(legacyIdentity.nlink, 1);
+      assert.equal(legacyIdentity.uid, process.geteuid());
+      fs.unlinkSync(legacyFile);
+    }
+    assert.equal(fs.existsSync(legacyFile), false, '本场景旧源文件不得污染后续严格 scanner');
   });
   await test('生产生成Code采用同一实现，SDK无密钥且状态决定展开', async () => {
     const workflow = JSON.parse(fs.readFileSync(path.join(project, 'n8n', 'workflow.json'), 'utf8'));

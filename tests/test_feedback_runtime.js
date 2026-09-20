@@ -7,7 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { createRuntime, mechanicalFailureAnswer } = require('../n8n/runtime');
-const { visitorFallbackFor } = require('../scripts/visitor-output');
+const { visitorFallbackFor, legacyGenericNonAnswer } = require('../scripts/visitor-output');
 
 const project = path.resolve(__dirname, '..');
 const work = path.join(project, '.work', 'v1.3.0');
@@ -2927,6 +2927,308 @@ const recoverSameJobOnce = async (fixture, session, jobId, expectedContent) => {
     assert.equal(f.exactRequests.length, exactBefore + 1,
       '退避到期后只允许一轮只读对账');
     assert.equal(f.postAttempts.length, 0, '不得删除旧计数后出现第四次 POST');
+  });
+
+  const ae01Clarification = '请确认要查询的是示例订单编号 A，还是示例订单编号 B。';
+  const ae01Plan = (fingerprint) => ({ type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+    content: ae01Clarification, fingerprint, answer_responsibility: 'clarification_confirmed' });
+  const ae01ReplyEvents = (fixture) => fixture.events().filter((event) => event.type === 'ai_reply');
+  const applyAe01Materials = (fixture, enabled = true) => {
+    const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']
+      .map((name) => [name, fixture.readConfig(name)]));
+    configuration.runtime = { ...configuration.runtime, enabled, revision: 1, applied_revision: 1 };
+    fixture.writeConfig('runtime', configuration.runtime);
+    const materials = fixture.writeAppliedMaterials(configuration);
+    assert.equal(materials.schema_version, 2);
+    assert.equal(materials.state, 'applied');
+    assert.equal(materials.configuration.runtime.enabled, enabled);
+    return materials;
+  };
+  const settleAe01ProviderPlan = (fixture, job, plan) => {
+    const responseGeneration = Number.isSafeInteger(job.response_generation) ? job.response_generation : 0;
+    job.provider_settlement = {
+      schema_version: 1,
+      state: 'settled',
+      plan_sha256: digest(canonical({
+        type: plan.type || '', purpose: plan.purpose || '', content: plan.content || '',
+        outcome: plan.outcome || '', sources: plan.sources || [], tags: plan.tags || [],
+      })),
+      response_generation: responseGeneration,
+      attempts: 1,
+      settled_at: fixture.now() - 1000,
+    };
+    assert.deepEqual(Object.keys(job.provider_settlement).sort(),
+      ['attempts', 'plan_sha256', 'response_generation', 'schema_version', 'settled_at', 'state']);
+    return job.provider_settlement;
+  };
+  const freezeAe01OutgoingIdentity = (job, plan, record) => {
+    Object.assign(record, {
+      delivery_identity_version: 1,
+      purpose: plan.purpose,
+      message_type: plan.type,
+      semantic_intent: 'answer',
+      semantic_status: 'valid_answer',
+      response_generation: Number.isSafeInteger(job.response_generation) ? job.response_generation : 0,
+      content_sha256: digest(canonical({ type: plan.type, content: plan.content })),
+    });
+    assert.equal(record.job_id, job.id);
+    return record;
+  };
+  const sealAe01SentRecord = (fixture, job, plan, record) => {
+    freezeAe01OutgoingIdentity(job, plan, record);
+    Object.assign(record, {
+      receipt_current: true,
+      receipt_confirmed_at: fixture.now() - 1000,
+    });
+    delete record.body;
+    return record;
+  };
+
+  await test('AE01a 未发送的遗留裸 clarification plan 无权威且不得可见出站', async () => {
+    const f = makeFixture('ae01-bare-clarification-unsent');
+    applyAe01Materials(f);
+    const session = 'session_ae01-bare-clarification-unsent';
+    const plan = ae01Plan(77600);
+    assert.equal(mechanicalFailureAnswer(plan.content), false,
+      '本场景必须证明 evidence 门禁，不得借机械故障过滤假绿');
+    assert.equal(legacyGenericNonAnswer(plan.content), false,
+      '本场景必须使用未列入历史固定 generic 集合的具体澄清');
+    const job = f.makeJob(session, 'ae01-bare-clarification-unsent', plan);
+    settleAe01ProviderPlan(f, job, plan);
+    assert.equal(Object.hasOwn(job, 'answer_evidence'), false);
+    await f.seed(session, (state) => state.jobs.push(job));
+    f.restart();
+    const result = await f.runtime().process(f.key(session), job.id);
+    const stored = f.rawState(session).jobs.find((item) => item.id === job.id);
+    assert.notEqual(result.status, 'sent', '裸 plan 不能直接形成可见成功');
+    assert.equal(f.postAttempts.length, 0, '无可信 evidence 时不得 POST 遗留正文');
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.modelRequests.length, 0, '旧 plan 迁移不得在同一调用栈偷偷重新推理');
+    assert.equal(ae01ReplyEvents(f).length, 0);
+    assert(stored, '同一原始应答责任必须保留');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'answer_evidence_unavailable');
+    assert.notEqual(stored.responsibility_status, 'answered_confirmed');
+    assert.notEqual(stored.responsibility_status, 'clarification_confirmed');
+    assert.equal(stored.plan, undefined, '失权裸 plan 不得留给下一轮自动重发');
+    assert.equal(stored.response_generation, 1,
+      '旧输出身份失权后必须推进一次响应代次，不能复用原 fingerprint 身份');
+    const retryable = stored.status === 'received'
+      && Number.isSafeInteger(stored.retry_at) && stored.retry_at >= f.now();
+    const reviewOnly = stored.status === 'done' && stored.retry_at === null
+      && stored.recovery_requires_review === true;
+    assert(retryable || reviewOnly,
+      '未发送责任必须明确进入可恢复重规划或人工审核，不能成为无期限死责任');
+    assert.equal(Object.values(f.rawState(session).outgoing)
+      .filter((record) => record.job_id === job.id).length, 0);
+    assert.equal(Object.hasOwn(stored, 'answer_evidence'), false);
+    assert.equal(Object.hasOwn(stored, 'answer_metrics_counted'), false);
+    assert.equal(Object.hasOwn(f.rawState(session).observations || {}, 'ai_reply_sent_at'), false);
+    assert(stored.data); assert.deepEqual(stored.data.content, job.data.content);
+  });
+
+  await test('AE01b 已确认 sent 但缺 answer evidence 时保留防重事实且不假回答', async () => {
+    const f = makeFixture('ae01-bare-clarification-sent');
+    applyAe01Materials(f);
+    const session = 'session_ae01-bare-clarification-sent';
+    const plan = ae01Plan(77601);
+    const job = f.makeJob(session, 'ae01-bare-clarification-sent', plan);
+    settleAe01ProviderPlan(f, job, plan);
+    const outgoing = sealAe01SentRecord(f, job, plan, f.makeOutgoing(job, plan.content, 'sent'));
+    assert.equal(Object.hasOwn(job, 'answer_evidence'), false);
+    assert.equal(Object.hasOwn(outgoing, 'answer_evidence_core_sha256'), false);
+    await f.seed(session, (state) => {
+      state.jobs.push(job);
+      state.outgoing[String(plan.fingerprint)] = outgoing;
+    });
+    f.restart();
+    const result = await f.runtime().process(f.key(session), job.id);
+    assert.equal(result.status, 'delivery_evidence_unavailable');
+    const state = f.rawState(session);
+    const retained = state.outgoing[String(plan.fingerprint)];
+    const unresolved = state.jobs.find((item) => item.id === job.id);
+    assert(retained, '已确认投递记录必须保留为防重事实');
+    assert.equal(retained.status, 'sent');
+    assert.equal(retained.job_id, job.id);
+    assert.equal(retained.delivery_identity_version, 1);
+    assert.equal(retained.purpose, plan.purpose);
+    assert.equal(retained.message_type, plan.type);
+    assert.equal(retained.semantic_intent, 'answer');
+    assert.equal(retained.response_generation, 0);
+    assert.equal(retained.semantic_status, 'valid_answer', '投递语义事实不得被改写成回答权威');
+    assert.equal(retained.receipt_current, true);
+    assert.equal(retained.content_sha256, outgoing.content_sha256);
+    assert.equal(Object.hasOwn(retained, 'body'), false);
+    assert.equal(unresolved.status, 'done');
+    assert.equal(unresolved.responsibility_status, 'unresolved_failure');
+    assert.equal(unresolved.failure_code, 'delivery_evidence_unavailable');
+    assert.equal(unresolved.recovery_requires_review, true);
+    assert.equal(unresolved.retry_at, null);
+    assert(unresolved.data, '投递成功但授权证据缺失时仍须保留原始责任');
+    assert.deepEqual(unresolved.data.content, job.data.content);
+    assert.equal(Object.hasOwn(unresolved, 'answer_evidence'), false);
+    assert.equal(Object.hasOwn(unresolved, 'answer_metrics_counted'), false);
+    assert.equal(Object.hasOwn(retained, 'answer_evidence_core_sha256'), false);
+    assert.deepEqual(Object.entries(state.outgoing)
+      .filter(([, record]) => record.job_id === job.id).map(([fingerprint]) => fingerprint),
+      [String(plan.fingerprint)], '同一 job 只能保留原始 fingerprint 的一份防重事实');
+    assert.equal(Object.hasOwn(state.observations || {}, 'ai_reply_sent_at'), false);
+    assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+    assert.equal(ae01ReplyEvents(f).length, 0);
+  });
+
+  await test('AE01c unknown 精确命中只能确认投递，缺 evidence 仍不得终结为回答', async () => {
+    const f = makeFixture('ae01-bare-clarification-unknown');
+    applyAe01Materials(f);
+    const session = 'session_ae01-bare-clarification-unknown';
+    const plan = ae01Plan(77602);
+    const job = f.makeJob(session, 'ae01-bare-clarification-unknown', plan);
+    settleAe01ProviderPlan(f, job, plan);
+    const outgoing = freezeAe01OutgoingIdentity(job, plan,
+      f.makeOutgoing(job, plan.content, 'unknown'));
+    assert.equal(Object.hasOwn(job, 'answer_evidence'), false);
+    assert.equal(Object.hasOwn(outgoing, 'answer_evidence_core_sha256'), false);
+    const remote = { ...outgoing.body, website_id: f.env.CRISP_WEBSITE_ID,
+      session_id: session, timestamp: f.now() - 1000 };
+    await f.seed(session, (state) => {
+      state.jobs.push(job);
+      state.outgoing[String(plan.fingerprint)] = outgoing;
+    });
+    f.histories.set(session, [remote]);
+    f.restart();
+    const result = await f.runtime().process(f.key(session), job.id);
+    assert.equal(result.status, 'delivery_evidence_unavailable');
+    const state = f.rawState(session);
+    const retained = state.outgoing[String(plan.fingerprint)];
+    const unresolved = state.jobs.find((item) => item.id === job.id);
+    assert.equal(retained.status, 'sent');
+    assert.equal(retained.job_id, job.id);
+    assert.equal(retained.delivery_identity_version, 1);
+    assert.equal(retained.purpose, plan.purpose);
+    assert.equal(retained.message_type, plan.type);
+    assert.equal(retained.semantic_intent, 'answer');
+    assert.equal(retained.response_generation, 0);
+    assert.equal(retained.semantic_status, 'valid_answer');
+    assert.equal(retained.receipt_current, true);
+    assert.equal(retained.content_sha256,
+      digest(canonical({ type: plan.type, content: plan.content })));
+    assert.equal(unresolved.status, 'done');
+    assert.equal(unresolved.responsibility_status, 'unresolved_failure');
+    assert.equal(unresolved.failure_code, 'delivery_evidence_unavailable');
+    assert.equal(unresolved.recovery_requires_review, true);
+    assert.equal(unresolved.retry_at, null);
+    assert(unresolved.data); assert.deepEqual(unresolved.data.content, job.data.content);
+    assert.equal(Object.hasOwn(unresolved, 'answer_evidence'), false);
+    assert.equal(Object.hasOwn(unresolved, 'answer_metrics_counted'), false);
+    assert.equal(Object.hasOwn(retained, 'answer_evidence_core_sha256'), false);
+    assert.deepEqual(Object.entries(state.outgoing)
+      .filter(([, record]) => record.job_id === job.id).map(([fingerprint]) => fingerprint),
+      [String(plan.fingerprint)], '远端确认后仍只能保留原始 fingerprint 的一份防重事实');
+    assert.equal(Object.hasOwn(state.observations || {}, 'ai_reply_sent_at'), false);
+    assert.deepEqual(f.histories.get(session), [remote], '只读对账不得改写远端历史');
+    assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+    assert.equal(ae01ReplyEvents(f).length, 0,
+      '确认投递不等于确认知识回答或必要澄清');
+  });
+
+  await test('AE01d technical 与已证 non-answer 保持原分类，不被 evidence 缺口洗成回答', async () => {
+    const technical = makeFixture('ae01-technical-control');
+    applyAe01Materials(technical);
+    const technicalSession = 'session_ae01-technical-control';
+    const technicalPlan = { type: 'internal', purpose: 'technical_unresolved', ordinary: true,
+      content: '', answer_responsibility: 'unresolved_failure', diagnostic_code: 'synthetic_evidence_control' };
+    const technicalJob = technical.makeJob(technicalSession, 'ae01-technical-control', technicalPlan);
+    await technical.seed(technicalSession, (state) => state.jobs.push(technicalJob));
+    technical.restart();
+    assert.equal((await technical.runtime().process(technical.key(technicalSession), technicalJob.id)).status,
+      'unresolved');
+    const technicalStored = technical.rawState(technicalSession).jobs.find((item) => item.id === technicalJob.id);
+    assert.equal(technicalStored.status, 'received');
+    assert.equal(technicalStored.responsibility_status, 'unresolved_failure');
+    assert.equal(technicalStored.failure_code, 'synthetic_evidence_control');
+    assert(technicalStored.data);
+    assert.equal(technical.postAttempts.length, 0); assert.equal(technical.sent.length, 0);
+    assert.equal(ae01ReplyEvents(technical).length, 0);
+
+    const nonAnswer = makeFixture('ae01-delivered-nonanswer-control');
+    applyAe01Materials(nonAnswer);
+    const nonAnswerSession = 'session_ae01-delivered-nonanswer-control';
+    const nonAnswerPlan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+      content: clarification, fingerprint: 77603, answer_responsibility: 'clarification_confirmed' };
+    const nonAnswerJob = nonAnswer.makeJob(nonAnswerSession, 'ae01-delivered-nonanswer-control', nonAnswerPlan);
+    settleAe01ProviderPlan(nonAnswer, nonAnswerJob, nonAnswerPlan);
+    const nonAnswerOutgoing = nonAnswer.makeOutgoing(nonAnswerJob, nonAnswerPlan.content, 'sent');
+    Object.assign(nonAnswerOutgoing, { purpose: nonAnswerPlan.purpose, message_type: nonAnswerPlan.type,
+      semantic_intent: 'answer', semantic_status: 'valid_answer', response_generation: 0,
+      content_sha256: digest(canonical({ type: nonAnswerPlan.type, content: nonAnswerPlan.content })) });
+    delete nonAnswerOutgoing.body;
+    await nonAnswer.seed(nonAnswerSession, (state) => {
+      state.jobs.push(nonAnswerJob);
+      state.outgoing[String(nonAnswerPlan.fingerprint)] = nonAnswerOutgoing;
+    });
+    nonAnswer.restart();
+    assert.equal((await nonAnswer.runtime().process(nonAnswer.key(nonAnswerSession), nonAnswerJob.id)).status,
+      'delivered_non_answer');
+    const nonAnswerState = nonAnswer.rawState(nonAnswerSession);
+    const nonAnswerStored = nonAnswerState.jobs.find((item) => item.id === nonAnswerJob.id);
+    assert.equal(nonAnswerState.outgoing[String(nonAnswerPlan.fingerprint)].semantic_status,
+      'delivered_non_answer');
+    assert.equal(nonAnswerStored.status, 'received');
+    assert.equal(nonAnswerStored.responsibility_status, 'unresolved_failure');
+    assert.equal(nonAnswerStored.failure_code, 'delivered_non_answer');
+    assert(nonAnswerStored.data);
+    assert.equal(nonAnswer.postAttempts.length, 0); assert.equal(nonAnswer.sent.length, 0);
+    assert.equal(ae01ReplyEvents(nonAnswer).length, 0);
+  });
+
+  await test('AE01e 人工与总开关静默优先，裸 clarification 字段不能抢答或改写控制', async () => {
+    for (const mode of ['human', 'global-off']) {
+      const f = makeFixture('ae01-policy-silence-' + mode);
+      applyAe01Materials(f, mode !== 'global-off');
+      const session = 'session_ae01-policy-silence-' + mode;
+      const plan = ae01Plan(mode === 'human' ? 77604 : 77605);
+      const generation = mode === 'human' ? 1 : 0;
+      const job = f.makeJob(session, 'ae01-policy-silence-' + mode, plan, { generation });
+      settleAe01ProviderPlan(f, job, plan);
+      await f.seed(session, (state) => {
+        state.jobs.push(job);
+        if (mode === 'human') {
+          state.mode = 'human'; state.generation = generation; state.resume_at = null;
+          state.pause_reason = 'confirmed_handoff'; state.last_human_at = f.now() - 1000;
+          state.control_watermark = f.now() - 1000;
+        }
+      });
+      f.restart();
+      const result = await f.runtime().process(f.key(session), job.id);
+      assert(['idle', 'cancelled'].includes(result.status));
+      const state = f.rawState(session);
+      const silent = state.jobs.find((item) => item.id === job.id);
+      assert.equal(silent.status, 'cancelled');
+      assert.equal(silent.responsibility_status, 'intentional_silence');
+      assert.equal(silent.responsibility_reason, mode === 'human' ? 'human_handoff' : 'global_disabled');
+      assert.equal(state.mode, mode === 'human' ? 'human' : 'ai');
+      assert.equal(f.postAttempts.length, 0); assert.equal(f.sent.length, 0);
+      assert.equal(f.modelRequests.length, 0); assert.equal(ae01ReplyEvents(f).length, 0);
+    }
+  });
+
+  await test('AE01f evidence 门禁不按问句形态拒绝本地受控具体澄清', async () => {
+    const f = makeFixture('ae01-local-specific-clarification');
+    applyAe01Materials(f);
+    const session = 'session_ae01-local-specific-clarification';
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: ae01Clarification, fingerprint: 77606 };
+    const job = f.makeJob(session, 'ae01-local-specific-clarification', plan);
+    await f.seed(session, (state) => state.jobs.push(job));
+    f.restart();
+    assert.equal((await f.runtime().process(f.key(session), job.id)).status, 'sent');
+    const answered = f.rawState(session).jobs.find((item) => item.id === job.id);
+    assert.equal(f.postAttempts.length, 1); assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].content, ae01Clarification);
+    assert.equal(answered.status, 'done');
+    assert.equal(answered.responsibility_status, 'answered_confirmed');
+    assert.notEqual(answered.responsibility_status, 'clarification_confirmed');
+    assert.equal(f.modelRequests.length, 0); assert.equal(ae01ReplyEvents(f).length, 0);
   });
 
   fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed, synthetic_only: true }, null, 2));
