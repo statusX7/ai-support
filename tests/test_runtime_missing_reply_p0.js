@@ -2509,7 +2509,7 @@ const test = async (name, action) => {
   await test('缺 job_id 的限流或拒绝记录不能仅凭 fingerprint 被当前任务接管', async () => {
     for (const [index, status] of ['rate_limited', 'rejected'].entries()) {
       const fx = fixture('delivery-unbound-' + status);
-      const session = 'session_unbound-' + status;
+      const session = 'session_unbound-' + status.replaceAll('_', '-');
       const fingerprint = 95662 + index;
       const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
         content: '没有任务身份的已拒绝发送记录。', fingerprint };
@@ -2524,6 +2524,9 @@ const test = async (name, action) => {
 
       const control = await webhook(fx, session, '真人已接管', 95664 + index,
         { event: 'message:received', from: 'operator', automated: false });
+      assert.equal(control.accepted, true);
+      assert.equal(control.statusCode, 200);
+      assert.match(control.key, /^[a-f0-9]{64}$/);
       const current = fx.runtime.readState(control.key);
       const record = current.outgoing[String(fingerprint)];
       assert.equal(Object.hasOwn(record, 'job_id'), false);
