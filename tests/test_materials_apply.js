@@ -241,6 +241,45 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const readback=await invokeReadback();assert.equal(readback.code,0,readback.stderr||readback.stdout);
     const snapshot=await invokeSnapshotValidate();assert.equal(snapshot.code,0,snapshot.stderr||snapshot.stdout);
   };
+  const appliedSnapshotPath=path.join(deploy,'backups/config-history/materials.applied.tar.gz');
+  const readKnowledgeSettingsSemantic=()=>{
+    const value=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-settings.json'),'utf8'));
+    return {schema_version:value.schema_version,workspace_slug:value.workspace_slug,temperature:value.temperature};
+  };
+  const assertRestoredBusinessGeneration=(restored,baseline,frozenSnapshotSha,baselineLocations,baselineSettings)=>{
+    assert.equal(restored.state,'applied');
+    assert.equal(restored.revision,baseline.revision+2,
+      '普通失败恢复必须只推进候选屏障和恢复投影两个代次');
+    assert.notEqual(restored.source_sha256,baseline.source_sha256,
+      '从冻结原文重建到新 location 后必须诚实生成新的完整运行代身份');
+    for(const key of ['runtime','handoff','keyword','menu','tags','feedback','prompt']) {
+      assert.equal(restored.source_components[key],baseline.source_components[key],`${key} 业务源身份`);
+    }
+    assert.deepEqual(restored.prompt,baseline.prompt);
+    for(const key of ['catalog_revision','catalog_sha256','enabled_library_ids','library_count',
+      'document_count','enabled_document_count']) {
+      assert.deepEqual(restored.knowledge[key],baseline.knowledge[key],`${key} 旧知识语义`);
+    }
+    assert.notEqual(restored.knowledge.manifest_sha256,baseline.knowledge.manifest_sha256);
+    assert.notEqual(restored.knowledge.map_sha256,baseline.knowledge.map_sha256);
+    assert.notEqual(restored.knowledge.lexical_sha256,baseline.knowledge.lexical_sha256);
+    assert.equal(restored.knowledge.profile_sha256,baseline.knowledge.profile_sha256,
+      '恢复必须继续使用冻结的 Embedding profile');
+    assert.deepEqual(readKnowledgeSettingsSemantic(),baselineSettings,
+      '恢复不得改变知识工作区或温度等非瞬态设置');
+    assert.equal(restored.source_components.knowledge,digest(canonical(restored.knowledge)));
+    assert.equal(restored.source_sha256,digest(canonical(restored.source_components)));
+    assert.equal(sha(appliedSnapshotPath),frozenSnapshotSha,'恢复后必须发布同一份冻结旧原文包');
+    assert.equal(locations.length,baselineLocations.length);
+    for(const location of baselineLocations) {
+      assert.equal(locations.includes(location),false,'旧 location 不得继续绑定工作区');
+      assert.equal(documents.has(location),false,'旧 location 不得继续留在上游文档记录');
+      assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',location)),false,
+        '旧 location 正文必须已删除');
+      assert.equal(fs.existsSync(cachePath(location)),false,'旧 location 向量缓存必须已删除');
+    }
+    assert.equal(documents.size,locations.length,'不得遗留 workspace 外的候选或旧文档');
+  };
   const writeProfile=()=>{
     const value={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
       passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
@@ -416,6 +455,8 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const nonemptyBaseline=JSON.parse(fs.readFileSync(projectionPath));
     const nonemptyManifest=JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json')));
     const nonemptyLocations=[...locations];
+    const nonemptySnapshotSha=sha(appliedSnapshotPath);
+    const nonemptySettings=readKnowledgeSettingsSemantic();
     assert.match(parsedText(nonemptyLocations[0]),/橙色/);
     fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为蓝色。\n',{mode:0o640});
     reuseNextLocation=nonemptyLocations[0];
@@ -424,7 +465,8 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     result=await invoke(['apply']);assert.notEqual(result.code,0);
     const nonemptyRestored=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(nonemptyRestored.state,'applied',result.stderr||result.stdout);
-    assert.equal(nonemptyRestored.source_sha256,nonemptyBaseline.source_sha256);
+    assertRestoredBusinessGeneration(nonemptyRestored,nonemptyBaseline,nonemptySnapshotSha,
+      nonemptyLocations,nonemptySettings);
     assert.deepEqual(embeddingPayloads[reusedLocationPayloadOffset],
       {adds:nonemptyLocations,deletes:[]},'复用旧受管 location 仍必须先进入候选索引请求');
     assert.equal(locations.length,1);assert.notDeepEqual(locations,nonemptyLocations);
@@ -499,12 +541,15 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     await ok(['apply']);
 
     const uncertainUploadBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const uncertainUploadLocations=[...locations];
+    const uncertainUploadSnapshotSha=sha(appliedSnapshotPath);
+    const uncertainUploadSettings=readKnowledgeSettingsSemantic();
     fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为青色。\n',{mode:0o640});
     uploadFailureAfterWrite=1;
     result=await invoke(['apply']);assert.notEqual(result.code,0);
     const uncertainUploadRestored=JSON.parse(fs.readFileSync(projectionPath));
-    assert.equal(uncertainUploadRestored.state,'applied');
-    assert.equal(uncertainUploadRestored.source_sha256,uncertainUploadBaseline.source_sha256);
+    assertRestoredBusinessGeneration(uncertainUploadRestored,uncertainUploadBaseline,
+      uncertainUploadSnapshotSha,uncertainUploadLocations,uncertainUploadSettings);
     assert.equal(locations.length,1);assert.equal(documents.size,1);
     assert.match(parsedText(locations[0]),/紫色/);assert.doesNotMatch(parsedText(locations[0]),/青色/);
     assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
@@ -514,12 +559,15 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     await ok(['apply']);
 
     const lostUploadReplyBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const lostUploadReplyLocations=[...locations];
+    const lostUploadReplySnapshotSha=sha(appliedSnapshotPath);
+    const lostUploadReplySettings=readKnowledgeSettingsSemantic();
     fs.writeFileSync(sourcePath,'# 虚构资料\n上传回执完全丢失后标记改为银色。\n',{mode:0o640});
     uploadReplyLostAfterWrite=1;
     result=await invoke(['apply']);assert.notEqual(result.code,0);
     const lostUploadReplyRestored=JSON.parse(fs.readFileSync(projectionPath));
-    assert.equal(lostUploadReplyRestored.state,'applied');
-    assert.equal(lostUploadReplyRestored.source_sha256,lostUploadReplyBaseline.source_sha256);
+    assertRestoredBusinessGeneration(lostUploadReplyRestored,lostUploadReplyBaseline,
+      lostUploadReplySnapshotSha,lostUploadReplyLocations,lostUploadReplySettings);
     assert.equal(locations.length,1);assert.equal(documents.size,1);
     assert.match(parsedText(locations[0]),/青色/);assert.doesNotMatch(parsedText(locations[0]),/银色/);
     assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
@@ -568,12 +616,15 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     pass('上传意图与正文持久化后进程在发出请求前崩溃，重入只重放该责任并完成同代应用');
 
     const unknownDeleteBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const unknownDeleteLocations=[...locations];
+    const unknownDeleteSnapshotSha=sha(appliedSnapshotPath);
+    const unknownDeleteSettings=readKnowledgeSettingsSemantic();
     fs.writeFileSync(sourcePath,'# 虚构资料\n删除回执丢失后标记改为黄色。\n',{mode:0o640});
     embeddingFailures=1;removeFailures=1;removeFailureAfterDelete=1;
     result=await invoke(['apply']);assert.notEqual(result.code,0);
     const unknownDeleteRestored=JSON.parse(fs.readFileSync(projectionPath));
-    assert.equal(unknownDeleteRestored.state,'applied');
-    assert.equal(unknownDeleteRestored.source_sha256,unknownDeleteBaseline.source_sha256);
+    assertRestoredBusinessGeneration(unknownDeleteRestored,unknownDeleteBaseline,
+      unknownDeleteSnapshotSha,unknownDeleteLocations,unknownDeleteSettings);
     assert.equal(locations.length,1);assert.equal(documents.size,1);
     assert.match(parsedText(locations[0]),/金色/);assert.doesNotMatch(parsedText(locations[0]),/黄色/);
     assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
