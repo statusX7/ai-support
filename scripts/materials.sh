@@ -1081,18 +1081,27 @@ materials_recovery_upload_response_file() {
 
 materials_recovery_track_locations() {
   local deploy_dir=$1 additions=$2 recovery="${1}/backups/config-history/materials.recovery"
-  local ledger="${1}/backups/config-history/materials.recovery/touched.json" existing='[]' merged observed temporary
+  local ledger="${1}/backups/config-history/materials.recovery/touched.json" existing='[]' merged observed managed allowed temporary
   [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
   jq -M -en --argjson value "$additions" '
     $value | type == "array" and length > 0 and
     all(.[]; type == "string" and test("^custom-documents/[^/\\\\[:cntrl:]]+\\.json$"))
   ' >/dev/null || return 1
-  # AnythingLLM 的响应正文不能授权删除任意既有文档。只有使用本事务随机
-  # alias 后在本实例持久卷真实出现、且不在冻结基线中的位置才归本次责任。
+  # AnythingLLM 的响应正文不能授权删除任意既有文档。随机 alias 位置
+  # 必须由持久卷独立识别；旧位置则只允许下方冻结的本项目 managed 集。
   observed=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" resolve-upload) || return 1
-  jq -M -en --argjson claimed "$additions" --argjson observed "$observed" \
-    '($claimed | unique | sort) == ($observed | unique | sort) and ($observed | length > 0)' \
+  managed=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" managed-locations) || return 1
+  # AnythingLLM 个别解析器会复用并原地覆盖本项目旧代自身的受管
+  # location。它不带本事务随机 alias，但冻结原文可在回滚时删除并
+  # 重建；只把 HTTP 已明确返回且属于冻结 managed 集的项目位置并入
+  # 允许集合，绝不授权清理同 workspace 的其他管理员资料。
+  allowed=$(jq -M -cn --argjson claimed "$additions" --argjson observed "$observed" --argjson managed "$managed" '
+    ($observed + [$claimed[] | select(. as $item | $managed | index($item) != null)]) | unique | sort
+  ') || return 1
+  jq -M -en --argjson claimed "$additions" --argjson allowed "$allowed" \
+    '($claimed | unique | sort) == $allowed and ($allowed | length > 0)' \
     >/dev/null || return 1
   if [[ -e "$ledger" || -L "$ledger" ]]; then
     [[ -f "$ledger" && ! -L "$ledger" ]] || return 1
@@ -1108,6 +1117,16 @@ materials_recovery_track_locations() {
   mv -f -- "$temporary" "$ledger"
 }
 
+materials_recovery_response_locations() {
+  local response=$1
+  [[ -f "$response" && ! -L "$response" ]] || return 1
+  # 与 common.sh 的正常上传路径使用同一响应字段。响应可能在 curl
+  # 写入途中因进程退出而不完整；这种情况不把正文当授权，调用方仍须
+  # 通过随机 alias 的持久卷观测或受控重放取得可清理位置。
+  jq -M -ce '[.documents[]?.location | select(type == "string")] | unique' \
+    "$response" 2>/dev/null || printf '[]\n'
+}
+
 materials_recovery_ingest_upload_response() {
   local deploy_dir=$1 recovery="${1}/backups/config-history/materials.recovery"
   local response="${1}/backups/config-history/materials.recovery/upload-response.json"
@@ -1118,13 +1137,25 @@ materials_recovery_ingest_upload_response() {
   [[ -f "$intent" && ! -L "$intent" ]] || return 1
   if [[ -e "$response" || -L "$response" ]]; then
     [[ -f "$response" && ! -L "$response" ]] || return 1
+    locations=$(materials_recovery_response_locations "$response") || return 1
+    if [[ "$locations" != '[]' ]]; then
+      # curl 已完整落盘但进程尚未来得及写 touched 时，必须先消费这份
+      # 持久回执。track_locations 会再次以随机 alias 或冻结 managed
+      # 集核权；foreign/mixed 声明失败后不得降级为较窄集合继续清理。
+      materials_recovery_track_locations "$deploy_dir" "$locations" || return 1
+      rm -f -- "$response" "$intent" "${recovery}/upload-payload" || return 1
+      return 0
+    fi
   fi
   locations=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" resolve-upload) || return 1
   if [[ "$locations" == '[]' ]]; then
     materials_recovery_retry_upload "$deploy_dir" || return 1
-    locations=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-      --recovery "$recovery" resolve-upload) || return 1
+    locations=$(materials_recovery_response_locations "$response") || return 1
+    if [[ "$locations" == '[]' ]]; then
+      locations=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+        --recovery "$recovery" resolve-upload) || return 1
+    fi
   fi
   [[ "$locations" != '[]' ]] || return 1
   if [[ "$locations" != '[]' ]]; then

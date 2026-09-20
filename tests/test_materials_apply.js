@@ -47,14 +47,17 @@ async function main() {
   let promptUpdates=0;
   let promptFailures=0;
   let embeddingUpdates=0;
+  const embeddingPayloads=[];
   let workspaceReads=0;
   let promptDelayMs=0;
   let failReadAfterNextEmbedding=false;
   let workspaceReadFailureCountdown=0;
   let removeFailures=0;
   let removeFailureAfterDelete=0;
+  let removeRequests=0;
   let uploadFailureAfterWrite=0;
   let uploadReplyLostAfterWrite=0;
+  let uploadRequests=0;
   let uploadLocationsPerDocument=1;
   let reuseNextLocation=null;
   let applyingObservation=null;
@@ -95,6 +98,7 @@ async function main() {
       send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;
     }
     if(request.url==='/api/v1/document/upload') {
+      uploadRequests++;
       const raw=data.toString('latin1');
       const match=/filename="([^"]+)"/.exec(raw);
       const filename=match?.[1] || `document-${sequence}`;
@@ -117,6 +121,7 @@ async function main() {
     }
     if(request.url==='/api/v1/workspace/crisp-support/update-embeddings') {
       embeddingUpdates++;
+      embeddingPayloads.push({adds:[...(body.adds||[])],deletes:[...(body.deletes||[])]});
       if(embeddingFailures>0){embeddingFailures--;send(400,{error:true});return;}
       for(const location of body.adds||[]) {
         fs.writeFileSync(cachePath(location),JSON.stringify({location,embedding:[0.1,0.2,0.3]})+'\n',{mode:0o600});
@@ -126,6 +131,7 @@ async function main() {
       send(200,{success:true});return;
     }
     if(request.url==='/api/v1/system/remove-documents') {
+      removeRequests++;
       if(removeFailures>0){removeFailures--;send(500,{error:true});return;}
       for(const name of body.names||[]) {
         documents.delete(name);
@@ -413,11 +419,14 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.match(parsedText(nonemptyLocations[0]),/橙色/);
     fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为蓝色。\n',{mode:0o640});
     reuseNextLocation=nonemptyLocations[0];
+    const reusedLocationPayloadOffset=embeddingPayloads.length;
     embeddingFailures=1;
     result=await invoke(['apply']);assert.notEqual(result.code,0);
     const nonemptyRestored=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(nonemptyRestored.state,'applied',result.stderr||result.stdout);
     assert.equal(nonemptyRestored.source_sha256,nonemptyBaseline.source_sha256);
+    assert.deepEqual(embeddingPayloads[reusedLocationPayloadOffset],
+      {adds:nonemptyLocations,deletes:[]},'复用旧受管 location 仍必须先进入候选索引请求');
     assert.equal(locations.length,1);assert.notDeepEqual(locations,nonemptyLocations);
     assert.match(parsedText(locations[0]),/橙色/);assert.doesNotMatch(parsedText(locations[0]),/蓝色/);
     assert.notDeepEqual(JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json'))),nonemptyManifest);
@@ -427,6 +436,47 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     pass('上游复用旧 location 并覆盖正文时拒绝快速复用，从冻结旧原文重建且待应用原文不被覆盖');
 
     await ok(['apply']);
+    const responseCrashBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const responseCrashLocations=[...locations];
+    const responseCrashRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    const responseCrashMarker=path.join(work,'kill-after-upload-response');
+    const responseCrashCurl=path.join(deploy,'bin/curl');
+    const responseCrashRealCurl=execFileSync('sh',['-c','command -v curl'],{encoding:'utf8'}).trim();
+    fs.writeFileSync(responseCrashMarker,'armed\n',{mode:0o600});
+    fs.writeFileSync(responseCrashCurl,[
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      `${JSON.stringify(responseCrashRealCurl)} "$@"`,
+      `if [[ " $* " == *"/api/v1/document/upload"* && -f ${JSON.stringify(responseCrashMarker)} ]]; then`,
+      `  rm -f -- ${JSON.stringify(responseCrashMarker)}`,
+      '  kill -KILL "$PPID"',
+      'fi',
+      '',
+    ].join('\n'),{mode:0o700});
+    reuseNextLocation=responseCrashLocations[0];
+    try {
+      result=await invoke(['apply','--force-knowledge']);assert.notEqual(result.code,0);
+    } finally {
+      fs.rmSync(responseCrashCurl,{force:true});
+      fs.rmSync(responseCrashMarker,{force:true});
+    }
+    assert.equal(fs.existsSync(path.join(responseCrashRecovery,'upload-response.json')),true);
+    assert.equal(fs.existsSync(path.join(responseCrashRecovery,'upload-intent.json')),true);
+    assert.equal(fs.existsSync(path.join(responseCrashRecovery,'touched.json')),false,
+      '测试必须停在HTTP回执已落盘但恢复账本尚未写入的崩溃窗口');
+    assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+    const responseCrashUploadOffset=uploadRequests;
+    await ok(['apply']);
+    const responseCrashRecovered=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(responseCrashRecovered.state,'applied');
+    assert.ok(responseCrashRecovered.revision>responseCrashBaseline.revision);
+    assert.equal(fs.existsSync(responseCrashRecovery),false);
+    assert.equal(uploadRequests,responseCrashUploadOffset+1,
+      '重入只能从冻结原文重建一次；不得忽略已持久回执后先重放上传');
+    assert.equal(locations.length,1);assert.notDeepEqual(locations,responseCrashLocations);
+    assert.match(parsedText(locations[0]),/蓝色/);
+    pass('HTTP回执已持久但写恢复账本前崩溃时，重入先核验回执中的旧受管location再恢复且不永久卡住');
+
     const beforeRebuild=JSON.parse(fs.readFileSync(projectionPath));
     const beforeRebuildLocations=[...locations];
     fs.writeFileSync(sourcePath,'# 虚构资料\n失败回滚标记改为紫色。\n',{mode:0o640});
@@ -806,6 +856,33 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(finalStatus.source_valid,true);assert.equal(finalStatus.projection_valid,true);
     assert.ok(!JSON.stringify(finalStatus).includes('虚构资料'));
     pass('状态只返回哈希、revision与稳定路径，不输出用户正文或秘密');
+
+    const foreignLocation='custom-documents/admin-owned.json';
+    const foreignContent='不属于本项目资料代的虚构管理员正文';
+    locations.push(foreignLocation);
+    documents.set(foreignLocation,{filename:'admin-owned.json',pageContent:foreignContent});
+    fs.writeFileSync(path.join(deploy,'data/anythingllm/documents',foreignLocation),
+      JSON.stringify({pageContent:foreignContent})+'\n',{mode:0o600});
+    const foreignRemoveOffset=removeRequests;
+    fs.writeFileSync(sourcePath,'# 虚构资料\n外来位置授权边界候选。\n',{mode:0o640});
+    uploadLocationsPerDocument=2;
+    reuseNextLocation=foreignLocation;
+    result=await invoke(['apply']);assert.notEqual(result.code,0);
+    const foreignRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    const foreignClaims=JSON.parse(fs.readFileSync(path.join(foreignRecovery,'upload-response.json'))).documents
+      .map(item=>item.location);
+    assert.equal(foreignClaims.length,2);
+    assert.equal(foreignClaims.includes(foreignLocation),true);
+    assert.equal(foreignClaims.some(item=>item!==foreignLocation),true);
+    assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+    assert.equal(fs.existsSync(path.join(foreignRecovery,'upload-response.json')),true);
+    assert.equal(fs.existsSync(path.join(foreignRecovery,'upload-intent.json')),true);
+    assert.equal(fs.existsSync(path.join(foreignRecovery,'touched.json')),false);
+    assert.equal(removeRequests,foreignRemoveOffset,'外来workspace位置不得进入删除调用');
+    assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',foreignLocation)),true);
+    assert.equal(locations.includes(foreignLocation),true);
+    assert.match(result.stderr,/外部恢复尚未确认/);
+    pass('HTTP声称复用外来workspace位置时保持fail-closed且不登记、不删除该位置');
     process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed:0,evidence:path.relative(root,work)})+'\n');
   } finally {
     server.closeAllConnections();
