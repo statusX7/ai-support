@@ -3828,6 +3828,10 @@ const abortablePending = (signal, started) => {
   });
   await test('P0 控制任务失去许可不提前释放人工归属栅栏', async () => {
     const session = 'session_permit-lost-control';
+    const beforeModels = modelRequests.length;
+    const beforeRetrievals = retrievalRequests.length;
+    const beforePosts = sendAttempts;
+    const beforeSent = sent.filter((item) => item.session_id === session).length;
     let startedResolve;
     const started = new Promise((resolve) => { startedResolve = resolve; });
     const controlRuntime = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
@@ -3842,6 +3846,7 @@ const abortablePending = (signal, started) => {
       event: 'message:received', timestamp: now, data }, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
     const running = controlRuntime.process(entry.key, entry.jobId);
     let replacement;
+    let persistedData;
     try {
       await awaitNamedGate(started, '人工归属精确回查开始');
       await waitForPermitSlot(7);
@@ -3849,18 +3854,77 @@ const abortablePending = (signal, started) => {
       assert.deepEqual(await running, { status: 'deferred', reason: 'processing_permit_lost' });
       const current = controlRuntime.readState(entry.key);
       const stored = current.jobs.find((job) => job.id === entry.jobId);
+      persistedData = structuredClone(stored.data);
       assert.equal(stored.status, 'received');
       assert.equal(stored.attempts, 0);
       assert.equal(stored.operator_resolution, undefined);
       assert(current.uncertain_events.includes(entry.jobId), '未确认归属前必须保留栅栏');
       assert.equal(current.mode, 'ai');
+      assert.equal(modelRequests.length, beforeModels);
+      assert.equal(retrievalRequests.length, beforeRetrievals);
+      assert.equal(sendAttempts, beforePosts);
+      assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
     } finally {
       replacement?.cleanup();
     }
     now += 1001;
-    const recovered = createRuntime(env, runtimeOptions);
-    assert.notEqual((await recovered.process(entry.key, entry.jobId)).status, 'failed');
-    assert.equal(recovered.readState(entry.key).uncertain_events.includes(entry.jobId), false);
+    let exactLookups = 0;
+    const recovered = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (parsed.pathname.includes('/conversation/' + encodeURIComponent(session) + '/message/')) {
+          exactLookups += 1;
+        }
+        return request(url, options);
+      } });
+    assert.deepEqual(await recovered.process(entry.key, entry.jobId),
+      { status: 'deferred', reason: 'operator_identity_pending' });
+    const pendingState = recovered.readState(entry.key);
+    const pendingJob = pendingState.jobs.find((job) => job.id === entry.jobId);
+    assert.equal(exactLookups, 1);
+    assert.equal(pendingJob.status, 'received');
+    assert.equal(pendingJob.attempts, 1);
+    assert.equal(pendingJob.responsibility_status, 'unresolved_failure');
+    assert.equal(pendingJob.failure_code, 'operator_identity_pending');
+    assert.equal(pendingJob.operator_resolution, undefined);
+    assert(Number.isFinite(pendingJob.retry_at) && pendingJob.retry_at > now);
+    assert.deepEqual(pendingJob.data, persistedData, '身份待确认时必须保留原始控制责任');
+    for (const field of ['session_id', 'fingerprint', 'from', 'type', 'content', 'timestamp']) {
+      assert.deepEqual(pendingJob.data[field], data[field], '持久控制消息身份字段不得改变：' + field);
+    }
+    assert(pendingState.uncertain_events.includes(entry.jobId), '官方身份仍不明时必须继续 fail-closed');
+    assert.equal(pendingState.mode, 'ai');
+    assert.equal(modelRequests.length, beforeModels);
+    assert.equal(retrievalRequests.length, beforeRetrievals);
+    assert.equal(sendAttempts, beforePosts);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+
+    // 同一官方消息后续获得明确 automated 身份时，必须收敛原控制责任；
+    // 不得把身份未决直接猜成非人工，也不得在恢复过程中触发模型或访客出站。
+    histories.set(session, [{ ...data, automated: true }]);
+    now = pendingJob.retry_at;
+    const resolved = await recovered.process(entry.key, entry.jobId);
+    assert.equal(resolved.status, 'none');
+    assert.equal(exactLookups, 2);
+    const resolvedState = recovered.readState(entry.key);
+    const resolvedJob = resolvedState.jobs.find((job) => job.id === entry.jobId);
+    assert.equal(resolvedJob.status, 'done');
+    assert.equal(resolvedJob.attempts, 2);
+    assert.equal(resolvedJob.responsibility_status, 'control_handled');
+    assert.equal(resolvedJob.responsibility_reason, 'operator_identity_resolved');
+    assert.equal(resolvedJob.operator_resolution.result, 'not-human');
+    assert.equal(resolvedJob.operator_resolution.human_changed, false);
+    assert.equal(resolvedJob.data, undefined);
+    assert.equal(resolvedJob.execution_token, undefined);
+    assert.equal(resolvedJob.processing_permit_losses, undefined);
+    assert.equal(resolvedState.uncertain_events.includes(entry.jobId), false);
+    assert.equal(resolvedState.mode, 'ai');
+    assert.equal(Object.values(resolvedState.outgoing || {})
+      .some((record) => record?.job_id === entry.jobId), false);
+    assert.equal(modelRequests.length, beforeModels);
+    assert.equal(retrievalRequests.length, beforeRetrievals);
+    assert.equal(sendAttempts, beforePosts);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
 
     // 同一栅栏还要覆盖 control 的旧执行迟到：新代次已接管后，
     // 旧 resolve_operator 不得写入 unknown/human，也不得改变新任务的尝试次数。
