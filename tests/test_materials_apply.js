@@ -65,6 +65,7 @@ async function main() {
   let uploadRequests=0;
   const uploadEvents=[];
   let uploadLocationsPerDocument=1;
+  const uploadLocationCountByContent=new Map();
   let reuseNextLocation=null;
   let applyingObservation=null;
   const documents=new Map();
@@ -131,9 +132,14 @@ async function main() {
       const contentEnd=boundary&&contentStart>=4?raw.indexOf(`\r\n--${boundary}`,contentStart):-1;
       if(contentStart<4||contentEnd<contentStart){send(400,{error:true});return;}
       const pageContent=data.subarray(contentStart,contentEnd).toString('utf8');
-      uploadEvents.push({filename,pageContent});
+      const contentIdentity=digest(pageContent);
+      if(!uploadLocationCountByContent.has(contentIdentity)) {
+        uploadLocationCountByContent.set(contentIdentity,uploadLocationsPerDocument);
+      }
+      const locationCount=uploadLocationCountByContent.get(contentIdentity);
+      uploadEvents.push({filename,pageContent,locationCount});
       const uploaded=[];
-      for(let index=0;index<uploadLocationsPerDocument;index++) {
+      for(let index=0;index<locationCount;index++) {
         const location=index===0&&reuseNextLocation?reuseNextLocation:`custom-documents/${filename}.${++sequence}.json`;
         uploaded.push({location});
         reuseNextLocation=null;
@@ -1136,9 +1142,13 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     }
     const multiLocationProjection=JSON.parse(fs.readFileSync(projectionPath));
     const multiLocationMap=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-map.json')));
+    const multiLocationContent=fs.readFileSync(sourcePath,'utf8');
+    const multiLocationContentIdentity=digest(multiLocationContent);
     assert.equal(locations.length,2);assert.equal(documents.size,2);
     assert.equal(multiLocationMap.documents.length,2);
     assert.equal(multiLocationProjection.knowledge.enabled_document_count,2);
+    assert.equal(uploadLocationCountByContent.get(multiLocationContentIdentity),2,
+      '固定解析器必须按同一冻结正文保持解析位置基数');
     await assertProjectionArtifacts(multiLocationProjection);
     pass('一个登记源解析成两个 AnythingLLM location 时，运行计数按 map 位置计算且快照同代门禁通过');
 
@@ -1250,8 +1260,9 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     pass('显式 force-external 对 Prompt-only 漂移只写一次 Prompt，知识上传、Embedding 和删除均为零');
 
     let interruptPrompt;
-    for(const signals of [['SIGINT'],['SIGTERM'],['SIGINT','SIGTERM']]) {
+    for(const [signalIndex,signals] of [['SIGINT'],['SIGTERM'],['SIGINT','SIGTERM']].entries()) {
     const beforeInterrupt=JSON.parse(fs.readFileSync(projectionPath));
+    const beforeInterruptLocations=[...locations];
     interruptPrompt='## 中断后待恢复的 Prompt '+signals.join('+')+'\n';
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),interruptPrompt,{mode:0o640});
     const promptPayloadOffset=promptPayloads.length;
@@ -1270,11 +1281,61 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.deepEqual(promptPayloads.slice(promptPayloadOffset),[interruptPrompt],
       '信号退出只能保留已进入外部请求的候选，不得在 EXIT 阶段伪造外部恢复');
     assert.equal(fs.readdirSync(path.join(deploy,'tmp')).filter(name=>name.startsWith('materials-result.')).length,0);
+    let countDriftLocations=[];
+    if(signalIndex===0) {
+      const frozenRecoveryProjection=JSON.parse(fs.readFileSync(path.join(recoveryRoot,'projection.json'),'utf8'));
+      assert.equal(frozenRecoveryProjection.knowledge.enabled_document_count,2,
+        '负例必须从两个位置的完整冻结旧代开始');
+      uploadLocationCountByContent.set(multiLocationContentIdentity,1);
+      const countDriftResult=await invoke(['apply']);
+      assert.notEqual(countDriftResult.code,0,'同一冻结正文的解析位置减少必须阻止恢复投影发布');
+      assert.match(countDriftResult.stderr,/恢复后的知识映射文档数与旧生效代不一致/);
+      assert.match(countDriftResult.stderr,/资料外部恢复未完成：生成旧资料恢复投影/);
+      assert.match(countDriftResult.stderr,/上次资料事务仍未恢复/);
+      assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+      const countDriftMap=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-map.json')));
+      assert.equal(countDriftMap.documents.length,1);
+      assert.equal(locations.length,1,'负例必须真实重建出少一个位置，而非只伪造投影计数');
+      countDriftLocations=[...locations];
+      uploadLocationCountByContent.set(multiLocationContentIdentity,2);
+    }
     await ok(['apply']);
     assert.equal(prompt,interruptPrompt);
-    assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applied');
-    assert.deepEqual(promptPayloads.slice(promptPayloadOffset),
-      [interruptPrompt,beforeInterrupt.prompt.text,interruptPrompt],
+    const recoveredAfterSignal=JSON.parse(fs.readFileSync(projectionPath));
+    const recoveredAfterSignalMap=JSON.parse(fs.readFileSync(path.join(deploy,'data/runtime/knowledge-map.json')));
+    assert.equal(recoveredAfterSignal.state,'applied');
+    assert.equal(recoveredAfterSignal.knowledge.enabled_document_count,2);
+    assert.equal(recoveredAfterSignalMap.documents.length,2);
+    assert.equal(locations.length,2);
+    const recoveredAfterSignalManifest=JSON.parse(
+      fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json'),'utf8'));
+    const primaryProjection=`${library}_${document}.md`;
+    const recoveredManifestLocations=[...recoveredAfterSignalManifest.files[primaryProjection].locations].sort();
+    const recoveredMapLocations=recoveredAfterSignalMap.documents
+      .filter(row=>row.projection===primaryProjection).map(row=>row.location).sort();
+    const recoveredWorkspaceLocations=[...locations].sort();
+    assert.deepEqual(recoveredManifestLocations,recoveredWorkspaceLocations);
+    assert.deepEqual(recoveredMapLocations,recoveredWorkspaceLocations);
+    assert.equal(documents.size,2,'恢复后不得遗留 workspace 外的解析文档');
+    for(const location of new Set([...beforeInterruptLocations,...countDriftLocations])) {
+      assert.equal(locations.includes(location),false,'旧代和失败恢复轮的位置必须退出 workspace');
+      assert.equal(documents.has(location),false,'旧代和失败恢复轮的解析记录必须删除');
+      assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',location)),false,
+        '旧代和失败恢复轮的解析正文必须删除');
+      assert.equal(fs.existsSync(cachePath(location)),false,
+        '旧代和失败恢复轮的向量缓存必须删除');
+    }
+    for(const location of locations) {
+      assert.equal(documents.has(location),true);
+      assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',location)),true);
+      assert.equal(fs.existsSync(cachePath(location)),true);
+    }
+    assert.equal(fs.existsSync(recoveryRoot),false,'恢复成功后受限事务目录必须退役');
+    await assertProjectionArtifacts(recoveredAfterSignal);
+    const expectedPromptPayloads=signalIndex===0
+      ? [interruptPrompt,beforeInterrupt.prompt.text,beforeInterrupt.prompt.text,interruptPrompt]
+      : [interruptPrompt,beforeInterrupt.prompt.text,interruptPrompt];
+    assert.deepEqual(promptPayloads.slice(promptPayloadOffset),expectedPromptPayloads,
       '重试必须以同一候选收敛，不得丢失或重复外部 Prompt 代次');
     }
     pass('真实进程组 SIGINT/SIGTERM/连续信号保持130/143、清理结果文件并以更高代次保持applying，保留候选且重试才解除停发');
