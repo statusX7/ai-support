@@ -2964,6 +2964,7 @@ const abortablePending = (signal, started) => {
   });
   await test('P0 大量历史会话不放大周期扫描，重叠调度退让且到期人工仍恢复', async () => {
     const bulk = [];
+    const currentDisableEpoch = readConfig('runtime').disable_epoch || 0;
     for (let index = 0; index < 500; index += 1) {
       const session = 'session_archived-' + String(index).padStart(4, '0');
       const filename = path.join(root, 'data/runtime/session-' + key(session) + '.json');
@@ -2978,6 +2979,7 @@ const abortablePending = (signal, started) => {
       if (index === 1) {
         value.jobs.push({ id: 'a'.repeat(64), event: 'message:send', control: false, status: 'received',
           received_at: now, retry_at: now + 60000, lease_until: 0, attempts: 1, data: { type: 'text' },
+          global_disable_epoch: currentDisableEpoch,
           responsibility_status: 'unresolved_failure', failure_code: 'legacy_generic_non_answer',
           plan: { type: 'internal', ordinary: true, purpose: 'technical_unresolved', safe_error_context: 'text',
             content: '', answer_responsibility: 'unresolved_failure', diagnostic_code: 'legacy_generic_non_answer', tags: [] } });
