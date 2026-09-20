@@ -3164,19 +3164,77 @@ const abortablePending = (signal, started) => {
       const queued = state('session_materials-during').jobs.find((job) => job.id === during.jobId);
       assert.equal(queued.status, 'received'); assert.equal(queued.deferred_configuration, true);
       assert(queued.data, '过渡期间已持久接收的问题不得丢失');
+      const queuedData = structuredClone(queued.data);
+      const queuedCoveredMessageIds = structuredClone(queued.covered_message_ids);
+      const queuedGeneration = queued.generation;
       now += 10; await operator('session_materials-human');
       assert.equal(state('session_materials-human').mode, 'human');
       finish(); await pending;
       assert.equal(sent.length, before);
       projection.state = 'applied'; publish();
       now += 5000;
-      const resumed = await runtime.scan();
-      assert(resumed.some((entry) => entry.jobId === during.jobId));
-      assert.equal((await runtime.process(during.key, during.jobId)).status, 'sent');
+      const scanBaseline = { models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length };
+      const healthFile = path.join(root, 'data/runtime/scheduler-health.json');
+      const sessionFileCount = fs.readdirSync(path.join(root, 'data/runtime'))
+        .filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name)).length;
+      const targetIdentity = during.key + '\0' + during.jobId;
+      const seenOrdinary = new Set();
+      let selected;
+      for (let attempt = 0; attempt <= sessionFileCount && !selected; attempt += 1) {
+        const previousCursor = JSON.parse(fs.readFileSync(healthFile, 'utf8')).ordinary_cursor;
+        const resumed = await runtime.scan();
+        const ordinary = resumed.filter((entry) => entry.control !== true);
+        const currentCursor = JSON.parse(fs.readFileSync(healthFile, 'utf8')).ordinary_cursor;
+        assert.equal(currentCursor, previousCursor + ordinary.length,
+          '每轮扫描必须按实际返回的普通任务数持久推进公平游标');
+        assert(ordinary.length > 0, '目标责任仍到期时每轮必须保留至少一个普通任务槽');
+        for (const entry of ordinary) {
+          const identity = entry.key + '\0' + entry.jobId;
+          if (identity === targetIdentity) { selected = entry; break; }
+          assert(!seenOrdinary.has(identity), '目标责任获选前普通游标不得重复同一任务');
+          seenOrdinary.add(identity);
+        }
+        const waiting = state('session_materials-during').jobs.filter((job) => job.id === during.jobId);
+        assert.equal(waiting.length, 1);
+        assert.deepEqual(waiting[0].data, queuedData, '公平轮转期间不得替换或截断原问题');
+        assert.deepEqual(waiting[0].covered_message_ids, queuedCoveredMessageIds,
+          '公平轮转期间不得丢失原消息覆盖关系');
+        assert.equal(waiting[0].generation, queuedGeneration);
+        assert.deepEqual({ models: modelRequests.length, retrievals: retrievalRequests.length,
+          posts: sendAttempts, visible: sent.length }, scanBaseline,
+        '仅扫描不得推理、检索、发送或产生可见消息');
+      }
+      assert.deepEqual(selected, { key: during.key, jobId: during.jobId, control: false },
+        '配置过渡责任必须由持久公平游标在有界轮次内重新选中');
+      const rebound = state('session_materials-during').jobs.find((job) => job.id === during.jobId);
+      assert(rebound); assert.equal(rebound.status, 'received'); assert.equal(rebound.revision, 501);
+      assert.equal(rebound.deferred_configuration, undefined);
+      assert.equal(rebound.generation, queuedGeneration);
+      assert.equal(rebound.generation, state('session_materials-during').generation);
+      assert.deepEqual(rebound.data, queuedData);
+      assert.deepEqual(rebound.covered_message_ids, queuedCoveredMessageIds);
+      assert.equal((await runtime.process(selected.key, selected.jobId)).status, 'sent');
+      assert.deepEqual({ models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length }, { models: scanBaseline.models + 1,
+        retrievals: scanBaseline.retrievals + 1, posts: scanBaseline.posts + 1,
+        visible: scanBaseline.visible + 1 });
+      const completed = state('session_materials-during');
+      const completedJob = completed.jobs.find((job) => job.id === during.jobId); assert(completedJob);
+      assert.equal(completedJob.status, 'done');
+      assert.equal(completedJob.responsibility_status, 'answered_confirmed');
+      const firstOutgoing = Object.values(completed.outgoing)
+        .filter((record) => record.job_id === during.jobId);
+      assert.equal(firstOutgoing.length, 1); assert.equal(firstOutgoing[0].status, 'sent');
+      assert.equal(state('session_materials-human').mode, 'human');
+      assert.equal(sent.filter((entry) => entry.session_id === 'session_materials-human').length, 0);
       assert.equal(sent.length, before + 1); assert.equal(sent.at(-1).session_id, 'session_materials-during');
       await deliver(message('session_materials-during', '之后的新问题'));
       assert.equal(sent.length, before + 2);
       assert.equal(sent.at(-1).session_id, 'session_materials-during');
+      assert.equal(Object.values(state('session_materials-during').outgoing)
+        .filter((record) => record.job_id === during.jobId).length, 1,
+      '后续新问题不得使首个恢复责任重复出站');
       fs.writeFileSync(mapFile, JSON.stringify({ synthetic: 'unapplied-map' }));
       assert.equal(runtime.settings().enabled, false, '知识投影错代禁止普通出站');
       now += 10; await operator('session_materials-map-human');
