@@ -1236,13 +1236,21 @@ const test = async (name, action) => {
 
       fx.tick(1001);
       const originalRequest = fx.options.request;
+      let limitedRequests = 0;
       const limited = createRuntime(env, { ...fx.options, request: async (url, options) => {
-        if (/\/conversations\/[1-9][0-9]*(?:\?|$)/.test(url)) return {
-          status, headers: { 'retry-after': '60' }, body: { error: true, reason: 'rate_limited' },
-        };
+        const parsed = new URL(url);
+        const catchupGet = options.method === 'GET'
+          && (/\/website\/[^/]+\/conversations\/[1-9][0-9]*$/.test(parsed.pathname)
+            || /\/website\/[^/]+\/conversation\/session_[A-Za-z0-9-]+\/messages$/.test(parsed.pathname));
+        if (catchupGet && limitedRequests === 0) {
+          limitedRequests += 1;
+          return { status, headers: { 'retry-after': '60' },
+            body: { error: true, reason: 'rate_limited' } };
+        }
         return originalRequest(url, options);
       } });
       const result = await limited.catchup();
+      assert.equal(limitedRequests, 1, status + ' 必须命中下一次实际补偿 GET');
       assert.equal(result.status, 'warning');
       assert.equal(result.error_code, 'rate_limited');
       const after = JSON.parse(fs.readFileSync(catchupFile, 'utf8'));
@@ -1437,7 +1445,8 @@ const test = async (name, action) => {
       assert(fx.exactRequests.includes(String(item.fingerprint)));
 
       // 即使补偿调度再次运行，也不能越过尚未确认的新旧边界。
-      fx.tick(1001);
+      progress = JSON.parse(fs.readFileSync(catchupFile, 'utf8'));
+      if (progress.next_scan_at > fx.now()) fx.tick(progress.next_scan_at - fx.now() + 1);
       const stillPending = await fx.runtime.catchup();
       assert.equal(stillPending.status, 'warning');
       assert.equal(stillPending.error_code, 'event_time_pending');
@@ -1488,7 +1497,8 @@ const test = async (name, action) => {
       // timestamp 也必须复用同一责任，不能永久卡住或生成第二条 job。
       progress = JSON.parse(fs.readFileSync(catchupFile, 'utf8'));
       for (let round = 0; round < 8 && progress.window; round += 1) {
-        fx.tick(1001);
+        const due = Number(progress.next_scan_at);
+        fx.tick(Number.isFinite(due) && due > fx.now() ? due - fx.now() + 1 : 1001);
         await fx.runtime.catchup();
         progress = JSON.parse(fs.readFileSync(catchupFile, 'utf8'));
       }
@@ -1791,7 +1801,12 @@ const test = async (name, action) => {
     // 先前某次 POST 的迟到可见结果仍可收敛同一 fingerprint，不能生成新答案。
     fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
       content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
-    fx.tick(5000);
+    const waiting = fx.runtime.readState(fx.runtime.stateKey(website, session));
+    const due = Math.max(
+      Number(waiting.jobs.find((entry) => entry.id === job.id)?.retry_at) || 0,
+      Number(waiting.outgoing[String(fingerprint)]?.next_action_at) || 0,
+    );
+    fx.tick(due > fx.now() ? due - fx.now() + 1 : 5000);
     const reconciled = await fx.runtime.process(fx.runtime.stateKey(website, session), job.id);
     assert(['sent', 'dispatched_after_cancel'].includes(reconciled.status));
     const settled = fx.runtime.readState(fx.runtime.stateKey(website, session));
