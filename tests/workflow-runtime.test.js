@@ -1051,9 +1051,8 @@ const abortablePending = (signal, started) => {
           assert.equal(pending.failure_code, 'operator_identity_pending');
           assert(snapshot.uncertain_events.includes(control.id));
           assert.equal(snapshot.mode, 'ai');
-          exactAt = now + 1;
+          now += 1;
           exact = { ...ambiguous, timestamp: exactAt, automated: true };
-          now = exactAt + 1;
           await runtime.transaction(visitor.key, (current) => {
             const stored = current.jobs.find((job) => job.id === control.id); assert(stored);
             stored.retry_at = 0;
