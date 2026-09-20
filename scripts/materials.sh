@@ -1844,8 +1844,8 @@ materials_apply() (
     || { rm -f -- "$old"; rm -rf -- "$stage"; return 1; }
   old_disable_epoch=$(jq -M -er '.configuration.runtime.disable_epoch // 0' "$old") || return 1
   candidate_disable_epoch=$(jq -M -er '.configuration.runtime.disable_epoch // 0' "${stage}/materials-applied.json") || return 1
-  old_enabled=$(jq -M -er '.configuration.runtime.enabled' "$old") || return 1
-  candidate_enabled=$(jq -M -er '.configuration.runtime.enabled' "${stage}/materials-applied.json") || return 1
+  old_enabled=$(jq -M -er '.configuration.runtime.enabled | select(type == "boolean") | tostring' "$old") || return 1
+  candidate_enabled=$(jq -M -er '.configuration.runtime.enabled | select(type == "boolean") | tostring' "${stage}/materials-applied.json") || return 1
   desired_disable_epoch=$old_disable_epoch
   if [[ "$old_enabled" == true && "$candidate_enabled" == false ]]; then
     (( old_disable_epoch < 2147483647 )) \
