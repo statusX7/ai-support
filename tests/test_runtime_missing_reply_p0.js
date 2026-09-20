@@ -3518,15 +3518,48 @@ const test = async (name, action) => {
     await fx.runtime.process(accepted.key, accepted.jobId);
     const recovered = fx.runtime.readState(accepted.key);
     assert(!recovered.uncertain_events.includes(accepted.jobId));
-    assert.equal(recovered.jobs.find((entry) => entry.id === accepted.jobId).operator_resolution.result, 'not-human');
+    const recoveredControl = recovered.jobs.find((entry) => entry.id === accepted.jobId);
+    assert.equal(recoveredControl.operator_resolution.result, 'not-human');
+    assert.equal(recoveredControl.responsibility_status, 'control_handled');
+    assert.equal(recoveredControl.responsibility_reason, 'operator_identity_resolved');
+    assert.equal(recoveredControl.failure_code, undefined);
     assert.equal(recovered.jobs.find((entry) => entry.id === visitor.jobId).deferred_control, undefined);
+  });
+
+  await test('畸形普通责任不得凭 resolve_operator action 冒充已完成控制', async () => {
+    const fx = fixture('operator-action-on-ordinary');
+    const session = 'session_operator-action-ordinary';
+    const malformed = jobValue(fx, 'operator-action-ordinary', 1, {
+      action: 'resolve_operator', control: false, responsibility_status: 'unresolved_failure',
+      failure_code: 'operator_identity_pending',
+    });
+    malformed.data.session_id = session;
+    writeState(fx, session, stateValue(fx, session, [malformed]));
+    const key = fx.runtime.stateKey(website, session);
+    const result = await fx.runtime.process(key, malformed.id);
+    const stored = fx.runtime.readState(key).jobs.find((entry) => entry.id === malformed.id); assert(stored);
+    assert.equal(result.status, 'deferred');
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'operator_control_state_invalid');
+    assert(stored.data, '畸形 action 不能删除原始访客责任');
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
   });
 
   await test('scan 自愈旧版 terminal/missing barrier，且保留 human/not-human 已知结果', async () => {
     const fx = fixture('operator-orphan-migration');
     const cases = [
-      { name: 'human', resolution: { schema_version: 1, result: 'human', human_changed: true }, selected: false },
-      { name: 'not-human', resolution: { schema_version: 1, result: 'not-human', human_changed: false }, selected: true },
+      { name: 'human', resolution: { schema_version: 1, result: 'human', human_changed: true },
+        oldFailure: true, selected: false },
+      { name: 'not-human', resolution: { schema_version: 1, result: 'not-human', human_changed: false },
+        oldFailure: true, selected: true },
+      { name: 'nonterminal-human', resolution: { schema_version: 1, result: 'human', human_changed: false },
+        status: 'received', oldFailure: true, selected: true },
+      { name: 'nonterminal-not-human', resolution: { schema_version: 1, result: 'not-human', human_changed: false },
+        status: 'received', oldFailure: true, selected: true },
+      { name: 'wrong-action', resolution: { schema_version: 1, result: 'human', human_changed: false },
+        action: 'menu_action', oldFailure: true, selected: false },
       { name: 'unknown', resolution: { schema_version: 1, result: 'unknown', human_changed: false },
         data: { from: 'operator', type: 'text', content: '旧版待核查消息', fingerprint: 51003 }, selected: false },
       { name: 'missing', missing: true, selected: false },
@@ -3537,8 +3570,12 @@ const test = async (name, action) => {
       const controlId = digest('control-' + item.name);
       const visitor = jobValue(fx, 'visitor-' + item.name, 2, { deferred_control: true, generation: 7 });
       const jobs = item.missing ? [visitor] : [jobValue(fx, 'control-' + item.name, 1, {
-        id: controlId, event: 'message:received', data: item.data, control: true, action: 'resolve_operator',
-        status: 'failed', operator_resolution: item.resolution || undefined,
+        id: controlId, event: 'message:received', data: item.data, control: true,
+        action: item.action || 'resolve_operator', status: item.status || 'failed',
+        operator_resolution: item.resolution || undefined,
+        ...(item.oldFailure ? { responsibility_status: 'unresolved_failure',
+          failure_code: 'operator_identity_pending', failure_since: fx.now() - 1000,
+          last_failure_at: fx.now() - 500, failure_rounds: 2 } : {}),
       }), visitor];
       writeState(fx, session, stateValue(fx, session, jobs, { sequence: 2, generation: 7, uncertain_events: [controlId] }));
       if (item.selected) expectedKeys.add(fx.runtime.stateKey(website, session));
@@ -3547,19 +3584,75 @@ const test = async (name, action) => {
     assert.deepEqual(new Set(scheduled.map((entry) => entry.key)), expectedKeys);
     for (const item of cases) {
       const session = 'session_orphan-' + item.name;
-      const current = fx.runtime.readState(fx.runtime.stateKey(website, session));
+      let current = fx.runtime.readState(fx.runtime.stateKey(website, session));
       if (item.name === 'human') {
         assert.deepEqual(current.uncertain_events, []);
         assert.equal(current.mode, 'human');
         assert.equal(current.jobs.find((entry) => !entry.control).status, 'cancelled');
-        assert.equal(current.jobs.find((entry) => entry.control).operator_resolution.result, 'human');
+        const control = current.jobs.find((entry) => entry.control);
+        assert.equal(control.operator_resolution.result, 'human');
+        assert.equal(control.responsibility_status, 'control_handled');
+        assert.equal(control.responsibility_reason, 'operator_reply');
+        for (const field of ['failure_code', 'failure_since', 'last_failure_at', 'failure_rounds']) {
+          assert.equal(control[field], undefined, '终态 human 控制自愈后必须清除旧失败字段：' + field);
+        }
       } else if (item.name === 'not-human') {
         assert.deepEqual(current.uncertain_events, []);
+        const control = current.jobs.find((entry) => entry.control);
+        assert.equal(control.responsibility_status, 'control_handled');
+        assert.equal(control.responsibility_reason, 'operator_identity_resolved');
+        for (const field of ['failure_code', 'failure_since', 'last_failure_at', 'failure_rounds']) {
+          assert.equal(control[field], undefined, '终态 not-human 控制自愈后必须清除旧失败字段：' + field);
+        }
         const visitor = current.jobs.find((entry) => !entry.control);
         assert.equal(visitor.status, 'received');
         assert.equal(visitor.generation, current.generation);
         assert.equal(visitor.deferred_control, undefined);
         assert.equal(current.generation, 7);
+      } else if (item.name === 'nonterminal-human') {
+        let control = current.jobs.find((entry) => entry.control);
+        assert(current.uncertain_events.includes(control.id));
+        assert.equal(current.mode, 'ai');
+        assert.equal(control.status, 'received');
+        assert.equal(control.responsibility_status, 'unresolved_failure');
+        assert.equal(control.failure_code, 'operator_identity_pending');
+        assert.equal(current.jobs.find((entry) => !entry.control).deferred_control, true);
+        assert(!['failed', 'unresolved'].includes((await fx.runtime.process(
+          fx.runtime.stateKey(website, session), control.id)).status));
+        current = fx.runtime.readState(fx.runtime.stateKey(website, session));
+        control = current.jobs.find((entry) => entry.control);
+        assert.deepEqual(current.uncertain_events, []);
+        assert.equal(current.mode, 'human');
+        assert.equal(control.status, 'done');
+        assert.equal(control.responsibility_status, 'control_handled');
+        assert.equal(control.responsibility_reason, 'operator_reply');
+        assert.equal(control.failure_code, undefined);
+        assert.equal(current.jobs.find((entry) => !entry.control).status, 'cancelled');
+      } else if (item.name === 'nonterminal-not-human') {
+        let control = current.jobs.find((entry) => entry.control);
+        assert(current.uncertain_events.includes(control.id));
+        assert.equal(current.mode, 'ai');
+        assert.equal(current.jobs.find((entry) => !entry.control).deferred_control, true);
+        assert(!['failed', 'unresolved'].includes((await fx.runtime.process(
+          fx.runtime.stateKey(website, session), control.id)).status));
+        current = fx.runtime.readState(fx.runtime.stateKey(website, session));
+        control = current.jobs.find((entry) => entry.control);
+        assert.deepEqual(current.uncertain_events, []);
+        assert.equal(current.mode, 'ai');
+        assert.equal(control.status, 'done');
+        assert.equal(control.responsibility_status, 'control_handled');
+        assert.equal(control.responsibility_reason, 'operator_identity_resolved');
+        assert.equal(control.failure_code, undefined);
+        assert.equal(current.jobs.find((entry) => !entry.control).status, 'received');
+        assert.equal(current.jobs.find((entry) => !entry.control).deferred_control, undefined);
+      } else if (item.name === 'wrong-action') {
+        const control = current.jobs.find((entry) => entry.control);
+        assert(current.uncertain_events.includes(control.id));
+        assert.equal(current.mode, 'ai');
+        assert.equal(control.status, 'failed');
+        assert.equal(control.responsibility_status, 'unresolved_failure');
+        assert.equal(control.failure_code, 'operator_control_state_invalid');
+        assert.equal(current.jobs.find((entry) => !entry.control).deferred_control, true);
       } else {
         assert(current.uncertain_events.includes(digest('control-' + item.name)));
         const visitor = current.jobs.find((entry) => !entry.control);

@@ -1066,6 +1066,13 @@ const abortablePending = (signal, started) => {
         assert.equal(resolved.event_time, exactAt,
           '控制时间必须来自 Crisp 精确消息，不得用本机收件时间冒充');
         assert.equal(resolved.responsibility_status, 'control_handled');
+        assert.equal(resolved.responsibility_reason,
+          item.human ? 'operator_reply' : 'operator_identity_resolved');
+        for (const field of ['failure', 'failure_code', 'failure_since', 'last_failure_at',
+          'failure_rounds', 'event_time_retry_reason']) {
+          assert.equal(resolved[field], undefined,
+            '控制归属恢复成功后必须清除旧瞬态失败字段：' + field);
+        }
         assert.equal(snapshot.uncertain_events.includes(control.id), false);
 
         if (item.human) {
@@ -1225,10 +1232,21 @@ const abortablePending = (signal, started) => {
         stored.status = 'processing';
         stored.lease_until = now - 1;
         stored.data = originalData;
+        stored.responsibility_status = 'unresolved_failure';
+        stored.failure_code = 'operator_identity_pending';
+        stored.failure_since = now - 1000;
+        stored.last_failure_at = now - 500;
+        stored.failure_rounds = 2;
         delete stored.plan;
       });
       runtime = createRuntime(env, runtimeOptions);
       await runtime.process(item.control.key, item.control.jobId);
+      const replayedControl = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+      assert.equal(replayedControl.responsibility_status, 'control_handled');
+      assert.equal(replayedControl.responsibility_reason,
+        expectedResult === 'human' ? 'operator_reply' : 'operator_identity_resolved');
+      assert.equal(replayedControl.failure_code, undefined,
+        '已持久身份结果的崩溃重放必须收敛旧控制故障');
       assert.equal(state(item.session).generation, firstGeneration, '重放不得再次推进会话代次');
       assert.equal(state(item.session).resume_at, firstResume, '重放不得重复延长或改写人工截止时间');
       if (expectedResult === 'human') {
@@ -1242,6 +1260,39 @@ const abortablePending = (signal, started) => {
         assert.equal(sent.length, sentBeforeNewVisitor + 1);
       }
     }
+  });
+  await test('P0 旧版已移除 operator 屏障但未保存归属结果时收敛控制责任', async () => {
+    const item = await deferredOperatorCase('legacy-committed-not-human', { automated: true });
+    const initialGeneration = state(item.session).generation;
+    await runtime.transaction(item.control.key, (current) => {
+      const stored = current.jobs.find((job) => job.id === item.control.jobId); assert(stored);
+      current.uncertain_events = current.uncertain_events.filter((id) => id !== stored.id);
+      for (const pending of current.jobs) {
+        if (!pending.control && pending.status === 'received') delete pending.deferred_control;
+      }
+      stored.status = 'received';
+      stored.responsibility_status = 'unresolved_failure';
+      stored.failure_code = 'operator_identity_pending';
+      stored.failure_since = now - 1000;
+      stored.last_failure_at = now - 500;
+      stored.failure_rounds = 2;
+      delete stored.operator_resolution;
+      delete stored.plan;
+    });
+    const result = await runtime.process(item.control.key, item.control.jobId);
+    assert(!['failed', 'unresolved'].includes(result.status));
+    const recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId); assert(recovered);
+    assert.equal(recovered.operator_resolution.result, 'not-human');
+    assert.equal(recovered.operator_resolution.legacy_recovered, true);
+    assert.equal(recovered.responsibility_status, 'control_handled');
+    assert.equal(recovered.responsibility_reason, 'operator_identity_resolved');
+    assert.equal(recovered.failure_code, undefined);
+    assert.equal(recovered.failure_since, undefined);
+    assert.equal(recovered.last_failure_at, undefined);
+    assert.equal(recovered.failure_rounds, undefined);
+    assert.equal(state(item.session).generation, initialGeneration);
+    assert.equal(item.visitorJob().deferred_control, undefined);
+    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
   });
   await test('P0 兼容旧版误终结 unknown 的崩溃状态，恢复屏障后精确确认才放行', async () => {
     const item = await deferredOperatorCase('legacy-resolution-replay', {});

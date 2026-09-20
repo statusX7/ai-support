@@ -2114,6 +2114,20 @@ function createRuntime(env = {}, options = {}) {
     }
     for (const id of [...new Set(state.uncertain_events)]) {
       const job = state.jobs.find((entry) => entry?.id === id);
+      if (job && (job.action !== 'resolve_operator' || job.control !== true)) {
+        // action 字段不能把普通访客责任提升成控制责任。旧数据若出现这种
+        // 不一致，保留会话屏障和原始数据供受控修复，并让 doctor 明确报错；
+        // 绝不能调用 markControlHandled 后把真实问题静默终结。
+        job.status = 'failed';
+        job.responsibility_status = 'unresolved_failure';
+        job.failure_code = 'operator_control_state_invalid';
+        job.failure_since = Number.isFinite(job.failure_since) ? job.failure_since : clock();
+        job.last_failure_at = clock();
+        job.retry_at = null;
+        job.lease_until = 0;
+        delete job.execution_token;
+        continue;
+      }
       if (job?.action === 'resolve_operator' && !terminalJob(job)) continue;
       const resolution = validOperatorResolution(job?.operator_resolution) ? job.operator_resolution : null;
       if (resolution?.result === 'human') {
@@ -2165,6 +2179,8 @@ function createRuntime(env = {}, options = {}) {
         job.status = 'done';
         job.lease_until = 0;
         job.retry_at = null;
+        markControlHandled(job, resolution?.result === 'human'
+          ? 'operator_reply' : 'operator_identity_resolved');
         delete job.execution_token;
       }
     }
@@ -5190,6 +5206,11 @@ function createRuntime(env = {}, options = {}) {
     if (job.plan) return job.plan.purpose === 'safe_error' ? safeErrorPlan(job, job.plan) : job.plan;
     if (job.action === 'operator') return { purpose: 'operator', tags: job.human_changed ? ['human_required'] : [] };
     if (job.action === 'resolve_operator') {
+      if (job.control !== true) {
+        const error = new Error('人工消息控制责任状态无效');
+        error.code = 'OPERATOR_CONTROL_STATE_INVALID';
+        throw error;
+      }
       const state = readState(key);
       // 归属解析和其状态栅栏先于 process 的最终 done 事务提交。进程若恰在两者
       // 之间退出，租约恢复会再次进入本分支；持久结果必须使重放成为幂等操作，
@@ -5201,12 +5222,29 @@ function createRuntime(env = {}, options = {}) {
         assertJobExecution(current, job, execution);
         const stored = current.jobs.find((entry) => entry.id === job.id);
         if (!stored) return;
+        const firstResolution = current.uncertain_events.includes(job.id);
         if (validOperatorResolution(stored.operator_resolution)) {
           result = stored.operator_resolution.result;
           changed = stored.operator_resolution.human_changed;
+          // 旧进程可能已经保存精确归属结果，却在移除会话屏障、应用人工
+          // 副作用之前退出。只要屏障仍在，本事务就必须消费该持久结果；
+          // 不能先标 control_handled，再等待下一轮 scan 偶然补齐业务状态。
+          if (firstResolution) {
+            current.uncertain_events = current.uncertain_events.filter((id) => id !== job.id);
+            if (result === 'human') {
+              changed = pause(current, job.id, job.event_time, 'operator_reply') || changed;
+            } else if (!operatorBarrier(current)) {
+              for (const pending of current.jobs) {
+                if (!pending.control && pending.status === 'received') delete pending.deferred_control;
+              }
+            }
+            stored.operator_resolution = { ...stored.operator_resolution,
+              human_changed: changed, recovered: true };
+          }
+          markControlHandled(stored, result === 'human'
+            ? 'operator_reply' : 'operator_identity_resolved');
           return;
         }
-        const firstResolution = current.uncertain_events.includes(job.id);
         if (!firstResolution) {
           // 兼容升级前已经完成栅栏、但尚未来得及把控制 job 置为 done 的崩溃状态。
           // uncertain ID 已原子移除即表示旧副作用已提交；不得猜测并重复执行。
@@ -5214,6 +5252,8 @@ function createRuntime(env = {}, options = {}) {
           if (alreadyHuman) result = 'human';
           changed = alreadyHuman;
           stored.operator_resolution = { schema_version: 1, result, human_changed: changed, legacy_recovered: true };
+          markControlHandled(stored, result === 'human'
+            ? 'operator_reply' : 'operator_identity_resolved');
           return;
         }
         current.uncertain_events = current.uncertain_events.filter((id) => id !== job.id);
@@ -5223,9 +5263,16 @@ function createRuntime(env = {}, options = {}) {
           for (const pending of current.jobs) if (!pending.control && pending.status === 'received') delete pending.deferred_control;
         }
         stored.operator_resolution = { schema_version: 1, result, human_changed: changed };
+        // identity pending 曾把控制责任标为 unresolved_failure。确认归属、移除
+        // 屏障并提交人工副作用的同一事务必须同时收敛该旧失败；否则 job 虽然
+        // 随后 done，doctor 仍会把已经完成的控制责任当成 P0 未解决故障。
+        markControlHandled(stored, result === 'human'
+          ? 'operator_reply' : 'operator_identity_resolved');
       });
       job.human_changed = changed;
       job.operator_resolution = { schema_version: 1, result, human_changed: changed };
+      markControlHandled(job, result === 'human'
+        ? 'operator_reply' : 'operator_identity_resolved');
       return { purpose: 'operator', tags: changed ? ['human_required'] : [] };
     }
     if (job.action === 'confirm_handoff') return { type: 'text', content: handoff().notify_user?.enabled === false ? '' : job.confirm_message, ordinary: false, purpose: 'handoff_ack', tags: ['human_required'] };
@@ -6826,7 +6873,8 @@ function createRuntime(env = {}, options = {}) {
             } else if (stored.status !== 'cancelled') {
               const persistedPlan = stored.plan && !technicalFailure(stored.plan);
               markUnresolved(stored, error?.code === 'OPERATOR_IDENTITY_PENDING'
-                ? 'operator_identity_pending' : persistedPlan
+                ? 'operator_identity_pending' : error?.code === 'OPERATOR_CONTROL_STATE_INVALID'
+                  ? 'operator_control_state_invalid' : persistedPlan
                   ? 'persisted_plan_delivery_pending' : 'runtime_processing_failed');
               if (!persistedPlan) {
                 delete stored.plan;
@@ -6954,7 +7002,8 @@ function createRuntime(env = {}, options = {}) {
   };
   const scanStateEnvelopeValid = (state) => state && typeof state === 'object' && !Array.isArray(state)
     && state.schema_version === 2 && typeof state.website_id === 'string' && typeof state.session_id === 'string'
-    && Array.isArray(state.jobs) && state.jobs.every((job) => job && typeof job === 'object' && !Array.isArray(job))
+    && Array.isArray(state.jobs) && state.jobs.every((job) => job && typeof job === 'object' && !Array.isArray(job)
+      && (job.action !== 'resolve_operator' || job.control === true))
     && state.offers && typeof state.offers === 'object' && !Array.isArray(state.offers)
     && Object.values(state.offers).every((offer) => offer && typeof offer === 'object' && !Array.isArray(offer))
     && state.outgoing && typeof state.outgoing === 'object' && !Array.isArray(state.outgoing)
