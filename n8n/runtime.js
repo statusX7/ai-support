@@ -2432,6 +2432,19 @@ function createRuntime(env = {}, options = {}) {
     return hash([event, String(data.fingerprint || ''),
       selection || (data.fingerprint ? '' : JSON.stringify(data))].join('|'));
   };
+  const incomingResponsibilityJobs = (state, data) => {
+    const fingerprint = String(data?.fingerprint ?? '');
+    if (!/^(?:0|[1-9][0-9]{0,15})$/.test(fingerprint)
+      || !Number.isSafeInteger(Number(fingerprint))) return [];
+    const idData = { type: data?.type, content: data?.content,
+      fingerprint: Number(fingerprint) };
+    const incomingIds = new Set(['message:send', 'message:received']
+      .map((event) => incomingEventId(event, idData)));
+    return state.jobs.filter((job) => job
+      && ['message:send', 'message:received'].includes(job.event)
+      && (incomingIds.has(job.id) || Array.isArray(job.covered_message_ids)
+        && job.covered_message_ids.includes(fingerprint)));
+  };
   const incomingResponsibilityIdentity = (website, event, data, eventTime) => hash(canonical({
     website_id: String(website || ''), session_id: String(data?.session_id || ''), event: String(event || ''),
     fingerprint: String(data?.fingerprint ?? ''), from: String(data?.from || ''), type: String(data?.type || ''),
@@ -2503,6 +2516,18 @@ function createRuntime(env = {}, options = {}) {
     let result;
     try {
       result = await transaction(key, (state) => {
+        if (internalCatchup && ['message:send', 'message:received'].includes(event)) {
+          const fingerprint = String(data.fingerprint ?? '');
+          const covered = incomingResponsibilityJobs(state, data);
+          if (covered.length > 1
+            || covered.some((job) => job.event !== event || job.id !== id
+              || !Array.isArray(job.covered_message_ids)
+              || !job.covered_message_ids.includes(fingerprint))) {
+            const conflict = new Error('Crisp 漏收消息与已有责任身份冲突');
+            conflict.code = 'CATCHUP_RESPONSIBILITY_CONFLICT';
+            throw conflict;
+          }
+        }
         if (state.jobs.some((job) => job.id === id)
           || (event !== 'message:updated' && state.legacy_fingerprints?.includes(hash(data.fingerprint || '')))) {
           return { duplicate: true, jobId: id };
@@ -2597,6 +2622,7 @@ function createRuntime(env = {}, options = {}) {
           if (job.status === 'received' && operatorBarrier(state)) job.deferred_control = true;
         } else if ((!global.enabled && !deferConfiguration) || state.mode !== 'ai') job.status = 'done';
         if (!job.event_time_unverified && !global.enabled && !deferConfiguration
+          && job.responsibility_status === 'pending'
           && job.action !== 'resolve_operator' && job.action !== 'operator') {
           job.status = 'done';
           if (event === 'message:send' && data.from === 'user' && data.automated !== true) markIntentionalSilence(job, 'global_disabled');
@@ -2876,6 +2902,10 @@ function createRuntime(env = {}, options = {}) {
   const catchupMessageKnownAutomation = (message, session) => {
     try { return automation(message, readState(stateKey(env.CRISP_WEBSITE_ID, session))) === true; }
     catch (_) { return false; }
+  };
+  const catchupMessageCoveredResponsibilities = (message, session) => {
+    const state = readState(stateKey(env.CRISP_WEBSITE_ID, session));
+    return incomingResponsibilityJobs(state, message);
   };
   const catchupUnresolvedReason = (message, session) => {
     if (message?.session_id && message.session_id !== session) return 'cross_session';
@@ -3316,10 +3346,56 @@ function createRuntime(env = {}, options = {}) {
           }
           // 内部 note、事件消息等不是访客问题或真人公开回复；它们应被
           const pickerUpdate = catchupPickerUpdate(message, session, conversation?.updated_at);
-          if (!pickerUpdate && (!catchupMessageRelevant(message)
-            || catchupMessageKnownAutomation(message, session))) continue;
+          const relevant = catchupMessageRelevant(message);
+          const knownAutomation = relevant && catchupMessageKnownAutomation(message, session);
           let candidate = pickerUpdate || catchupMessage(message, session);
+          let coveredResponsibilities = [];
+          if (!pickerUpdate && (!relevant || knownAutomation)) {
+            coveredResponsibilities = catchupMessageCoveredResponsibilities(message, session);
+            if (knownAutomation && candidate && coveredResponsibilities.length === 1) {
+              const automationEvent = candidate.data.from === 'user' ? 'message:send' : 'message:received';
+              const covered = coveredResponsibilities[0];
+              const expectedAutomationReason = automationEvent === 'message:send'
+                ? 'non_visitor_message' : 'non_operator_message';
+              const coveredReasons = ['responsibility_reason', 'action']
+                .filter((field) => Object.prototype.hasOwnProperty.call(covered, field))
+                .map((field) => covered[field]);
+              const terminalAutomation = covered.status === 'done'
+                && covered.responsibility_status === 'control_handled'
+                && Array.isArray(covered.covered_message_ids)
+                && covered.covered_message_ids.includes(String(candidate.data.fingerprint))
+                && coveredReasons.length > 0
+                && coveredReasons.every((value) => typeof value === 'string' && value.length > 0
+                  && value === expectedAutomationReason)
+                && (automationEvent === 'message:send'
+                  ? covered.control === false : covered.control === true);
+              if (terminalAutomation && covered.event === automationEvent
+                && covered.id === incomingEventId(automationEvent, candidate.data)) {
+                const candidateTime = candidate.event_time_unverified
+                  ? covered.event_time : candidate.event_time;
+                const trustedTime = Number.isFinite(covered.event_time) && covered.event_time > 0
+                  && (candidate.event_time_unverified || candidateTime === covered.event_time);
+                const expectedIdentity = incomingResponsibilityIdentity(env.CRISP_WEBSITE_ID,
+                  automationEvent, candidate.data, candidateTime);
+                if (trustedTime && /^[a-f0-9]{64}$/.test(covered.input_identity_sha256 || '')
+                  && covered.input_identity_sha256 === expectedIdentity) continue;
+              }
+            }
+            if (coveredResponsibilities.length) {
+              const failure = new Error('Crisp 漏收消息与已有责任身份冲突');
+              failure.code = 'CATCHUP_LOCAL_PERSISTENCE_FAILED';
+              throw failure;
+            }
+            continue;
+          }
           if (!candidate) {
+            coveredResponsibilities = coveredResponsibilities.length ? coveredResponsibilities
+              : catchupMessageCoveredResponsibilities(message, session);
+            if (coveredResponsibilities.length) {
+              const failure = new Error('Crisp 漏收消息与已有责任身份冲突');
+              failure.code = 'CATCHUP_LOCAL_PERSISTENCE_FAILED';
+              throw failure;
+            }
             const unresolved = await quarantineCatchupMessage(state, message, session, window.start, at);
             if (observedEntry) observedEntry.unresolved_id = unresolved.id;
             invalidMessages += 1;
@@ -3352,13 +3428,29 @@ function createRuntime(env = {}, options = {}) {
                 Number.isFinite(stored.retry_at) ? stored.retry_at - at : 0);
               throw failure;
             }
-            candidate = { ...candidate, event_time: stored.event_time, event_time_unverified: false,
-              data: JSON.parse(JSON.stringify(stored.data)) };
-            if (!durableCatchupResponsibility(candidate, event)) {
+            const storedData = stored.data && typeof stored.data === 'object' && !Array.isArray(stored.data)
+              ? stored.data : null;
+            const terminalDataRetired = stored.data === undefined
+              && ['done', 'cancelled'].includes(stored.status)
+              && (stored.control === true
+                ? stored.responsibility_status === 'control_handled'
+                : ['answered_confirmed', 'clarification_confirmed', 'intentional_silence']
+                  .includes(stored.responsibility_status));
+            const rebuiltData = JSON.parse(JSON.stringify(candidate.data));
+            rebuiltData.timestamp = stored.event_time;
+            const rebuilt = { ...candidate, event_time: stored.event_time,
+              event_time_unverified: false, data: rebuiltData };
+            const frozenIdentityAvailable = /^[a-f0-9]{64}$/.test(stored.input_identity_sha256 || '')
+              || Boolean(storedData);
+            if ((!storedData && !terminalDataRetired) || !frozenIdentityAvailable
+              || stored.event !== event || !Array.isArray(stored.covered_message_ids)
+              || !stored.covered_message_ids.includes(String(candidate.data.fingerprint))
+              || !durableCatchupResponsibility(rebuilt, event)) {
               const failure = new Error('Crisp 漏收消息本地责任与精确消息不一致');
               failure.code = 'CATCHUP_LOCAL_PERSISTENCE_FAILED';
               throw failure;
             }
+            candidate = rebuilt;
             if (accepted.reason === '已持久接收') recoveredMessages += 1;
             if (candidate.event_time >= state.bootstrapped_at && candidate.event_time <= window.end
               && (candidate.event_time > cursor

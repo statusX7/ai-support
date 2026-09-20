@@ -1492,6 +1492,20 @@ const test = async (name, action) => {
         assert.equal(stored.responsibility_status, 'control_handled');
       }
       assert.equal(fx.postAttempts.length, 0, '时间确认流程不得向访客产生任何消息');
+      const resolvedFacts = {
+        status: stored.status, responsibility_status: stored.responsibility_status,
+        responsibility_reason: stored.responsibility_reason, event: stored.event,
+        control: stored.control, event_time: stored.event_time,
+        event_time_source: stored.event_time_source,
+        input_identity_sha256: stored.input_identity_sha256,
+        covered_message_ids: structuredClone(stored.covered_message_ids),
+        mode: current.mode, pause_reason: current.pause_reason,
+        last_human_at: current.last_human_at,
+        control_watermark: current.control_watermark, generation: current.generation,
+      };
+      assert.match(resolvedFacts.input_identity_sha256, /^[a-f0-9]{64}$/);
+      if (item.expected === 'visitor') assert(stored.data, '活动访客责任必须继续保留原问题');
+      else assert.equal(stored.data, undefined, '终态责任必须继续清理访客或操作者正文');
 
       // 精确结果落盘后，原固定窗口才可安全完成；history 持续返回损坏
       // timestamp 也必须复用同一责任，不能永久卡住或生成第二条 job。
@@ -1504,8 +1518,247 @@ const test = async (name, action) => {
       }
       assert.equal(progress.window, null);
       assert.equal(progress.watermark, frozenEnd);
-      assert.equal(fx.runtime.readState(key).jobs.filter((job) => job.id === stored.id).length, 1);
+      const replayedState = fx.runtime.readState(key);
+      const replayedJobs = replayedState.jobs.filter((job) => job.id === stored.id);
+      assert.equal(replayedJobs.length, 1);
+      const replayed = replayedJobs[0];
+      assert.deepEqual({
+        status: replayed.status, responsibility_status: replayed.responsibility_status,
+        responsibility_reason: replayed.responsibility_reason, event: replayed.event,
+        control: replayed.control, event_time: replayed.event_time,
+        event_time_source: replayed.event_time_source,
+        input_identity_sha256: replayed.input_identity_sha256,
+        covered_message_ids: replayed.covered_message_ids,
+        mode: replayedState.mode, pause_reason: replayedState.pause_reason,
+        last_human_at: replayedState.last_human_at,
+        control_watermark: replayedState.control_watermark, generation: replayedState.generation,
+      }, resolvedFacts, '坏 timestamp 重见只能确认既有责任，不能重做人工/回答副作用');
+      if (item.expected === 'visitor') assert(replayed.data);
+      else assert.equal(replayed.data, undefined, '补偿收敛不得恢复终态正文');
     }
+  });
+
+  await test('终态补偿只按冻结身份收敛，正文、事件、哈希或责任形状冲突均失败关闭', async () => {
+    const seedRetired = async (name, fingerprint) => {
+      const fx = fixture('rest-catchup-terminal-identity-' + name);
+      const baseline = fx.now();
+      assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+      const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+      const session = 'session_terminal-' + name;
+      fx.tick(16000);
+      fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+        updated_at: fx.now() }]);
+      const history = { website_id: website, session_id: session, from: 'user', type: 'text',
+        content: '冻结身份的受控原始问题', fingerprint };
+      fx.catchupMessages.set(session, [history]);
+      fx.exactMessages.set(String(fingerprint), { status: 503 });
+      const first = await fx.runtime.catchup();
+      assert.equal(first.error_code, 'event_time_pending');
+      const frozenEnd = readJson(catchupFile).window.end;
+      const key = fx.runtime.stateKey(website, session);
+      let state = fx.runtime.readState(key);
+      let job = state.jobs.find((entry) => entry.data?.fingerprint === fingerprint);
+      assert(job);
+      await fx.runtime.process(key, job.id);
+      state = fx.runtime.readState(key);
+      job = state.jobs.find((entry) => entry.id === job.id);
+      fx.exactMessages.set(String(fingerprint), { ...history, timestamp: baseline - 1000 });
+      if (job.retry_at > fx.now()) fx.tick(job.retry_at - fx.now() + 1);
+      const retired = await fx.runtime.process(key, job.id);
+      assert(['discarded', 'cancelled'].includes(retired.status));
+      state = fx.runtime.readState(key);
+      job = state.jobs.find((entry) => entry.id === job.id);
+      assert.equal(job.status, 'done');
+      assert.equal(job.responsibility_status, 'intentional_silence');
+      assert.equal(job.responsibility_reason, 'before_catchup_bootstrap');
+      assert.equal(job.data, undefined);
+      assert.match(job.input_identity_sha256, /^[a-f0-9]{64}$/);
+      return { fx, baseline, catchupFile, session, history, frozenEnd, key, jobId: job.id,
+        frozenHash: job.input_identity_sha256 };
+    };
+    const scanAtDue = async ({ fx, catchupFile }) => {
+      const progress = readJson(catchupFile);
+      if (progress.next_scan_at > fx.now()) fx.tick(progress.next_scan_at - fx.now() + 1);
+      return fx.runtime.catchup();
+    };
+    const failureBaseline = (seed) => {
+      const state = seed.fx.runtime.readState(seed.key);
+      const job = state.jobs.find((entry) => entry.id === seed.jobId);
+      return {
+        progress: readJson(seed.catchupFile),
+        cursor: structuredClone(state.crisp_rest_catchup ?? null),
+        identity: {
+          id: job.id, event: job.event, control: job.control, status: job.status,
+          responsibility_status: job.responsibility_status,
+          responsibility_reason: job.responsibility_reason,
+          failure_code: job.failure_code,
+          input_identity_sha256: job.input_identity_sha256,
+          covered_message_ids: structuredClone(job.covered_message_ids),
+          data: job.data === undefined ? undefined : structuredClone(job.data),
+        },
+      };
+    };
+    const assertFailedClosed = (seed, before, result) => {
+      assert.equal(result.status, 'warning');
+      assert.equal(result.error_code, 'local_persistence_failed');
+      const progress = readJson(seed.catchupFile);
+      assert.equal(progress.watermark, before.progress.watermark);
+      assert.deepEqual(progress.window, before.progress.window);
+      const state = seed.fx.runtime.readState(seed.key);
+      assert.equal(state.jobs.length, 1, '身份冲突不得建立第二条责任');
+      assert.equal(state.mode, 'ai');
+      assert.deepEqual(state.crisp_rest_catchup ?? null, before.cursor,
+        '身份冲突不得推进逐会话补偿 cursor');
+      const job = state.jobs[0];
+      assert.deepEqual({
+        id: job.id, event: job.event, control: job.control, status: job.status,
+        responsibility_status: job.responsibility_status,
+        responsibility_reason: job.responsibility_reason,
+        failure_code: job.failure_code,
+        input_identity_sha256: job.input_identity_sha256,
+        covered_message_ids: job.covered_message_ids,
+        data: job.data,
+      }, before.identity, '失败关闭不得补签、修复或改写原责任身份');
+      assert.equal(seed.fx.postAttempts.length, 0);
+      assert.equal(seed.fx.sent.length, 0);
+      return job;
+    };
+
+    const changedContent = await seedRetired('changed-content', 95571);
+    const changedBefore = failureBaseline(changedContent);
+    changedContent.fx.catchupMessages.set(changedContent.session,
+      [{ ...changedContent.history, content: '同 fingerprint 的篡改正文' }]);
+    let preserved = assertFailedClosed(changedContent, changedBefore, await scanAtDue(changedContent));
+    assert.equal(preserved.input_identity_sha256, changedContent.frozenHash);
+    assert.equal(preserved.data, undefined);
+    changedContent.fx.catchupMessages.set(changedContent.session, [changedContent.history]);
+    let recoveredProgress = readJson(changedContent.catchupFile);
+    for (let round = 0; round < 8 && recoveredProgress.window; round += 1) {
+      await scanAtDue(changedContent);
+      recoveredProgress = readJson(changedContent.catchupFile);
+    }
+    assert.equal(recoveredProgress.window, null, '恢复原候选后同一固定窗口必须能够收敛');
+    assert.equal(recoveredProgress.watermark, changedContent.frozenEnd);
+    preserved = changedContent.fx.runtime.readState(changedContent.key).jobs[0];
+    assert.equal(preserved.data, undefined);
+    assert.equal(preserved.input_identity_sha256, changedContent.frozenHash);
+
+    const changedType = await seedRetired('changed-type', 95578);
+    const typeBefore = failureBaseline(changedType);
+    changedType.fx.catchupMessages.set(changedType.session, [{ ...changedType.history,
+      type: 'file', content: { name: '受控附件.pdf', type: 'application/pdf',
+        url: 'https://example.invalid/controlled-document.pdf' } }]);
+    preserved = assertFailedClosed(changedType, typeBefore, await scanAtDue(changedType));
+    assert.equal(preserved.event, 'message:send');
+    assert.equal(preserved.control, false);
+    assert.equal(preserved.input_identity_sha256, changedType.frozenHash);
+
+    const changedEvent = await seedRetired('changed-event', 95572);
+    const eventBefore = failureBaseline(changedEvent);
+    changedEvent.fx.catchupMessages.set(changedEvent.session,
+      [{ ...changedEvent.history, from: 'operator', automated: true }]);
+    preserved = assertFailedClosed(changedEvent, eventBefore, await scanAtDue(changedEvent));
+    assert.equal(preserved.event, 'message:send');
+    assert.equal(preserved.control, false);
+    assert.equal(preserved.input_identity_sha256, changedEvent.frozenHash);
+
+    const changedHumanEvent = await seedRetired('changed-human-event', 95582);
+    let changedHumanState = changedHumanEvent.fx.runtime.readState(changedHumanEvent.key);
+    changedHumanState.jobs.find((entry) => entry.id === changedHumanEvent.jobId).covered_message_ids = [];
+    writeState(changedHumanEvent.fx, changedHumanEvent.session, changedHumanState);
+    const humanEventBefore = failureBaseline(changedHumanEvent);
+    changedHumanEvent.fx.catchupMessages.set(changedHumanEvent.session,
+      [{ ...changedHumanEvent.history, from: 'operator', automated: false }]);
+    preserved = assertFailedClosed(changedHumanEvent, humanEventBefore,
+      await scanAtDue(changedHumanEvent));
+    assert.equal(preserved.event, 'message:send');
+    assert.equal(preserved.control, false);
+    assert.deepEqual(preserved.covered_message_ids, []);
+
+    const malformedResponsibilities = ['hash', 'missing-hash', 'covered', 'active-without-data'];
+    for (const variant of malformedResponsibilities) {
+      const seeded = await seedRetired(variant, 95573 + malformedResponsibilities.indexOf(variant));
+      const state = seeded.fx.runtime.readState(seeded.key);
+      const job = state.jobs.find((entry) => entry.id === seeded.jobId);
+      if (variant === 'hash') job.input_identity_sha256 =
+        (job.input_identity_sha256.startsWith('f') ? 'e' : 'f') + job.input_identity_sha256.slice(1);
+      if (variant === 'missing-hash') delete job.input_identity_sha256;
+      if (variant === 'covered') job.covered_message_ids = [];
+      if (variant === 'active-without-data') {
+        job.status = 'received';
+        job.responsibility_status = 'unresolved_failure';
+        job.failure_code = 'synthetic_missing_active_payload';
+      }
+      writeState(seeded.fx, seeded.session, state);
+      const before = failureBaseline(seeded);
+      preserved = assertFailedClosed(seeded, before, await scanAtDue(seeded));
+      assert.equal(preserved.data, undefined);
+      if (variant === 'active-without-data') {
+        assert.equal(preserved.status, 'received');
+        assert.equal(preserved.responsibility_status, 'unresolved_failure');
+      }
+    }
+  });
+
+  await test('活动补偿责任兼容仅缺冻结哈希的旧状态且不在重放中补签', async () => {
+    const fx = fixture('rest-catchup-active-legacy-hash');
+    const baseline = fx.now();
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+    const session = 'session_active-legacy-hash';
+    const fingerprint = 95579;
+    fx.tick(16000);
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+      updated_at: fx.now() }]);
+    const history = { website_id: website, session_id: session, from: 'user', type: 'text',
+      content: '仍在处理且保留正文的旧状态问题', fingerprint };
+    fx.catchupMessages.set(session, [history]);
+    fx.exactMessages.set(String(fingerprint), { status: 503 });
+    assert.equal((await fx.runtime.catchup()).error_code, 'event_time_pending');
+    const frozenEnd = readJson(catchupFile).window.end;
+    const key = fx.runtime.stateKey(website, session);
+    let state = fx.runtime.readState(key);
+    let job = state.jobs.find((entry) => entry.data?.fingerprint === fingerprint);
+    await fx.runtime.process(key, job.id);
+    state = fx.runtime.readState(key);
+    job = state.jobs.find((entry) => entry.id === job.id);
+    fx.exactMessages.set(String(fingerprint), { ...history, timestamp: baseline + 1000 });
+    fs.writeFileSync(path.join(fx.root, 'config', 'provider-pool-transaction.json'), '{}', { mode: 0o600 });
+    if (job.retry_at > fx.now()) fx.tick(job.retry_at - fx.now() + 1);
+    assert.equal((await fx.runtime.process(key, job.id)).status, 'deferred');
+    state = fx.runtime.readState(key);
+    job = state.jobs.find((entry) => entry.id === job.id);
+    assert(job.data);
+    const frozen = {
+      id: job.id, event: job.event, control: job.control, status: job.status,
+      responsibility_status: job.responsibility_status,
+      covered_message_ids: structuredClone(job.covered_message_ids),
+      data: structuredClone(job.data),
+    };
+    delete job.input_identity_sha256;
+    writeState(fx, session, state);
+
+    let progress = readJson(catchupFile);
+    for (let round = 0; round < 8 && progress.window; round += 1) {
+      if (progress.next_scan_at > fx.now()) fx.tick(progress.next_scan_at - fx.now() + 1);
+      await fx.runtime.catchup();
+      progress = readJson(catchupFile);
+    }
+    assert.equal(progress.window, null);
+    assert.equal(progress.watermark, frozenEnd);
+    state = fx.runtime.readState(key);
+    assert.equal(state.jobs.length, 1);
+    job = state.jobs[0];
+    assert.deepEqual({
+      id: job.id, event: job.event, control: job.control, status: job.status,
+      responsibility_status: job.responsibility_status,
+      covered_message_ids: job.covered_message_ids, data: job.data,
+    }, frozen);
+    assert.equal(job.input_identity_sha256, undefined,
+      '旧状态回算只用于比对，重放不得用当前 history 补签持久身份');
+    assert.equal(state.crisp_rest_catchup.cursor, frozenEnd);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
   });
 
   await test('REST 重叠窗口迟到发现的上线后消息不被滚动扫描水位误判为接入前历史', async () => {
@@ -1596,6 +1849,211 @@ const test = async (name, action) => {
       assert.equal(stored.responsibility_status, 'control_handled');
       assert.equal(fx.exactRequests.length, 0, '已确认自动化身份不应浪费精确消息配额');
       assert.equal(fx.postAttempts.length, 0);
+    }
+  });
+
+  await test('外部 Hook 已确认的自动化消息缺时间时可被 REST 重见且不重建业务责任', async () => {
+    for (const item of [
+      { name: 'user', from: 'user', event: 'message:send', fingerprint: 95668,
+        reason: 'non_visitor_message' },
+      { name: 'operator', from: 'operator', event: 'message:received', fingerprint: 95669,
+        reason: 'non_operator_message' },
+      { name: 'user-global-off', from: 'user', event: 'message:send', fingerprint: 95672,
+        reason: 'non_visitor_message', globalOff: true },
+    ]) {
+      const fx = fixture('catchup-external-automation-' + item.name);
+      const session = 'session_external-auto-' + item.name;
+      if (item.globalOff) fx.publishRuntimeConfiguration({ enabled: false });
+      const accepted = await webhook(fx, session, '本项目自动化回流', item.fingerprint,
+        { event: item.event, from: item.from, automated: true, omitTimestamp: true });
+      assert.equal(accepted.statusCode, 200);
+      assert.equal(accepted.route, 'ignore');
+      let state = fx.runtime.readState(accepted.key);
+      let job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      assert(job);
+      assert.equal(job.status, 'done');
+      assert.equal(job.responsibility_status, 'control_handled');
+      assert.equal(job.responsibility_reason, item.reason);
+      assert.equal(job.data, undefined);
+      assert.match(job.input_identity_sha256, /^[a-f0-9]{64}$/);
+      const frozenJob = {
+        id: job.id, event: job.event, control: job.control, status: job.status,
+        responsibility_status: job.responsibility_status,
+        responsibility_reason: job.responsibility_reason, action: job.action,
+        event_time: job.event_time, event_time_source: job.event_time_source,
+        input_identity_sha256: job.input_identity_sha256,
+        covered_message_ids: structuredClone(job.covered_message_ids), data: job.data,
+      };
+
+      assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+      const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+      fx.tick(16000);
+      fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+        updated_at: fx.now() }]);
+      fx.catchupMessages.set(session, [{ website_id: website, session_id: session,
+        from: item.from, type: 'text', content: '本项目自动化回流',
+        fingerprint: item.fingerprint, automated: true }]);
+
+      let progress = readJson(catchupFile);
+      for (let round = 0; round < 8 && (round === 0 || progress.window); round += 1) {
+        if (progress.next_scan_at > fx.now()) fx.tick(progress.next_scan_at - fx.now() + 1);
+        await fx.runtime.catchup();
+        progress = readJson(catchupFile);
+      }
+      assert.equal(progress.window, null, '合法自动化重见不得永久占住补偿窗口');
+      state = fx.runtime.readState(accepted.key);
+      assert.equal(state.jobs.length, 1);
+      job = state.jobs[0];
+      assert.deepEqual({
+        id: job.id, event: job.event, control: job.control, status: job.status,
+        responsibility_status: job.responsibility_status,
+        responsibility_reason: job.responsibility_reason, action: job.action,
+        event_time: job.event_time, event_time_source: job.event_time_source,
+        input_identity_sha256: job.input_identity_sha256,
+        covered_message_ids: job.covered_message_ids, data: job.data,
+      }, frozenJob, 'REST 重见不得改写已由外部 Hook 终结的自动化责任');
+      assert.equal(state.crisp_rest_catchup.cursor, progress.watermark);
+      assert.equal(fx.exactRequests.length, 0,
+        '已由外部 Hook 确认的自动化消息不得重新消耗精确消息配额');
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+      if (item.globalOff) assert.equal(readJson(path.join(fx.root, 'config', 'runtime.yaml')).enabled,
+        false, '补偿不得为了自动化消息改变客服总开关');
+    }
+  });
+
+  await test('自动化终态同 fingerprint 的正文或类型变化必须失败关闭', async () => {
+    const cases = [
+      {
+        name: 'content', fingerprint: 95673, originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '同 fingerprint 的替换正文',
+      },
+      {
+        name: 'type', fingerprint: 95674, originalType: 'file',
+        originalContent: { name: '受控附件', type: 'image/gif',
+          url: 'https://example.invalid/controlled-animation.gif' },
+        replayType: 'animation', replayContent: { name: '受控附件', type: 'image/gif',
+          url: 'https://example.invalid/controlled-animation.gif' },
+      },
+      {
+        name: 'covered', fingerprint: 95675, originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.covered_message_ids = []; },
+      },
+      {
+        name: 'cross-event-without-covered', fingerprint: 95676,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文', replayFrom: 'operator',
+        mutate: (job) => { job.covered_message_ids = []; },
+      },
+      {
+        name: 'trusted-time', fingerprint: 95677,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文', replayTimeOffset: 1000,
+      },
+      {
+        name: 'send-control-shape', fingerprint: 95678,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.control = true; },
+      },
+      {
+        name: 'received-control-shape', fingerprint: 95679,
+        originalEvent: 'message:received', originalFrom: 'operator',
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.control = false; },
+      },
+      {
+        name: 'cancelled', fingerprint: 95680,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.status = 'cancelled'; },
+      },
+      {
+        name: 'reason-action-conflict', fingerprint: 95681,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.action = 'non_operator_message'; },
+      },
+      {
+        name: 'reason-action-object', fingerprint: 95682,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.action = {}; },
+      },
+      {
+        name: 'reason-action-empty', fingerprint: 95683,
+        originalType: 'text', originalContent: '冻结的自动化正文',
+        replayType: 'text', replayContent: '冻结的自动化正文',
+        mutate: (job) => { job.action = ''; },
+      },
+    ];
+    for (const item of cases) {
+      const fx = fixture('catchup-automation-conflict-' + item.name);
+      const session = 'session_auto-conflict-' + item.name;
+      const accepted = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET }, body: {
+        website_id: website, event: item.originalEvent || 'message:send', data: {
+          session_id: session, from: item.originalFrom || 'user', type: item.originalType,
+          content: item.originalContent, fingerprint: item.fingerprint, automated: true,
+        },
+      } });
+      assert.equal(accepted.statusCode, 200);
+      let state = fx.runtime.readState(accepted.key);
+      let job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      assert(job);
+      assert.equal(job.status, 'done');
+      assert.equal(job.responsibility_status, 'control_handled');
+      assert.equal(job.data, undefined);
+      if (item.mutate) {
+        item.mutate(job);
+        writeState(fx, session, state);
+        state = fx.runtime.readState(accepted.key);
+        job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      }
+      const frozenJob = {
+        id: job.id, event: job.event, control: job.control, status: job.status,
+        responsibility_status: job.responsibility_status,
+        responsibility_reason: job.responsibility_reason, action: job.action,
+        event_time: job.event_time, event_time_source: job.event_time_source,
+        input_identity_sha256: job.input_identity_sha256,
+        covered_message_ids: structuredClone(job.covered_message_ids), data: job.data,
+      };
+
+      assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+      const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+      const bootstrap = readJson(catchupFile);
+      fx.tick(16000);
+      fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+        updated_at: fx.now() }]);
+      fx.catchupMessages.set(session, [{ website_id: website, session_id: session,
+        from: item.replayFrom || item.originalFrom || 'user', type: item.replayType,
+        content: item.replayContent, fingerprint: item.fingerprint, automated: true,
+        ...(item.replayTimeOffset ? { timestamp: job.event_time + item.replayTimeOffset } : {}) }]);
+
+      const result = await fx.runtime.catchup();
+      assert.equal(result.status, 'warning');
+      assert.equal(result.error_code, 'local_persistence_failed');
+      const progress = readJson(catchupFile);
+      assert.equal(progress.watermark, bootstrap.watermark,
+        '自动化身份冲突不得推进全局补偿水位');
+      assert(progress.window, '身份冲突必须保留未完成窗口供管理员诊断和恢复');
+      state = fx.runtime.readState(accepted.key);
+      assert.equal(state.jobs.length, 1);
+      job = state.jobs[0];
+      assert.deepEqual({
+        id: job.id, event: job.event, control: job.control, status: job.status,
+        responsibility_status: job.responsibility_status,
+        responsibility_reason: job.responsibility_reason, action: job.action,
+        event_time: job.event_time, event_time_source: job.event_time_source,
+        input_identity_sha256: job.input_identity_sha256,
+        covered_message_ids: job.covered_message_ids, data: job.data,
+      }, frozenJob, '身份冲突不得改写既有自动化责任');
+      assert.equal(state.crisp_rest_catchup, undefined,
+        '失败关闭不得凭冲突候选建立逐会话补偿游标');
+      assert.equal(fx.exactRequests.length, 0);
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
     }
   });
 
