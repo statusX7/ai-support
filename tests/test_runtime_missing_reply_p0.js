@@ -1710,6 +1710,131 @@ const test = async (name, action) => {
     fs.writeFileSync(runtimeConfig, original);
   });
 
+  await test('单会话状态 EIO 只隔离本责任，健康会话仍调度且全局存储错误失败关闭', async () => {
+    const injectAtomicRenameFailure = async (target, code, action) => {
+      const originalRename = fs.renameSync;
+      const resolvedTarget = path.resolve(target);
+      let injected = 0;
+      fs.renameSync = function (source, destination) {
+        if (injected === 0 && path.resolve(String(destination)) === resolvedTarget
+          && path.resolve(String(source)).startsWith(resolvedTarget + '.tmp-')) {
+          injected += 1;
+          const error = new Error('受控原子提交失败（' + code + '）');
+          error.code = code;
+          throw error;
+        }
+        return originalRename.apply(this, arguments);
+      };
+      try { return { value: await action(), injected }; }
+      finally { fs.renameSync = originalRename; }
+    };
+    const assertNoAtomicTemporary = (fx, target) => {
+      const prefix = path.basename(target) + '.tmp-';
+      assert.equal(fs.readdirSync(fx.runtimeDirectory).some((name) => name.startsWith(prefix)), false,
+        '失败的原子状态候选必须被清理');
+    };
+
+    const fx = fixture('scan-session-write-eio');
+    const ordered = ['session_write-eio-a', 'session_write-eio-b'].map((session) => ({
+      session, key: fx.runtime.stateKey(website, session),
+    })).sort((left, right) => left.key.localeCompare(right.key));
+    const bad = ordered[0];
+    const healthy = ordered[1];
+    const badJob = jobValue(fx, 'scan-write-eio-bad', 1, { responsibility_status: 'pending' });
+    badJob.data.session_id = bad.session;
+    const healthyJob = jobValue(fx, 'scan-write-eio-healthy', 1, { responsibility_status: 'pending' });
+    healthyJob.data.session_id = healthy.session;
+    writeState(fx, bad.session, stateValue(fx, bad.session, [badJob]));
+    writeState(fx, healthy.session, stateValue(fx, healthy.session, [healthyJob]));
+    const badFile = stateFile(fx, bad.session);
+    const badBytes = fs.readFileSync(badFile);
+
+    const isolated = await injectAtomicRenameFailure(badFile, 'EIO', () => fx.runtime.scan());
+    assert.equal(isolated.injected, 1, '必须只命中坏会话的一次原子状态发布');
+    assert(isolated.value.some((entry) => entry.key === healthy.key), '健康会话必须在同轮获得调度');
+    assert(!isolated.value.some((entry) => entry.key === bad.key), '状态未提交的坏会话不得获得执行许可');
+    assert(fs.readFileSync(badFile).equals(badBytes), '坏会话活动状态字节不得被部分覆盖');
+    const preserved = fx.runtime.readState(bad.key).jobs.find((job) => job.id === badJob.id);
+    assert.equal(preserved.status, 'received');
+    assert.equal(preserved.responsibility_status, 'pending');
+    assert.equal(preserved.attempts, 0);
+    assert.deepEqual(preserved.data, badJob.data, '原问题与持久责任必须完整保留');
+    assertNoAtomicTemporary(fx, badFile);
+    const health = JSON.parse(fs.readFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
+    assert.deepEqual(health.isolated_sessions,
+      { count: 1, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0, io_error: 1 } });
+    assert.equal(JSON.stringify(health).includes(bad.key), false, '调度健康不得泄露会话身份');
+
+    const recoveredSelection = await fx.runtime.scan();
+    assert(recoveredSelection.some((entry) => entry.key === bad.key && entry.jobId === badJob.id),
+      '移除故障注入后的下一轮必须重新调度同一坏会话责任');
+    const recoveredHealth = JSON.parse(
+      fs.readFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
+    assert.equal(recoveredHealth.isolated_sessions.count, 0, '单次 EIO 不得形成永久隔离');
+    assert.equal(recoveredHealth.isolated_sessions.reasons.io_error ?? 0, 0,
+      '下一轮调度健康必须清除上一轮 io_error');
+
+    for (const code of ['ENOSPC', 'EDQUOT', 'EROFS']) {
+      const fatal = fixture('scan-session-fatal-' + code.toLowerCase());
+      const session = 'session_fatal-' + code.toLowerCase();
+      const job = jobValue(fatal, 'scan-fatal-' + code, 1, { responsibility_status: 'pending' });
+      job.data.session_id = session;
+      writeState(fatal, session, stateValue(fatal, session, [job]));
+      const target = stateFile(fatal, session);
+      const before = fs.readFileSync(target);
+      const rejected = await injectAtomicRenameFailure(target, code, async () => {
+        await assert.rejects(fatal.runtime.scan(), (error) => error?.code === code,
+          code + ' 必须作为全局存储故障中止扫描');
+      });
+      assert.equal(rejected.injected, 1);
+      assert(fs.readFileSync(target).equals(before));
+      assertNoAtomicTemporary(fatal, target);
+      const fatalHealth = JSON.parse(fs.readFileSync(
+        path.join(fatal.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
+      assert.equal(fatalHealth.isolated_sessions.count, 0,
+        code + ' 不得被误记成可隔离的单会话 EIO');
+    }
+
+    const healthFailure = fixture('scan-global-health-eio');
+    const healthSession = 'session_global-health-eio';
+    writeState(healthFailure, healthSession,
+      stateValue(healthFailure, healthSession, [jobValue(healthFailure, 'global-health-eio')]));
+    const healthFile = path.join(healthFailure.runtimeDirectory, 'scheduler-health.json');
+    const healthRejected = await injectAtomicRenameFailure(healthFile, 'EIO', async () => {
+      await assert.rejects(healthFailure.runtime.scan(), (error) => error?.code === 'EIO',
+        '全局 scheduler-health 写失败不得降级为单会话隔离');
+    });
+    assert.equal(healthRejected.injected, 1);
+    assert.equal(fs.existsSync(healthFile), false);
+    assertNoAtomicTemporary(healthFailure, healthFile);
+
+    const rootFailure = fixture('scan-global-root-eio');
+    const rootSession = 'session_global-root-eio';
+    writeState(rootFailure, rootSession,
+      stateValue(rootFailure, rootSession, [jobValue(rootFailure, 'global-root-eio')]));
+    const rootBytes = fs.readFileSync(stateFile(rootFailure, rootSession));
+    const originalMkdir = fs.mkdirSync;
+    let rootInjected = 0;
+    fs.mkdirSync = function (target) {
+      if (rootInjected === 0
+        && path.resolve(String(target)) === path.resolve(rootFailure.runtimeDirectory)) {
+        rootInjected += 1;
+        const error = new Error('受控运行目录故障'); error.code = 'EIO'; throw error;
+      }
+      return originalMkdir.apply(this, arguments);
+    };
+    try {
+      await assert.rejects(rootFailure.runtime.scan(), (error) => error?.code === 'EIO',
+        '全局会话根故障不得降级为单会话隔离');
+    } finally { fs.mkdirSync = originalMkdir; }
+    assert.equal(rootInjected, 1);
+    assert(fs.readFileSync(stateFile(rootFailure, rootSession)).equals(rootBytes));
+    assert.equal(fs.existsSync(path.join(rootFailure.runtimeDirectory, 'scheduler-health.json')), false);
+
+    // scan lock 的 EIO 继续由下方 claim/heartbeat 原子发布用例直接断言 reject；
+    // 这里不重复或放宽全局锁语义。
+  });
+
   await test('safe_error 的坏 outgoing.body 只隔离所属会话', async () => {
     const fx = fixture('state-nested-isolation');
     const good = 'session_nested-good';
