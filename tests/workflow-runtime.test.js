@@ -834,7 +834,7 @@ const abortablePending = (signal, started) => {
     runtime = createRuntime(env, { ...runtimeOptions, request: gatedRequest });
     let visitor;
     try {
-      visitor = await receive(message(session, '推理前人工归属确认窗口里的普通问题'));
+      visitor = await receive(message(session, '推理前归属核验窗口里的普通配置问题'));
       const interrupted = await runtime.process(visitor.key, visitor.jobId);
       assert.equal(injected, true);
       assert.equal(interrupted.status, 'deferred');
