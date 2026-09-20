@@ -2180,6 +2180,258 @@ const abortablePending = (signal, started) => {
     assert.equal(fencedJob.responsibility_status, 'pending');
     assert.notEqual(fencedJob.responsibility_status, 'answered_confirmed');
   });
+  await test('P0 发送代次 token 仅兼容旧版双空，畸形或不对称值与正文错配均关闭失败', async () => {
+    const analytics = path.join(root, 'data/analytics/events.jsonl');
+    const events = () => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n')
+      .filter(Boolean).map(JSON.parse) : [];
+    const countEvents = (type, reason) => events().filter((event) => event.type === type
+      && (reason === undefined || event.reason === reason)).length;
+    const gate = () => {
+      let enter;
+      let release;
+      let released = false;
+      const entered = new Promise((resolve) => { enter = resolve; });
+      const waiting = new Promise((resolve) => { release = resolve; });
+      return { entered, waiting, enter,
+        release: () => { if (!released) { released = true; release(); } } };
+    };
+    const prepareHistoryReceipt = async (session, token, hasToken = true) => {
+      runtime = createRuntime(env, runtimeOptions);
+      let initial;
+      try {
+        sendRejection = 403;
+        initial = await deliver(message(session, '受控旧版回执责任'));
+      } finally { sendRejection = 0; }
+      assert.equal(initial.status, 'rejected');
+      let fingerprint;
+      let body;
+      await runtime.transaction(initial.key, (current) => {
+        const job = current.jobs.find((item) => item.id === initial.jobId); assert(job?.plan);
+        const pair = Object.entries(current.outgoing).find(([, record]) => record.job_id === initial.jobId);
+        assert(pair, '必须先由正式出站路径建立冻结身份');
+        [fingerprint] = pair;
+        const record = pair[1]; assert(record.body);
+        record.status = 'unknown';
+        record.created_at = now - 20000;
+        delete record.failure;
+        delete record.recovery_deferred;
+        delete record.resend_forbidden;
+        delete record.next_action_at;
+        delete record.reconcile_misses;
+        delete record.reconcile_checked_at;
+        if (hasToken) record.attempt_token = token;
+        else delete record.attempt_token;
+        body = structuredClone(record.body);
+        job.status = 'received';
+        job.responsibility_status = 'pending';
+        job.retry_at = 0;
+        job.lease_until = 0;
+        delete job.failure_code;
+        delete job.failure_since;
+        delete job.last_failure_at;
+        delete job.execution_token;
+        current.worker = null;
+      });
+      const history = histories.get(session) || [];
+      history.push({ ...body, timestamp: now });
+      histories.set(session, history);
+      return { ...initial, fingerprint, body };
+    };
+
+    const legacy = await prepareHistoryReceipt('session_attempt-token-empty', '', true);
+    let snapshot = state('session_attempt-token-empty');
+    let record = snapshot.outgoing[legacy.fingerprint];
+    assert.equal(Object.hasOwn(record, 'attempt_token'), true);
+    assert.equal(record.attempt_token, '');
+    let postBaseline = sendAttempts;
+    let modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(legacy.key, legacy.jobId)).status, 'sent');
+    snapshot = state('session_attempt-token-empty');
+    record = snapshot.outgoing[legacy.fingerprint];
+    let job = snapshot.jobs.find((item) => item.id === legacy.jobId);
+    assert.equal(record.status, 'sent');
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(job.status, 'done');
+    assert.equal(job.responsibility_status, 'answered_confirmed');
+    assert.equal(sendAttempts, postBaseline, '旧版显式双空回执只能对账，不能重新 POST');
+    assert.equal(modelRequests.length, modelBaseline, '已有计划的旧版回执不得重新推理');
+
+    for (const malformed of [
+      { suffix: 'null', value: null },
+      { suffix: 'object', value: { invalid: true } },
+    ]) {
+      const session = 'session_attempt-token-malformed-' + malformed.suffix;
+      const prepared = await prepareHistoryReceipt(session, malformed.value, true);
+      const before = state(session);
+      const frozenRecord = structuredClone(before.outgoing[prepared.fingerprint]);
+      assert.equal(Object.hasOwn(frozenRecord, 'attempt_token'), true);
+      if (malformed.suffix === 'null') assert.equal(frozenRecord.attempt_token, null);
+      else assert.deepEqual(frozenRecord.attempt_token, { invalid: true });
+      postBaseline = sendAttempts;
+      modelBaseline = modelRequests.length;
+      const replies = countEvents('ai_reply');
+      const result = await runtime.process(prepared.key, prepared.jobId);
+      assert.equal(result.status, 'dispatched_after_cancel');
+      snapshot = state(session);
+      assert.deepEqual(snapshot.outgoing[prepared.fingerprint], frozenRecord,
+        '畸形 token 的迟到回执不得改写持久出站记录');
+      job = snapshot.jobs.find((item) => item.id === prepared.jobId);
+      assert.equal(job.status, 'done');
+      assert.equal(job.responsibility_status, 'unresolved_failure');
+      assert.equal(job.failure_code, 'delivery_after_state_change');
+      assert(job.data, '畸形 token 不得删除原访客责任');
+      assert(job.plan, '畸形 token 不得删除仍需对账的冻结计划');
+      assert.equal(sendAttempts, postBaseline);
+      assert.equal(modelRequests.length, modelBaseline);
+      assert.equal(countEvents('ai_reply'), replies);
+    }
+
+    const emptyToNonemptySession = 'session_attempt-token-empty-to-nonempty';
+    const emptyToNonempty = await prepareHistoryReceipt(emptyToNonemptySession, undefined, false);
+    const historyGate = gate();
+    let historyCalls = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === emptyToNonemptySession
+        && match[2] === '/messages' && historyCalls++ === 0) {
+        historyGate.enter();
+        await historyGate.waiting;
+      }
+      return request(url, options);
+    } });
+    let historyPending;
+    try {
+      const replies = countEvents('ai_reply');
+      postBaseline = sendAttempts;
+      modelBaseline = modelRequests.length;
+      historyPending = runtime.process(emptyToNonempty.key, emptyToNonempty.jobId);
+      await awaitNamedGate(historyGate.entered, '空 token 历史对账进入网络门');
+      assert.equal(historyCalls, 1);
+      assert.equal(Object.hasOwn(state(emptyToNonemptySession).outgoing[emptyToNonempty.fingerprint],
+        'attempt_token'), false);
+      let frozenRecord;
+      await runtime.transaction(emptyToNonempty.key, (current) => {
+        const currentRecord = current.outgoing[emptyToNonempty.fingerprint]; assert(currentRecord);
+        currentRecord.attempt_token = 'a'.repeat(32);
+        frozenRecord = structuredClone(currentRecord);
+      });
+      assert.equal(state(emptyToNonemptySession).outgoing[emptyToNonempty.fingerprint].attempt_token,
+        'a'.repeat(32));
+      historyGate.release();
+      const result = await historyPending;
+      assert.equal(result.status, 'dispatched_after_cancel');
+      snapshot = state(emptyToNonemptySession);
+      assert.deepEqual(snapshot.outgoing[emptyToNonempty.fingerprint], frozenRecord,
+        '空 caller 不得认领后来出现的非空 token');
+      job = snapshot.jobs.find((item) => item.id === emptyToNonempty.jobId);
+      assert.equal(job.status, 'done');
+      assert.equal(job.responsibility_status, 'unresolved_failure');
+      assert.equal(job.failure_code, 'delivery_after_state_change');
+      assert(job.data);
+      assert(job.plan);
+      assert.equal(sendAttempts, postBaseline);
+      assert.equal(modelRequests.length, modelBaseline);
+      assert.equal(countEvents('ai_reply'), replies);
+    } finally {
+      historyGate.release();
+      if (historyPending) await awaitNamedGate(historyPending.then(() => undefined, () => undefined),
+        '空 token 历史对账收尾', 10000);
+      runtime = createRuntime(env, runtimeOptions);
+    }
+
+    const postCases = [
+      { suffix: 'missing', mutate: (currentRecord) => { delete currentRecord.attempt_token; },
+        assertShape: (currentRecord) => assert.equal(Object.hasOwn(currentRecord, 'attempt_token'), false),
+        expected: 'dispatched_after_cancel' },
+      { suffix: 'empty', mutate: (currentRecord) => { currentRecord.attempt_token = ''; },
+        assertShape: (currentRecord) => assert.equal(currentRecord.attempt_token, ''),
+        expected: 'dispatched_after_cancel' },
+      { suffix: 'body-mismatch', mutate: (currentRecord, originalToken) => {
+        currentRecord.attempt_token = originalToken === 'b'.repeat(32) ? 'c'.repeat(32) : 'b'.repeat(32);
+      }, assertShape: (currentRecord) => assert.match(currentRecord.attempt_token, /^[bc]{32}$/),
+      mutateBody: true, expected: 'delivery_semantic_unknown' },
+    ];
+    for (const item of postCases) {
+      const session = 'session_attempt-token-post-' + item.suffix;
+      const postGate = gate();
+      let capturedBody;
+      let postCalls = 0;
+      runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && decodeURIComponent(match[1]) === session
+          && match[2] === '/message' && options.method === 'POST') {
+          postCalls += 1;
+          capturedBody = options.body;
+          postGate.enter();
+          await postGate.waiting;
+        }
+        return request(url, options);
+      } });
+      let pending;
+      try {
+        const replies = countEvents('ai_reply');
+        const superseded = countEvents('delivery_after_state_change', 'attempt_superseded');
+        const sessionSent = sent.filter((entry) => entry.session_id === session).length;
+        postBaseline = sendAttempts;
+        modelBaseline = modelRequests.length;
+        const entry = await receive(message(session, '受控发送代次竞态'));
+        pending = runtime.process(entry.key, entry.jobId);
+        await awaitNamedGate(postGate.entered, '非空 token Crisp POST 进入网络门');
+        assert.equal(postCalls, 1);
+        assert(capturedBody && typeof capturedBody.content === 'string');
+        let frozenRecord;
+        let originalBody;
+        await runtime.transaction(entry.key, (current) => {
+          const currentRecord = Object.values(current.outgoing)
+            .find((candidate) => candidate.job_id === entry.jobId); assert(currentRecord);
+          assert.match(currentRecord.attempt_token, /^[a-f0-9]{32}$/);
+          const originalToken = currentRecord.attempt_token;
+          originalBody = structuredClone(currentRecord.body);
+          item.mutate(currentRecord, originalToken);
+          assert.notEqual(currentRecord.attempt_token, originalToken);
+          item.assertShape(currentRecord);
+          frozenRecord = structuredClone(currentRecord);
+        });
+        if (item.mutateBody) {
+          capturedBody.content += '（受控错配）';
+          assert.notEqual(digest(JSON.stringify(capturedBody.content)),
+            digest(JSON.stringify(originalBody.content)));
+          assert.deepEqual(state(session).outgoing[String(capturedBody.fingerprint)].body, originalBody,
+            '只允许修改已经离开持久层的受控请求副本');
+        }
+        postGate.release();
+        const result = await pending;
+        assert.equal(result.status, item.expected);
+        snapshot = state(session);
+        record = Object.values(snapshot.outgoing).find((candidate) => candidate.job_id === entry.jobId);
+        assert.deepEqual(record, frozenRecord,
+          '旧 POST 回执不得修改缺失、空值或新 token 持有的 record');
+        job = snapshot.jobs.find((candidate) => candidate.id === entry.jobId);
+        assert.notEqual(job.responsibility_status, 'answered_confirmed');
+        assert(job.data, '发送代次冲突不得删除原访客责任');
+        if (item.expected === 'delivery_semantic_unknown') {
+          assert.equal(job.status, 'received');
+          assert.equal(job.failure_code, 'delivery_semantic_unknown');
+        } else {
+          assert.equal(job.status, 'done');
+          assert.equal(job.failure_code, 'delivery_after_state_change');
+        }
+        assert.equal(postCalls, 1);
+        assert.equal(sendAttempts, postBaseline + 1, '每个竞态子例只能交出一次 POST');
+        assert.equal(modelRequests.length, modelBaseline + 1, '每个竞态子例只能生成一次答案');
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, sessionSent + 1);
+        assert.equal(countEvents('ai_reply'), replies);
+        assert.equal(countEvents('delivery_after_state_change', 'attempt_superseded'), superseded + 1);
+      } finally {
+        postGate.release();
+        if (pending) await awaitNamedGate(pending.then(() => undefined, () => undefined),
+          '非空 token POST 竞态收尾', 10000);
+        runtime = createRuntime(env, runtimeOptions);
+      }
+    }
+  });
   await test('T29/T30 十秒截止、真人追加、访客与乱序不改时间', async () => {
     const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 10; publishConfiguration('handoff', handoff);
     const start = now += 100; await operator('session_timeline01');
@@ -2364,9 +2616,41 @@ const abortablePending = (signal, started) => {
   await test('T40/T41 标签并集、权限失败、检索未知与历史负反馈保留', async () => {
     await deliver(message('session_tags0001', '有资料的问题')); assert(segments.get('session_tags0001').includes('external-vip')); assert(segments.get('session_tags0001').includes('ai_replied')); assert(!segments.get('session_tags0001').includes('ai_resolved'));
     tagFailure = true; await deliver(message('session_tagsfail1', '标签失败正文仍发送')); assert.equal(sent.at(-1).session_id, 'session_tagsfail1'); tagFailure = false;
-    const beforeMiss = sent.length; miss = true; const missResult = await deliver(message('session_miss0001', '知识未命中')); miss = false;
-    assert.equal(sent.length, beforeMiss); assertUnresolved('session_miss0001', missResult, 'knowledge_miss');
+    const eventFile = path.join(root, 'data', 'analytics', 'events.jsonl');
+    const readEvents = () => fs.existsSync(eventFile) ? fs.readFileSync(eventFile, 'utf8').trim().split('\n')
+      .filter(Boolean).map(JSON.parse) : [];
+    const countEvents = (type, reason) => readEvents().filter((event) => event.type === type
+      && (reason === undefined || event.reason === reason)).length;
+    const missBaseline = {
+      question: countEvents('question'), hit: countEvents('knowledge_hit'), miss: countEvents('knowledge_miss'),
+      unresolved: countEvents('answer_responsibility_unresolved', 'knowledge_miss'),
+      replies: countEvents('ai_reply'), models: modelRequests.length,
+      sent: sent.filter((entry) => entry.session_id === 'session_miss0001').length,
+    };
+    miss = true; const missResult = await deliver(message('session_miss0001', '知识未命中')); miss = false;
+    assert.equal(sent.filter((entry) => entry.session_id === 'session_miss0001').length, missBaseline.sent);
+    const missJob = assertUnresolved('session_miss0001', missResult, 'knowledge_miss');
+    assert(missJob.data, '知识暂时不可用时必须保留原始应答责任');
+    assert.equal(missJob.plan, undefined, '技术未完成不得持久成普通知识计划');
+    assert.equal(Object.values(state('session_miss0001').outgoing)
+      .filter((record) => record.job_id === missResult.jobId).length, 0);
+    assert.equal(modelRequests.length, missBaseline.models, '知识未命中不得调用 Provider 伪造答案');
+    assert.equal(countEvents('question'), missBaseline.question);
+    assert.equal(countEvents('knowledge_hit'), missBaseline.hit);
+    assert.equal(countEvents('knowledge_miss'), missBaseline.miss,
+      '未完成的知识故障不能冒充普通 knowledge outcome');
+    assert.equal(countEvents('answer_responsibility_unresolved', 'knowledge_miss'), missBaseline.unresolved + 1);
+    assert.equal(countEvents('ai_reply'), missBaseline.replies);
     await recoverUnresolved('session_miss0001', missResult);
+    const recoveredMissJob = state('session_miss0001').jobs.find((job) => job.id === missResult.jobId);
+    assert.equal(recoveredMissJob.status, 'done');
+    assert.equal(recoveredMissJob.responsibility_status, 'answered_confirmed');
+    assert.equal(recoveredMissJob.knowledge_counted, true);
+    assert.equal(countEvents('question'), missBaseline.question + 1);
+    assert.equal(countEvents('knowledge_hit'), missBaseline.hit + 1);
+    assert.equal(countEvents('knowledge_miss'), missBaseline.miss);
+    assert.equal(countEvents('answer_responsibility_unresolved', 'knowledge_miss'), missBaseline.unresolved + 1);
+    assert.equal(countEvents('ai_reply'), missBaseline.replies + 1);
     low = true; await deliver(message('session_low00001', '低分问题')); low = false;
     const beforeInvalidRetrieval = modelRequests.length;
     const beforeInvalidSend = sent.length; unknownSources = true;
@@ -2378,14 +2662,13 @@ const abortablePending = (signal, started) => {
     const modelResult = await deliver(message('session_modelerror', '接口失败')); modelFailure = false;
     assert.equal(sent.length, beforeModelSend); assertUnresolved('session_modelerror', modelResult, 'upstream_unavailable');
     await recoverUnresolved('session_modelerror', modelResult);
-    const eventFile = path.join(root, 'data', 'analytics', 'events.jsonl');
     const historicalFeedback = { type: 'feedback', at: new Date(now).toISOString(), answer_id: 'synthetic-historical-answer', session: 'synthetic-history', question: '[历史问题指纹]', feedback: 'negative' };
     fs.appendFileSync(eventFile, JSON.stringify(historicalFeedback) + '\n');
     const modelCount = modelRequests.length;
     await deliver(message('session_negative1', 'token=synthetic-private-value 为什么失败')); await deliver(message('session_negative1', '👎')); assert.equal(state('session_negative1').mode, 'ai');
     assert.equal(modelRequests.length, modelCount + 2); assert.equal(state('session_negative1').pending_feedback, null);
-    const events = fs.readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse);
-    assert(events.some((event) => event.type === 'retrieval_failed' && event.reason === 'retrieval_invalid')); assert(events.some((event) => event.type === 'knowledge_miss'));
+    const events = readEvents();
+    assert(events.some((event) => event.type === 'retrieval_failed' && event.reason === 'retrieval_invalid'));
     assert.deepEqual(events.filter((event) => event.type === 'feedback'), [historicalFeedback]);
     assert(!JSON.stringify(events).includes('synthetic-private-value')); assert.equal(state('session_modelerror').mode, 'ai');
   });
