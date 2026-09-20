@@ -3709,7 +3709,7 @@ const test = async (name, action) => {
     assert.equal(remnants().length, 0);
   });
 
-  await test('claim/heartbeat 真实提交窗口失败残件不阻断后续扫描', async () => {
+  await test('claim 崩溃残件与 heartbeat fd 刷新失败不阻断后续扫描', async () => {
     const fx = fixture('scan-lock-crash-injection');
     const lock = path.join(fx.runtimeDirectory, 'scheduler-scan.lock');
     const originalRename = fs.renameSync;
@@ -3740,27 +3740,40 @@ const test = async (name, action) => {
     await fx.runtime.scan();
     assert(!fs.existsSync(strandedClaim));
 
-    let strandedHeartbeat = '';
-    fs.renameSync = function (source, target) {
-      if (path.resolve(String(target)) === path.resolve(lock, 'owner.json')
-        && String(source).startsWith(lock + '.heartbeat-')) {
-        strandedHeartbeat = String(source);
-        const error = new Error('受控 heartbeat 发布中断'); error.code = 'EIO'; throw error;
-      }
-      return originalRename.apply(this, arguments);
+    const originalOpen = fs.openSync;
+    const originalClose = fs.closeSync;
+    const originalFutimes = fs.futimesSync;
+    const ownerFile = path.resolve(lock, 'owner.json');
+    const ownerDescriptors = new Set();
+    let heartbeatFailures = 0;
+    fs.openSync = function (target) {
+      const descriptor = originalOpen.apply(this, arguments);
+      if (path.resolve(String(target)) === ownerFile) ownerDescriptors.add(descriptor);
+      return descriptor;
     };
-    fs.unlinkSync = function (target) {
-      if (strandedHeartbeat && path.resolve(String(target)) === path.resolve(strandedHeartbeat)) {
-        const error = new Error('模拟进程退出'); error.code = 'EBUSY'; throw error;
-      }
-      return originalUnlink.apply(this, arguments);
+    fs.closeSync = function (descriptor) {
+      const result = originalClose.apply(this, arguments);
+      ownerDescriptors.delete(descriptor);
+      return result;
     };
-    try { await assert.rejects(fx.runtime.scan(), /受控 heartbeat/); }
-    finally { fs.renameSync = originalRename; fs.unlinkSync = originalUnlink; }
-    assert(strandedHeartbeat && fs.existsSync(strandedHeartbeat));
-    fs.utimesSync(strandedHeartbeat, oldTime(), oldTime());
+    fs.futimesSync = function (descriptor) {
+      if (heartbeatFailures === 0 && ownerDescriptors.has(descriptor)) {
+        heartbeatFailures += 1;
+        const error = new Error('受控 heartbeat fd 刷新失败'); error.code = 'EIO'; throw error;
+      }
+      return originalFutimes.apply(this, arguments);
+    };
+    try { await assert.rejects(fx.runtime.scan(), /调度锁所有权已变化/); }
+    finally {
+      fs.futimesSync = originalFutimes;
+      fs.closeSync = originalClose;
+      fs.openSync = originalOpen;
+    }
+    assert.equal(heartbeatFailures, 1, '必须精确命中已验证 owner fd 的 heartbeat 刷新');
+    assert.equal(ownerDescriptors.size, 0, '受控 owner fd 必须由运行时关闭');
+    assert(!fs.existsSync(lock), 'heartbeat 刷新失败后必须释放本次 scanner 锁');
     await fx.runtime.scan();
-    assert(!fs.existsSync(strandedHeartbeat));
+    assert(!fs.existsSync(lock), 'heartbeat 故障收口后下一轮扫描必须正常完成');
   });
 
   await test('两个 scanner 竞态只有一方取得完整 owner', async () => {
