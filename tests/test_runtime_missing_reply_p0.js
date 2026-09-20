@@ -17,23 +17,221 @@ const env = {
   CRISP_AUTH_B64: 'test-only-auth',
   CRISP_TOKEN_TIER: 'website',
   AI_API_KEY: 'test-only-key',
+  ANYTHINGLLM_API_KEY: 'test-only-anything-key',
+  ANYTHINGLLM_WORKSPACE: 'synthetic-missing-reply',
 };
-const digest = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
+const canonical = (value) => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort()
+    .map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = (value) => crypto.createHash('sha256')
+  .update(Buffer.isBuffer(value) ? value : String(value)).digest('hex');
 const oldTime = () => new Date(Date.now() - 120000);
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const writeJson = (file, value) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+};
+const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const atomicWrite = (file, content) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = file + '.candidate-' + crypto.randomBytes(8).toString('hex');
+  try {
+    fs.writeFileSync(temporary, content, { mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+};
+const atomicWriteJson = (file, value) => atomicWrite(file, JSON.stringify(value));
+const sealMaterials = (value) => {
+  const runtime = structuredClone(value.configuration.runtime);
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  value.source_components = {
+    runtime: digest(canonical(runtime)),
+    handoff: digest(canonical(value.configuration.handoff)),
+    keyword: digest(canonical(value.configuration.keyword)),
+    menu: digest(canonical(value.configuration.menu)),
+    tags: digest(canonical(value.configuration.tags)),
+    feedback: digest(canonical(value.configuration.feedback)),
+    prompt: value.prompt.sha256,
+    knowledge: digest(canonical(value.knowledge)),
+  };
+  value.source_sha256 = digest(canonical(value.source_components));
+  return value;
+};
+const assertAppliedMaterials = (root, materials, expectedEnabled) => {
+  const configDirectory = path.join(root, 'config');
+  const dataDirectory = path.join(root, 'data');
+  const runtimeDirectory = path.join(dataDirectory, 'runtime');
+  for (const directory of [root, configDirectory, dataDirectory, runtimeDirectory]) {
+    const stat = fs.lstatSync(directory);
+    assert(stat.isDirectory() && !stat.isSymbolicLink(), 'fixture 受管路径必须是非链接目录');
+    assert.equal(stat.uid, process.geteuid(), 'fixture 受管目录必须归当前 EUID 所有');
+    assert.equal(stat.mode & 0o777, 0o700, 'fixture 受管目录必须为0700');
+  }
+  const authoritativeFiles = [
+    ...['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback', 'provider']
+      .map((name) => path.join(configDirectory, name + '.yaml')),
+    path.join(configDirectory, 'prompt.md'),
+    path.join(configDirectory, 'materials-applied.json'),
+    ...['knowledge-map', 'knowledge-settings', 'knowledge-profile', 'knowledge-lexical']
+      .map((name) => path.join(runtimeDirectory, name + '.json')),
+  ];
+  for (const file of authoritativeFiles) {
+    const stat = fs.lstatSync(file);
+    assert(stat.isFile() && !stat.isSymbolicLink(), 'fixture 权威文件必须是非链接普通文件');
+    assert.equal(stat.nlink, 1, 'fixture 权威文件必须是单链接');
+    assert.equal(stat.uid, process.geteuid(), 'fixture 权威文件必须归当前 EUID 所有');
+    assert.equal(stat.mode & 0o777, 0o600, 'fixture 权威文件必须为0600');
+  }
+  const mapRaw = fs.readFileSync(path.join(runtimeDirectory, 'knowledge-map.json'));
+  const settingsRaw = fs.readFileSync(path.join(runtimeDirectory, 'knowledge-settings.json'));
+  const profileRaw = fs.readFileSync(path.join(runtimeDirectory, 'knowledge-profile.json'));
+  const lexicalRaw = fs.readFileSync(path.join(runtimeDirectory, 'knowledge-lexical.json'));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(configDirectory, 'materials-applied.json'), 'utf8')),
+    materials, '权威 applied materials 必须与刚发布的完整对象逐项一致');
+  const map = JSON.parse(mapRaw);
+  const settings = JSON.parse(settingsRaw);
+  const profile = JSON.parse(profileRaw);
+  const lexical = JSON.parse(lexicalRaw);
+  assert.equal(materials.schema_version, 2);
+  assert.equal(materials.state, 'applied');
+  assert.equal(materials.configuration.runtime.enabled, expectedEnabled);
+  assert.equal(materials.configuration.runtime.revision, materials.revision);
+  assert.equal(materials.configuration.runtime.applied_revision, materials.revision);
+  assert.equal(materials.prompt.bytes, Buffer.byteLength(materials.prompt.text));
+  assert.equal(materials.prompt.sha256, digest(materials.prompt.text));
+  assert.equal(materials.knowledge.map_sha256, digest(mapRaw));
+  assert.equal(materials.knowledge.settings_sha256, digest(settingsRaw));
+  assert.equal(materials.knowledge.profile_sha256, digest(profileRaw));
+  assert.equal(materials.knowledge.lexical_sha256, digest(lexicalRaw));
+  assert.equal(map.schema_version, 2);
+  assert.equal(materials.knowledge.document_count, map.documents.length);
+  assert.equal(materials.knowledge.enabled_document_count, map.documents.length);
+  assert.deepEqual(materials.knowledge.enabled_library_ids,
+    [...new Set(map.documents.map((item) => item.library_id))].sort());
+  assert.equal(materials.knowledge.library_count, materials.knowledge.enabled_library_ids.length);
+  assert.equal(settings.schema_version, 1);
+  assert.equal(settings.workspace_slug, env.ANYTHINGLLM_WORKSPACE);
+  assert.equal(typeof settings.temperature, 'number');
+  assert.equal(profile.schema_version, 1);
+  assert.equal(profile.state, 'applied');
+  assert.equal(profile.fingerprint, digest(canonical(profile.profile)));
+  assert.equal(lexical.schema_version, 2);
+  assert.equal(lexical.map_sha256, digest(mapRaw));
+  const { payload_sha256: lexicalDigest, ...lexicalPayload } = lexical;
+  assert.equal(lexicalDigest, digest(canonical(lexicalPayload)));
+  const runtime = structuredClone(materials.configuration.runtime);
+  delete runtime.revision;
+  delete runtime.applied_revision;
+  assert.deepEqual(materials.source_components, {
+    runtime: digest(canonical(runtime)),
+    handoff: digest(canonical(materials.configuration.handoff)),
+    keyword: digest(canonical(materials.configuration.keyword)),
+    menu: digest(canonical(materials.configuration.menu)),
+    tags: digest(canonical(materials.configuration.tags)),
+    feedback: digest(canonical(materials.configuration.feedback)),
+    prompt: materials.prompt.sha256,
+    knowledge: digest(canonical(materials.knowledge)),
+  });
+  assert.equal(materials.source_sha256, digest(canonical(materials.source_components)));
+  assert.equal(fs.existsSync(path.join(root, 'data/runtime/knowledge-migration.json')), false);
+};
+const makeMaterials = (root, now, configuration, revision) => {
+  const prompt = fs.readFileSync(path.join(root, 'config/prompt.md'), 'utf8');
+  const mapRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-map.json'));
+  const map = JSON.parse(mapRaw);
+  const settingsRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-settings.json'));
+  const profileRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-profile.json'));
+  const lexicalRaw = fs.readFileSync(path.join(root, 'data/runtime/knowledge-lexical.json'));
+  const enabledLibraries = [...new Set(map.documents.map((item) => item.library_id))].sort();
+  return sealMaterials({ schema_version: 2, state: 'applied', revision, applied_at: now,
+    source_sha256: '', source_components: {}, configuration,
+    prompt: { text: prompt, bytes: Buffer.byteLength(prompt), sha256: digest(prompt) },
+    knowledge: {
+      catalog_revision: 1,
+      catalog_sha256: digest(canonical({ fixture: 'missing-reply-catalog', documents: map.documents })),
+      manifest_sha256: digest(canonical({ fixture: 'missing-reply-manifest',
+        locations: map.documents.map((item) => item.location) })),
+      map_sha256: digest(mapRaw), settings_sha256: digest(settingsRaw),
+      profile_sha256: digest(profileRaw), lexical_sha256: digest(lexicalRaw),
+      enabled_library_ids: enabledLibraries, library_count: enabledLibraries.length,
+      document_count: map.documents.length, enabled_document_count: map.documents.length,
+    } });
+};
+const installReplyReadyMaterials = (root, now) => {
+  const projection = 'kb_1111111111111111_doc_2222222222222222.md';
+  const mapPath = path.join(root, 'data/runtime/knowledge-map.json');
+  writeJson(mapPath, { schema_version: 2, revision: 1, documents: [{
+    library_id: 'kb_1111111111111111', library_name: '虚构消息可靠性资料',
+    document_id: 'doc_2222222222222222', projection,
+    location: 'custom-documents/' + projection + '-33333333-3333-4333-8333-333333333333.json',
+  }] });
+  const settingsPath = path.join(root, 'data/runtime/knowledge-settings.json');
+  writeJson(settingsPath, { schema_version: 1, workspace_slug: env.ANYTHINGLLM_WORKSPACE,
+    temperature: 0.25, observed_at: now });
+  const profileValue = { engine: 'native', model: 'synthetic-missing-reply-embedding',
+    chunk_size: 1000, chunk_overlap: 20, passage_prefix: '', query_prefix: '',
+    component_version: 'synthetic' };
+  writeJson(path.join(root, 'data/runtime/knowledge-profile.json'), {
+    schema_version: 1, state: 'applied', profile: profileValue,
+    fingerprint: digest(canonical(profileValue)), applied_at: now,
+  });
+  const mapRaw = fs.readFileSync(mapPath);
+  const lexicalPayload = { schema_version: 2, algorithm: 'crispai-lexical-v2',
+    map_sha256: digest(mapRaw), complete: false,
+    coverage: { source_documents: 1, indexed_documents: 0, omitted_documents: 1,
+      source_bytes: 1, indexed_bytes: 0, omitted_bytes: 1, reasons: ['index_capacity'] },
+    passages: [] };
+  writeJson(path.join(root, 'data/runtime/knowledge-lexical.json'), {
+    ...lexicalPayload, payload_sha256: digest(canonical(lexicalPayload)),
+  });
+  const configuration = Object.fromEntries(['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']
+    .map((name) => [name, readJson(path.join(root, 'config', name + '.yaml'))]));
+  const materials = makeMaterials(root, now, configuration, configuration.runtime.revision);
+  atomicWriteJson(path.join(root, 'config/materials-applied.json'), materials);
+  assertAppliedMaterials(root, materials, true);
+  return materials;
+};
 
 const fixture = (name, runtimeOverrides = {}) => {
   const root = path.join(work, name);
+  const configDirectory = path.join(root, 'config');
+  const dataDirectory = path.join(root, 'data');
   const runtimeDirectory = path.join(root, 'data', 'runtime');
-  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
-  fs.mkdirSync(runtimeDirectory, { recursive: true });
-  for (const config of ['handoff', 'keyword', 'menu', 'tags', 'feedback', 'provider']) {
-    fs.copyFileSync(path.join(project, 'config', config + '.yaml.example'), path.join(root, 'config', config + '.yaml'));
+  for (const directory of [root, configDirectory, dataDirectory, runtimeDirectory]) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(directory, 0o700);
   }
-  fs.writeFileSync(path.join(root, 'config', 'runtime.yaml'), JSON.stringify({ schema_version: 2, enabled: true,
-    disable_epoch: 0, revision: 1, applied_revision: 1 }));
-  fs.writeFileSync(path.join(root, 'config', 'prompt.md'), '受控测试提示');
+  for (const config of ['handoff', 'keyword', 'menu', 'tags', 'feedback', 'provider']) {
+    const destination = path.join(configDirectory, config + '.yaml');
+    fs.copyFileSync(path.join(project, 'config', config + '.yaml.example'), destination);
+    fs.chmodSync(destination, 0o600);
+  }
+  fs.writeFileSync(path.join(configDirectory, 'runtime.yaml'), JSON.stringify({ schema_version: 2, enabled: true,
+    disable_epoch: 0, revision: 1, applied_revision: 1 }), { mode: 0o600 });
+  fs.writeFileSync(path.join(configDirectory, 'prompt.md'), '受控测试提示', { mode: 0o600 });
   let now = 1760000000000;
+  const materialsPath = path.join(root, 'config', 'materials-applied.json');
+  installReplyReadyMaterials(root, now);
+  const publishRuntimeConfiguration = (patch) => {
+    const previous = readJson(materialsPath);
+    const revision = previous.revision + 1;
+    const configuration = structuredClone(previous.configuration);
+    const crossed = configuration.runtime.enabled === true && patch.enabled === false;
+    configuration.runtime = { ...configuration.runtime, ...patch,
+      disable_epoch: patch.disable_epoch ?? Math.min(2147483647,
+        Number(configuration.runtime.disable_epoch || 0) + (crossed ? 1 : 0)),
+      revision, applied_revision: revision };
+    writeJson(path.join(root, 'config/runtime.yaml'), configuration.runtime);
+    const materials = makeMaterials(root, now, configuration, revision);
+    atomicWriteJson(materialsPath, materials);
+    assertAppliedMaterials(root, materials, configuration.runtime.enabled);
+    return materials;
+  };
   const exactMessages = new Map();
   const exactRequests = [];
   const catchupConversationPages = new Map();
@@ -121,7 +319,7 @@ const fixture = (name, runtimeOverrides = {}) => {
     tick(milliseconds = 5000) { now += milliseconds; },
     now: () => now,
     exactMessages, exactRequests, catchupConversationPages, catchupMessages, catchupRequests,
-    postAttempts, postResponses, sent,
+    postAttempts, postResponses, sent, publishRuntimeConfiguration,
   };
 };
 
@@ -483,8 +681,7 @@ const test = async (name, action) => {
       '真人暂停必须取消/关闭前后的普通任务并释放正文');
 
     // 关闭总开关后补偿仍推进水位，否则重新开启时会把关闭期旧问题补发。
-    fs.writeFileSync(path.join(fx.root, 'config', 'runtime.yaml'),
-      JSON.stringify({ schema_version: 2, enabled: false, revision: 2, applied_revision: 2 }));
+    fx.publishRuntimeConfiguration({ enabled: false });
     fx.tick(16000);
     const offSession = 'session_catchup-off0001';
     fx.catchupConversationPages.set(1, [{ website_id: website, session_id: offSession, updated_at: fx.now() }]);
@@ -494,8 +691,7 @@ const test = async (name, action) => {
     assert(!(await fx.runtime.scan()).some((entry) => entry.key === fx.runtime.stateKey(website, offSession)));
     const off = fx.runtime.readState(fx.runtime.stateKey(website, offSession));
     assert.equal(off.jobs.length, 1); assert.equal(off.jobs[0].status, 'done');
-    fs.writeFileSync(path.join(fx.root, 'config', 'runtime.yaml'),
-      JSON.stringify({ schema_version: 2, enabled: true, revision: 3, applied_revision: 3 }));
+    fx.publishRuntimeConfiguration({ enabled: true });
     fx.tick(16000);
     await fx.runtime.catchup();
     await fx.runtime.scan();
@@ -1363,11 +1559,8 @@ const test = async (name, action) => {
     });
     job.data.session_id = session;
     writeState(fx, session, stateValue(fx, session, [job]));
-    const runtimeConfig = path.join(fx.root, 'config', 'runtime.yaml');
-    fs.writeFileSync(runtimeConfig, JSON.stringify({ schema_version: 2, enabled: false,
-      disable_epoch: 1, revision: 2, applied_revision: 2 }));
-    fs.writeFileSync(runtimeConfig, JSON.stringify({ schema_version: 2, enabled: true,
-      disable_epoch: 1, revision: 3, applied_revision: 3 }));
+    fx.publishRuntimeConfiguration({ enabled: false, disable_epoch: 1 });
+    fx.publishRuntimeConfiguration({ enabled: true, disable_epoch: 1 });
 
     assert.deepEqual(await fx.runtime.scan(), [], '停用代次处理本身不得把旧问题重新排入发送队列');
     const current = fx.runtime.readState(fx.runtime.stateKey(website, session));
@@ -1502,8 +1695,7 @@ const test = async (name, action) => {
         await webhook(policy.fx, policy.session, '真人已接管', 95820,
           { event: 'message:received', from: 'operator', automated: false });
       } else {
-        fs.writeFileSync(path.join(policy.fx.root, 'config', 'runtime.yaml'),
-          JSON.stringify({ schema_version: 2, enabled: false, revision: 2, applied_revision: 2 }));
+        policy.fx.publishRuntimeConfiguration({ enabled: false });
       }
       if (policy.retryAt > policy.fx.now()) policy.fx.tick(policy.retryAt - policy.fx.now() + 1);
       for (let round = 0; round < 3; round += 1) {
@@ -1702,16 +1894,17 @@ const test = async (name, action) => {
     assert.deepEqual(health.isolated_sessions,
       { count: 3, reasons: { too_large: 1, invalid_json: 1, invalid_state: 1 } });
 
-    const runtimeConfig = path.join(fx.root, 'config', 'runtime.yaml');
-    const original = fs.readFileSync(runtimeConfig);
-    fs.writeFileSync(runtimeConfig, '{broken');
-    await assert.rejects(fx.runtime.scan(), /JSON|Unexpected token/,
-      '全局配置故障不得被伪装成单会话隔离');
-    fs.writeFileSync(runtimeConfig, original);
+    const materialsConfig = path.join(fx.root, 'config', 'materials-applied.json');
+    const original = fs.readFileSync(materialsConfig);
+    fs.writeFileSync(materialsConfig, '{broken', { mode: 0o600 });
+    try {
+      await assert.rejects(fx.runtime.scan(), /JSON|Unexpected token/,
+        '全局配置故障不得被伪装成单会话隔离');
+    } finally { atomicWrite(materialsConfig, original); }
   });
 
   await test('单会话状态 EIO 只隔离本责任，健康会话仍调度且全局存储错误失败关闭', async () => {
-    const injectAtomicRenameFailure = async (target, code, action) => {
+    const injectAtomicRenameFailure = async (target, code, action, options = {}) => {
       const originalRename = fs.renameSync;
       const resolvedTarget = path.resolve(target);
       let injected = 0;
@@ -1719,6 +1912,7 @@ const test = async (name, action) => {
         if (injected === 0 && path.resolve(String(destination)) === resolvedTarget
           && path.resolve(String(source)).startsWith(resolvedTarget + '.tmp-')) {
           injected += 1;
+          if (options.publishBeforeThrow === true) originalRename.apply(this, arguments);
           const error = new Error('受控原子提交失败（' + code + '）');
           error.code = code;
           throw error;
@@ -1733,6 +1927,20 @@ const test = async (name, action) => {
       assert.equal(fs.readdirSync(fx.runtimeDirectory).some((name) => name.startsWith(prefix)), false,
         '失败的原子状态候选必须被清理');
     };
+    const establishHealthBaseline = async (fx) => {
+      assert.deepEqual(await fx.runtime.scan(), []);
+      const health = readJson(path.join(fx.runtimeDirectory, 'scheduler-health.json'));
+      fx.tick(1000);
+      return health.completed_at;
+    };
+    const assertScanDidNotComplete = (fx, completedAt) => {
+      const health = readJson(path.join(fx.runtimeDirectory, 'scheduler-health.json'));
+      assert.equal(health.completed_at, completedAt,
+        '结果未知或清理不完整时不得发布本轮完成健康状态');
+      assert.equal(health.isolated_sessions.count, 0);
+      assert.equal(health.isolated_sessions.reasons.io_error ?? 0, 0,
+        'fail-closed 分支不得冒充已安全隔离的 io_error');
+    };
 
     const fx = fixture('scan-session-write-eio');
     const ordered = ['session_write-eio-a', 'session_write-eio-b'].map((session) => ({
@@ -1742,6 +1950,10 @@ const test = async (name, action) => {
     const healthy = ordered[1];
     const badJob = jobValue(fx, 'scan-write-eio-bad', 1, { responsibility_status: 'pending' });
     badJob.data.session_id = bad.session;
+    const writeVisitorBody = '访客唯一正文-write-eio-不得出现在调度健康';
+    const writePayloadMarker = 'synthetic-write-eio-payload-private';
+    badJob.data.content = writeVisitorBody;
+    badJob.data.payload_marker = writePayloadMarker;
     const healthyJob = jobValue(fx, 'scan-write-eio-healthy', 1, { responsibility_status: 'pending' });
     healthyJob.data.session_id = healthy.session;
     writeState(fx, bad.session, stateValue(fx, bad.session, [badJob]));
@@ -1763,7 +1975,11 @@ const test = async (name, action) => {
     const health = JSON.parse(fs.readFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
     assert.deepEqual(health.isolated_sessions,
       { count: 1, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0, io_error: 1 } });
-    assert.equal(JSON.stringify(health).includes(bad.key), false, '调度健康不得泄露会话身份');
+    const exposedWriteHealth = JSON.stringify(health);
+    for (const identity of [bad.key, bad.session, badJob.id, badFile,
+      writeVisitorBody, writePayloadMarker]) {
+      assert.equal(exposedWriteHealth.includes(identity), false, '调度健康不得泄露会话责任身份或正文');
+    }
 
     const recoveredSelection = await fx.runtime.scan();
     assert(recoveredSelection.some((entry) => entry.key === bad.key && entry.jobId === badJob.id),
@@ -1773,6 +1989,272 @@ const test = async (name, action) => {
     assert.equal(recoveredHealth.isolated_sessions.count, 0, '单次 EIO 不得形成永久隔离');
     assert.equal(recoveredHealth.isolated_sessions.reasons.io_error ?? 0, 0,
       '下一轮调度健康必须清除上一轮 io_error');
+
+    for (const variant of [
+      { name: 'outer-lstat', method: 'lstatSync', failAt: 1 },
+      { name: 'outer-read', method: 'readFileSync', failAt: 1 },
+      { name: 'transaction-read', method: 'readFileSync', failAt: 2 },
+    ]) {
+      const readFailure = fixture('scan-session-read-eio-' + variant.name);
+      const sessions = ['session_read-eio-a-' + variant.name, 'session_read-eio-b-' + variant.name]
+        .map((session) => ({ session, key: readFailure.runtime.stateKey(website, session) }))
+        .sort((left, right) => left.key.localeCompare(right.key));
+      const readBad = sessions[0];
+      const readHealthy = sessions[1];
+      const readBadJob = jobValue(readFailure, 'scan-read-eio-bad-' + variant.name, 1,
+        { responsibility_status: 'pending' });
+      readBadJob.data.session_id = readBad.session;
+      const visitorBody = '访客唯一正文-read-eio-' + variant.name + '-不得出现在调度健康';
+      const payloadMarker = 'synthetic-read-eio-payload-' + variant.name + '-private';
+      readBadJob.data.content = visitorBody;
+      readBadJob.data.payload_marker = payloadMarker;
+      const readHealthyJob = jobValue(readFailure, 'scan-read-eio-healthy-' + variant.name, 1,
+        { responsibility_status: 'pending' });
+      readHealthyJob.data.session_id = readHealthy.session;
+      writeState(readFailure, readBad.session,
+        stateValue(readFailure, readBad.session, [readBadJob]));
+      writeState(readFailure, readHealthy.session,
+        stateValue(readFailure, readHealthy.session, [readHealthyJob]));
+      const readBadFile = stateFile(readFailure, readBad.session);
+      const readBadBytes = fs.readFileSync(readBadFile);
+      const originalRead = fs[variant.method];
+      const resolvedReadBadFile = path.resolve(readBadFile);
+      let exactCalls = 0;
+      let readInjected = 0;
+      fs[variant.method] = function (target) {
+        if (path.resolve(String(target)) === resolvedReadBadFile) {
+          exactCalls += 1;
+          if (exactCalls === variant.failAt) {
+            readInjected += 1;
+            const error = new Error('受控会话状态读取失败');
+            error.code = 'EIO';
+            throw error;
+          }
+        }
+        return originalRead.apply(this, arguments);
+      };
+      let readSelected;
+      try { readSelected = await readFailure.runtime.scan(); }
+      finally { fs[variant.method] = originalRead; }
+      assert.equal(readInjected, 1, variant.name + ' 必须只注入一次 exact session read EIO');
+      assert(readSelected.some((entry) => entry.key === readHealthy.key),
+        variant.name + ' 不得阻断同轮健康会话');
+      assert(!readSelected.some((entry) => entry.key === readBad.key),
+        variant.name + ' 的坏会话不得获得执行许可');
+      assert(fs.readFileSync(readBadFile).equals(readBadBytes),
+        variant.name + ' 不得改写坏会话活动状态');
+      const readPreserved = readFailure.runtime.readState(readBad.key).jobs
+        .find((job) => job.id === readBadJob.id);
+      assert.equal(readPreserved.status, 'received');
+      assert.equal(readPreserved.responsibility_status, 'pending');
+      assert.equal(readPreserved.attempts, 0);
+      assert.deepEqual(readPreserved.data, readBadJob.data);
+      const readHealth = readJson(path.join(readFailure.runtimeDirectory, 'scheduler-health.json'));
+      assert.deepEqual(readHealth.isolated_sessions,
+        { count: 1, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0, io_error: 1 } });
+      const exposed = JSON.stringify(readHealth);
+      for (const identity of [readBad.key, readBad.session, readBadJob.id, readBadFile,
+        visitorBody, payloadMarker]) {
+        assert.equal(exposed.includes(identity), false, '读取隔离健康状态不得泄露会话责任身份');
+      }
+      const readRecovered = await readFailure.runtime.scan();
+      assert(readRecovered.some((entry) => entry.key === readBad.key && entry.jobId === readBadJob.id),
+        variant.name + ' 移除注入后必须重新选择同一坏会话责任');
+      const cleanReadHealth = readJson(path.join(readFailure.runtimeDirectory, 'scheduler-health.json'));
+      assert.equal(cleanReadHealth.isolated_sessions.count, 0);
+      assert.equal(cleanReadHealth.isolated_sessions.reasons.io_error ?? 0, 0);
+    }
+
+    const publishedFailure = fixture('scan-session-rename-published-eio');
+    const publishedBaseline = await establishHealthBaseline(publishedFailure);
+    const publishedSessions = ['session_rename-published-a', 'session_rename-published-b']
+      .map((session) => ({ session, key: publishedFailure.runtime.stateKey(website, session) }))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const publishedBad = publishedSessions[0];
+    const publishedHealthy = publishedSessions[1];
+    const publishedJob = jobValue(publishedFailure, 'scan-rename-published-bad', 1,
+      { responsibility_status: 'pending' });
+    publishedJob.data.session_id = publishedBad.session;
+    const publishedHealthyJob = jobValue(publishedFailure, 'scan-rename-published-healthy', 1,
+      { responsibility_status: 'pending' });
+    publishedHealthyJob.data.session_id = publishedHealthy.session;
+    writeState(publishedFailure, publishedBad.session,
+      stateValue(publishedFailure, publishedBad.session, [publishedJob]));
+    writeState(publishedFailure, publishedHealthy.session,
+      stateValue(publishedFailure, publishedHealthy.session, [publishedHealthyJob]));
+    const publishedFile = stateFile(publishedFailure, publishedBad.session);
+    const publishedIdentity = fs.lstatSync(publishedFile);
+    const published = await injectAtomicRenameFailure(publishedFile, 'EIO', async () => {
+      await assert.rejects(publishedFailure.runtime.scan(), (error) => error?.code === 'EIO',
+        'rename 已实际替换后抛 EIO 必须整轮 fail closed');
+    }, { publishBeforeThrow: true });
+    assert.equal(published.injected, 1);
+    const publishedAfter = fs.lstatSync(publishedFile);
+    assert.notEqual(publishedAfter.ino, publishedIdentity.ino,
+      '该负例必须证明 active 目录项已由真实 rename 换代');
+    const publishedState = readJson(publishedFile);
+    const publishedPreserved = publishedState.jobs.find((job) => job.id === publishedJob.id);
+    assert(publishedPreserved?.data, '结果未知时仍不得删除原问题责任');
+    assert.equal(publishedPreserved.responsibility_status, 'pending');
+    assertNoAtomicTemporary(publishedFailure, publishedFile);
+    assertScanDidNotComplete(publishedFailure, publishedBaseline);
+
+    const readbackFailure = fixture('scan-session-target-readback-eio');
+    const readbackBaseline = await establishHealthBaseline(readbackFailure);
+    const readbackSessions = ['session_readback-eio-a', 'session_readback-eio-b']
+      .map((session) => ({ session, key: readbackFailure.runtime.stateKey(website, session) }))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const readbackBad = readbackSessions[0];
+    const readbackHealthy = readbackSessions[1];
+    const readbackJob = jobValue(readbackFailure, 'scan-readback-eio-bad', 1,
+      { responsibility_status: 'pending' });
+    readbackJob.data.session_id = readbackBad.session;
+    const readbackHealthyJob = jobValue(readbackFailure, 'scan-readback-eio-healthy', 1,
+      { responsibility_status: 'pending' });
+    readbackHealthyJob.data.session_id = readbackHealthy.session;
+    writeState(readbackFailure, readbackBad.session,
+      stateValue(readbackFailure, readbackBad.session, [readbackJob]));
+    writeState(readbackFailure, readbackHealthy.session,
+      stateValue(readbackFailure, readbackHealthy.session, [readbackHealthyJob]));
+    const readbackFile = stateFile(readbackFailure, readbackBad.session);
+    const readbackBytes = fs.readFileSync(readbackFile);
+    const readbackTarget = path.resolve(readbackFile);
+    const originalReadbackRename = fs.renameSync;
+    const originalReadbackOpen = fs.openSync;
+    const originalReadbackRead = fs.readFileSync;
+    let readbackRenameInjected = 0;
+    let readbackProofFailures = 0;
+    fs.renameSync = function (source, destination) {
+      if (readbackRenameInjected === 0 && path.resolve(String(destination)) === readbackTarget
+        && path.resolve(String(source)).startsWith(readbackTarget + '.tmp-')) {
+        readbackRenameInjected += 1;
+        const error = new Error('受控发布前 rename 失败'); error.code = 'EIO'; throw error;
+      }
+      return originalReadbackRename.apply(this, arguments);
+    };
+    const failReadback = (target) => readbackRenameInjected > 0
+      && path.resolve(String(target)) === readbackTarget;
+    fs.openSync = function (target) {
+      if (failReadback(target)) {
+        readbackProofFailures += 1;
+        const error = new Error('受控 active identity 读回失败'); error.code = 'EIO'; throw error;
+      }
+      return originalReadbackOpen.apply(this, arguments);
+    };
+    fs.readFileSync = function (target) {
+      if (failReadback(target)) {
+        readbackProofFailures += 1;
+        const error = new Error('受控 active bytes 读回失败'); error.code = 'EIO'; throw error;
+      }
+      return originalReadbackRead.apply(this, arguments);
+    };
+    try {
+      await assert.rejects(readbackFailure.runtime.scan(), (error) => error?.code === 'EIO',
+        'active identity/bytes 无法读回时必须整轮 fail closed');
+    } finally {
+      fs.readFileSync = originalReadbackRead;
+      fs.openSync = originalReadbackOpen;
+      fs.renameSync = originalReadbackRename;
+    }
+    assert.equal(readbackRenameInjected, 1);
+    assert(readbackProofFailures >= 1,
+      '生产必须在降级为单会话隔离前实际核验 active identity/bytes');
+    assert(fs.readFileSync(readbackFile).equals(readbackBytes));
+    assertNoAtomicTemporary(readbackFailure, readbackFile);
+    assertScanDidNotComplete(readbackFailure, readbackBaseline);
+
+    const cleanupFailure = fixture('scan-session-cleanup-eio');
+    const cleanupBaseline = await establishHealthBaseline(cleanupFailure);
+    const cleanupSessions = ['session_cleanup-eio-a', 'session_cleanup-eio-b']
+      .map((session) => ({ session, key: cleanupFailure.runtime.stateKey(website, session) }))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const cleanupBad = cleanupSessions[0];
+    const cleanupHealthy = cleanupSessions[1];
+    const cleanupJob = jobValue(cleanupFailure, 'scan-cleanup-eio-bad', 1,
+      { responsibility_status: 'pending' });
+    cleanupJob.data.session_id = cleanupBad.session;
+    const cleanupHealthyJob = jobValue(cleanupFailure, 'scan-cleanup-eio-healthy', 1,
+      { responsibility_status: 'pending' });
+    cleanupHealthyJob.data.session_id = cleanupHealthy.session;
+    writeState(cleanupFailure, cleanupBad.session,
+      stateValue(cleanupFailure, cleanupBad.session, [cleanupJob]));
+    writeState(cleanupFailure, cleanupHealthy.session,
+      stateValue(cleanupFailure, cleanupHealthy.session, [cleanupHealthyJob]));
+    const cleanupFile = stateFile(cleanupFailure, cleanupBad.session);
+    const cleanupBytes = fs.readFileSync(cleanupFile);
+    const cleanupTarget = path.resolve(cleanupFile);
+    const cleanupDirectoryBefore = fs.lstatSync(cleanupFailure.runtimeDirectory);
+    const cleanupDirectoryIdentity = {
+      dev: cleanupDirectoryBefore.dev,
+      ino: cleanupDirectoryBefore.ino,
+      uid: cleanupDirectoryBefore.uid,
+      mode: cleanupDirectoryBefore.mode,
+      isDirectory: cleanupDirectoryBefore.isDirectory(),
+      isSymbolicLink: cleanupDirectoryBefore.isSymbolicLink(),
+    };
+    assert.equal(cleanupDirectoryIdentity.isDirectory, true);
+    assert.equal(cleanupDirectoryIdentity.isSymbolicLink, false);
+    assert.equal(cleanupDirectoryIdentity.uid, process.geteuid());
+    assert.equal(cleanupDirectoryIdentity.mode & 0o777, 0o700);
+    const originalCleanupRename = fs.renameSync;
+    const originalCleanupUnlink = fs.unlinkSync;
+    let cleanupRenameInjected = 0;
+    let cleanupFailures = 0;
+    let ownedTemporary = '';
+    let cleanupError;
+    fs.renameSync = function (source, destination) {
+      if (cleanupRenameInjected === 0 && path.resolve(String(destination)) === cleanupTarget
+        && path.resolve(String(source)).startsWith(cleanupTarget + '.tmp-')) {
+        cleanupRenameInjected += 1;
+        ownedTemporary = path.resolve(String(source));
+        const error = new Error('受控发布前 rename 失败'); error.code = 'EIO'; throw error;
+      }
+      return originalCleanupRename.apply(this, arguments);
+    };
+    fs.unlinkSync = function (target) {
+      if (ownedTemporary && path.resolve(String(target)) === ownedTemporary) {
+        cleanupFailures += 1;
+        const error = new Error('受控临时文件清理失败'); error.code = 'EIO'; throw error;
+      }
+      return originalCleanupUnlink.apply(this, arguments);
+    };
+    try { await cleanupFailure.runtime.scan(); }
+    catch (error) { cleanupError = error; }
+    finally {
+      fs.unlinkSync = originalCleanupUnlink;
+      fs.renameSync = originalCleanupRename;
+      if (ownedTemporary) {
+        const directoryNow = fs.lstatSync(cleanupFailure.runtimeDirectory);
+        const directoryIdentityNow = {
+          dev: directoryNow.dev,
+          ino: directoryNow.ino,
+          uid: directoryNow.uid,
+          mode: directoryNow.mode,
+          isDirectory: directoryNow.isDirectory(),
+          isSymbolicLink: directoryNow.isSymbolicLink(),
+        };
+        const stat = fs.lstatSync(ownedTemporary);
+        const ownedDirectory = path.dirname(ownedTemporary) === path.resolve(cleanupFailure.runtimeDirectory);
+        assert.deepEqual(directoryIdentityNow, cleanupDirectoryIdentity,
+          '清理 test-owned temporary 前 runtime 目录身份必须与注入前逐项一致');
+        const unchangedDirectory = directoryIdentityNow.isDirectory && !directoryIdentityNow.isSymbolicLink
+          && directoryIdentityNow.uid === process.geteuid()
+          && (directoryIdentityNow.mode & 0o777) === 0o700;
+        const ownedName = new RegExp('^' + path.basename(cleanupFile).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          + '\\.tmp-[a-f0-9]{16}$').test(path.basename(ownedTemporary));
+        const ownedIdentity = stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1
+          && stat.uid === process.geteuid() && (stat.mode & 0o777) === 0o600;
+        if (unchangedDirectory && ownedDirectory && ownedName && ownedIdentity) originalCleanupUnlink(ownedTemporary);
+        assert(unchangedDirectory && ownedDirectory && ownedName && ownedIdentity,
+          '测试只能清理本 fixture 精确拥有的安全 atomic temporary');
+      }
+    }
+    assert.equal(cleanupError?.code, 'EIO', 'cleanup 不完整必须令整轮 reject');
+    assert.equal(cleanupRenameInjected, 1);
+    assert(cleanupFailures >= 1, '必须真实命中 temporary cleanup 失败');
+    assert(fs.readFileSync(cleanupFile).equals(cleanupBytes));
+    assertNoAtomicTemporary(cleanupFailure, cleanupFile);
+    assertScanDidNotComplete(cleanupFailure, cleanupBaseline);
 
     for (const code of ['ENOSPC', 'EDQUOT', 'EROFS']) {
       const fatal = fixture('scan-session-fatal-' + code.toLowerCase());
