@@ -46,13 +46,13 @@ async function main() {
   let sequence=0;
   let embeddingFailures=0;
   let promptUpdates=0;
+  const promptPayloads=[];
   let promptFailures=0;
   let embeddingUpdates=0;
   const embeddingPayloads=[];
   const removePayloads=[];
   const httpEvents=[];
   let workspaceReads=0;
-  let promptDelayMs=0;
   let promptGate=null;
   let failReadAfterNextEmbedding=false;
   let workspaceReadFailureCountdown=0;
@@ -93,17 +93,12 @@ async function main() {
       const projection=JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json'),'utf8'));
       applyingObservation={state:projection.state,revision:projection.revision,applied_revision:projection.configuration.runtime.applied_revision};
       if(promptFailures>0){promptFailures--;send(500,{error:true});return;}
-      httpEvents.push('prompt_update');promptUpdates++;prompt=body.openAiPrompt;
-      if(promptGate!==null) {
-        promptGate.entered++;
-        promptGate.signal();
-        await promptGate.release;
-      }
-      if(promptDelayMs>0) {
-        await new Promise(resolve=>{
-          const timer=setTimeout(resolve,promptDelayMs);
-          response.once('close',()=>{clearTimeout(timer);resolve();});
-        });
+      httpEvents.push('prompt_update');promptUpdates++;prompt=body.openAiPrompt;promptPayloads.push(prompt);
+      const activePromptGate=promptGate;
+      if(activePromptGate!==null) {
+        activePromptGate.entered++;
+        activePromptGate.signal();
+        await activePromptGate.release;
         if(response.destroyed) return;
       }
       send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;
@@ -228,13 +223,36 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
   };
   const armPromptGate=()=>{
     assert.equal(promptGate,null,'同一时刻只能建立一个 Prompt 响应门');
-    let signalEntered,releaseGate;
+    let signalEntered,releaseGate,closed=false;
     const entered=new Promise(resolve=>{signalEntered=resolve;});
     const release=new Promise(resolve=>{releaseGate=resolve;});
     const gate={entered:0,signal:()=>signalEntered(),release,
-      close:()=>{releaseGate();if(promptGate===gate)promptGate=null;}};
+      close:()=>{if(!closed){closed=true;releaseGate();}if(promptGate===gate)promptGate=null;},
+      closed:()=>closed};
     promptGate=gate;
     return {gate,entered,close:gate.close};
+  };
+  const promptGateWaitMilliseconds=20000;
+  const waitForPromptGate=async(gate,operation,label)=>{
+    let timeoutId=null;
+    const timeout=new Promise(resolve=>{
+      timeoutId=setTimeout(()=>resolve({kind:'timeout'}),promptGateWaitMilliseconds);
+    });
+    let outcome;
+    try {
+      outcome=await Promise.race([
+        gate.entered.then(()=>({kind:'entered'})),
+        operation.then(result=>({kind:'closed',result})),
+        timeout,
+      ]);
+    } finally {
+      if(timeoutId!==null)clearTimeout(timeoutId);
+    }
+    if(outcome.kind==='closed') {
+      throw new Error(`${label}建立前 apply 已退出：code=${outcome.result.code} signal=${outcome.result.signal||''}`);
+    }
+    if(outcome.kind==='timeout')throw new Error(`未在有界时限内建立${label}`);
+    assert.equal(gate.gate.entered,1,`${label}必须只进入一次`);
   };
   const processGroupId=pid=>{
     const value=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
@@ -343,6 +361,114 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       }
       throw error;
     } finally {
+      for(const file of [groupReady,groupGo,groupReadyTmp,groupGoTmp])fs.rmSync(file,{force:true});
+    }
+  };
+  const invokeSignalledAtPromptGate=async(args,signals,extra={})=>{
+    assert.ok(Array.isArray(signals)&&signals.length>=1&&signals.length<=2
+      &&signals.every(signal=>['SIGINT','SIGTERM'].includes(signal)),'中断夹具仅允许受控信号');
+    const ownPgid=processGroupId(process.pid);
+    const nonce=crypto.randomBytes(8).toString('hex');
+    const groupReady=path.join(work,`materials-signal-${nonce}.group-ready`);
+    const groupGo=path.join(work,`materials-signal-${nonce}.group-go`);
+    const groupReadyTmp=`${groupReady}.tmp`;
+    const groupGoTmp=`${groupGo}.tmp`;
+    const gate=armPromptGate();
+    const launcher=[
+      'set -euo pipefail',
+      'group_ready=$1',
+      'group_go=$2',
+      'shift 2',
+      'umask 077',
+      'printf "%s\\n" "$BASHPID" > "${group_ready}.tmp"',
+      'mv -f -- "${group_ready}.tmp" "$group_ready"',
+      'deadline=$((SECONDS+10))',
+      'while [[ ! -f "$group_go" ]]; do',
+      '  (( SECONDS < deadline )) || exit 96',
+      '  sleep 0.02',
+      'done',
+      'exec bash "$@"',
+    ].join('\n');
+    const child=spawn('bash',['-c',launcher,'materials-signal-group',groupReady,groupGo,
+      path.join(root,'scripts/materials.sh'),'--deploy-dir',deploy,...args],{
+      cwd:work,detached:true,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`,...extra}
+    });
+    let stdout='',stderr='',closedResult=null,spawnError=null,pgid=null,secondSignalTimer=null,secondSignalError=null;
+    child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    const closed=new Promise(resolve=>{
+      child.on('error',error=>{spawnError=error;});
+      child.on('close',(code,signal)=>{closedResult={code,signal,stdout,stderr};resolve(closedResult);});
+    });
+    const waitForClose=async(timeout,message)=>{
+      const timeoutValue=Symbol('close-timeout');
+      const value=await Promise.race([closed,delay(timeout).then(()=>timeoutValue)]);
+      if(value===timeoutValue)throw new Error(message);
+      return value;
+    };
+    const killAndDrain=async()=>{
+      if(pgid!==null&&pgid===child.pid&&pgid!==ownPgid&&processGroupAlive(pgid)) {
+        process.kill(-pgid,'SIGKILL');
+      } else if(pgid===null&&!closedResult)child.kill('SIGKILL');
+      const result=closedResult||await waitForClose(3000,`中断夹具进程未退出：${child.pid}`);
+      if(pgid!==null) {
+        const goneDeadline=Date.now()+3000;
+        while(processGroupAlive(pgid)&&Date.now()<goneDeadline)await delay(20);
+        if(processGroupAlive(pgid))throw new Error(`中断夹具进程组未退出：${pgid}`);
+      }
+      return result;
+    };
+    try {
+      const groupDeadline=Date.now()+3000;
+      while(!fs.existsSync(groupReady)) {
+        if(closedResult)throw new Error(`中断进程组尚未就绪，apply 已退出：code=${closedResult.code}`);
+        if(Date.now()>=groupDeadline)throw new Error('未在时限内建立中断进程组');
+        await delay(20);
+      }
+      if(spawnError)throw spawnError;
+      const announcedPid=fs.readFileSync(groupReady,'utf8').trim();
+      if(!/^\d+$/.test(announcedPid)||Number(announcedPid)!==child.pid) {
+        throw new Error(`中断进程组身份不一致：child=${child.pid} announced=${announcedPid}`);
+      }
+      const observedPgid=processGroupId(child.pid);
+      if(observedPgid!==child.pid||observedPgid===ownPgid) {
+        throw new Error(`拒绝向未隔离进程组发信号：child=${child.pid} pgrp=${observedPgid} own=${ownPgid}`);
+      }
+      pgid=observedPgid;
+      fs.writeFileSync(groupGoTmp,'go\n',{mode:0o600});
+      fs.renameSync(groupGoTmp,groupGo);
+      await waitForPromptGate(gate,closed,'Prompt 中断响应门');
+      const projection=JSON.parse(fs.readFileSync(projectionPath,'utf8'));
+      assert.equal(projection.state,'applying','只能在权威投影进入 applying 后发中断信号');
+      assert.ok(applyingObservation,'Prompt handler 必须回读 applying 投影');
+      assert.deepEqual(applyingObservation,{state:'applying',revision:projection.revision,
+        applied_revision:projection.configuration.runtime.applied_revision});
+      assert.ok(projection.configuration.runtime.applied_revision<projection.revision);
+      assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery','complete.json')),true,
+        '中断前必须已持久严格恢复基线');
+      if(!processGroupAlive(pgid))throw new Error('发信号前中断进程组已退出');
+      process.kill(-pgid,signals[0]);
+      if(signals.length>1) {
+        secondSignalTimer=setTimeout(()=>{
+          try { if(!closedResult&&processGroupAlive(pgid))process.kill(-pgid,signals[1]); }
+          catch(error) { if(error.code!=='ESRCH')secondSignalError=error; }
+        },35);
+      }
+      // 保持响应门直到受信号进程收口；finally 再释放 handler，
+      // 以阻止夹具响应抢在中断信号前把请求伪装成正常完成。
+      const result=await waitForClose(promptGateWaitMilliseconds,
+        `发出${signals.join('+')}后 apply 未在有界时限内退出`);
+      if(secondSignalError!==null)throw secondSignalError;
+      const goneDeadline=Date.now()+3000;
+      while(processGroupAlive(pgid)&&Date.now()<goneDeadline)await delay(20);
+      if(processGroupAlive(pgid))throw new Error(`中断后进程组仍存在：${pgid}`);
+      return {...result,promptGateObserved:true,groupGone:true};
+    } catch(error) {
+      try { await killAndDrain(); }
+      catch(cleanupError) { if(cleanupError.code!=='ESRCH')error.cleanupError=cleanupError.message; }
+      throw error;
+    } finally {
+      if(secondSignalTimer!==null)clearTimeout(secondSignalTimer);
+      gate.close();
       for(const file of [groupReady,groupGo,groupReadyTmp,groupGoTmp])fs.rmSync(file,{force:true});
     }
   };
@@ -1048,36 +1174,11 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const beforeInterrupt=JSON.parse(fs.readFileSync(projectionPath));
     interruptPrompt='## 中断后待恢复的 Prompt '+signals.join('+')+'\n';
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),interruptPrompt,{mode:0o640});
-    promptDelayMs=5000;
-    const interruptedResult=await new Promise((resolve,reject)=>{
-      const child=spawn('bash',[path.join(root,'scripts/materials.sh'),'--deploy-dir',deploy,'apply'],{
-        cwd:work,detached:true,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
-      });
-      let stdout='',stderr='',finished=false;
-      child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
-      child.on('error',reject);
-      child.on('close',(code,signal)=>{finished=true;resolve({code,signal,stdout,stderr});});
-      const deadline=Date.now()+5000;
-      const observe=()=>{
-        if(finished)return;
-        try {
-          const value=JSON.parse(fs.readFileSync(projectionPath,'utf8'));
-          if(value.state==='applying') {
-            process.kill(-child.pid,signals[0]);
-            if(signals.length>1)setTimeout(()=>{if(!finished){try{process.kill(-child.pid,signals[1]);}catch(error){if(error.code!=='ESRCH')reject(error);}}},35);
-            return;
-          }
-        } catch {}
-        if(Date.now()>=deadline) {
-          process.kill(-child.pid,'SIGKILL');
-          reject(new Error('未观察到 applying，无法执行中断测试'));
-          return;
-        }
-        setTimeout(observe,20);
-      };
-      observe();
-    });
-    promptDelayMs=0;
+    const promptPayloadOffset=promptPayloads.length;
+    applyingObservation=null;
+    const interruptedResult=await invokeSignalledAtPromptGate(['apply'],signals);
+    assert.equal(interruptedResult.promptGateObserved,true);
+    assert.equal(interruptedResult.groupGone,true);
     assert.equal(interruptedResult.code,signals[0]==='SIGINT'?130:143,JSON.stringify({code:interruptedResult.code,signal:interruptedResult.signal})+'\n'+interruptedResult.stderr);
     assert.equal(interruptedResult.signal,null);
     assert.match(interruptedResult.stderr,/资料应用已中断/);
@@ -1086,10 +1187,15 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.ok(afterInterrupt.revision>beforeInterrupt.revision);
     assert.equal(afterInterrupt.prompt.text,beforeInterrupt.prompt.text);
     assert.equal(fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'),interruptPrompt);
+    assert.deepEqual(promptPayloads.slice(promptPayloadOffset),[interruptPrompt],
+      '信号退出只能保留已进入外部请求的候选，不得在 EXIT 阶段伪造外部恢复');
     assert.equal(fs.readdirSync(path.join(deploy,'tmp')).filter(name=>name.startsWith('materials-result.')).length,0);
     await ok(['apply']);
     assert.equal(prompt,interruptPrompt);
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applied');
+    assert.deepEqual(promptPayloads.slice(promptPayloadOffset),
+      [interruptPrompt,beforeInterrupt.prompt.text,interruptPrompt],
+      '重试必须以同一候选收敛，不得丢失或重复外部 Prompt 代次');
     }
     pass('真实进程组 SIGINT/SIGTERM/连续信号保持130/143、清理结果文件并以更高代次保持applying，保留候选且重试才解除停发');
 
@@ -1181,8 +1287,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const repairPromise=invoke(['apply','--force-external']);
     let repairInspectionError=null;
     try {
-      await Promise.race([repairGate.entered,delay(5000).then(()=>{throw new Error('未在时限内进入 Prompt 修复响应门');})]);
-      assert.equal(repairGate.gate.entered,1);
+      await waitForPromptGate(repairGate,repairPromise,'Prompt 修复响应门');
       const repairRecovery=path.join(deploy,'backups/config-history/materials.recovery');
       const completePath=path.join(repairRecovery,'complete.json');
       assert.equal(fs.statSync(repairRecovery).mode&0o777,0o700);
@@ -1280,8 +1385,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const failedRepairPromise=invoke(['apply','--force-external']);
     let failedRepairInspectionError=null;
     try {
-      await Promise.race([failedRepairGate.entered,delay(5000).then(()=>{throw new Error('未在时限内进入失败恢复 Prompt 门');})]);
-      assert.equal(failedRepairGate.gate.entered,1);
+      await waitForPromptGate(failedRepairGate,failedRepairPromise,'失败恢复 Prompt 门');
       locations.push(failedRepairTargetLocation);
       assert.equal(locations.includes(failedRepairTargetLocation),true);
     } catch(error) {
