@@ -1802,7 +1802,26 @@ const abortablePending = (signal, started) => {
     }
   });
   await test('T19/T21 真点击缺少from/type、原fingerprint已见也只暂停A', async () => {
-    const card = sent.find((entry) => entry.session_id === 'session_client-a' && entry.type === 'picker');
+    const modelCount = modelRequests.length;
+    await deliver(message('session_client-a', '人工'));
+    const card = sent.at(-1);
+    assert.equal(card.session_id, 'session_client-a');
+    assert.equal(card.type, 'picker');
+    assert.equal(modelRequests.length, modelCount);
+    const current = state('session_client-a');
+    const outbound = current.outgoing[String(card.fingerprint)];
+    assert(outbound && outbound.status === 'sent' && outbound.message_type === 'picker'
+      && outbound.purpose === 'handoff_offer',
+      '人工按钮 fingerprint 必须先形成已确认的本项目出站身份');
+    const echoId = digest(['message:received', String(card.fingerprint),
+      digest(JSON.stringify(card.content))].join('|'));
+    const echo = current.jobs.find((job) => job.id === echoId);
+    assert(echo && echo.status === 'done' && echo.control === true
+      && echo.action === 'non_operator_message' && echo.responsibility_status === 'control_handled',
+      '人工按钮自回流必须先被接收核心识别为本项目控制消息');
+    const offer = current.offers[card.content.id];
+    assert(offer && offer.consumed_at === null && offer.expires_at > now,
+      '点击场景必须使用当前有效且尚未消费的人工按钮');
     await deliver(click('session_client-a', card));
     assert.equal(state('session_client-a').mode, 'human');
     assert.equal(sent.at(-1).content, '您的人工协助请求已收到，请稍候。');
