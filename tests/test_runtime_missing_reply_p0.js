@@ -346,6 +346,32 @@ const outgoingValue = (fx, job, plan, extra = {}) => ({
 });
 const stateFile = (fx, session) => path.join(fx.runtimeDirectory, 'session-' + fx.runtime.stateKey(website, session) + '.json');
 const writeState = (fx, session, value) => fs.writeFileSync(stateFile(fx, session), JSON.stringify(value), { mode: 0o600 });
+const assertNoBusinessResponsibility = (fx, session, prohibitedContent = []) => {
+  const file = stateFile(fx, session);
+  const persisted = [];
+  if (fs.existsSync(file)) {
+    const raw = fs.readFileSync(file, 'utf8');
+    persisted.push(raw);
+    const state = JSON.parse(raw);
+    const { crisp_rest_catchup: cursor, ...business } = state;
+    assert(cursor && typeof cursor === 'object' && !Array.isArray(cursor),
+      '仅允许因补偿游标建立会话状态');
+    assert.deepEqual(Object.keys(cursor).sort(), ['cursor', 'schema_version', 'site_binding']);
+    assert.equal(cursor.schema_version, 2);
+    assert.match(cursor.site_binding, /^[a-f0-9]{64}$/);
+    assert(Number.isFinite(cursor.cursor) && cursor.cursor >= 0 && cursor.cursor <= fx.now());
+    assert.deepEqual(business, stateValue(fx, session),
+      'quarantine 状态除合法补偿游标外必须保持标准空会话');
+  }
+  const catchup = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+  if (fs.existsSync(catchup)) persisted.push(fs.readFileSync(catchup, 'utf8'));
+  for (const content of prohibitedContent) {
+    assert.equal(persisted.some((raw) => raw.includes(content)), false,
+      'quarantine 状态不得保存畸形访客正文');
+  }
+  assert.deepEqual(fx.postAttempts, [], 'quarantine 不得产生 Crisp 出站尝试');
+  assert.deepEqual(fx.sent, [], 'quarantine 不得产生可见消息');
+};
 const webhook = (fx, session, content, fingerprint, extra = {}) => {
   const timestampFields = extra.omitTimestamp ? {} : { timestamp: extra.timestamp ?? fx.now() };
   return fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET }, body: {
@@ -1057,7 +1083,7 @@ const test = async (name, action) => {
     let progress = JSON.parse(fs.readFileSync(catchupFile, 'utf8'));
     assert.equal(progress.unresolved_messages.length, 1);
     assert.equal(progress.unresolved_messages[0].reason, 'invalid_content');
-    assert(!fs.existsSync(stateFile(fx, session)), '错误 text 结构不能进入知识或 Provider 责任链');
+    assertNoBusinessResponsibility(fx, session, ['错误结构']);
 
     const valid = { ...invalid, content: '精确端点恢复出的合法合成问题' };
     fx.exactMessages.set(String(fingerprint), valid);
@@ -1096,8 +1122,10 @@ const test = async (name, action) => {
     assert.equal(catchup.unresolved_messages.length, malformed.length);
     assert.deepEqual(new Set(catchup.unresolved_messages.map((entry) => entry.reason)),
       new Set(['invalid_content']));
-    assert(!fs.existsSync(stateFile(fx, session)),
-      '畸形结构消息不得绕过 quarantine 进入业务责任或 Provider');
+    assertNoBusinessResponsibility(fx, session,
+      ['image/png', 'https://example.invalid/file', 'image/gif', 'audio/ogg',
+        'https://example.invalid/audio', 'picker-1', '请选择', 'one',
+        'field-1', '请输入', '选项']);
   });
 
   await test('REST 补偿内部接收 400/413 时不推进任何水位并报告本地持久失败', async () => {
