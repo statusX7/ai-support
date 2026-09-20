@@ -2929,6 +2929,38 @@ knowledge_clear_pending() {
   mv -f -- "$manifest_temp" "$manifest" || { rm -f -- "$manifest_temp"; return 1; }
 }
 
+knowledge_recovery_classify_deletes() {
+  local deploy_dir=$1 requested=$2 recovery="${1}/backups/config-history/materials.recovery" result
+  jq -M -en --argjson requested "$requested" '
+    $requested | type == "array" and length <= 100000 and
+    all(.[]; type == "string" and test("^custom-documents/[^/\\\\[:cntrl:]]+\\.json$")) and
+    (($requested | unique | length) == ($requested | length))
+  ' >/dev/null || return 1
+  if [[ ! -e "$recovery" && ! -L "$recovery" ]]; then
+    jq -M -cn --argjson requested "$requested" \
+      '{schema_version:1,delete:($requested | sort),preserve_missing:[]}'
+    return
+  fi
+  [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
+  require_command python3
+  result=$(printf '%s\n' "$requested" | python3 -B "${COMMON_DIR}/materials-recovery.py" \
+    --deploy-dir "$deploy_dir" --recovery "$recovery" classify-delete) || return 1
+  jq -M -e '
+    (keys | sort) == ["delete","preserve_missing","schema_version"] and
+    .schema_version == 1 and
+    (.delete | type == "array") and (.preserve_missing | type == "array") and
+    ((.delete | unique | sort) == .delete) and
+    ((.preserve_missing | unique | sort) == .preserve_missing) and
+    ((.delete - .preserve_missing | length) == (.delete | length)) and
+    all((.delete + .preserve_missing)[];
+      type == "string" and test("^custom-documents/[^/\\\\[:cntrl:]]+\\.json$"))
+  ' <<< "$result" >/dev/null || return 1
+  jq -M -en --argjson requested "$requested" --argjson classified "$result" '
+    ($requested | unique | sort) == (($classified.delete + $classified.preserve_missing) | unique | sort)
+  ' >/dev/null || return 1
+  printf '%s\n' "$result"
+}
+
 knowledge_sync_legacy() {
   local deploy_dir=$1
   local force=${2:-0}
@@ -2936,6 +2968,7 @@ knowledge_sync_legacy() {
   local knowledge_dir=${4:-${deploy_dir}/knowledge}
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
   local response_file manifest_temp file filename hash old_hash locations old_locations payload status=000 stale_locations garbage_locations escaped_key
+  local delete_scope delete_locations
   local upload_filename='' upload_file=''
   local curl_result=0 response_persistent=false
   local pending_hash pending_locations pending_old_locations pending_started pending_age pending_retry_after update_status
@@ -2980,14 +3013,18 @@ knowledge_sync_legacy() {
 
   garbage_locations=$(jq -c '(.garbage_locations // []) | unique' "$manifest")
   if [[ "$scope" == null && "$garbage_locations" != "[]" ]]; then
-    payload=$(jq -cn --argjson deletes "$garbage_locations" '{adds:[],deletes:$deletes}')
-    if anythingllm_update_embeddings "$payload" \
-      && anythingllm_remove_documents "$garbage_locations"; then
+    delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$garbage_locations") \
+      || { warn "遗留知识清理位置不属于当前恢复事务"; return 1; }
+    delete_locations=$(jq -M -ce '.delete' <<< "$delete_scope") || return 1
+    payload=$(jq -cn --argjson deletes "$delete_locations" '{adds:[],deletes:$deletes}')
+    if { [[ "$delete_locations" == "[]" ]] \
+        || { anythingllm_update_embeddings "$payload" \
+          && anythingllm_remove_documents "$delete_locations"; }; }; then
       if manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") \
         && jq '.garbage_locations = []' "$manifest" > "$manifest_temp" \
         && chmod 600 "$manifest_temp" \
         && mv -f -- "$manifest_temp" "$manifest"; then
-        info "已清理上次同步遗留的 AnythingLLM 源文档"
+        info "已收口上次同步遗留的知识清理责任"
       else
         rm -f -- "${manifest_temp:-}"
         warn "服务端旧文档已清理，但本机知识责任记录未能提交"
@@ -3038,10 +3075,13 @@ knowledge_sync_legacy() {
           ((failures += 1))
           continue
         fi
-        payload=$(jq -cn --argjson deletes "$pending_locations" '{adds:[],deletes:$deletes}')
-        if [[ "$pending_locations" != "[]" ]] \
+        delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$pending_locations") \
+          || { warn "未完成索引含无删除权限的位置：$filename"; ((failures += 1)); continue; }
+        delete_locations=$(jq -M -ce '.delete' <<< "$delete_scope") || return 1
+        payload=$(jq -cn --argjson deletes "$delete_locations" '{adds:[],deletes:$deletes}')
+        if [[ "$delete_locations" != "[]" ]] \
           && { ! anythingllm_update_embeddings "$payload" \
-            || ! anythingllm_remove_documents "$pending_locations"; }; then
+            || ! anythingllm_remove_documents "$delete_locations"; }; then
           warn "无法安全清理已变更文件的上次索引进度：$filename"
           ((failures += 1))
           continue
@@ -3186,7 +3226,15 @@ knowledge_sync_legacy() {
           warn "知识索引结果暂时未知，已保留恢复信息且不会删除服务端文档：$filename"
         else
           warn "知识索引被 AnythingLLM 明确拒绝，已保留旧索引：$filename"
-          if anythingllm_remove_documents "$locations"; then
+          delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$locations") \
+            || { warn "候选上传位置不属于当前恢复事务：$filename"; ((failures += 1)); continue; }
+          delete_locations=$(jq -M -ce '
+            select(.preserve_missing == []) | .delete
+          ' <<< "$delete_scope") || { warn "候选上传位置没有连续删除权：$filename"; ((failures += 1)); continue; }
+          jq -M -en --argjson expected "$locations" --argjson actual "$delete_locations" \
+            '($expected | unique | sort) == ($actual | unique | sort)' >/dev/null \
+            || { warn "候选上传位置删除授权不完整：$filename"; ((failures += 1)); continue; }
+          if anythingllm_remove_documents "$delete_locations"; then
             knowledge_clear_pending "$manifest" "$filename" \
               || warn "源文档已清理，但知识进度记录将在下次同步继续收口：$filename"
           else
@@ -3203,6 +3251,9 @@ knowledge_sync_legacy() {
     stale_locations='[]'
     if [[ "$old_locations" != "[]" ]]; then
       stale_locations=$(jq -cn --argjson old "$old_locations" --argjson current "$locations" '$old - $current')
+      delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$stale_locations") \
+        || { warn "旧索引含无删除权限的位置：$filename"; ((failures += 1)); continue; }
+      stale_locations=$(jq -M -ce '.delete' <<< "$delete_scope") || return 1
       payload=$(jq -cn --argjson deletes "$stale_locations" '{adds:[],deletes:$deletes}')
       if [[ "$stale_locations" != "[]" ]] && ! anythingllm_update_embeddings "$payload"; then
         warn "旧索引清理结果无法确认；新索引保持可用，旧位置已登记供下次重试：$filename"
@@ -3251,10 +3302,13 @@ knowledge_sync_legacy() {
       ((failures += 1))
       continue
     fi
-    payload=$(jq -cn --argjson deletes "$pending_locations" '{adds:[],deletes:$deletes}')
-    if [[ "$pending_locations" != "[]" ]] \
+    delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$pending_locations") \
+      || { warn "已删除文件含无删除权限的未完成位置：$filename"; ((failures += 1)); continue; }
+    delete_locations=$(jq -M -ce '.delete' <<< "$delete_scope") || return 1
+    payload=$(jq -cn --argjson deletes "$delete_locations" '{adds:[],deletes:$deletes}')
+    if [[ "$delete_locations" != "[]" ]] \
       && { ! anythingllm_update_embeddings "$payload" \
-        || ! anythingllm_remove_documents "$pending_locations"; }; then
+        || ! anythingllm_remove_documents "$delete_locations"; }; then
       warn "无法安全清理已删除文件的未完成索引：$filename"
       ((failures += 1))
       continue
@@ -3272,16 +3326,19 @@ knowledge_sync_legacy() {
       || { warn "清单含非法路径，拒绝处理：$filename"; ((failures += 1)); continue; }
     [[ -e "${knowledge_dir}/${filename}" ]] && continue
     old_locations=$(jq -c --arg name "$filename" '.files[$name].locations // []' "$manifest")
-    payload=$(jq -cn --argjson deletes "$old_locations" '{adds:[],deletes:$deletes}')
-    if [[ "$old_locations" != "[]" ]] && ! anythingllm_update_embeddings "$payload"; then
+    delete_scope=$(knowledge_recovery_classify_deletes "$deploy_dir" "$old_locations") \
+      || { warn "已删除文件含无删除权限的旧位置：$filename"; ((failures += 1)); continue; }
+    delete_locations=$(jq -M -ce '.delete' <<< "$delete_scope") || return 1
+    payload=$(jq -cn --argjson deletes "$delete_locations" '{adds:[],deletes:$deletes}')
+    if [[ "$delete_locations" != "[]" ]] && ! anythingllm_update_embeddings "$payload"; then
       warn "移除知识索引失败：$filename"
       ((failures += 1))
       continue
     fi
     garbage_locations='[]'
-    if [[ "$old_locations" != "[]" ]] && ! anythingllm_remove_documents "$old_locations"; then
+    if [[ "$delete_locations" != "[]" ]] && ! anythingllm_remove_documents "$delete_locations"; then
       warn "源文档清理失败，已登记供下次同步重试：$filename"
-      garbage_locations=$old_locations
+      garbage_locations=$delete_locations
       ((failures += 1))
     fi
     manifest_temp=$(mktemp "${manifest}.tmp.XXXXXX") \

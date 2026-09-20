@@ -2,6 +2,8 @@
 """资料应用事务的旧生效代冻结、校验与恢复投影生成。"""
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -149,13 +151,13 @@ def atomic_json(path, value, mode, temporary_directory=None, temporary_prefix=No
     descriptor, temporary = tempfile.mkstemp(prefix=prefix, dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            if os.geteuid() == 0 and mode == 0o640:
+                os.fchown(stream.fileno(), 0, 1000)
             json.dump(value, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, mode)
-        if os.geteuid() == 0 and mode == 0o640:
-            os.chown(temporary, 0, 1000)
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -172,6 +174,69 @@ def fsync_directory(path):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def fsync_tree_directories(root):
+    """把新建恢复树的目录项由深到浅持久化。"""
+    root_info = root.lstat()
+    expected_gid = 0 if os.geteuid() == 0 else os.getegid()
+    if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink() \
+            or stat.S_IMODE(root_info.st_mode) != 0o700 \
+            or root_info.st_uid != expected_owner() or root_info.st_gid != expected_gid:
+        fail("资料恢复目录树根不安全")
+    directories = [root]
+    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+        parent = Path(directory)
+        for name in names:
+            member = parent / name
+            info = member.lstat()
+            if not stat.S_ISDIR(info.st_mode) or member.is_symlink() \
+                    or info.st_uid != expected_owner() or info.st_gid != expected_gid \
+                    or stat.S_IMODE(info.st_mode) & 0o077:
+                fail("资料恢复目录树包含链接或非目录成员")
+            directories.append(member)
+        for name in files:
+            member = parent / name
+            info = member.lstat()
+            allowed_gid = 1000 if os.geteuid() == 0 and stat.S_IMODE(info.st_mode) == 0o640 else expected_gid
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or member.is_symlink() \
+                    or info.st_uid != expected_owner() or info.st_gid != allowed_gid \
+                    or stat.S_IMODE(info.st_mode) not in (0o600, 0o640):
+                fail("资料恢复目录树包含不安全文件")
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        fsync_directory(directory)
+
+
+def rename_directory_noreplace(source, destination):
+    """Linux 上以 RENAME_NOREPLACE 发布目录；不可用时安全失败。"""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError):
+        fail("当前系统不支持安全发布资料恢复目录")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        code = ctypes.get_errno()
+        if code in (errno.EEXIST, errno.ENOTEMPTY):
+            fail("已有资料恢复事务，拒绝覆盖")
+        fail("资料恢复目录无法安全发布")
+
+
+def make_private_parents(root, parent):
+    """只在本 helper 新建的 stage 内创建 0700 父目录。"""
+    try:
+        relative = parent.relative_to(root)
+    except ValueError:
+        fail("资料恢复目标目录越界")
+    current = root
+    for part in relative.parts:
+        current /= part
+        current.mkdir(exist_ok=True)
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or current.is_symlink():
+            fail("资料恢复目标父目录不安全")
+        os.chmod(current, 0o700)
 
 
 def safe_root(raw):
@@ -430,6 +495,41 @@ def locations(value):
     return sorted(checked)
 
 
+def canonical_locations(value):
+    checked = locations(value)
+    if value != checked:
+        fail("工作区位置清单不是规范排序")
+    return checked
+
+
+def location_contract(complete):
+    """把 v1/v2 恢复清单解释成唯一的位置权限视图。"""
+    managed = locations(complete.get("managed_locations"))
+    if complete.get("schema_version") == 1:
+        observed = locations(complete.get("workspace_locations"))
+        if not set(managed).issubset(observed):
+            fail("冻结时工作区缺少旧代受管位置")
+        return {"mode": "verified", "managed": managed, "observed": observed,
+                "protected": observed, "deletable": managed, "missing": []}
+    if complete.get("schema_version") != 2:
+        fail("资料恢复清单版本无效")
+    managed = canonical_locations(complete.get("managed_locations"))
+    observed = canonical_locations(complete.get("observed_workspace_locations"))
+    protected = canonical_locations(complete.get("protected_workspace_locations"))
+    deletable = canonical_locations(complete.get("deletable_managed_locations"))
+    missing = canonical_locations(complete.get("missing_managed_locations"))
+    expected_protected = sorted(set(observed) | set(managed))
+    expected_deletable = sorted(set(observed) & set(managed))
+    expected_missing = sorted(set(managed) - set(observed))
+    if protected != expected_protected or deletable != expected_deletable or missing != expected_missing:
+        fail("资料恢复位置权限集合不一致")
+    mode = complete.get("capture_mode")
+    if mode not in ("verified", "external_repair") or mode == "verified" and missing:
+        fail("资料恢复捕获模式与外部状态不一致")
+    return {"mode": mode, "managed": managed, "observed": observed,
+            "protected": protected, "deletable": deletable, "missing": missing}
+
+
 def profile_contract(profile, manifest):
     files = manifest.get("files")
     if manifest.get("version") != 1 or not isinstance(files, dict) \
@@ -514,10 +614,16 @@ def validate_complete(root, recovery):
         fail("资料恢复目录权限或所有者无效")
     private_file(recovery / "complete.json", 1048576)
     complete = read_json(recovery / "complete.json", 1048576)
-    required = {"schema_version", "created_at", "projection_sha256", "source_sha256", "metadata_presence",
-                "managed_locations", "workspace_locations", "inventory"}
-    if not isinstance(complete, dict) or set(complete) != required or complete.get("schema_version") != 1 \
-            or not isinstance(complete.get("created_at"), int) or complete["created_at"] < 0:
+    required_v1 = {"schema_version", "created_at", "projection_sha256", "source_sha256", "metadata_presence",
+                   "managed_locations", "workspace_locations", "inventory"}
+    required_v2 = {"schema_version", "capture_mode", "created_at", "projection_sha256", "source_sha256",
+                   "metadata_presence", "managed_locations", "observed_workspace_locations",
+                   "protected_workspace_locations", "deletable_managed_locations",
+                   "missing_managed_locations", "inventory"}
+    if not isinstance(complete, dict) or complete.get("schema_version") not in (1, 2) \
+            or (complete.get("schema_version") == 1 and set(complete) != required_v1) \
+            or (complete.get("schema_version") == 2 and set(complete) != required_v2) \
+            or type(complete.get("created_at")) is not int or complete["created_at"] < 0:
         fail("资料恢复清单无效")
     expected_inventory = complete["inventory"]
     actual_inventory = [item for item in inventory(recovery)
@@ -544,11 +650,9 @@ def validate_complete(root, recovery):
     profile = read_json(recovery / "metadata/data/runtime/knowledge-profile.json", 65536) \
         if presence["data/runtime/knowledge-profile.json"] else None
     managed = profile_contract(profile, manifest)
-    if managed != locations(complete["managed_locations"]):
+    contract = location_contract(complete)
+    if managed != contract["managed"]:
         fail("资料恢复受管位置清单不一致")
-    workspace = locations(complete["workspace_locations"])
-    if not set(managed).issubset(workspace):
-        fail("冻结时工作区缺少旧代受管位置")
     knowledge = projection.get("knowledge") if isinstance(projection, dict) else None
     if projection.get("schema_version") != 2 or projection.get("state") != "applied" or not isinstance(knowledge, dict):
         fail("冻结的旧资料投影无效")
@@ -565,6 +669,20 @@ def validate_complete(root, recovery):
         if not isinstance(digest, str) or actual != digest:
             fail("旧资料投影与恢复元数据摘要不一致")
     generation_contract(recovery, projection, manifest)
+    touched_path = recovery / "touched.json"
+    touched_locations = []
+    if touched_path.exists() or touched_path.is_symlink():
+        private_file(touched_path, MAX_JSON_BYTES)
+        touched = read_json(touched_path)
+        if not isinstance(touched, dict) or set(touched) != {"schema_version", "locations"} \
+                or touched.get("schema_version") != 1:
+            fail("资料恢复上传位置账本无效")
+        touched_locations = locations(touched.get("locations"))
+        if complete["schema_version"] == 2 and touched.get("locations") != touched_locations:
+            fail("资料恢复上传位置账本不是规范排序")
+        forbidden_touched = set(touched_locations) & set(contract["protected"]) - set(contract["deletable"])
+        if forbidden_touched:
+            fail("资料恢复上传位置账本包含无连续所有权的位置")
     cleanup_path = recovery / "cleanup.json"
     if cleanup_path.exists() or cleanup_path.is_symlink():
         private_file(cleanup_path, MAX_JSON_BYTES)
@@ -572,15 +690,12 @@ def validate_complete(root, recovery):
         if not isinstance(cleanup, dict) or set(cleanup) != {"schema_version", "locations"} \
                 or cleanup.get("schema_version") != 1:
             fail("资料恢复清理责任无效")
-        locations(cleanup.get("locations"))
-    touched_path = recovery / "touched.json"
-    if touched_path.exists() or touched_path.is_symlink():
-        private_file(touched_path, MAX_JSON_BYTES)
-        touched = read_json(touched_path)
-        if not isinstance(touched, dict) or set(touched) != {"schema_version", "locations"} \
-                or touched.get("schema_version") != 1:
-            fail("资料恢复上传位置账本无效")
-        locations(touched.get("locations"))
+        cleanup_locations = locations(cleanup.get("locations"))
+        if complete["schema_version"] == 2 and cleanup.get("locations") != cleanup_locations:
+            fail("资料恢复清理责任不是规范排序")
+        allowed_cleanup = set(contract["deletable"]) | set(touched_locations)
+        if set(cleanup_locations) - allowed_cleanup or set(cleanup_locations) & set(contract["missing"]):
+            fail("资料恢复清理责任包含未授权位置")
     response_path = recovery / "upload-response.json"
     if response_path.exists() or response_path.is_symlink():
         private_file(response_path, MAX_JSON_BYTES, empty=True)
@@ -660,7 +775,9 @@ def validate_orphan_tree(path):
                     fail("资料恢复临时目录包含不安全成员")
                 continue
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 \
-                    or info.st_uid != expected_owner() or info.st_gid != expected_gid \
+                    or info.st_uid != expected_owner() \
+                    or info.st_gid != (1000 if os.geteuid() == 0 and stat.S_IMODE(info.st_mode) == 0o640
+                                       else expected_gid) \
                     or stat.S_IMODE(info.st_mode) & 0o022:
                 fail("资料恢复临时目录包含链接或特殊成员")
             total += info.st_size
@@ -773,6 +890,167 @@ def resolve_upload(root, recovery):
     return matches
 
 
+def mutable_location_list(recovery, name):
+    path = recovery / name
+    if not path.exists() and not path.is_symlink():
+        return []
+    private_file(path, MAX_JSON_BYTES)
+    value = read_json(path)
+    if not isinstance(value, dict) or set(value) != {"schema_version", "locations"} \
+            or value.get("schema_version") != 1:
+        fail("资料恢复位置账本无效")
+    return locations(value.get("locations"))
+
+
+def stdin_locations():
+    raw = sys.stdin.buffer.read(MAX_JSON_BYTES + 1)
+    if not raw or len(raw) > MAX_JSON_BYTES:
+        fail("资料恢复位置输入大小无效")
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        fail("资料恢复位置输入 JSON 无效")
+    return locations(value)
+
+
+def record_touched(root, recovery, additions):
+    """在收口上传意图前持久登记本事务取得连续所有权的位置。"""
+    complete, _projection = validate_complete(root, recovery)
+    contract = location_contract(complete)
+    additions = locations(additions)
+    if not additions:
+        fail("资料恢复上传位置为空")
+    aliases = set(resolve_upload(root, recovery))
+    allowed = aliases | (set(additions) & set(contract["deletable"]))
+    if set(additions) != allowed:
+        fail("知识上传位置没有连续所有权证据")
+    merged = sorted(set(mutable_location_list(recovery, "touched.json")) | set(additions))
+    atomic_json(recovery / "touched.json", {"schema_version": 1, "locations": merged}, 0o600,
+                recovery.parent, recovery.name + ".touched.")
+    fsync_directory(recovery)
+    validate_complete(root, recovery)
+
+
+def write_cleanup(root, recovery, requested):
+    """在执行两段外部删除前持久登记完整清理责任。"""
+    requested = locations(requested)
+    if not requested:
+        fail("资料恢复清理位置为空")
+    cleanup_path = recovery / "cleanup.json"
+    if cleanup_path.exists() or cleanup_path.is_symlink():
+        fail("已有未收口的资料恢复清理责任")
+    classified = classify_delete(root, recovery, requested)
+    if classified["preserve_missing"] or classified["delete"] != requested:
+        fail("资料恢复清理位置没有完整删除授权")
+    atomic_json(cleanup_path, {"schema_version": 1, "locations": requested}, 0o600,
+                recovery.parent, recovery.name + ".cleanup.")
+    fsync_directory(recovery)
+    validate_complete(root, recovery)
+
+
+def settle_cleanup(root, recovery, removed):
+    """外部删除完成后，先持久移除责任，再收窄可重建的 touched 集。"""
+    validate_complete(root, recovery)
+    removed = locations(removed)
+    cleanup_path = recovery / "cleanup.json"
+    if not cleanup_path.exists() and not cleanup_path.is_symlink():
+        fail("资料恢复清理责任缺失")
+    cleanup = read_json(cleanup_path)
+    if not isinstance(cleanup, dict) or set(cleanup) != {"schema_version", "locations"} \
+            or cleanup.get("schema_version") != 1 or locations(cleanup.get("locations")) != removed:
+        fail("资料恢复清理责任与完成范围不一致")
+    cleanup_path.unlink()
+    # 先持久收口 cleanup。若随后崩溃，剩余 touched 会在重入时幂等重建责任；
+    # 反向顺序会留下引用已移除位置但失去 touched 授权的无效 cleanup。
+    fsync_directory(recovery)
+    touched_path = recovery / "touched.json"
+    if touched_path.exists() or touched_path.is_symlink():
+        remaining = sorted(set(mutable_location_list(recovery, "touched.json")) - set(removed))
+        if remaining:
+            atomic_json(touched_path, {"schema_version": 1, "locations": remaining}, 0o600,
+                        recovery.parent, recovery.name + ".touched.")
+        else:
+            touched_path.unlink()
+        fsync_directory(recovery)
+    validate_complete(root, recovery)
+
+
+def finish_upload(root, recovery):
+    """touched 已持久后，成套移除上传意图、正文和回执并持久化目录项。"""
+    validate_complete(root, recovery)
+    for name in ("upload-response.json", "upload-intent.json", "upload-payload"):
+        path = recovery / name
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            # 顺序持久：先去回执（重入仍可由 intent/alias 恢复），再去意图
+            # （仅余 payload 时 cleanup-upload-orphan 可安全收口），最后去正文。
+            # 不把三个 unlink 留在一个未持久的掉电窗口内。
+            fsync_directory(recovery)
+    validate_complete(root, recovery)
+
+
+def finish_tracking(root, recovery):
+    """外部回读成功后持久收口最后的 touched 责任。"""
+    validate_complete(root, recovery)
+    for name in ("cleanup.json", "upload-response.json", "upload-intent.json", "upload-payload"):
+        if (recovery / name).exists() or (recovery / name).is_symlink():
+            fail("资料恢复仍有未收口的外部责任")
+    touched = recovery / "touched.json"
+    if touched.exists() or touched.is_symlink():
+        touched.unlink()
+        fsync_directory(recovery)
+    validate_complete(root, recovery)
+
+
+def classify_delete(root, recovery, requested):
+    """把删除请求分为连续所有权位置与只解除本地引用的 missing。"""
+    complete, _projection = validate_complete(root, recovery)
+    contract = location_contract(complete)
+    requested_locations = locations(requested)
+    touched = mutable_location_list(recovery, "touched.json")
+    allowed = set(contract["deletable"]) | set(touched)
+    missing = set(contract["missing"])
+    rejected = set(requested_locations) - allowed - missing
+    if rejected:
+        fail("知识删除请求包含未授权位置")
+    return {"schema_version": 1,
+            "delete": sorted(set(requested_locations) & allowed),
+            "preserve_missing": sorted(set(requested_locations) & missing)}
+
+
+def repair_scope(root, recovery):
+    """只从冻结 canonical 与 recovery 权限集合派生外部修复范围。"""
+    complete, _projection = validate_complete(root, recovery)
+    contract = location_contract(complete)
+    missing = set(contract["missing"])
+    if not missing:
+        return {"schema_version": 1, "projections": []}
+    manifest = read_json(recovery / "metadata/data/knowledge-manifest.json")
+    catalog = snapshot_catalog_contract(recovery / "source.tar.gz")
+    enabled = {document["projection"] for library in catalog["libraries"] if library["enabled"]
+               for document in library["documents"]}
+    result = []
+    covered = set()
+    for projection_name in sorted(manifest.get("files", {})):
+        record = manifest["files"][projection_name]
+        old_locations = locations(record.get("locations"))
+        missing_locations = sorted(set(old_locations) & missing)
+        if not missing_locations:
+            continue
+        if projection_name not in enabled:
+            fail("缺失知识位置没有对应的冻结启用文档")
+        if covered & set(missing_locations):
+            fail("缺失知识位置映射到多个冻结文档")
+        covered.update(missing_locations)
+        result.append({"projection": projection_name,
+                       "missing_locations": missing_locations,
+                       "deletable_old_locations": sorted(
+                           set(old_locations) & set(contract["deletable"]))})
+    if covered != missing:
+        fail("缺失知识位置无法唯一映射到冻结文档")
+    return {"schema_version": 1, "projections": result}
+
+
 def retired_directories(recovery):
     prefix = recovery.name + ".retired."
     result = []
@@ -797,11 +1075,15 @@ def retired_directories(recovery):
 
 def cleanup_retired(recovery):
     pending = []
+    removed = False
     for member in retired_directories(recovery):
         try:
             shutil.rmtree(member)
+            removed = True
         except OSError:
             pending.append(member.name)
+    if removed:
+        fsync_directory(recovery.parent)
     return not pending
 
 
@@ -810,11 +1092,14 @@ def retire(root, recovery):
     if any((recovery / name).exists() or (recovery / name).is_symlink() for name in MUTABLE_MEMBERS):
         fail("资料恢复仍有未完成的外部责任，拒绝退役事务")
     tombstone = recovery.with_name(recovery.name + ".retired." + uuid.uuid4().hex)
-    os.replace(recovery, tombstone)
+    rename_directory_noreplace(recovery, tombstone)
+    fsync_directory(recovery.parent)
     return cleanup_retired(recovery)
 
 
-def capture(root, recovery, projection_path, snapshot_path, workspace_path):
+def capture(root, recovery, projection_path, snapshot_path, workspace_path, capture_mode):
+    if capture_mode not in ("verified", "external_repair"):
+        fail("资料恢复捕获模式无效")
     cleanup_sibling_orphans(recovery)
     projection_path = controlled_input(root, projection_path, "projection")
     snapshot_path = controlled_input(root, snapshot_path, "snapshot")
@@ -841,7 +1126,7 @@ def capture(root, recovery, projection_path, snapshot_path, workspace_path):
         projection = read_json(stage / "projection.json")
         if projection.get("schema_version") != 2 or projection.get("state") != "applied":
             fail("只能冻结完整已应用资料代")
-        workspace = locations(read_json(workspace_copy, MAX_JSON_BYTES))
+        observed = locations(read_json(workspace_copy, MAX_JSON_BYTES))
         workspace_copy.unlink()
         presence = {}
         for relative, (required_member, mode, maximum) in METADATA.items():
@@ -853,8 +1138,7 @@ def capture(root, recovery, projection_path, snapshot_path, workspace_path):
                     fail("旧资料代缺少必需元数据")
                 continue
             destination = stage / "metadata" / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(destination.parent, 0o700)
+            make_private_parents(stage, destination.parent)
             source_identities.append((source, stable_copy(
                 source, destination, maximum, mode, 1000 if mode == 0o640 else 0)))
         manifest = read_json(stage / "metadata/data/knowledge-manifest.json")
@@ -862,21 +1146,27 @@ def capture(root, recovery, projection_path, snapshot_path, workspace_path):
             if presence["data/runtime/knowledge-profile.json"] else None
         managed = profile_contract(profile, manifest)
         validate_live_bindings(root, profile, manifest)
-        if not set(managed).issubset(workspace):
+        if capture_mode == "verified" and not set(managed).issubset(observed):
             fail("当前工作区缺少旧代受管位置，未开始资料修改")
+        protected = sorted(set(observed) | set(managed))
+        deletable = sorted(set(observed) & set(managed))
+        missing = sorted(set(managed) - set(observed))
         content_inventory = inventory(stage)
-        complete = {"schema_version": 1, "created_at": int(time.time()),
+        complete = {"schema_version": 2, "capture_mode": capture_mode, "created_at": int(time.time()),
                     "projection_sha256": file_hash(stage / "projection.json"),
                     "source_sha256": file_hash(stage / "source.tar.gz"),
                     "metadata_presence": presence, "managed_locations": managed,
-                    "workspace_locations": workspace, "inventory": content_inventory}
+                    "observed_workspace_locations": observed,
+                    "protected_workspace_locations": protected,
+                    "deletable_managed_locations": deletable,
+                    "missing_managed_locations": missing, "inventory": content_inventory}
         atomic_json(stage / "complete.json", complete, 0o600)
+        fsync_tree_directories(stage)
         validate_complete(root, stage)
         for source, identity in source_identities:
             verify_identity(source, identity)
-        if recovery.exists() or recovery.is_symlink():
-            fail("已有资料恢复事务，拒绝覆盖")
-        os.replace(stage, recovery)
+        rename_directory_noreplace(stage, recovery)
+        fsync_directory(recovery.parent)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -885,12 +1175,11 @@ def capture(root, recovery, projection_path, snapshot_path, workspace_path):
 def prepare_rebuild(root, recovery, current_workspace_path):
     current_workspace_path = controlled_input(root, current_workspace_path, "current-workspace")
     complete, _projection = validate_complete(root, recovery)
+    contract = location_contract(complete)
     current = locations(read_json(current_workspace_path, MAX_JSON_BYTES))
-    old_managed = set(complete["managed_locations"])
-    baseline = set(complete["workspace_locations"])
-    if set(current) - baseline:
+    if set(current) - set(contract["protected"]):
         fail("工作区仍有来源未确认的新位置，拒绝重建旧代")
-    garbage = sorted(old_managed)
+    garbage = contract["deletable"]
     profile_relative = "data/runtime/knowledge-profile.json"
     profile_target = safe_member(root, profile_relative)
     if complete["metadata_presence"][profile_relative]:
@@ -954,6 +1243,7 @@ def main():
     capture_command.add_argument("--projection", required=True)
     capture_command.add_argument("--snapshot", required=True)
     capture_command.add_argument("--workspace-locations", required=True)
+    capture_command.add_argument("--capture-mode", choices=("verified", "external_repair"), required=True)
     commands.add_parser("validate")
     rebuild = commands.add_parser("prepare-rebuild")
     rebuild.add_argument("--current-workspace-locations", required=True)
@@ -962,6 +1252,18 @@ def main():
     build.add_argument("--output", required=True)
     commands.add_parser("baseline-locations")
     commands.add_parser("managed-locations")
+    commands.add_parser("observed-locations")
+    commands.add_parser("protected-locations")
+    commands.add_parser("deletable-locations")
+    commands.add_parser("missing-locations")
+    commands.add_parser("missing-projections")
+    commands.add_parser("repair-scope")
+    commands.add_parser("classify-delete")
+    commands.add_parser("record-touched")
+    commands.add_parser("write-cleanup")
+    commands.add_parser("settle-cleanup")
+    commands.add_parser("finish-upload")
+    commands.add_parser("finish-tracking")
     begin = commands.add_parser("begin-upload")
     begin.add_argument("--filename", required=True)
     begin.add_argument("--source", required=True)
@@ -974,17 +1276,49 @@ def main():
     root = safe_root(args.deploy_dir)
     recovery = recovery_root(root, args.recovery)
     if args.action == "capture":
-        capture(root, recovery, Path(args.projection), Path(args.snapshot), Path(args.workspace_locations))
+        capture(root, recovery, Path(args.projection), Path(args.snapshot), Path(args.workspace_locations),
+                args.capture_mode)
     elif args.action == "validate":
         validate_complete(root, recovery)
     elif args.action == "prepare-rebuild":
         prepare_rebuild(root, recovery, Path(args.current_workspace_locations))
     elif args.action == "build-projection":
         build_projection(root, recovery, args.revision, Path(args.output))
-    elif args.action in ("baseline-locations", "managed-locations"):
+    elif args.action in ("baseline-locations", "managed-locations", "observed-locations",
+                         "protected-locations", "deletable-locations", "missing-locations",
+                         "missing-projections"):
         complete, _projection = validate_complete(root, recovery)
-        key = "workspace_locations" if args.action == "baseline-locations" else "managed_locations"
-        print(json.dumps(complete[key], ensure_ascii=False, separators=(",", ":")))
+        contract = location_contract(complete)
+        if args.action == "baseline-locations":
+            value = contract["protected"]
+        elif args.action == "managed-locations":
+            value = contract["managed"]
+        elif args.action == "observed-locations":
+            value = contract["observed"]
+        elif args.action == "protected-locations":
+            value = contract["protected"]
+        elif args.action == "deletable-locations":
+            value = contract["deletable"]
+        elif args.action == "missing-locations":
+            value = contract["missing"]
+        else:
+            value = [item["projection"] for item in repair_scope(root, recovery)["projections"]]
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    elif args.action == "repair-scope":
+        print(json.dumps(repair_scope(root, recovery), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    elif args.action == "classify-delete":
+        print(json.dumps(classify_delete(root, recovery, stdin_locations()), ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":")))
+    elif args.action == "record-touched":
+        record_touched(root, recovery, stdin_locations())
+    elif args.action == "write-cleanup":
+        write_cleanup(root, recovery, stdin_locations())
+    elif args.action == "settle-cleanup":
+        settle_cleanup(root, recovery, stdin_locations())
+    elif args.action == "finish-upload":
+        finish_upload(root, recovery)
+    elif args.action == "finish-tracking":
+        finish_tracking(root, recovery)
     elif args.action == "begin-upload":
         print(json.dumps(begin_upload(root, recovery, args.filename, args.source), ensure_ascii=False, separators=(",", ":")))
     elif args.action == "resolve-upload":
@@ -999,7 +1333,10 @@ def main():
         print(json.dumps({"ok": True, "action": args.action, "cleaned": retire(root, recovery)}, ensure_ascii=False))
     elif args.action == "cleanup-retired":
         print(json.dumps({"ok": True, "action": args.action, "cleaned": cleanup_retired(recovery)}, ensure_ascii=False))
-    if args.action not in ("baseline-locations", "managed-locations", "begin-upload", "resolve-upload",
+    if args.action not in ("baseline-locations", "managed-locations", "observed-locations",
+                           "protected-locations", "deletable-locations", "missing-locations",
+                           "missing-projections", "repair-scope", "classify-delete",
+                           "begin-upload", "resolve-upload",
                            "cleanup-upload-orphan", "cleanup-orphans", "retire", "cleanup-retired"):
         print(json.dumps({"ok": True, "action": args.action}, ensure_ascii=False))
 

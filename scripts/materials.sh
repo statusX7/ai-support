@@ -1034,14 +1034,23 @@ materials_knowledge_generation_validate() {
 }
 
 materials_recovery_capture() {
-  local deploy_dir=$1 projection=$2 snapshot=$3 recovery="${1}/backups/config-history/materials.recovery"
-  local workspace
+  local deploy_dir=$1 projection=$2 snapshot=$3 capture_mode=${4:-verified}
+  local recovery="${1}/backups/config-history/materials.recovery" workspace
+  [[ "$capture_mode" == verified || "$capture_mode" == external_repair ]] || return 1
   if [[ -e "$recovery" || -L "$recovery" ]]; then
     materials_error '发现未收口的资料恢复事务，拒绝覆盖旧代保全'
     return 1
   fi
-  materials_applied_external_readback "$deploy_dir" "$snapshot" "$projection" \
-    || { materials_error '上一有效原文包与生效投影不一致，未开始外部修改'; return 1; }
+  if [[ "$capture_mode" == verified ]]; then
+    materials_applied_external_readback "$deploy_dir" "$snapshot" "$projection" \
+      || { materials_error '上一有效原文包与生效投影不一致，未开始外部修改'; return 1; }
+  else
+    # 显式修复的对象就是已漂移的外部 Prompt 或受管 membership，不能要求它们
+    # 预先健康；但本机 canonical、五项知识摘要和容器投影仍必须严格同代。
+    materials_snapshot_validate_generation "$deploy_dir" "$snapshot" "$projection" \
+      && materials_projection_readback "$deploy_dir" \
+      || { materials_error '上一有效本机资料代不完整，未开始外部修复'; return 1; }
+  fi
   anythingllm_connection "$deploy_dir"
   workspace=$(mktemp "${deploy_dir}/tmp/materials-workspace.XXXXXXXX") || return 1
   if ! anythingllm_workspace_locations > "$workspace"; then
@@ -1051,7 +1060,7 @@ materials_recovery_capture() {
   fi
   if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" capture --projection "$projection" --snapshot "$snapshot" \
-    --workspace-locations "$workspace" >/dev/null; then
+    --workspace-locations "$workspace" --capture-mode "$capture_mode" >/dev/null; then
     rm -f -- "$workspace"
     materials_error '上一有效资料代未能成套冻结，未开始外部修改'
     return 1
@@ -1073,7 +1082,10 @@ materials_recovery_upload_response_file() {
   python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" begin-upload --filename "$filename" --source "$source" >/dev/null || return 1
   if ! (umask 077; : > "$response"); then
-    rm -f -- "$intent"
+    # 尚未发出网络请求；尽力用同一持久 helper 成套收口。若文件系统故障
+    # 令收口也失败，保留完整 recovery 供下次 cleanup-upload-orphan 处理。
+    python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+      --recovery "$recovery" finish-upload >/dev/null 2>&1 || true
     return 1
   fi
   printf '%s\n' "$response"
@@ -1081,40 +1093,12 @@ materials_recovery_upload_response_file() {
 
 materials_recovery_track_locations() {
   local deploy_dir=$1 additions=$2 recovery="${1}/backups/config-history/materials.recovery"
-  local ledger="${1}/backups/config-history/materials.recovery/touched.json" existing='[]' merged observed managed allowed temporary
   [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
-  jq -M -en --argjson value "$additions" '
-    $value | type == "array" and length > 0 and
-    all(.[]; type == "string" and test("^custom-documents/[^/\\\\[:cntrl:]]+\\.json$"))
-  ' >/dev/null || return 1
-  # AnythingLLM 的响应正文不能授权删除任意既有文档。随机 alias 位置
-  # 必须由持久卷独立识别；旧位置则只允许下方冻结的本项目 managed 集。
-  observed=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" resolve-upload) || return 1
-  managed=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" managed-locations) || return 1
-  # AnythingLLM 个别解析器会复用并原地覆盖本项目旧代自身的受管
-  # location。它不带本事务随机 alias，但冻结原文可在回滚时删除并
-  # 重建；只把 HTTP 已明确返回且属于冻结 managed 集的项目位置并入
-  # 允许集合，绝不授权清理同 workspace 的其他管理员资料。
-  allowed=$(jq -M -cn --argjson claimed "$additions" --argjson observed "$observed" --argjson managed "$managed" '
-    ($observed + [$claimed[] | select(. as $item | $managed | index($item) != null)]) | unique | sort
-  ') || return 1
-  jq -M -en --argjson claimed "$additions" --argjson allowed "$allowed" \
-    '($claimed | unique | sort) == $allowed and ($allowed | length > 0)' \
-    >/dev/null || return 1
-  if [[ -e "$ledger" || -L "$ledger" ]]; then
-    [[ -f "$ledger" && ! -L "$ledger" ]] || return 1
-    existing=$(jq -M -ce 'select(.schema_version == 1) | .locations' "$ledger") || return 1
-  fi
-  merged=$(jq -M -cn --argjson old "$existing" --argjson add "$additions" '$old + $add | unique') || return 1
-  temporary=$(mktemp "${recovery}.touched.XXXXXXXX") || return 1
-  if ! jq -M -n --argjson locations "$merged" '{schema_version:1,locations:$locations}' > "$temporary"; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  chmod 600 "$temporary" || { rm -f -- "$temporary"; return 1; }
-  mv -f -- "$temporary" "$ledger"
+  # Python helper 在同一个受限事务中重做 alias/deletable 核权，随后执行
+  # file fsync → no-clobber/replace → recovery-dir fsync。只有它返回成功后，
+  # 调用方才能删除上传意图或发出任何清理请求。
+  printf '%s\n' "$additions" | python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" \
+    --deploy-dir "$deploy_dir" --recovery "$recovery" record-touched >/dev/null
 }
 
 materials_recovery_response_locations() {
@@ -1143,7 +1127,7 @@ materials_recovery_ingest_upload_response() {
       # 持久回执。track_locations 会再次以随机 alias 或冻结 managed
       # 集核权；foreign/mixed 声明失败后不得降级为较窄集合继续清理。
       materials_recovery_track_locations "$deploy_dir" "$locations" || return 1
-      rm -f -- "$response" "$intent" "${recovery}/upload-payload" || return 1
+      materials_recovery_finish_upload "$deploy_dir" || return 1
       return 0
     fi
   fi
@@ -1161,7 +1145,7 @@ materials_recovery_ingest_upload_response() {
   if [[ "$locations" != '[]' ]]; then
     materials_recovery_track_locations "$deploy_dir" "$locations" || return 1
   fi
-  rm -f -- "$response" "$intent" "${recovery}/upload-payload" || return 1
+  materials_recovery_finish_upload "$deploy_dir"
 }
 
 materials_recovery_retry_upload() {
@@ -1196,24 +1180,30 @@ materials_recovery_retry_upload() {
 }
 
 materials_recovery_finish_upload() {
-  local recovery="${1}/backups/config-history/materials.recovery"
+  local deploy_dir=$1 recovery="${1}/backups/config-history/materials.recovery"
   [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
-  rm -f -- "${recovery}/upload-response.json" "${recovery}/upload-intent.json" "${recovery}/upload-payload"
+  python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" finish-upload >/dev/null
 }
 
 materials_recovery_finish_tracking() {
-  local recovery="${1}/backups/config-history/materials.recovery"
+  local deploy_dir=$1 recovery="${1}/backups/config-history/materials.recovery"
   [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
-  [[ ! -e "${recovery}/cleanup.json" && ! -L "${recovery}/cleanup.json" \
-    && ! -e "${recovery}/upload-response.json" && ! -L "${recovery}/upload-response.json" \
-    && ! -e "${recovery}/upload-intent.json" && ! -L "${recovery}/upload-intent.json" ]] || return 1
-  [[ ! -e "${recovery}/upload-payload" && ! -L "${recovery}/upload-payload" ]] || return 1
-  rm -f -- "${recovery}/touched.json"
+  python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" finish-tracking >/dev/null
+}
+
+materials_recovery_authorize_cleanup() {
+  local deploy_dir=$1 requested=$2 authorization deletable
+  authorization=$(knowledge_recovery_classify_deletes "$deploy_dir" "$requested") || return 1
+  deletable=$(jq -M -ce 'select(.preserve_missing == []) | .delete' <<< "$authorization") || return 1
+  jq -M -en --argjson requested "$requested" --argjson deletable "$deletable" \
+    '($requested | unique | sort) == ($deletable | unique | sort)' >/dev/null
 }
 
 materials_cleanup_ledger_retry() {
-  local deploy_dir=$1 recovery=$2 ledger="${2}/cleanup.json" touched="${2}/touched.json"
-  local locations payload remaining='[]' temporary
+  local deploy_dir=$1 recovery=$2 ledger="${2}/cleanup.json"
+  local locations payload
   [[ ! -e "$ledger" && ! -L "$ledger" ]] && return 0
   python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" validate >/dev/null || return 1
@@ -1222,6 +1212,7 @@ materials_cleanup_ledger_retry() {
       (.locations | length > 0) and all(.locations[]; type == "string")
     then .locations else empty end
   ' "$ledger") || return 1
+  materials_recovery_authorize_cleanup "$deploy_dir" "$locations" || return 1
   payload=$(jq -M -cn --argjson deletes "$locations" '{adds:[],deletes:$deletes}') || return 1
   anythingllm_update_embeddings "$payload" || return 1
   if ! anythingllm_remove_documents "$locations"; then
@@ -1234,51 +1225,32 @@ materials_cleanup_ledger_retry() {
         && ! -L "${deploy_dir}/data/anythingllm/documents/${location}" ]] || return 1
     done < <(jq -M -r '.[]' <<< "$locations")
   fi
-  if [[ -e "$touched" || -L "$touched" ]]; then
-    [[ -f "$touched" && ! -L "$touched" ]] || return 1
-    remaining=$(jq -M -cn --slurpfile touched "$touched" --argjson removed "$locations" \
-      '($touched[0].locations // []) - $removed') || return 1
-    if [[ "$remaining" == '[]' ]]; then
-      rm -f -- "$touched" || return 1
-    else
-      temporary=$(mktemp "${recovery}.touched.XXXXXXXX") || return 1
-      if ! jq -M -n --argjson locations "$remaining" '{schema_version:1,locations:$locations}' > "$temporary"; then
-        rm -f -- "$temporary"
-        return 1
-      fi
-      chmod 600 "$temporary" || { rm -f -- "$temporary"; return 1; }
-      mv -f -- "$temporary" "$touched" || return 1
-    fi
-  fi
-  rm -f -- "$ledger"
+  # 先 durable 移除 cleanup，再收窄 touched；中途崩溃时，剩余 touched
+  # 会在重入时重新生成同一清理责任，不会出现有 cleanup 却失去授权。
+  printf '%s\n' "$locations" | python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" \
+    --deploy-dir "$deploy_dir" --recovery "$recovery" settle-cleanup >/dev/null
 }
 
 materials_cleanup_ledger_write() {
-  local recovery=$1 locations=$2 ledger="${1}/cleanup.json" temporary
+  local deploy_dir=$1 recovery=$2 locations=$3 ledger="${2}/cleanup.json"
   [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
   [[ ! -e "$ledger" && ! -L "$ledger" ]] || return 1
-  temporary=$(mktemp "${recovery}.cleanup.XXXXXXXX") || return 1
-  if ! jq -M -n --argjson locations "$locations" \
-    '{schema_version:1,locations:$locations}' > "$temporary"; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  chmod 600 "$temporary" || { rm -f -- "$temporary"; return 1; }
-  mv -f -- "$temporary" "$ledger"
+  printf '%s\n' "$locations" | python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" \
+    --deploy-dir "$deploy_dir" --recovery "$recovery" write-cleanup >/dev/null
 }
 
 materials_cleanup_workspace_delta() {
-  local deploy_dir=$1 recovery=$2 actual=$3 baseline managed ledger transient touched='[]' delta cleanup unknown foreign
+  local deploy_dir=$1 recovery=$2 actual=$3 protected deletable ledger transient touched='[]' allowed delta cleanup unknown forbidden
   materials_recovery_ingest_upload_response "$deploy_dir" || return 1
   # 两个外部删除调用之间崩溃时，先按持久清理责任幂等收口，再重新读取
   # workspace；不能使用崩溃前已经过期的列表。
   materials_cleanup_ledger_retry "$deploy_dir" "$recovery" || return 1
   anythingllm_workspace_locations > "$actual" || return 1
-  baseline=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" baseline-locations) || return 1
-  managed=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
-    --recovery "$recovery" managed-locations) || return 1
-  delta=$(jq -M -cn --argjson current "$(<"$actual")" --argjson baseline "$baseline" '$current - $baseline') || return 1
+  protected=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" protected-locations) || return 1
+  deletable=$(python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" deletable-locations) || return 1
+  delta=$(jq -M -cn --argjson current "$(<"$actual")" --argjson protected "$protected" '$current - $protected') || return 1
   ledger=$(jq -M -c '[
     ((.files // {})[] | (.locations // [])[]),
     ((.pending_files // {})[] | ((.locations // [])[], (.old_locations // [])[])),
@@ -1292,19 +1264,21 @@ materials_cleanup_workspace_delta() {
     [[ -f "${recovery}/touched.json" && ! -L "${recovery}/touched.json" ]] || return 1
     touched=$(jq -M -ce 'select(.schema_version == 1) | .locations' "${recovery}/touched.json") || return 1
   fi
-  cleanup=$(jq -M -cn --argjson delta "$delta" --argjson ledger "$ledger" --argjson transient "$transient" --argjson touched "$touched" \
-    '([$delta[] | select(. as $item | $ledger | index($item) != null)] + $transient + $touched) | unique') || return 1
+  allowed=$(jq -M -cn --argjson deletable "$deletable" --argjson touched "$touched" \
+    '($deletable + $touched) | unique | sort') || return 1
+  cleanup=$(jq -M -cn --argjson delta "$delta" --argjson ledger "$ledger" \
+    --argjson transient "$transient" --argjson touched "$touched" --argjson allowed "$allowed" '
+    ([$delta[] | select(. as $item | $ledger | index($item) != null)] +
+      [$transient[] | select(. as $item | $allowed | index($item) != null)] + $touched) | unique | sort
+  ') || return 1
   unknown=$(jq -M -cn --argjson delta "$delta" --argjson cleanup "$cleanup" '$delta - $cleanup') || return 1
   # 新出现但没有进入本事务 manifest 的位置可能是管理员并发添加的资料；不能误删，
   # 也不能在来源不明时宣布旧代已恢复。
   [[ "$unknown" == '[]' ]] || return 1
-  # 如果上游把候选上传复用了冻结时的其他（非本资料代）位置，不能删除
-  # 管理员资料；旧代自身被复用的位置允许删掉，随后一律从冻结原文重建。
-  foreign=$(jq -M -cn --argjson cleanup "$cleanup" --argjson baseline "$baseline" --argjson managed "$managed" \
-    '$cleanup | map(select(. as $item | ($baseline | index($item) != null) and ($managed | index($item) == null)))') || return 1
-  [[ "$foreign" == '[]' ]] || return 1
+  forbidden=$(jq -M -cn --argjson cleanup "$cleanup" --argjson allowed "$allowed" '$cleanup - $allowed') || return 1
+  [[ "$forbidden" == '[]' ]] || return 1
   [[ "$cleanup" != '[]' ]] || return 0
-  materials_cleanup_ledger_write "$recovery" "$cleanup" || return 1
+  materials_cleanup_ledger_write "$deploy_dir" "$recovery" "$cleanup" || return 1
   materials_cleanup_ledger_retry "$deploy_dir" "$recovery"
 }
 
@@ -1745,10 +1719,12 @@ materials_initialize() (
 materials_apply() (
   local deploy_dir=$1 knowledge_mode=${2:-none} projection="${1}/config/materials-applied.json" old_snapshot old='' stage='' revision=0
   local prompt_changed knowledge_changed config_changed final_stage='' rollback_revision history candidate_snapshot result=0 recovering=false
+  local repair_scope_file=''
   local recovery="${1}/backups/config-history/materials.recovery"
   local transition_started=false transition_committed=false signal_status=0
   local recovery_cleanup_pending=false
   local old_disable_epoch=0 candidate_disable_epoch=0 desired_disable_epoch=0 old_enabled=true candidate_enabled=true
+  local capture_mode=verified repair_files='[]'
   if [[ -f "$projection" && ! -L "$projection" ]] \
     && ! materials_projection_validate "$projection" \
     && materials_projection_validate_legacy "$projection"; then
@@ -1777,7 +1753,7 @@ materials_apply() (
         materials_error '资料应用异常退出，且无法写回受阻止投影；请立即停止自动客服并从上一有效备份恢复'
       fi
     fi
-    rm -f -- "${old:-}"
+    rm -f -- "${old:-}" "${repair_scope_file:-}"
     rm -rf -- "${stage:-}" "${final_stage:-}"
     if (( signal_status != 0 )); then
       materials_error '资料应用已中断；候选原文已保留，自动回复保持受阻止状态，请重新执行资料应用以恢复'
@@ -1861,7 +1837,17 @@ materials_apply() (
     materials_prepare_candidate "$deploy_dir" "$stage" "$revision" applied \
       || { rm -f -- "$old"; rm -rf -- "$stage"; return 1; }
   fi
-  if [[ "$recovering" == false && "$knowledge_mode" == none && $(jq -M -r '.source_sha256' "$old") == $(jq -M -r '.source_sha256' "${stage}/materials-applied.json") ]]; then
+  if [[ "$recovering" == false && "$knowledge_mode" == external \
+    && $(jq -M -r '.source_sha256' "$old") != $(jq -M -r '.source_sha256' "${stage}/materials-applied.json") ]]; then
+    materials_error '当前可编辑资料含尚未应用的修改；请先执行普通应用，再单独修复外部偏离'
+    return 1
+  fi
+  if [[ "$recovering" == false && "$knowledge_mode" == none \
+    && $(jq -M -r '.source_sha256' "$old") == $(jq -M -r '.source_sha256' "${stage}/materials-applied.json") ]]; then
+    if ! materials_applied_external_readback "$deploy_dir" "$old_snapshot" "$old"; then
+      materials_error '本机原文未变化，但外部 Prompt 或受管知识关系与当前生效代不一致；未写入任何外部配置'
+      return 1
+    fi
     jq -M -n --argjson revision "$(jq -M -r '.revision' "$old")" \
       --argjson cleanup "$recovery_cleanup_pending" \
       '{applied:true,changed:false,revision:$revision,recovery_cleanup_pending:$cleanup}'
@@ -1873,7 +1859,7 @@ materials_apply() (
   [[ "$knowledge_mode" != sync && "$knowledge_mode" != reindex ]] || knowledge_changed=true
   if [[ "$knowledge_mode" == external ]]; then
     prompt_changed=true
-    knowledge_changed=true
+    capture_mode=external_repair
   fi
   if [[ "$recovering" == true ]]; then
     # 上次外部回滚未能确认时，不能仅凭原文哈希相同就解除停发。
@@ -1888,8 +1874,20 @@ materials_apply() (
 
   if [[ "$prompt_changed" == true || "$knowledge_changed" == true || "$config_changed" == true ]] \
     && [[ "$recovering" == false ]]; then
-    materials_recovery_capture "$deploy_dir" "$old" "$old_snapshot" \
+    materials_recovery_capture "$deploy_dir" "$old" "$old_snapshot" "$capture_mode" \
       || { materials_error '未建立可验证的旧资料恢复事务，拒绝开始外部修改'; return 1; }
+    if [[ "$capture_mode" == external_repair ]]; then
+      repair_scope_file=$(mktemp "${deploy_dir}/tmp/materials-repair-scope.XXXXXXXX") || return 1
+      if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+          --recovery "$recovery" repair-scope > "$repair_scope_file" \
+        || ! chmod 600 "$repair_scope_file"; then
+        rm -f -- "$repair_scope_file"
+        repair_scope_file=''
+        return 1
+      fi
+      repair_files=$(jq -M -ce '[.projections[].projection]' "$repair_scope_file") || return 1
+      [[ "$repair_files" == '[]' ]] || knowledge_changed=true
+    fi
   fi
 
   history=$(mktemp -d "${deploy_dir}/backups/config-history/materials.XXXXXXXX") || return 1
@@ -1911,6 +1909,8 @@ materials_apply() (
         chown root:1000 "${deploy_dir}/knowledge/catalog.json" 2>/dev/null || true
         if [[ "$knowledge_mode" == reindex || "$recovering" == true ]]; then
           knowledge_sync_catalog "$deploy_dir" 1 || result=1
+        elif [[ "$capture_mode" == external_repair ]]; then
+          knowledge_sync_catalog_repair "$deploy_dir" "$repair_scope_file" || result=1
         else
           knowledge_sync_catalog "$deploy_dir" 0 || result=1
         fi
@@ -1958,7 +1958,7 @@ materials_apply() (
     jq -M -n --argjson revision "$revision" --argjson config "$config_changed" --argjson prompt "$prompt_changed" --argjson knowledge "$knowledge_changed" \
       --argjson cleanup "$recovery_cleanup_pending" \
       '{applied:true,changed:true,revision:$revision,recovery_cleanup_pending:$cleanup,components:{configuration:$config,prompt:$prompt,knowledge:$knowledge}}'
-    rm -f -- "$old"; rm -rf -- "$stage" "${final_stage:-}"
+    rm -f -- "$old" "${repair_scope_file:-}"; rm -rf -- "$stage" "${final_stage:-}"
     return 0
   fi
 
@@ -1981,7 +1981,7 @@ materials_apply() (
   fi
   # 未确认外部恢复时保留 old 到 EXIT 门禁，由其强制写回更高代次的 applying 后再清理。
   if [[ "$transition_committed" == true ]]; then
-    rm -f -- "$old"; rm -rf -- "$stage" "${final_stage:-}"
+    rm -f -- "$old" "${repair_scope_file:-}"; rm -rf -- "$stage" "${final_stage:-}"
   fi
   return 1
 )

@@ -566,6 +566,64 @@ knowledge_sync_catalog() {
   return 1
 }
 
+knowledge_sync_catalog_repair() {
+  local deploy_dir=$1 scope_file=$2 recovery="${1}/backups/config-history/materials.recovery"
+  local expected actual filenames status=0 temporary
+  [[ -f "$scope_file" && ! -L "$scope_file" && "$scope_file" == "${deploy_dir}/tmp/"* \
+    && $(stat -c '%h' -- "$scope_file") == 1 \
+    && $(stat -c '%u' -- "$scope_file") == "$EUID" \
+    && $(stat -c '%s' -- "$scope_file") -le 16777216 ]] || return 1
+  [[ $(realpath -e -- "$scope_file") == "$(realpath -e -- "${deploy_dir}/tmp")/"* ]] || return 1
+  (( (8#$(stat -c '%a' -- "$scope_file") & 0077) == 0 )) || return 1
+  [[ -d "$recovery" && ! -L "$recovery" ]] || return 1
+  expected=$(python3 -B "${KNOWLEDGE_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
+    --recovery "$recovery" repair-scope) || return 1
+  actual=$(jq -M -ecS '
+    select(.schema_version == 1) |
+    select((keys | sort) == ["projections","schema_version"]) |
+    select(.projections | type == "array") |
+    select(all(.projections[];
+      (keys | sort) == ["deletable_old_locations","missing_locations","projection"] and
+      (.projection | type == "string" and length > 0 and
+        (test("[\\x00-\\x1f\\\\/;,]") | not)) and
+      (.missing_locations | type == "array") and
+      (.deletable_old_locations | type == "array")))
+  ' "$scope_file") || return 1
+  [[ "$actual" == "$(jq -M -cS . <<< "$expected")" ]] || return 1
+  filenames=$(jq -M -c '[.projections[].projection]' <<< "$actual") || return 1
+  knowledge_catalog_migrate "$deploy_dir" || return 1
+  knowledge_profile_refresh_bindings "$deploy_dir" false true || return 1
+  jq -M -e --argjson filenames "$filenames" '
+    ([.libraries[] | select(.enabled) | .documents[].projection] | unique) as $enabled |
+    all($filenames[]; . as $name | $enabled | index($name) != null)
+  ' "${deploy_dir}/knowledge/catalog.json" >/dev/null || return 1
+  knowledge_catalog_project "$deploy_dir" || return 1
+  if [[ "$filenames" != '[]' ]]; then
+    declare -F knowledge_sync_legacy >/dev/null || return 1
+    knowledge_sync_legacy "$deploy_dir" 1 "$filenames" >&2 || status=$?
+  fi
+  if (( status == 0 )) && knowledge_catalog_readback "$deploy_dir" all false; then
+    return 0
+  fi
+  temporary=$(mktemp "${deploy_dir}/knowledge/catalog.json.tmp.XXXXXX") || return 1
+  if ! jq -M --argjson filenames "$filenames" --slurpfile manifest "${deploy_dir}/data/knowledge-manifest.json" '
+      .libraries |= map(if .enabled then
+        .documents |= map(. as $document | if ($filenames | index($document.projection)) != null then
+          .index_status=(if $manifest[0].files[$document.projection].sha256 == .sha256 then "indexed"
+            elif $manifest[0].pending_files[$document.projection] != null then "pending" else "failed" end) |
+          .last_error=(if .index_status == "indexed" then null else "索引或服务端对账未完成，可重新同步继续" end)
+        else . end) |
+        .status=(if all(.documents[]; .index_status == "indexed") then "indexed" else "pending" end) |
+        .error=(if .status == "indexed" then null else "索引或服务端对账未完成，可重新同步继续" end)
+      else . end)
+    ' "${deploy_dir}/knowledge/catalog.json" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  knowledge_catalog_write "$deploy_dir" "$temporary"
+  return 1
+}
+
 knowledge_catalog_update() {
   local deploy_dir=$1 filter=$2; shift 2
   local temporary

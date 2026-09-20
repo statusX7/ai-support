@@ -49,8 +49,11 @@ async function main() {
   let promptFailures=0;
   let embeddingUpdates=0;
   const embeddingPayloads=[];
+  const removePayloads=[];
+  const httpEvents=[];
   let workspaceReads=0;
   let promptDelayMs=0;
+  let promptGate=null;
   let failReadAfterNextEmbedding=false;
   let workspaceReadFailureCountdown=0;
   let removeFailures=0;
@@ -81,6 +84,7 @@ async function main() {
     let body={};
     if(request.headers['content-type']?.includes('application/json')) body=JSON.parse(data.toString('utf8')||'{}');
     if(request.url==='/api/v1/workspace/crisp-support' && request.method==='GET') {
+      httpEvents.push('workspace_get');
       workspaceReads++;
       if(workspaceReadFailureCountdown>0&&--workspaceReadFailureCountdown===0){send(500,{error:true});return;}
       send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;
@@ -89,7 +93,12 @@ async function main() {
       const projection=JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json'),'utf8'));
       applyingObservation={state:projection.state,revision:projection.revision,applied_revision:projection.configuration.runtime.applied_revision};
       if(promptFailures>0){promptFailures--;send(500,{error:true});return;}
-      promptUpdates++;prompt=body.openAiPrompt;
+      httpEvents.push('prompt_update');promptUpdates++;prompt=body.openAiPrompt;
+      if(promptGate!==null) {
+        promptGate.entered++;
+        promptGate.signal();
+        await promptGate.release;
+      }
       if(promptDelayMs>0) {
         await new Promise(resolve=>{
           const timer=setTimeout(resolve,promptDelayMs);
@@ -113,6 +122,7 @@ async function main() {
         }
       }
       uploadRequests++;
+      httpEvents.push('upload');
       const raw=data.toString('latin1');
       const match=/filename="([^"]+)"/.exec(raw);
       const filename=match?.[1] || `document-${sequence}`;
@@ -135,6 +145,7 @@ async function main() {
       send(200,{success:true,documents:uploaded});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update-embeddings') {
+      httpEvents.push('embedding_update');
       embeddingUpdates++;
       embeddingPayloads.push({adds:[...(body.adds||[])],deletes:[...(body.deletes||[])]});
       if(embeddingFailures>0){embeddingFailures--;send(400,{error:true});return;}
@@ -146,7 +157,9 @@ async function main() {
       send(200,{success:true});return;
     }
     if(request.url==='/api/v1/system/remove-documents') {
+      httpEvents.push('remove_documents');
       removeRequests++;
+      removePayloads.push([...(body.names||[])]);
       if(removeFailures>0){removeFailures--;send(500,{error:true});return;}
       for(const name of body.names||[]) {
         documents.delete(name);
@@ -206,6 +219,23 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
   const delay=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+  const externalCounters=()=>({promptUpdates,uploadRequests,embeddingUpdates,removeRequests,workspaceReads});
+  const assertNoExternalWrites=(before,label)=>{
+    assert.deepEqual({promptUpdates,uploadRequests,embeddingUpdates,removeRequests},{
+      promptUpdates:before.promptUpdates,uploadRequests:before.uploadRequests,
+      embeddingUpdates:before.embeddingUpdates,removeRequests:before.removeRequests,
+    },label);
+  };
+  const armPromptGate=()=>{
+    assert.equal(promptGate,null,'同一时刻只能建立一个 Prompt 响应门');
+    let signalEntered,releaseGate;
+    const entered=new Promise(resolve=>{signalEntered=resolve;});
+    const release=new Promise(resolve=>{releaseGate=resolve;});
+    const gate={entered:0,signal:()=>signalEntered(),release,
+      close:()=>{releaseGate();if(promptGate===gate)promptGate=null;}};
+    promptGate=gate;
+    return {gate,entered,close:gate.close};
+  };
   const processGroupId=pid=>{
     const value=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
     const close=value.lastIndexOf(') ');
@@ -983,14 +1013,35 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert(reenabled.revision>disabledRevision);
     pass('客服停用代次只在成功停用边界递增，重新启用保持同一代次');
 
-    const beforeForced={promptUpdates,workspaceReads};
+    const sourceIdentityFiles=[projectionPath,appliedSnapshotPath,
+      path.join(deploy,'data/knowledge-manifest.json'),path.join(deploy,'data/knowledge-projection.json'),
+      path.join(deploy,'data/runtime/knowledge-map.json'),path.join(deploy,'data/runtime/knowledge-settings.json'),
+      path.join(deploy,'data/runtime/knowledge-profile.json'),path.join(deploy,'data/runtime/knowledge-lexical.json')];
+    const driftIdentity=Object.fromEntries(sourceIdentityFiles.map(file=>[file,fs.readFileSync(file)]));
+    const beforeDrift=externalCounters();
     prompt='## WebUI 漂移的虚构 Prompt\n';
-    await ok(['apply','--force-external']);
+    result=await invoke(['apply']);
+    assert.notEqual(result.code,0);assert.match(result.stderr,/外部 Prompt 或受管知识关系.*不一致/);
+    assertNoExternalWrites(beforeDrift,'普通 apply 面对外部漂移必须零写失败');
+    assert.ok(workspaceReads>beforeDrift.workspaceReads,'普通 apply 必须实际执行外部只读回读');
+    for(const [file,content] of Object.entries(driftIdentity))assert.deepEqual(fs.readFileSync(file),content,file);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    pass('普通 apply 面对 Prompt 外部漂移严格回读并零写失败，不再用 changed=false 假成功');
+
+    const beforeForced=externalCounters();
+    const forcedResult=await ok(['apply','--force-external']);
     assert.equal(prompt,failedPrompt);
-    assert.ok(promptUpdates>beforeForced.promptUpdates);
+    assert.equal(promptUpdates,beforeForced.promptUpdates+1);
+    assert.equal(uploadRequests,beforeForced.uploadRequests);
+    assert.equal(embeddingUpdates,beforeForced.embeddingUpdates);
+    assert.equal(removeRequests,beforeForced.removeRequests);
     assert.ok(workspaceReads>=beforeForced.workspaceReads+2);
+    assert.equal(JSON.parse(forcedResult.stdout).components.knowledge,false);
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applied');
-    pass('显式 force-external 即使原文未变也重新同步并回读 Prompt 与启用知识，知识使用增量对账');
+    const afterForced=externalCounters();
+    await ok(['apply']);
+    assertNoExternalWrites(afterForced,'修复后的普通 apply 不得产生外部写');
+    pass('显式 force-external 对 Prompt-only 漂移只写一次 Prompt，知识上传、Embedding 和删除均为零');
 
     let interruptPrompt;
     for(const signals of [['SIGINT'],['SIGTERM'],['SIGINT','SIGTERM']]) {
@@ -1098,6 +1149,185 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(new Set(duplicateRows.map(row=>row.library_id)).size,2);
     assert.equal(new Set(duplicateRows.map(row=>row.projection)).size,2);
     pass('文档 ID 只要求库内唯一；两个命名库可使用相同 ID，秘密和索引映射仍按稳定库 ID 隔离');
+
+    const repairManifestPath=path.join(deploy,'data/knowledge-manifest.json');
+    const repairMapPath=path.join(deploy,'data/runtime/knowledge-map.json');
+    const repairManifestBefore=JSON.parse(fs.readFileSync(repairManifestPath));
+    const repairEntries=Object.entries(repairManifestBefore.files);
+    const singleLocationEntries=repairEntries
+      .filter(([,record])=>Array.isArray(record.locations)&&record.locations.length===1);
+    assert.ok(singleLocationEntries.length>=1,'定向修复夹具必须包含一个单 location 目标投影');
+    const [repairTarget,repairTargetRecord]=singleLocationEntries[0];
+    const [repairControl,repairControlRecord]=repairEntries.find(([name])=>name!==repairTarget) || [];
+    assert.ok(repairControl&&repairControlRecord,'定向修复夹具必须包含一个不同的 control 投影');
+    const repairMissingLocation=repairTargetRecord.locations[0];
+    const repairControlRows=JSON.parse(fs.readFileSync(repairMapPath)).documents
+      .filter(row=>row.projection===repairControl);
+    locations=locations.filter(location=>location!==repairMissingLocation);
+    assert.equal(documents.has(repairMissingLocation),true,'missing 负例必须保留原源文档以模拟仅远端解绑');
+    assert.equal(fs.existsSync(cachePath(repairMissingLocation)),true,'missing 负例必须保留冻结缓存');
+    const repairForeignLocation='custom-documents/external-repair-foreign.json';
+    const repairForeignContent='外部修复边界中的虚构管理员资料';
+    locations.push(repairForeignLocation);
+    documents.set(repairForeignLocation,{filename:'external-repair-foreign.json',pageContent:repairForeignContent});
+    fs.writeFileSync(path.join(deploy,'data/anythingllm/documents',repairForeignLocation),
+      JSON.stringify({pageContent:repairForeignContent})+'\n',{mode:0o600});
+    const canonicalPrompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8');
+    prompt='## 定向修复前的虚构外部漂移\n';
+    const repairCounters=externalCounters();
+    const repairEmbeddingOffset=embeddingPayloads.length;
+    const repairRemoveOffset=removePayloads.length;
+    const repairGate=armPromptGate();
+    const repairPromise=invoke(['apply','--force-external']);
+    let repairInspectionError=null;
+    try {
+      await Promise.race([repairGate.entered,delay(5000).then(()=>{throw new Error('未在时限内进入 Prompt 修复响应门');})]);
+      assert.equal(repairGate.gate.entered,1);
+      const repairRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+      const completePath=path.join(repairRecovery,'complete.json');
+      assert.equal(fs.statSync(repairRecovery).mode&0o777,0o700);
+      assert.equal(fs.statSync(completePath).mode&0o777,0o600);
+      assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+      const completeBytes=fs.readFileSync(completePath);
+      const complete=JSON.parse(completeBytes);
+      assert.equal(complete.schema_version,2);assert.equal(complete.capture_mode,'external_repair');
+      const managed=[...complete.managed_locations].sort();
+      const observed=[...complete.observed_workspace_locations].sort();
+      assert.deepEqual(complete.protected_workspace_locations,[...new Set([...managed,...observed])].sort());
+      assert.deepEqual(complete.deletable_managed_locations,managed.filter(item=>observed.includes(item)));
+      assert.deepEqual(complete.missing_managed_locations,managed.filter(item=>!observed.includes(item)));
+      assert.deepEqual(complete.missing_managed_locations,[repairMissingLocation]);
+      assert.ok(complete.observed_workspace_locations.includes(repairForeignLocation));
+      assert.equal(complete.managed_locations.includes(repairForeignLocation),false);
+      const repairScopeResult=await invokeRecovery(repairRecovery,['repair-scope']);
+      assert.equal(repairScopeResult.code,0,repairScopeResult.stderr);
+      const repairScope=JSON.parse(repairScopeResult.stdout);
+      assert.deepEqual(repairScope.projections.map(item=>item.projection),[repairTarget]);
+      assert.deepEqual(repairScope.projections[0].missing_locations,[repairMissingLocation]);
+      assert.equal(repairScope.projections.some(item=>item.projection===repairControl),false);
+      const tampered=[
+        value=>({...value,capture_mode:'unknown'}),
+        value=>({...value,protected_workspace_locations:[...value.protected_workspace_locations,'custom-documents/tamper.json'].sort()}),
+        value=>({...value,missing_managed_locations:[]}),
+        value=>({...value,deletable_managed_locations:[...value.deletable_managed_locations,repairMissingLocation].sort()}),
+        value=>({...value,observed_workspace_locations:[...value.observed_workspace_locations,value.observed_workspace_locations[0]]}),
+        value=>({...value,unexpected_field:true}),
+      ];
+      for(const mutate of tampered) {
+        fs.writeFileSync(completePath,JSON.stringify(mutate(structuredClone(complete)))+'\n',{mode:0o600});
+        const rejected=await invokeRecovery(repairRecovery,['validate']);
+        assert.notEqual(rejected.code,0,'篡改的 schema v2 恢复清单必须被拒绝');
+        fs.writeFileSync(completePath,completeBytes,{mode:0o600});
+      }
+      const restoredValidation=await invokeRecovery(repairRecovery,['validate']);
+      assert.equal(restoredValidation.code,0,restoredValidation.stderr);
+      // capture 已完成后才让同字符串位置重新出现在 workspace。它可能已由
+      // 管理员或第三方接管；旧 manifest 只能保护它，不能重新取得删除权。
+      locations.push(repairMissingLocation);
+      assert.equal(locations.includes(repairMissingLocation),true);
+    } catch(error) {
+      repairInspectionError=error;
+    } finally {
+      repairGate.close();
+    }
+    result=await repairPromise;
+    if(repairInspectionError!==null)throw repairInspectionError;
+    assert.equal(result.code,0,result.stderr||result.stdout);
+    assert.equal(prompt,canonicalPrompt);
+    assert.equal(promptUpdates,repairCounters.promptUpdates+1);
+    assert.equal(uploadRequests,repairCounters.uploadRequests+1);
+    assert.equal(embeddingUpdates,repairCounters.embeddingUpdates+1);
+    assert.equal(removeRequests,repairCounters.removeRequests);
+    const repairManifestAfter=JSON.parse(fs.readFileSync(repairManifestPath));
+    assert.notDeepEqual(repairManifestAfter.files[repairTarget].locations,[repairMissingLocation]);
+    assert.deepEqual(repairManifestAfter.files[repairControl],repairControlRecord);
+    assert.deepEqual(JSON.parse(fs.readFileSync(repairMapPath)).documents.filter(row=>row.projection===repairControl),repairControlRows);
+    assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',repairMissingLocation)),true);
+    assert.equal(locations.includes(repairMissingLocation),true,
+      'capture 后同字符串重现的位置必须保留为非受管 workspace 成员');
+    assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',repairForeignLocation)),true);
+    assert.equal(locations.includes(repairForeignLocation),true);
+    for(const payload of embeddingPayloads.slice(repairEmbeddingOffset)) {
+      assert.equal(payload.deletes.includes(repairMissingLocation),false);
+      assert.equal(payload.deletes.includes(repairForeignLocation),false);
+    }
+    for(const payload of removePayloads.slice(repairRemoveOffset)) {
+      assert.equal(payload.includes(repairMissingLocation),false);
+      assert.equal(payload.includes(repairForeignLocation),false);
+    }
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    await assertProjectionArtifacts(JSON.parse(fs.readFileSync(projectionPath)));
+    pass('schema v2 定向重建唯一 missing 投影，control 与外来位置保持不变且无越权删除');
+
+    const failedRepairBaseline=JSON.parse(fs.readFileSync(projectionPath));
+    const failedRepairSnapshotSha=sha(appliedSnapshotPath);
+    const failedRepairManifest=JSON.parse(fs.readFileSync(repairManifestPath));
+    const failedRepairTargetLocation=failedRepairManifest.files[repairTarget].locations[0];
+    locations=locations.filter(location=>location!==failedRepairTargetLocation);
+    assert.equal(documents.has(failedRepairTargetLocation),true);
+    prompt='## 知识失败恢复前的虚构外部漂移\n';
+    const failedRepairCounters=externalCounters();
+    const failedRepairEmbeddingOffset=embeddingPayloads.length;
+    const failedRepairRemoveOffset=removePayloads.length;
+    const failedRepairEventOffset=httpEvents.length;
+    const failedRepairUploadOffset=uploadEvents.length;
+    const enabledProjectionCount=Object.keys(failedRepairManifest.files).length;
+    const enabledProjectionContents=Object.keys(failedRepairManifest.files).sort()
+      .map(name=>fs.readFileSync(path.join(deploy,'knowledge',name),'utf8')).sort();
+    const failedRepairTargetContent=fs.readFileSync(path.join(deploy,'knowledge',repairTarget),'utf8');
+    embeddingFailures=1;
+    const failedRepairGate=armPromptGate();
+    const failedRepairPromise=invoke(['apply','--force-external']);
+    let failedRepairInspectionError=null;
+    try {
+      await Promise.race([failedRepairGate.entered,delay(5000).then(()=>{throw new Error('未在时限内进入失败恢复 Prompt 门');})]);
+      assert.equal(failedRepairGate.gate.entered,1);
+      locations.push(failedRepairTargetLocation);
+      assert.equal(locations.includes(failedRepairTargetLocation),true);
+    } catch(error) {
+      failedRepairInspectionError=error;
+    } finally {
+      failedRepairGate.close();
+    }
+    result=await failedRepairPromise;
+    if(failedRepairInspectionError!==null)throw failedRepairInspectionError;
+    assert.notEqual(result.code,0,'修复阶段知识失败后即使旧代恢复成功，本次 apply 仍须返回失败');
+    const failedRepairRestored=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(failedRepairRestored.state,'applied');
+    assert.equal(failedRepairRestored.revision,failedRepairBaseline.revision+2);
+    assert.equal(prompt,canonicalPrompt);
+    assert.equal(promptUpdates,failedRepairCounters.promptUpdates+2);
+    assert.equal(uploadRequests,failedRepairCounters.uploadRequests+1+enabledProjectionCount);
+    const failedRepairUploads=uploadEvents.slice(failedRepairUploadOffset);
+    assert.equal(failedRepairUploads.length,1+enabledProjectionCount);
+    assert.equal(failedRepairUploads[0].pageContent,failedRepairTargetContent,
+      '修复阶段唯一上传必须对应 missing target');
+    assert.deepEqual(failedRepairUploads.slice(1).map(event=>event.pageContent).sort(),enabledProjectionContents,
+      '恢复阶段必须把每个 canonical projection 恰好重建一次');
+    assert.equal(new Set(failedRepairUploads.map(event=>event.filename)).size,failedRepairUploads.length,
+      '修复与恢复的每次上传必须使用不同随机 alias');
+    const failedRepairEvents=httpEvents.slice(failedRepairEventOffset);
+    assert.equal(failedRepairEvents[0],'workspace_get');
+    assert.ok(failedRepairEvents.indexOf('prompt_update')>=0);
+    assert.ok(failedRepairEvents.indexOf('prompt_update')<failedRepairEvents.indexOf('upload'));
+    assert.equal(sha(appliedSnapshotPath),failedRepairSnapshotSha);
+    assert.equal(fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'),canonicalPrompt);
+    for(const payload of embeddingPayloads.slice(failedRepairEmbeddingOffset)) {
+      assert.equal(payload.deletes.includes(failedRepairTargetLocation),false);
+      assert.equal(payload.deletes.includes(repairForeignLocation),false);
+    }
+    for(const payload of removePayloads.slice(failedRepairRemoveOffset)) {
+      assert.equal(payload.includes(failedRepairTargetLocation),false);
+      assert.equal(payload.includes(repairForeignLocation),false);
+    }
+    assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',failedRepairTargetLocation)),true);
+    assert.equal(locations.includes(failedRepairTargetLocation),true,
+      '失败恢复也不得删除 capture 后重现的 missing 同字符串位置');
+    assert.equal(fs.existsSync(path.join(deploy,'data/anythingllm/documents',repairForeignLocation)),true);
+    assert.equal(locations.includes(repairForeignLocation),true);
+    assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery')),false);
+    await assertProjectionArtifacts(failedRepairRestored);
+    pass('Prompt 修复成功后知识失败会恢复冻结 canonical，missing 与外来同名位置始终不获删除权');
 
     const bytesResult=await new Promise(resolve=>{
       const child=spawn('bash',['-c','source scripts/knowledge.sh; knowledge_utf8_bytes 人工客服'],{cwd:root});
