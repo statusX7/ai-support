@@ -1328,6 +1328,17 @@ function createRuntime(env = {}, options = {}) {
     const stat = fs.lstatSync(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('会话目录不安全');
   };
+  const managedRuntimeOwnerUid = () => {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()
+      || (stat.mode & 0o022) !== 0
+      || !Number.isSafeInteger(stat.uid) || stat.uid < 0) {
+      const error = new Error('受管运行目录身份不安全');
+      error.code = 'MANAGED_DIRECTORY_UNSAFE';
+      throw error;
+    }
+    return stat.uid;
+  };
   const serialized = (value) => JSON.stringify(value);
   const assertSerializedWithin = (value, maximum) => {
     const content = serialized(value);
@@ -1345,15 +1356,16 @@ function createRuntime(env = {}, options = {}) {
     let primary;
     let proof;
     try {
+      const expectedOwnerUid = managedRuntimeOwnerUid();
       descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       const before = fs.fstatSync(descriptor);
       if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
-        || before.uid !== process.geteuid() || (before.mode & 0o777) !== 0o600
+        || before.uid !== expectedOwnerUid || (before.mode & 0o777) !== 0o600
         || before.size > maximum) throw new Error('受管文件证明不安全');
       const bytes = fs.readFileSync(descriptor);
       const after = fs.fstatSync(descriptor);
       if (bytes.length !== before.size || !after.isFile() || after.isSymbolicLink()
-        || after.nlink !== 1 || after.uid !== process.geteuid() || (after.mode & 0o777) !== 0o600
+        || after.nlink !== 1 || after.uid !== expectedOwnerUid || (after.mode & 0o777) !== 0o600
         || after.size > maximum) throw new Error('受管文件证明已变化');
       const fields = ['dev', 'ino', 'uid', 'mode', 'nlink', 'size', 'mtimeMs', 'ctimeMs'];
       if (!fields.every((name) => before[name] === after[name])) throw new Error('受管文件证明已变化');
@@ -1401,12 +1413,13 @@ function createRuntime(env = {}, options = {}) {
       catch (error) { throw bindManagedIoError(error, file, 'atomic_write', name); }
     };
     try {
+      const expectedOwnerUid = phase('temporary_open', () => managedRuntimeOwnerUid());
       descriptor = phase('temporary_open', () => fs.openSync(temporary, 'wx', 0o600));
       temporaryOwned = true;
       descriptorClosed = false;
       const temporaryStat = phase('temporary_open', () => fs.fstatSync(descriptor));
       if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() || temporaryStat.nlink !== 1
-        || temporaryStat.uid !== process.geteuid() || (temporaryStat.mode & 0o777) !== 0o600) {
+        || temporaryStat.uid !== expectedOwnerUid || (temporaryStat.mode & 0o777) !== 0o600) {
         const error = new Error('受管临时文件身份不安全');
         error.code = 'MANAGED_TEMPORARY_UNSAFE';
         throw bindManagedIoError(error, file, 'atomic_write', 'temporary_open');

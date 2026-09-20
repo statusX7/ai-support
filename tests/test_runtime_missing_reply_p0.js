@@ -395,6 +395,15 @@ const test = async (name, action) => {
     const humanAt = fx.now();
     const operator = await webhook(fx, session, '人工处理', 90001,
       { event: 'message:received', from: 'operator', automated: false, timestamp: humanAt });
+    assert.equal(operator.accepted, true, '首次合法真人事件必须完成持久接收');
+    assert.equal(operator.statusCode, 200, '首次合法真人事件必须返回持久接收成功');
+    assert.equal(operator.route, 'process', '真人控制事件必须进入控制处理链');
+    assert.match(operator.key, /^[a-f0-9]{64}$/, '持久接收成功必须返回合法会话键');
+    const operatorState = stateFile(fx, session);
+    assert.equal(fs.existsSync(operatorState + '.lock'), false, '成功事务不得遗留会话锁');
+    assert.equal(fs.readdirSync(fx.runtimeDirectory)
+      .some((name) => name.startsWith(path.basename(operatorState) + '.tmp-')), false,
+    '成功事务不得遗留原子写临时文件');
     const paused = fx.runtime.readState(operator.key);
     assert.equal(paused.mode, 'human');
     const resumeAt = paused.resume_at;
