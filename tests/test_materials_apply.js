@@ -222,6 +222,56 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       embeddingUpdates:before.embeddingUpdates,removeRequests:before.removeRequests,
     },label);
   };
+  const materialsResultDirectory=path.join(deploy,'tmp');
+  const assertMaterialsResultDirectory=(expected,label)=>{
+    const metadata=fs.lstatSync(materialsResultDirectory);
+    assert.equal(metadata.isSymbolicLink(),false,`${label}结果临时目录不得是符号链接`);
+    assert.equal(metadata.isDirectory(),true,`${label}结果临时目录必须是真实目录`);
+    assert.equal(metadata.uid,process.geteuid(),`${label}结果临时目录必须属于当前测试身份`);
+    if(expected!==null) {
+      assert.equal(metadata.dev,expected.dev,`${label}结果临时目录设备号不得变化`);
+      assert.equal(metadata.ino,expected.ino,`${label}结果临时目录inode不得变化`);
+      assert.equal(metadata.uid,expected.uid,`${label}结果临时目录属主不得变化`);
+    }
+    return {dev:metadata.dev,ino:metadata.ino,uid:metadata.uid};
+  };
+  const materialsResultSnapshot=label=>{
+    const directory=assertMaterialsResultDirectory(null,label);
+    const files=fs.readdirSync(materialsResultDirectory)
+      .filter(name=>name.startsWith('materials-result.')).sort();
+    assertMaterialsResultDirectory(directory,label);
+    return {directory,files};
+  };
+  const cleanKilledResultDelta=(before,label)=>{
+    assertMaterialsResultDirectory(before.directory,label);
+    const after=fs.readdirSync(materialsResultDirectory)
+      .filter(name=>name.startsWith('materials-result.')).sort();
+    assertMaterialsResultDirectory(before.directory,label);
+    const beforeSet=new Set(before.files);
+    const added=after.filter(name=>!beforeSet.has(name));
+    assert.deepEqual(after.filter(name=>!added.includes(name)),before.files,
+      `${label}不得删除或改名既有结果临时文件`);
+    assert.equal(added.length,1,`${label}必须只产生一个结果临时文件`);
+    assert.match(added[0],/^materials-result\.[A-Za-z0-9]{8}$/,
+      `${label}结果临时文件名必须来自受控mktemp模式`);
+    const candidate=path.join(materialsResultDirectory,added[0]);
+    assert.equal(path.dirname(candidate),materialsResultDirectory);
+    assertMaterialsResultDirectory(before.directory,label);
+    const metadata=fs.lstatSync(candidate);
+    assert.equal(metadata.isSymbolicLink(),false,`${label}结果临时文件不得是符号链接`);
+    assert.equal(metadata.isFile(),true,`${label}结果临时对象必须是普通文件`);
+    assert.equal(metadata.nlink,1,`${label}结果临时文件不得有额外硬链接`);
+    assert.equal(metadata.uid,process.geteuid(),`${label}结果临时文件必须属于当前测试身份`);
+    assert.equal(metadata.mode&0o077,0,`${label}结果临时文件不得向group/other开放`);
+    assertMaterialsResultDirectory(before.directory,label);
+    fs.unlinkSync(candidate);
+    assertMaterialsResultDirectory(before.directory,label);
+    assert.deepEqual(
+      fs.readdirSync(materialsResultDirectory)
+        .filter(name=>name.startsWith('materials-result.')).sort(),
+      before.files,`${label}必须清理自己的唯一结果临时增量`);
+    assertMaterialsResultDirectory(before.directory,label);
+  };
   const armPromptGate=()=>{
     assert.equal(promptGate,null,'同一时刻只能建立一个 Prompt 响应门');
     let signalEntered,releaseGate,closed=false;
@@ -768,6 +818,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const responseCrashJq=path.join(deploy,'bin/jq');
     const responseCrashFile=path.join(responseCrashRecovery,'upload-response.json');
     const responseCrashRealJq=execFileSync('sh',['-c','command -v jq'],{encoding:'utf8'}).trim();
+    const responseCrashResultFiles=materialsResultSnapshot('HTTP回执后SIGKILL夹具基线');
     fs.writeFileSync(responseCrashArm,'armed\n',{mode:0o600});
     fs.writeFileSync(responseCrashJq,[
       '#!/usr/bin/env bash',
@@ -803,6 +854,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       assert.equal(result.code,null,JSON.stringify(result));
       assert.equal(result.signal,'SIGKILL',JSON.stringify(result));
       assert.equal(result.markerObserved,true);assert.equal(result.groupGone,true);
+      cleanKilledResultDelta(responseCrashResultFiles,'HTTP回执后SIGKILL夹具');
     } finally {
       fs.rmSync(responseCrashJq,{force:true});
       fs.rmSync(responseCrashArm,{force:true});
@@ -923,11 +975,13 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     ].join('\n'),{mode:0o700});
     const dispatchUploadOffset=uploadRequests;
     const dispatchEventOffset=uploadEvents.length;
+    const dispatchResultFiles=materialsResultSnapshot('请求发出前SIGKILL夹具基线');
     try {
       result=await invokeKilledAtMarker(['apply'],dispatchReady);
       assert.equal(result.code,null,JSON.stringify(result));
       assert.equal(result.signal,'SIGKILL',JSON.stringify(result));
       assert.equal(result.markerObserved,true);assert.equal(result.groupGone,true);
+      cleanKilledResultDelta(dispatchResultFiles,'请求发出前SIGKILL夹具');
     } finally {
       fs.rmSync(curlWrapper,{force:true});
       fs.rmSync(dispatchArm,{force:true});
