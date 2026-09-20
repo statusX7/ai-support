@@ -1112,6 +1112,8 @@ const abortablePending = (signal, started) => {
   });
   await test('P0 不确定 operator 仍无法归属时保留屏障，确认自动化后才放行其后问题', async () => {
     const before = sent.length;
+    const beforeModels = modelRequests.length;
+    const beforePosts = sendAttempts;
     const item = await deferredOperatorCase('unknown', {});
     const previousGeneration = state(item.session).generation;
     assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'deferred');
@@ -1125,10 +1127,31 @@ const abortablePending = (signal, started) => {
     history[0].automated = true;
     const control = state(item.session).jobs.find((job) => job.id === item.control.jobId);
     now = Math.max(now + 1, control.retry_at + 1);
-    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'sent');
-    assert.equal(state(item.session).uncertain_events.length, 0);
+    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'none');
+    const resolved = state(item.session);
+    const resolvedControl = resolved.jobs.find((job) => job.id === item.control.jobId);
+    assert(resolvedControl);
+    assert.equal(resolvedControl.status, 'done');
+    assert.equal(resolvedControl.responsibility_status, 'control_handled');
+    assert.equal(resolvedControl.responsibility_reason, 'operator_identity_resolved');
+    assert.equal(resolved.uncertain_events.length, 0);
     assert.equal(item.visitorJob().deferred_control, undefined);
-    assert.equal((await runtime.process(item.visitor.key, item.visitor.jobId)).status, 'sent');
+    assert.equal(modelRequests.length, beforeModels);
+    assert.equal(sendAttempts, beforePosts);
+    assert.equal(sent.length, before);
+    const visitorResult = await runtime.process(item.visitor.key, item.visitor.jobId);
+    assert.equal(visitorResult.status, 'sent');
+    const answered = state(item.session);
+    const answeredVisitor = answered.jobs.find((job) => job.id === item.visitor.jobId);
+    assert(answeredVisitor);
+    assert.equal(answeredVisitor.status, 'done');
+    assert.equal(answeredVisitor.responsibility_status, 'answered_confirmed');
+    const visitorOutgoing = Object.values(answered.outgoing || {})
+      .filter((entry) => entry.job_id === item.visitor.jobId);
+    assert.equal(visitorOutgoing.length, 1);
+    assert.equal(visitorOutgoing[0].status, 'sent');
+    assert.equal(modelRequests.length, beforeModels + 1);
+    assert.equal(sendAttempts, beforePosts + 1);
     assert.equal(sent.length, before + 1);
   });
   await test('P0 同一时间戳按持久 sequence 判断先后，控制后的访客消息仍处理一次', async () => {
