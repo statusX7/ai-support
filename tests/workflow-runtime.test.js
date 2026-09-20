@@ -3115,7 +3115,10 @@ const abortablePending = (signal, started) => {
       assert.equal(serviceRule.role, 'system');
       const serviceText = typeof serviceRule.content === 'string' ? serviceRule.content : serviceRule.content[0].text;
       assert.match(serviceText, /不得主动邀请用户评价、评分、点赞或确认满意度/);
-      assert.match(serviceText, /仅在完成当前咨询确实缺少必要信息时提出具体澄清问题/);
+      assert.match(serviceText, /只有缺少一个会改变判断的必要字段时/);
+      assert.match(serviceText, /先回答能够确认的部分，再只询问该具体字段/);
+      assert.match(serviceText, /不得要求用户笼统重述情况、提示和已尝试方法/);
+      assert.match(serviceText, /不得连续索取已经提供的信息/);
       projection.revision += 1; projection.configuration.runtime.revision += 1; projection.configuration.runtime.applied_revision += 1;
       projection.configuration.keyword.rules[0].text = '已应用版本二'; publish();
       await deliver(message('session_materials001', '资料应用测试'));
