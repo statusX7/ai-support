@@ -1187,12 +1187,15 @@ const abortablePending = (signal, started) => {
     assert.equal(sent.length, before + 1);
   });
   await test('P0 多个未决 operator 逐次建立栅栏，最后归属前不提前释放访客任务', async () => {
-    for (const [suffix, resolutions, outcome] of [
-      ['unknown-then-automated', [{}, { automated: true }], 'send'],
-      ['unknown-then-unknown', [{}, {}], 'pending'],
-      ['unknown-then-human', [{}, { automated: false }], 'human'],
+    for (const [suffix, resolutions, firstStatus, barriersAfterFirst, secondStatus, barriersAfterSecond, outcome] of [
+      ['automated-then-automated', [{ automated: true }, { automated: true }], 'none', [1], 'none', [], 'send'],
+      ['unknown-then-automated', [{}, { automated: true }], 'deferred', [0, 1], 'none', [0], 'pending'],
+      ['unknown-then-unknown', [{}, {}], 'deferred', [0, 1], 'deferred', [0, 1], 'pending'],
+      ['unknown-then-human', [{}, { automated: false }], 'deferred', [0, 1], 'none', [0], 'human'],
     ]) {
       const before = sent.length;
+      const modelBefore = modelRequests.length;
+      const postBefore = sendAttempts;
       const session = 'session_multi-control-' + suffix;
       const controls = [];
       const originals = [];
@@ -1205,28 +1208,61 @@ const abortablePending = (signal, started) => {
       now += 1;
       const visitor = await receive(message(session, '两个 operator 归属确认期间的新问题'));
       const visitorJob = () => state(session).jobs.find((job) => job.id === visitor.jobId);
+      const originalVisitorData = structuredClone(visitorJob().data);
       assert.equal(visitorJob().deferred_control, true);
       histories.set(session, [...originals.map((data, index) => ({ ...data, ...resolutions[index] })), ...(histories.get(session) || [])]);
-      await runtime.process(controls[0].key, controls[0].jobId);
-      assert.equal(state(session).uncertain_events.length, 1);
-      assert.equal(visitorJob().deferred_control, true, '尚有第二个未决控制时不能提前释放');
-      await runtime.process(controls[1].key, controls[1].jobId);
+      const firstResult = await runtime.process(controls[0].key, controls[0].jobId);
+      assert.equal(firstResult.status, firstStatus);
+      if (firstStatus === 'deferred') assert.equal(firstResult.reason, 'operator_identity_pending');
+      const controlJob = (index) => state(session).jobs.find((job) => job.id === controls[index].jobId);
+      assert.deepEqual(state(session).uncertain_events, barriersAfterFirst.map((index) => controls[index].jobId));
+      assert.equal(controlJob(0).status, firstStatus === 'deferred' ? 'received' : 'done');
+      assert.equal(controlJob(0).responsibility_status, firstStatus === 'deferred' ? 'unresolved_failure' : 'control_handled');
+      if (firstStatus === 'deferred') assert.equal(controlJob(0).failure_code, 'operator_identity_pending');
+      assert.equal(visitorJob().status, 'received');
+      assert.equal(visitorJob().deferred_control, true, '尚有未决控制时不能提前释放');
+      assert.equal(modelRequests.length, modelBefore, '控制归属处理不得调用模型');
+      assert.equal(sendAttempts, postBefore, '控制归属处理不得发普通客服消息');
+      assert.equal(sent.length, before, '控制归属处理不得产生可见 AI 回复');
+      const secondResult = await runtime.process(controls[1].key, controls[1].jobId);
+      assert.equal(secondResult.status, secondStatus);
+      if (secondStatus === 'deferred') assert.equal(secondResult.reason, 'operator_identity_pending');
+      assert.deepEqual(state(session).uncertain_events, barriersAfterSecond.map((index) => controls[index].jobId));
+      assert.equal(controlJob(1).status, secondStatus === 'deferred' ? 'received' : 'done');
+      assert.equal(controlJob(1).responsibility_status, secondStatus === 'deferred' ? 'unresolved_failure' : 'control_handled');
+      if (secondStatus === 'deferred') assert.equal(controlJob(1).failure_code, 'operator_identity_pending');
       if (outcome === 'send') {
         assert.equal(state(session).mode, 'ai');
         assert.equal(visitorJob().status, 'received');
         assert.equal(visitorJob().deferred_control, undefined);
         assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'sent');
+        assert.equal(visitorJob().status, 'done');
+        assert.equal(visitorJob().responsibility_status, 'answered_confirmed');
+        const outgoing = Object.values(state(session).outgoing || {})
+          .filter((record) => record.job_id === visitor.jobId);
+        assert.equal(outgoing.length, 1);
+        assert.equal(outgoing[0].status, 'sent');
+        assert.equal(modelRequests.length, modelBefore + 1);
+        assert.equal(sendAttempts, postBefore + 1);
         assert.equal(sent.length, before + 1);
       } else if (outcome === 'human') {
         assert.equal(state(session).mode, 'human');
         assert.equal(visitorJob().status, 'cancelled');
+        assert.equal(visitorJob().responsibility_status, 'intentional_silence');
+        assert.equal(visitorJob().responsibility_reason, 'human_reply');
+        assert.equal(modelRequests.length, modelBefore);
+        assert.equal(sendAttempts, postBefore);
         assert.equal(sent.length, before);
       } else {
         assert.equal(state(session).mode, 'ai');
         assert.equal(visitorJob().status, 'received');
         assert.equal(visitorJob().deferred_control, true);
-        assert.equal(state(session).uncertain_events.length, 1);
         assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'idle');
+        assert.equal(visitorJob().status, 'received');
+        assert.equal(visitorJob().responsibility_status, 'pending');
+        assert.deepEqual(visitorJob().data, originalVisitorData, '未决屏障不得删除或改写访客原始责任');
+        assert.equal(modelRequests.length, modelBefore);
+        assert.equal(sendAttempts, postBefore);
         assert.equal(sent.length, before);
       }
     }
