@@ -2093,8 +2093,11 @@ const abortablePending = (signal, started) => {
   });
   await test('P0 远端已收字节的迟到回执如实隔离，不记正常 AI 回复且旧 attempt 不覆盖新记录', async () => {
     const analytics = path.join(root, 'data/analytics/events.jsonl');
-    const countEvents = type => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
-      .map(line => JSON.parse(line)).filter(event => event.type === type).length : 0;
+    const events = () => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n')
+      .filter(Boolean).map(line => JSON.parse(line)) : [];
+    const countEvents = type => events().filter(event => event.type === type).length;
+    const countSupersededEvents = () => events().filter(event => event.type === 'delivery_after_state_change'
+      && event.reason === 'attempt_superseded').length;
     const normalReplies = countEvents('ai_reply');
     const lateDeliveries = countEvents('delivery_after_state_change');
     let release;
@@ -2124,22 +2127,58 @@ const abortablePending = (signal, started) => {
     delayedCrisp = new Promise((resolve) => { release = resolve; });
     const fencedSession = 'session_crisp-attempt-fence';
     const fencedAttempts = sendAttempts;
+    const fencedNormalReplies = countEvents('ai_reply');
+    const fencedLateDeliveries = countEvents('delivery_after_state_change');
+    const fencedSupersededDeliveries = countSupersededEvents();
     const fenced = await receive(message(fencedSession, '模拟旧实例迟到回执'));
     const fencedPending = runtime.process(fenced.key, fenced.jobId);
     for (let tries = 0; tries < 200 && sendAttempts === fencedAttempts; tries += 1) await wait(5);
-    const replacement = 'e'.repeat(32);
+    assert.equal(sendAttempts, fencedAttempts + 1, '旧 attempt 只能发起一次 POST');
+    let replacement;
+    let replacementRecord;
+    let replacementJob;
+    let replacementWorker;
     await runtime.transaction(fenced.key, current => {
       const record = Object.values(current.outgoing).find(value => value.job_id === fenced.jobId);
+      const stored = current.jobs.find(value => value.id === fenced.jobId);
+      const candidate = 'e'.repeat(32);
+      const ownerCandidate = stored.execution_token === 'd'.repeat(24)
+        ? 'c'.repeat(24) : 'd'.repeat(24);
+      replacement = record.attempt_token === candidate ? 'f'.repeat(32) : candidate;
+      assert.notEqual(record.attempt_token, replacement);
+      assert.notEqual(stored.execution_token, ownerCandidate);
       record.attempt_token = replacement;
       record.status = 'sending';
+      stored.status = 'processing';
+      stored.execution_token = ownerCandidate;
+      stored.lease_until = now + 300000;
+      current.worker = { job: stored.id, token: ownerCandidate, until: now + 300000 };
+      replacementRecord = JSON.parse(JSON.stringify(record));
+      replacementJob = JSON.parse(JSON.stringify(stored));
+      replacementWorker = JSON.parse(JSON.stringify(current.worker));
     });
     release();
     const fencedResult = await fencedPending;
     ignoreCrispAbort = false;
     assert.equal(fencedResult.status, 'dispatched_after_cancel');
-    const fencedRecord = Object.values(state(fencedSession).outgoing).find(record => record.job_id === fenced.jobId);
-    assert.equal(fencedRecord.attempt_token, replacement);
-    assert.equal(fencedRecord.status, 'sending', '旧实例不得用迟到回执覆盖新 attempt 的状态');
+    const fencedState = state(fencedSession);
+    const fencedRecord = Object.values(fencedState.outgoing).find(record => record.job_id === fenced.jobId);
+    const fencedJob = fencedState.jobs.find(job => job.id === fenced.jobId);
+    assert.deepEqual(fencedRecord, replacementRecord,
+      '旧实例不得用迟到回执修改新 attempt 的任何持久字段');
+    assert.equal(sendAttempts, fencedAttempts + 1, '迟到回执不得触发第二次 POST');
+    assert.equal(countEvents('ai_reply'), fencedNormalReplies,
+      '旧 attempt 的迟到回执不得登记为正常 AI 回复');
+    assert.equal(countEvents('delivery_after_state_change'), fencedLateDeliveries + 1,
+      '旧 attempt 只记录一次脱敏的发送代次变化事件');
+    assert.equal(countSupersededEvents(), fencedSupersededDeliveries + 1);
+    assert.deepEqual(fencedJob, replacementJob,
+      '旧 worker 的回执及收尾都不能改写新 owner 持有的应答责任');
+    assert.deepEqual(fencedState.worker, replacementWorker,
+      '旧 worker 的收尾不能释放新 owner 的执行租约');
+    assert.equal(fencedJob.status, 'processing');
+    assert.equal(fencedJob.responsibility_status, 'pending');
+    assert.notEqual(fencedJob.responsibility_status, 'answered_confirmed');
   });
   await test('T29/T30 十秒截止、真人追加、访客与乱序不改时间', async () => {
     const handoff = readConfig('handoff'); handoff.handoff.resume_after_seconds = 10; publishConfiguration('handoff', handoff);

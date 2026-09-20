@@ -510,6 +510,35 @@ function createRuntime(env = {}, options = {}) {
     if (plan.type === 'text' && typeof plan.content === 'string' && Boolean(plan.content.trim())) return 'answer';
     return 'unknown';
   };
+  const attemptTokensMatch = (record, attemptToken) => {
+    if (!record) return true;
+    const hasRecordToken = Object.hasOwn(record, 'attempt_token');
+    if (attemptToken === '') return !hasRecordToken || record.attempt_token === '';
+    return typeof attemptToken === 'string' && Boolean(attemptToken)
+      && hasRecordToken && typeof record.attempt_token === 'string'
+      && Boolean(record.attempt_token) && record.attempt_token === attemptToken;
+  };
+  const attemptReceiptSemanticStatus = (key, job, plan, fingerprint, body) => {
+    if (!plan || typeof plan !== 'object' || Array.isArray(plan)
+      || !body || typeof body !== 'object' || Array.isArray(body)
+      || !frozenOutboundPurpose(plan.purpose)) return 'semantic_unknown';
+    const type = String(plan.type || 'text');
+    if (!frozenOutboundMessageType(type)
+      || String(plan.fingerprint ?? responseFingerprint(key, job, plan.purpose)) !== String(fingerprint)
+      || body.from !== 'operator' || body.origin !== 'chat'
+      || String(body.fingerprint ?? '') !== String(fingerprint)
+      || String(body.type || '') !== type) return 'semantic_unknown';
+    const expectedContent = type === 'picker' && plan.content
+      && typeof plan.content === 'object' && !Array.isArray(plan.content)
+      ? { ...plan.content, required: false } : plan.content;
+    if (!outboundContentSha256(type, expectedContent)
+      || outboundContentSha256(type, expectedContent) !== outboundContentSha256(body.type, body.content)) {
+      return 'semantic_unknown';
+    }
+    const intent = planSemanticIntent(job, plan);
+    return intent === 'answer' ? 'valid_answer' : intent === 'non_answer' ? 'delivered_non_answer'
+      : intent === 'control' ? 'control_delivered' : 'semantic_unknown';
+  };
   const matchingOutgoingPlan = (key, job, record, fingerprint) => {
     const plan = job?.plan;
     if (!plan || typeof plan !== 'object' || record?.job_id !== job.id) return null;
@@ -5356,6 +5385,14 @@ function createRuntime(env = {}, options = {}) {
     const confirmedContent = confirmedBody?.content ?? record?.body?.content ?? plan?.content;
     const confirmedDigest = outboundContentSha256(confirmedType, confirmedContent);
     const confirmedIntent = planSemanticIntent(job, plan);
+    // POST 回执只属于登记它的 attempt。即使 job、正文与配置代次仍相同，旧
+    // worker 也不能用迟到回执覆盖后来取得发送权的新 record。旧版双方均无
+    // token 的回执仍走下方严格身份迁移；任何不对称或畸形 token 均 fail closed。
+    if (record && !attemptTokensMatch(record, attemptToken)) {
+      const semanticStatus = attemptReceiptSemanticStatus(key, job, plan, fingerprint, confirmedBody);
+      return { recorded: false, current: semanticStatus === 'semantic_unknown' ? null : false,
+        state_change_reason: 'attempt_superseded', semantic_status: semanticStatus, answer_valid: false };
+    }
     if (record && !record.job_id && confirmedBody) {
       const plannedFingerprint = plan?.fingerprint ?? responseFingerprint(key, job, plan?.purpose);
       const recordType = String(record.message_type || record.body?.type || '');
@@ -5402,8 +5439,7 @@ function createRuntime(env = {}, options = {}) {
       };
       return { recorded: false, current: null, semantic_status: 'semantic_unknown', answer_valid: false };
     }
-    if (!record || !sameIdentity && (confirmedBody
-      || attemptToken && record.attempt_token !== attemptToken)) {
+    if (!record || !sameIdentity && confirmedBody) {
       const stored = state.jobs.find((entry) => entry.id === job.id);
       if (record && confirmedBody && !record.job_id && record.response_generation === undefined
         && responseGeneration(job) !== 0) {
