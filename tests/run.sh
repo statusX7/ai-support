@@ -487,9 +487,11 @@ INSTALL_LOG="${TEST_ROOT}/install.log"
 TEST_PROVIDER_KEY='test-only-provider-key'
 TEST_CRISP_KEY='test-only-crisp-key'
 TEST_ANYTHING_KEY='test-only-anything-key'
+TEST_RESPONSES_ANYTHING_KEY='test-only-responses-anything-key'
 TEST_CRISP_AUTH=$(printf '%s' "test-only-identifier:${TEST_CRISP_KEY}" | base64 | tr -d '\n')
 export MOCK_FORBIDDEN_ARG_FILE="${TEST_ROOT}/forbidden-curl-args.txt"
-printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" "$TEST_CRISP_AUTH" \
+printf '%s\n' "$TEST_PROVIDER_KEY" "$TEST_CRISP_KEY" "$TEST_ANYTHING_KEY" \
+  "$TEST_RESPONSES_ANYTHING_KEY" "$TEST_CRISP_AUTH" \
   'test-only-failing-provider-key' 'test-only-failing-crisp-key' \
   'test-only-failing-anything-key' 'test-only-plugin-signing-secret' \
   'test-only-plugin-provider-key' 'test-only-plugin-crisp-key' \
@@ -897,7 +899,7 @@ expect_local_ready_install env MOCK_PROVIDER_RESPONSES_ONLY=1 AI_API_MODE=respon
   AI_API_BASE_URL=https://provider.invalid AI_API_KEY="$TEST_PROVIDER_KEY" AI_MODEL=gpt-vision-test \
   CRISP_WEBSITE_ID=77777777-7777-7777-7777-777777777777 CRISP_TOKEN_TIER=website \
   CRISP_TOKEN_IDENTIFIER=test-only-identifier CRISP_TOKEN_KEY="$TEST_CRISP_KEY" \
-  ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" N8N_HOST=responses.example.invalid \
+  ANYTHINGLLM_API_KEY="$TEST_RESPONSES_ANYTHING_KEY" N8N_HOST=responses.example.invalid \
   PUBLIC_WEBHOOK_URL=https://responses.example.invalid/ TIMEZONE=UTC \
   "${PROJECT_ROOT}/install.sh" --deploy-dir "$RESPONSES_DEPLOY_DIR" \
     --command-path "${TEST_ROOT}/bin/crispai-responses" --non-interactive \
@@ -908,6 +910,9 @@ grep -Fxq 'AI_ANYTHINGLLM_BASE_URL=http://provider-adapter:8787/v1' "${RESPONSES
   || fail "Responses-only 未接入内部兼容层"
 grep -Fxq 'state=local-ready' "${RESPONSES_DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "Responses-only 协议安装未完成应用初始化"
+if grep -Fq "$TEST_RESPONSES_ANYTHING_KEY" "${TEST_ROOT}/responses-only.log"; then
+  fail "Responses-only 安装日志泄露 AnythingLLM Key"
+fi
 pass "Responses-only 经受管桥接完成安装链路（模拟 Provider 与 Docker）"
 
 TEST_PLUGIN_SIGNING_SECRET='test-only-plugin-signing-secret'

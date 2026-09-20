@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RAG 配置应用边界：合成 Docker/API；不启动服务、不进行模型调用。"""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -142,13 +143,201 @@ def lifecycle_mock_checks():
         assert api(key, 3002, config_mode=0o644)[0] == "401"
         equivalent, _ = fixture("api-equivalent", 3002, key)
         assert docker(equivalent, "up", "-d").returncode == 0
-        assert api(key, 3002) == ("200", {"settings": {"GenericOpenAiTokenLimit": "8192"}})
+        assert api(key, 3002)[0] == "503", "同端口同认证的多实例即使窗口相同也必须拒绝"
         change_window(equivalent, 16384)
         assert docker(equivalent, "up", "-d").returncode == 0
         assert api(key, 3002)[0] == "503", "同端口同认证的运行窗口冲突必须拒绝"
         assert api("synthetic-wrong-key", 3002)[0] == "401"
         assert (evidence / "anything-state.json").stat().st_mode & 0o777 == 0o600
         assert key not in (evidence / "anything-state.json").read_text(), "独立运行记录不得落盘 API Key 原文"
+
+    def legacy_prompt_migration_check():
+        state_file = evidence / "legacy-prompt-state.json"
+        migration_extra = {"MOCK_ANYTHING_STATE": str(state_file)}
+        owner, owner_key = fixture("legacy-prompt-owner", 3012)
+        successor, successor_key = fixture("legacy-prompt-successor", 3013)
+        third, _ = fixture("legacy-prompt-third", 3014)
+        legacy_prompt = "旧 schema 应完整保留的 Prompt"
+
+        def instance(project, key, port, prompt=None):
+            value = {
+                "context_window": 8192,
+                "port": port,
+                "api_key_sha256": hashlib.sha256(key.encode()).hexdigest(),
+                "knowledge_model": "Xenova/all-MiniLM-L6-v2",
+                "knowledge_chunk_size": 1000,
+                "knowledge_chunk_overlap": 20,
+                "knowledge_chunk_explicit": False,
+                "documents": [],
+                "removed_documents": [],
+            }
+            if prompt is not None:
+                value["prompt"] = prompt
+            return str(project), value
+
+        def write_state(value):
+            state_file.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            state_file.chmod(0o600)
+
+        def snapshot():
+            root_info = evidence.stat()
+            file_info = state_file.stat()
+            return (
+                root_info.st_dev, root_info.st_ino, root_info.st_mode, root_info.st_nlink,
+                root_info.st_uid, root_info.st_gid, root_info.st_size,
+                root_info.st_mtime_ns, root_info.st_ctime_ns,
+                file_info.st_dev, file_info.st_ino, file_info.st_mode, file_info.st_nlink,
+                file_info.st_uid, file_info.st_gid, file_info.st_size,
+                file_info.st_mtime_ns, file_info.st_ctime_ns,
+                hashlib.sha256(state_file.read_bytes()).hexdigest(),
+                tuple(sorted(path.name for path in evidence.glob(".mock-anything-*"))),
+            )
+
+        write_state({"documents": [], "prompt": legacy_prompt, "rag_instances": {}})
+        assert docker(owner, "up", "-d", extra=migration_extra).returncode == 0
+        migrated = json.loads(state_file.read_text())
+        assert "prompt" not in migrated
+        assert migrated["rag_instances"][str(owner)]["prompt"] == legacy_prompt
+
+        owner_name, owner_value = instance(owner, owner_key, 3012)
+        write_state({"documents": [], "prompt": legacy_prompt,
+                     "rag_instances": {owner_name: owner_value}})
+        assert docker(successor, "up", "-d", extra=migration_extra).returncode == 0
+        migrated = json.loads(state_file.read_text())
+        assert "prompt" not in migrated
+        assert migrated["rag_instances"][str(owner)]["prompt"] == legacy_prompt
+        assert migrated["rag_instances"][str(successor)]["prompt"] == ""
+
+        owner_name, owner_value = instance(owner, owner_key, 3012, legacy_prompt)
+        write_state({"documents": [], "prompt": legacy_prompt,
+                     "rag_instances": {owner_name: owner_value}})
+        assert docker(successor, "up", "-d", extra=migration_extra).returncode == 0
+        migrated = json.loads(state_file.read_text())
+        assert "prompt" not in migrated
+        assert migrated["rag_instances"][str(owner)]["prompt"] == legacy_prompt
+
+        owner_name, owner_value = instance(owner, owner_key, 3012, "冲突的实例 Prompt")
+        write_state({"documents": [], "prompt": legacy_prompt,
+                     "rag_instances": {owner_name: owner_value}})
+        before = snapshot()
+        assert docker(successor, "up", "-d", extra=migration_extra).returncode != 0
+        assert snapshot() == before, "冲突 legacy Prompt 必须失败且零改写"
+
+        owner_name, owner_value = instance(owner, owner_key, 3012)
+        successor_name, successor_value = instance(successor, successor_key, 3013)
+        write_state({"documents": [], "prompt": legacy_prompt,
+                     "rag_instances": {owner_name: owner_value,
+                                       successor_name: successor_value}})
+        before = snapshot()
+        assert docker(third, "up", "-d", extra=migration_extra).returncode != 0
+        assert snapshot() == before, "多实例 legacy Prompt 歧义必须失败且零改写"
+
+        owner_name, owner_value = instance(owner, owner_key, 3012)
+        write_state({"documents": [], "prompt": "界" * (256 * 1024 // 3 + 1),
+                     "rag_instances": {owner_name: owner_value}})
+        before = snapshot()
+        assert docker(third, "up", "-d", extra=migration_extra).returncode != 0
+        assert snapshot() == before, "超限 legacy Prompt 必须失败且零改写"
+
+    def cache_digest_check():
+        helper = ROOT / "tests/mocks/anything-cache.py"
+        with tempfile.TemporaryDirectory(prefix=".test-runtime.cache-digest.", dir=ROOT) as temporary:
+            scope = Path(temporary)
+            primary = scope / "primary"
+            secondary = scope / "secondary"
+            primary.mkdir(mode=0o700)
+            secondary.mkdir(mode=0o700)
+            state_file = scope / "anything-state.json"
+            key = "synthetic-cache-digest-primary"
+            alternate_key = "synthetic-cache-digest-secondary"
+            digest = hashlib.sha256(key.encode()).hexdigest()
+            alternate_digest = hashlib.sha256(alternate_key.encode()).hexdigest()
+            location = "custom-documents/existing.json"
+            state = {"rag_instances": {
+                str(primary): {"port": 3011, "api_key_sha256": digest,
+                               "documents": [location], "removed_documents": [],
+                               "prompt": "primary-old"},
+                str(secondary): {"port": 3011, "api_key_sha256": digest,
+                                 "documents": [location], "removed_documents": [],
+                                 "prompt": "secondary-old"},
+            }}
+            state_file.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+            state_file.chmod(0o600)
+            url = "http://127.0.0.1:3011/api/v1/workspace/crisp-support"
+
+            def snapshot():
+                values = []
+                for path in [scope, *sorted(scope.rglob("*"))]:
+                    metadata = path.lstat()
+                    content = hashlib.sha256(path.read_bytes()).hexdigest() \
+                        if path.is_file() and not path.is_symlink() else ""
+                    values.append((str(path.relative_to(scope)), metadata.st_dev, metadata.st_ino,
+                                   metadata.st_mode, metadata.st_nlink, metadata.st_uid,
+                                   metadata.st_gid, metadata.st_size, metadata.st_mtime_ns,
+                                   metadata.st_ctime_ns, content))
+                return values
+
+            def invoke(action, reference, *arguments, input_text=None):
+                return subprocess.run([sys.executable, str(helper), action, str(state_file),
+                                       str(scope), url, reference, *arguments],
+                                      input=input_text, capture_output=True, text=True, timeout=10)
+
+            baseline = snapshot()
+            assert invoke("observe", "sha256:not-a-valid-digest").returncode != 0
+            assert snapshot() == baseline, "畸形摘要不得改写状态或缓存"
+            for action, arguments in (("observe", ()),
+                                      ("workspace-observe", ()),
+                                      ("update", ('["custom-documents/new.json"]', "[]")),
+                                      ("remove", ('["custom-documents/existing.json"]',))):
+                assert invoke(action, "sha256:" + digest, *arguments).returncode != 0
+                assert snapshot() == baseline, "同端口同摘要歧义不得改写任何实例"
+            assert invoke("prompt-write", "sha256:" + digest,
+                          input_text=json.dumps("不得写入的歧义 Prompt")).returncode != 0
+            assert snapshot() == baseline, "Prompt 歧义不得改写任何实例"
+
+            state["rag_instances"][str(secondary)]["api_key_sha256"] = alternate_digest
+            state["rag_instances"][str(secondary)]["documents"] = []
+            state_file.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+            state_file.chmod(0o600)
+            unique_baseline = snapshot()
+            for invalid_prompt in (json.dumps(""),
+                                   json.dumps("x" * (256 * 1024 + 1)),
+                                   "x" * (2 * 1024 * 1024 + 1)):
+                assert invoke("prompt-write", "sha256:" + alternate_digest,
+                              input_text=invalid_prompt).returncode != 0
+                assert snapshot() == unique_baseline, \
+                    "空值、解码后超限或输入封套超限的 Prompt 必须零改写"
+            added = "custom-documents/unique.json"
+            expected_after_update = json.loads(json.dumps(state))
+            expected_after_update["rag_instances"][str(secondary)]["documents"] = [added]
+            state_identity = state_file.stat()
+            result = invoke("update", "sha256:" + alternate_digest,
+                            json.dumps([added], separators=(",", ":")), "[]")
+            assert result.returncode == 0, "同端口不同摘要应唯一修改目标实例"
+            updated = json.loads(state_file.read_text())
+            assert updated == expected_after_update, "摘要写入只能修改目标实例的指定字段"
+            replaced_identity = state_file.stat()
+            assert (replaced_identity.st_dev, replaced_identity.st_ino) != \
+                   (state_identity.st_dev, state_identity.st_ino), "状态必须原子替换"
+            assert replaced_identity.st_nlink == 1 \
+                   and (replaced_identity.st_mode & 0o777) == 0o600 \
+                   and replaced_identity.st_uid == os.geteuid()
+            assert not list(scope.glob(".mock-state-*.tmp")), "原子状态不得遗留临时文件"
+
+            expected = json.loads(json.dumps(expected_after_update))
+            expected["rag_instances"][str(primary)]["prompt"] = "primary-new"
+            expected["rag_instances"][str(secondary)]["prompt"] = "secondary-new"
+            assert invoke("prompt-write", "sha256:" + digest,
+                          input_text=json.dumps("primary-new")).returncode == 0
+            assert invoke("prompt-write", "sha256:" + alternate_digest,
+                          input_text=json.dumps("secondary-new")).returncode == 0
+            final_state = json.loads(state_file.read_text())
+            assert final_state == expected, "不同摘要的 Prompt 只能写入各自实例"
+            primary_view = invoke("workspace-observe", "sha256:" + digest)
+            secondary_view = invoke("workspace-observe", "sha256:" + alternate_digest)
+            assert primary_view.returncode == secondary_view.returncode == 0
+            assert json.loads(primary_view.stdout) == {"documents": [location], "prompt": "primary-new"}
+            assert json.loads(secondary_view.stdout) == {"documents": [added], "prompt": "secondary-new"}
 
     def status_check():
         root, _ = fixture("status", 3004)
@@ -177,6 +366,8 @@ def lifecycle_mock_checks():
 
     for label, action in (("生命周期桩仅由 Anything up/recreate更新独立运行窗口", capture_check),
                           ("生命周期 API/system 鉴权、运行值与实例隔离", api_check),
+                          ("生命周期旧 Prompt 唯一迁移且歧义零改写", legacy_prompt_migration_check),
+                          ("生命周期缓存摘要唯一绑定且歧义零改写", cache_digest_check),
                           ("生命周期 adapter状态匹配真实schema，未知不假绿、pending不冒applied", status_check)):
         try:
             action()

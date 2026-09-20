@@ -19,9 +19,12 @@ URL=""
 FAIL_ON_HTTP=0
 FORM_FILE=""
 CONFIG_FILE=""
+CONFIG_CONTENT=""
 DATA_FILE=""
 REQUEST_BODY="{}"
 REQUEST_METHOD=GET
+AUTH_DIGEST=""
+CONFIG_INPUT_SECURE=0
 
 while (( $# > 0 )); do
   case "$1" in
@@ -79,13 +82,53 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ -n "$DATA_FILE" && -f "$DATA_FILE" ]]; then
-  REQUEST_BODY=$(<"$DATA_FILE")
-fi
-# 认证配置仅用于确保测试桩接受与真实 curl 相同的安全调用形式。
-if [[ -n "$CONFIG_FILE" && ! -f "$CONFIG_FILE" ]]; then
-  printf 'curl 测试桩收到无效的 --config 文件\n' >&2
+if [[ "$CONFIG_FILE" == "-" && "$DATA_FILE" == "-" ]]; then
+  printf 'curl 测试桩拒绝认证配置与正文共用 stdin\n' >&2
   exit 2
+fi
+if [[ -n "$CONFIG_FILE" ]]; then
+  if [[ "$CONFIG_FILE" == "-" ]]; then
+    CONFIG_CONTENT=$(cat)
+    CONFIG_INPUT_SECURE=1
+  elif [[ "$CONFIG_FILE" =~ ^/(dev/fd|proc/self/fd)/[0-9]+$ ]] \
+    && [[ -r "$CONFIG_FILE" ]] && [[ -p "$CONFIG_FILE" ]]; then
+    CONFIG_CONTENT=$(cat -- "$CONFIG_FILE")
+    CONFIG_INPUT_SECURE=1
+  elif [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
+    CONFIG_CONTENT=$(<"$CONFIG_FILE")
+    if [[ "$(stat -c '%a' -- "$CONFIG_FILE")" == 600 ]]; then
+      CONFIG_INPUT_SECURE=1
+    fi
+  else
+    printf 'curl 测试桩收到无效的 --config 输入\n' >&2
+    exit 2
+  fi
+fi
+if [[ -n "$DATA_FILE" ]]; then
+  if [[ "$DATA_FILE" == "-" ]]; then
+    REQUEST_BODY=$(cat)
+  elif [[ -f "$DATA_FILE" ]]; then
+    REQUEST_BODY=$(<"$DATA_FILE")
+  fi
+fi
+# 认证值只在测试桩内存中解析；后续缓存夹具只接收不可逆摘要。
+if [[ -n "$CONFIG_CONTENT" && "$CONFIG_INPUT_SECURE" == 1 ]]; then
+  if ! AUTH_DIGEST=$(printf '%s' "$CONFIG_CONTENT" | python3 -c '
+import hashlib, json, sys
+headers = []
+for line in sys.stdin.read().splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key.strip() == "header":
+        headers.append(json.loads(value.strip()))
+values = [header[len("Authorization: Bearer "):] for header in headers
+          if isinstance(header, str) and header.startswith("Authorization: Bearer ")]
+if len(values) > 1 or any("\n" in value or "\r" in value or not value for value in values):
+    raise SystemExit(1)
+print(hashlib.sha256(values[0].encode()).hexdigest() if values else "")
+'); then
+    printf 'curl 测试桩收到无效的认证配置\n' >&2
+    exit 2
+  fi
 fi
 
 [[ -n "$URL" ]] || {
@@ -156,13 +199,13 @@ case "$URL" in
     BODY='{"authenticated":true,"success":true}'
     ;;
   */api/v1/system)
-    result=$(python3 - "${MOCK_ANYTHING_STATE:-}" "$CONFIG_FILE" "$URL" "$REQUEST_METHOD" <<'PY'
-import hashlib, json, pathlib, stat, sys, urllib.parse
+    result=$(python3 - "${MOCK_ANYTHING_STATE:-}" "$AUTH_DIGEST" "$URL" "$REQUEST_METHOD" <<'PY'
+import json, pathlib, sys, urllib.parse
 def respond(status, value):
     print(json.dumps({"status": status, "body": value}))
     raise SystemExit(0)
 try:
-    state_file, config = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+    state_file, digest = pathlib.Path(sys.argv[1]), sys.argv[2]
     url = urllib.parse.urlsplit(sys.argv[3])
     if sys.argv[4] != "GET":
         respond(405, {"error": "synthetic-method-not-allowed"})
@@ -170,24 +213,17 @@ try:
         respond(503, {"error": "synthetic-unknown-component"})
     if not sys.argv[1] or state_file.is_symlink() or not state_file.is_file():
         respond(503, {"error": "synthetic-component-not-started"})
-    if not sys.argv[2] or config.is_symlink() or not config.is_file() or stat.S_IMODE(config.stat().st_mode) != 0o600:
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         respond(401, {"error": "synthetic-authentication-failed"})
-    headers = []
-    for line in config.read_text().splitlines():
-        name, separator, value = line.partition("=")
-        if separator and name.strip() == "header":
-            headers.append(json.loads(value.strip()))
-    authorization = [header[len("Authorization: Bearer "):] for header in headers if header.startswith("Authorization: Bearer ")]
     instances = json.loads(state_file.read_text()).get("rag_instances", {})
     candidates = [entry for entry in instances.values() if entry.get("port") == url.port]
     if not candidates:
         respond(503, {"error": "synthetic-component-not-started"})
-    if len(authorization) != 1:
-        respond(401, {"error": "synthetic-authentication-failed"})
-    digest = hashlib.sha256(authorization[0].encode()).hexdigest()
     candidates = [entry for entry in candidates if entry.get("api_key_sha256") == digest]
     if not candidates:
         respond(401, {"error": "synthetic-authentication-failed"})
+    if len(candidates) != 1:
+        respond(503, {"error": "synthetic-conflicting-running-state"})
     windows = [entry["context_window"] for entry in candidates]
     if any(type(window) is not int or not 256 <= window <= 2097152 for window in windows):
         raise ValueError()
@@ -210,7 +246,7 @@ PY
         [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
         REMOVED_DOCUMENTS=$(jq -c '.names // []' <<< "$REQUEST_BODY")
         python3 -B "${MOCK_CURL_DIR}/anything-cache.py" remove \
-          "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$REMOVED_DOCUMENTS"
+          "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "sha256:${AUTH_DIGEST}" "$REMOVED_DOCUMENTS"
       fi
       BODY='{"success":true}'
     fi
@@ -221,7 +257,7 @@ PY
       '{success:true,documents:[{location:$location}]}')
     if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
       python3 -B "${MOCK_CURL_DIR}/anything-cache.py" upload \
-        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$FORM_FILE" "$DOCUMENT_NAME"
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "sha256:${AUTH_DIGEST}" "$FORM_FILE" "$DOCUMENT_NAME"
     fi
     ;;
   */api/v1/workspace/*/update-embeddings)
@@ -230,7 +266,7 @@ PY
       ADDS=$(jq -c '.adds // []' <<< "$REQUEST_BODY")
       DELETES=$(jq -c '.deletes // []' <<< "$REQUEST_BODY")
       python3 -B "${MOCK_CURL_DIR}/anything-cache.py" update \
-        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE" "$ADDS" "$DELETES"
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "sha256:${AUTH_DIGEST}" "$ADDS" "$DELETES"
     fi
     BODY='{"success":true}'
     ;;
@@ -239,10 +275,9 @@ PY
     WORKSPACE_SLUG=${WORKSPACE_SLUG%%/*}
     PROMPT=$(jq -c '.openAiPrompt // ""' <<< "$REQUEST_BODY")
     if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then
-      [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[],"prompt":""}\n' > "$MOCK_ANYTHING_STATE"
-      STATE_TEMP="${MOCK_ANYTHING_STATE}.tmp.$$"
-      jq --argjson prompt "$PROMPT" '.prompt = $prompt' "$MOCK_ANYTHING_STATE" > "$STATE_TEMP"
-      mv -f -- "$STATE_TEMP" "$MOCK_ANYTHING_STATE"
+      [[ -f "$MOCK_ANYTHING_STATE" ]] || printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
+      printf '%s' "$PROMPT" | python3 -B "${MOCK_CURL_DIR}/anything-cache.py" prompt-write \
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "sha256:${AUTH_DIGEST}"
     fi
     BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" \
       '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:[]}}')
@@ -260,11 +295,10 @@ PY
     DOCUMENTS='[]'
     PROMPT='""'
     if [[ -n "${MOCK_ANYTHING_STATE:-}" && -f "$MOCK_ANYTHING_STATE" ]]; then
-      INSTANCE_DOCUMENTS=$(python3 -B "${MOCK_CURL_DIR}/anything-cache.py" observe \
-        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "$CONFIG_FILE")
-      DOCUMENTS=$(jq -cn --argjson documents "$INSTANCE_DOCUMENTS" \
-        '[$documents[] | {docpath:.}]')
-      PROMPT=$(jq -c '.prompt // ""' "$MOCK_ANYTHING_STATE")
+      INSTANCE_WORKSPACE=$(python3 -B "${MOCK_CURL_DIR}/anything-cache.py" workspace-observe \
+        "$MOCK_ANYTHING_STATE" "${MOCK_CHOWN_ROOT:?}" "$URL" "sha256:${AUTH_DIGEST}")
+      DOCUMENTS=$(jq -c '[.documents[] | {docpath:.}]' <<< "$INSTANCE_WORKSPACE")
+      PROMPT=$(jq -c '.prompt' <<< "$INSTANCE_WORKSPACE")
     fi
     BODY=$(jq -cn --arg slug "$WORKSPACE_SLUG" --argjson prompt "$PROMPT" --argjson documents "$DOCUMENTS" \
       '{workspace:{slug:$slug,openAiPrompt:$prompt,documents:$documents}}')

@@ -2299,51 +2299,40 @@ anythingllm_api_ready() {
 }
 
 anythingllm_secure_request() {
-  local deploy_dir=$1
+  local _deploy_dir=$1
   local method=$2
   local url=$3
   local auth_value=${4:-}
   local payload=${5:-}
   local output_file=$6
   local max_time=${7:-60}
-  local config_file payload_file status escaped_auth
+  local request_config status escaped_auth
 
   [[ "$method" == GET || "$method" == POST || "$method" == DELETE ]] || die "AnythingLLM 请求方法无效"
   [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]{1,5}/ ]] || die "AnythingLLM 本地 API 地址无效"
   if [[ ! "$max_time" =~ ^[0-9]+$ ]] || (( max_time < 1 || max_time > 3600 )); then
     die "AnythingLLM 请求超时参数无效"
   fi
-  config_file=$(mktemp "${deploy_dir}/tmp/curl-config.XXXXXX") || return 1
-  payload_file=$(mktemp "${deploy_dir}/tmp/curl-body.XXXXXX") \
-    || { rm -f -- "$config_file"; return 1; }
-  chmod 600 "$config_file" "$payload_file" \
-    || { rm -f -- "$config_file" "$payload_file"; return 1; }
-  if ! {
-    printf 'header = "Accept: application/json"\n'
-    if [[ -n "$auth_value" ]]; then
-      validate_env_value "$auth_value" || die "AnythingLLM 认证值无效"
-      escaped_auth=$(curl_config_escape "$auth_value") || die "AnythingLLM 认证值无法安全写入请求配置"
-      printf 'header = "Authorization: Bearer %s"\n' "$escaped_auth"
-    fi
-    if [[ "$method" == POST || "$method" == DELETE ]]; then
-      printf 'header = "Content-Type: application/json"\n'
-    fi
-  } > "$config_file"; then
-    rm -f -- "$config_file" "$payload_file"
-    return 1
+  request_config=$'header = "Accept: application/json"\n'
+  if [[ -n "$auth_value" ]]; then
+    validate_env_value "$auth_value" || die "AnythingLLM 认证值无效"
+    escaped_auth=$(curl_config_escape "$auth_value") \
+      || die "AnythingLLM 认证值无法安全写入请求配置"
+    printf -v request_config '%sheader = "Authorization: Bearer %s"\n' \
+      "$request_config" "$escaped_auth"
   fi
   if [[ "$method" == POST || "$method" == DELETE ]]; then
-    printf '%s' "$payload" > "$payload_file" \
-      || { rm -f -- "$config_file" "$payload_file"; return 1; }
-    status=$(curl --silent --output "$output_file" --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time "$max_time" --config "$config_file" \
-      --request "$method" \
-      --data-binary "@${payload_file}" "$url" 2>/dev/null || true)
+    printf -v request_config '%sheader = "Content-Type: application/json"\n' "$request_config"
+    status=$(printf '%s' "$payload" \
+      | curl --silent --output "$output_file" --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time "$max_time" \
+        --config <(printf '%s' "$request_config") --request "$method" \
+        --data-binary @- "$url" 2>/dev/null || true)
   else
-    status=$(curl --silent --output "$output_file" --write-out '%{http_code}' \
-      --connect-timeout 5 --max-time "$max_time" --config "$config_file" "$url" 2>/dev/null || true)
+    status=$(printf '%s' "$request_config" \
+      | curl --silent --output "$output_file" --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time "$max_time" --config - "$url" 2>/dev/null || true)
   fi
-  rm -f -- "$config_file" "$payload_file"
   printf '%s\n' "${status:-000}"
 }
 

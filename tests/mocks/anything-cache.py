@@ -292,9 +292,10 @@ def publish_state(scope_fd, relative, value):
 
 
 def main():
-    if len(sys.argv) < 6 or sys.argv[1] not in ("upload", "remove", "update", "observe"):
+    if len(sys.argv) < 6 or sys.argv[1] not in (
+            "upload", "remove", "update", "observe", "prompt-write", "workspace-observe"):
         fail()
-    action, state_name, scope, url, config = sys.argv[1:6]
+    action, state_name, scope, url, config_reference = sys.argv[1:6]
     scope = validate_scope(scope)
     scope_fd = directory_fd(scope)
     project_fd = None
@@ -302,8 +303,9 @@ def main():
     try:
         state_raw = stable_read_at(scope_fd, relative_to_scope(scope, state_name), 16 * 1024 * 1024)
         state = json.loads(state_raw.decode("utf-8", "strict"))
-        # 先根据请求中的端口和实际 curl 配置鉴权摘要唯一选中实例，绝不遍历
-        # shared state 中的其它部署目录。
+        # 先根据请求端口和鉴权摘要唯一选中实例，绝不遍历
+        # shared state 中的其它部署目录。新curl桩只传递内存摘要；
+        # 直接安全边界测试仍保留严格受管配置路径入口。
         candidates = state.get("rag_instances", {})
         parsed = urllib.parse.urlsplit(url)
         if not isinstance(candidates, dict) or not parsed.port:
@@ -311,20 +313,26 @@ def main():
         possible = [project for project, value in candidates.items()
                     if isinstance(value, dict) and value.get("port") == parsed.port
                     and is_within(scope, project)]
-        bound = [project for project in possible if is_within(project, config)]
-        if len(bound) > 1:
-            fail()
-        if bound:
-            candidate_fd = open_child_directories(scope_fd, relative_to_scope(scope, bound[0]))
-            if candidate_fd is None:
+        if config_reference.startswith("sha256:"):
+            supplied_digest = config_reference[len("sha256:"):]
+            if len(supplied_digest) != 64 \
+                    or any(character not in "0123456789abcdef" for character in supplied_digest):
                 fail()
-            try:
-                supplied_digest = parse_project_config(candidate_fd, bound[0], config)
-            finally:
-                os.close(candidate_fd)
-            possible = bound
         else:
-            supplied_digest = parse_doctor_config(config)
+            bound = [project for project in possible if is_within(project, config_reference)]
+            if len(bound) > 1:
+                fail()
+            if bound:
+                candidate_fd = open_child_directories(scope_fd, relative_to_scope(scope, bound[0]))
+                if candidate_fd is None:
+                    fail()
+                try:
+                    supplied_digest = parse_project_config(candidate_fd, bound[0], config_reference)
+                finally:
+                    os.close(candidate_fd)
+                possible = bound
+            else:
+                supplied_digest = parse_doctor_config(config_reference)
         matches = [project for project in possible
                    if value_digest(candidates[project]) == supplied_digest]
         if len(matches) != 1:
@@ -340,6 +348,9 @@ def main():
             fail()
         for location in documents:
             safe_location(location)
+        prompt = instance.setdefault("prompt", "")
+        if not isinstance(prompt, str) or len(prompt.encode("utf-8")) > 256 * 1024:
+            fail()
         work = []
         if action == "upload":
             if len(sys.argv) != 8:
@@ -411,6 +422,23 @@ def main():
                 safe_location(location)
             instance["documents"] = sorted((set(documents) | set(additions)) - set(deletions))
             publish_state(scope_fd, relative_to_scope(scope, state_name), state)
+        elif action == "prompt-write":
+            if len(sys.argv) != 6:
+                fail()
+            raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                fail()
+            prompt = json.loads(raw.decode("utf-8", "strict"))
+            if not isinstance(prompt, str) or not prompt \
+                    or len(prompt.encode("utf-8")) > 256 * 1024:
+                fail()
+            instance["prompt"] = prompt
+            publish_state(scope_fd, relative_to_scope(scope, state_name), state)
+        elif action == "workspace-observe":
+            if len(sys.argv) != 6:
+                fail()
+            print(json.dumps({"documents": documents, "prompt": prompt},
+                             ensure_ascii=False, separators=(",", ":")))
         else:
             if len(sys.argv) != 6:
                 fail()

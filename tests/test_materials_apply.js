@@ -85,12 +85,16 @@ async function main() {
     let body={};
     if(request.headers['content-type']?.includes('application/json')) body=JSON.parse(data.toString('utf8')||'{}');
     if(request.url==='/api/v1/workspace/crisp-support' && request.method==='GET') {
+      assert.equal(request.headers.authorization,`Bearer ${anythingKey}`,
+        'Prompt回读必须携带stdin配置中的虚构认证头');
       httpEvents.push('workspace_get');
       workspaceReads++;
       if(workspaceReadFailureCountdown>0&&--workspaceReadFailureCountdown===0){send(500,{error:true});return;}
       send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update') {
+      assert.equal(request.headers.authorization,`Bearer ${anythingKey}`,
+        'Prompt更新必须携带内存配置中的虚构认证头');
       const projection=JSON.parse(fs.readFileSync(path.join(deploy,'config/materials-applied.json'),'utf8'));
       applyingObservation={state:projection.state,revision:projection.revision,applied_revision:projection.configuration.runtime.applied_revision};
       if(promptFailures>0){promptFailures--;send(500,{error:true});return;}
@@ -272,6 +276,26 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       before.files,`${label}必须清理自己的唯一结果临时增量`);
     assertMaterialsResultDirectory(before.directory,label);
   };
+  const assertNoAnythingRequestInputs=(forbiddenPayload,label)=>{
+    const names=fs.readdirSync(materialsResultDirectory).sort();
+    assert.deepEqual(names.filter(name=>
+      name.startsWith('curl-config.')||name.startsWith('curl-body.')),[],
+    `${label}不得存在有名AnythingLLM请求输入文件`);
+    for(const name of names) {
+      const candidate=path.join(materialsResultDirectory,name);
+      const metadata=fs.lstatSync(candidate);
+      if(!metadata.isFile()||metadata.isSymbolicLink())continue;
+      const content=fs.readFileSync(candidate);
+      assert.equal(content.includes(Buffer.from(anythingKey)),false,
+        `${label}受管临时文件不得含AnythingLLM认证值`);
+      if(forbiddenPayload!=='') {
+        const payloadForms=[Buffer.from(forbiddenPayload),
+          Buffer.from(JSON.stringify(forbiddenPayload).slice(1,-1))];
+        assert.equal(payloadForms.some(value=>content.includes(value)),false,
+          `${label}受管临时文件不得含本次候选Prompt或其JSON编码`);
+      }
+    }
+  };
   const armPromptGate=()=>{
     assert.equal(promptGate,null,'同一时刻只能建立一个 Prompt 响应门');
     let signalEntered,releaseGate,closed=false;
@@ -415,7 +439,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       for(const file of [groupReady,groupGo,groupReadyTmp,groupGoTmp])fs.rmSync(file,{force:true});
     }
   };
-  const invokeSignalledAtPromptGate=async(args,signals,extra={})=>{
+  const invokeSignalledAtPromptGate=async(args,signals,forbiddenPayload,extra={})=>{
     assert.ok(Array.isArray(signals)&&signals.length>=1&&signals.length<=2
       &&signals.every(signal=>['SIGINT','SIGTERM'].includes(signal)),'中断夹具仅允许受控信号');
     const ownPgid=processGroupId(process.pid);
@@ -497,6 +521,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       assert.equal(fs.existsSync(path.join(deploy,'backups/config-history/materials.recovery','complete.json')),true,
         '中断前必须已持久严格恢复基线');
       if(!processGroupAlive(pgid))throw new Error('发信号前中断进程组已退出');
+      assertNoAnythingRequestInputs(forbiddenPayload,'Prompt请求在途中断前');
       process.kill(-pgid,signals[0]);
       if(signals.length>1) {
         secondSignalTimer=setTimeout(()=>{
@@ -512,6 +537,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
       const goneDeadline=Date.now()+3000;
       while(processGroupAlive(pgid)&&Date.now()<goneDeadline)await delay(20);
       if(processGroupAlive(pgid))throw new Error(`中断后进程组仍存在：${pgid}`);
+      assertNoAnythingRequestInputs(forbiddenPayload,'Prompt请求中断收口后');
       return {...result,promptGateObserved:true,groupGone:true};
     } catch(error) {
       try { await killAndDrain(); }
@@ -1230,7 +1256,7 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),interruptPrompt,{mode:0o640});
     const promptPayloadOffset=promptPayloads.length;
     applyingObservation=null;
-    const interruptedResult=await invokeSignalledAtPromptGate(['apply'],signals);
+    const interruptedResult=await invokeSignalledAtPromptGate(['apply'],signals,interruptPrompt);
     assert.equal(interruptedResult.promptGateObserved,true);
     assert.equal(interruptedResult.groupGone,true);
     assert.equal(interruptedResult.code,signals[0]==='SIGINT'?130:143,JSON.stringify({code:interruptedResult.code,signal:interruptedResult.signal})+'\n'+interruptedResult.stderr);

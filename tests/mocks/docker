@@ -158,7 +158,11 @@ try:
     if state_file.exists() and not stat.S_ISREG(state_file.stat().st_mode):
         raise ValueError()
     state = json.loads(state_file.read_text()) if state_file.exists() else {"documents": []}
+    if not isinstance(state, dict):
+        raise ValueError()
     instances = state.setdefault("rag_instances", {})
+    if not isinstance(instances, dict):
+        raise ValueError()
     if action == "capture":
         env_file = project / ".env"
         if env_file.is_symlink() or not env_file.is_file():
@@ -176,7 +180,35 @@ try:
         port, key = int(values.get("ANYTHINGLLM_PORT", "3001")), values.get("ANYTHINGLLM_API_KEY", "")
         if not 256 <= window <= 2097152 or not 1 <= port <= 65535 or not key:
             raise ValueError()
-        previous = instances.get(str(project), {})
+        project_name = str(project)
+        previous = instances.get(project_name, {})
+        if not isinstance(previous, dict):
+            raise ValueError()
+        legacy_present = "prompt" in state
+        legacy_prompt = state.get("prompt", "")
+        legacy_target = None
+        if legacy_present:
+            if not isinstance(legacy_prompt, str) \
+                    or len(legacy_prompt.encode("utf-8")) > 256 * 1024:
+                raise ValueError()
+            if len(instances) > 1:
+                raise ValueError()
+            legacy_target = next(iter(instances), project_name)
+            target_instance = instances.get(legacy_target, {})
+            if not isinstance(target_instance, dict):
+                raise ValueError()
+            if "prompt" in target_instance:
+                target_prompt = target_instance["prompt"]
+                if not isinstance(target_prompt, str) \
+                        or len(target_prompt.encode("utf-8")) > 256 * 1024 \
+                        or target_prompt != legacy_prompt:
+                    raise ValueError()
+        current_prompt = previous.get("prompt", "")
+        if legacy_present and legacy_target == project_name:
+            current_prompt = legacy_prompt
+        if not isinstance(current_prompt, str) \
+                or len(current_prompt.encode("utf-8")) > 256 * 1024:
+            raise ValueError()
         document_root = project / "data/anythingllm/documents/custom-documents"
         documents = []
         if document_root.exists():
@@ -188,7 +220,11 @@ try:
                         or not document.name.endswith(".json"):
                     raise ValueError()
                 documents.append("custom-documents/" + document.name)
-        instances[str(project)] = {
+        if legacy_present:
+            if legacy_target in instances:
+                instances[legacy_target]["prompt"] = legacy_prompt
+            del state["prompt"]
+        instances[project_name] = {
             "context_window": window,
             "port": port,
             "api_key_sha256": hashlib.sha256(key.encode()).hexdigest(),
@@ -200,6 +236,7 @@ try:
             "knowledge_chunk_explicit": previous.get("knowledge_chunk_explicit", False),
             "documents": sorted(documents),
             "removed_documents": previous.get("removed_documents", []),
+            "prompt": current_prompt,
         }
         descriptor, temporary = tempfile.mkstemp(prefix=".mock-anything-", dir=state_file.parent)
         with os.fdopen(descriptor, "w") as stream:
