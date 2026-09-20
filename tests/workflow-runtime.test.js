@@ -2291,10 +2291,19 @@ const abortablePending = (signal, started) => {
     assert.equal(state('session_permanent1').mode, 'human');
   });
   await test('D12 无客户流量时持久扫描心跳仍更新且不包含客户资料', async () => {
-    await runtime.scan();
     const file = path.join(root, 'data/runtime/scheduler-health.json');
+    fs.writeFileSync(file, JSON.stringify({
+      schema_version: 1, started_at: now - 1, completed_at: now - 1,
+      control_cursor: 0, ordinary_cursor: 0,
+      isolated_sessions: { count: 0, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0 } },
+      health_recovered: null,
+    }), { mode: 0o600 });
+    await runtime.scan();
     const first = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(first.completed_at, now);
+    assert.deepEqual(first.isolated_sessions,
+      { count: 0, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0, io_error: 0 } },
+      '旧三键隔离心跳必须在下一次成功扫描后规范化为当前四键 schema');
     now += 5000;
     await runtime.scan();
     const next = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -2305,7 +2314,8 @@ const abortablePending = (signal, started) => {
       'isolated_sessions', 'ordinary_cursor', 'schema_version', 'started_at']);
     assert(['bootstrap', 'idle', 'ok', 'warning'].includes(next.crisp_rest_catchup.status));
     assert(!JSON.stringify(next.crisp_rest_catchup).includes('session_'));
-    assert.deepEqual(Object.keys(next.isolated_sessions.reasons).sort(), ['invalid_json', 'invalid_state', 'too_large']);
+    assert.deepEqual(Object.keys(next.isolated_sessions.reasons).sort(),
+      ['invalid_json', 'invalid_state', 'io_error', 'too_large']);
     assert.equal(next.isolated_sessions.count, Object.values(next.isolated_sessions.reasons)
       .reduce((total, count) => total + count, 0));
     assert.equal(next.health_recovered, null);

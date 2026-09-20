@@ -2839,11 +2839,17 @@ const test = async (name, action) => {
     fs.writeFileSync(stateFile(fx, invalidJson), '{broken', { mode: 0o600 });
     const invalidState = 'session_isolation-shape';
     fs.writeFileSync(stateFile(fx, invalidState), JSON.stringify({ schema_version: 2, jobs: 'broken' }), { mode: 0o600 });
+    fs.writeFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), JSON.stringify({
+      schema_version: 1, started_at: fx.now() - 1, completed_at: fx.now() - 1,
+      control_cursor: 0, ordinary_cursor: 0,
+      isolated_sessions: { count: 0, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0 } },
+      health_recovered: null,
+    }), { mode: 0o600 });
     const jobs = await fx.runtime.scan();
     assert(jobs.some((entry) => entry.key === fx.runtime.stateKey(website, good)));
     const health = JSON.parse(fs.readFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
     assert.deepEqual(health.isolated_sessions,
-      { count: 3, reasons: { too_large: 1, invalid_json: 1, invalid_state: 1 } });
+      { count: 3, reasons: { too_large: 1, invalid_json: 1, invalid_state: 1, io_error: 0 } });
 
     const materialsConfig = path.join(fx.root, 'config', 'materials-applied.json');
     const original = fs.readFileSync(materialsConfig);
@@ -3014,6 +3020,45 @@ const test = async (name, action) => {
       const cleanReadHealth = readJson(path.join(readFailure.runtimeDirectory, 'scheduler-health.json'));
       assert.equal(cleanReadHealth.isolated_sessions.count, 0);
       assert.equal(cleanReadHealth.isolated_sessions.reasons.io_error ?? 0, 0);
+    }
+
+    for (const variant of [
+      { name: 'outer-lstat-eacces', method: 'lstatSync', failAt: 1, code: 'EACCES' },
+      { name: 'transaction-read-eperm', method: 'readFileSync', failAt: 2, code: 'EPERM' },
+    ]) {
+      const permissionFailure = fixture('scan-session-' + variant.name);
+      const completedAt = await establishHealthBaseline(permissionFailure);
+      const session = 'session_' + variant.name;
+      const job = jobValue(permissionFailure, 'scan-' + variant.name, 1,
+        { responsibility_status: 'pending' });
+      job.data.session_id = session;
+      writeState(permissionFailure, session, stateValue(permissionFailure, session, [job]));
+      const file = stateFile(permissionFailure, session);
+      const before = fs.readFileSync(file);
+      const original = fs[variant.method];
+      const target = path.resolve(file);
+      let exactCalls = 0;
+      let injected = 0;
+      fs[variant.method] = function (candidate) {
+        if (path.resolve(String(candidate)) === target) {
+          exactCalls += 1;
+          if (exactCalls === variant.failAt) {
+            injected += 1;
+            const error = new Error('受控会话状态权限故障');
+            error.code = variant.code;
+            throw error;
+          }
+        }
+        return original.apply(this, arguments);
+      };
+      try {
+        await assert.rejects(permissionFailure.runtime.scan(),
+          (error) => error?.code === variant.code,
+          variant.code + ' 必须整轮 fail closed，不能记成单会话 I/O 隔离');
+      } finally { fs[variant.method] = original; }
+      assert.equal(injected, 1);
+      assert(fs.readFileSync(file).equals(before));
+      assertScanDidNotComplete(permissionFailure, completedAt);
     }
 
     const publishedFailure = fixture('scan-session-rename-published-eio');
@@ -3207,7 +3252,122 @@ const test = async (name, action) => {
     assertNoAtomicTemporary(cleanupFailure, cleanupFile);
     assertScanDidNotComplete(cleanupFailure, cleanupBaseline);
 
-    for (const code of ['ENOSPC', 'EDQUOT', 'EROFS']) {
+    const lockCleanupFailure = fixture('scan-session-lock-cleanup-eio');
+    const lockCleanupBaseline = await establishHealthBaseline(lockCleanupFailure);
+    const lockSessions = ['session_lock-cleanup-a', 'session_lock-cleanup-b']
+      .map((session) => ({ session, key: lockCleanupFailure.runtime.stateKey(website, session) }))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const lockBad = lockSessions[0];
+    const lockHealthy = lockSessions[1];
+    const lockJob = jobValue(lockCleanupFailure, 'scan-lock-cleanup-bad', 1,
+      { responsibility_status: 'pending' });
+    lockJob.data.session_id = lockBad.session;
+    const lockHealthyJob = jobValue(lockCleanupFailure, 'scan-lock-cleanup-healthy', 1,
+      { responsibility_status: 'pending' });
+    lockHealthyJob.data.session_id = lockHealthy.session;
+    writeState(lockCleanupFailure, lockBad.session,
+      stateValue(lockCleanupFailure, lockBad.session, [lockJob]));
+    writeState(lockCleanupFailure, lockHealthy.session,
+      stateValue(lockCleanupFailure, lockHealthy.session, [lockHealthyJob]));
+    const lockFile = stateFile(lockCleanupFailure, lockBad.session);
+    const lockBytes = fs.readFileSync(lockFile);
+    const sessionLock = lockFile + '.lock';
+    const sessionLockOwner = path.join(sessionLock, 'owner.json');
+    const originalLockUnlink = fs.unlinkSync;
+    let lockCleanupInjected = 0;
+    fs.unlinkSync = function (target) {
+      if (path.resolve(String(target)) === path.resolve(sessionLockOwner)) {
+        lockCleanupInjected += 1;
+        const error = new Error('受控会话锁清理失败'); error.code = 'EIO'; throw error;
+      }
+      return originalLockUnlink.apply(this, arguments);
+    };
+    try {
+      await injectAtomicRenameFailure(lockFile, 'EIO', async () => {
+        await assert.rejects(lockCleanupFailure.runtime.scan(), (error) => error?.code === 'EIO',
+          '会话锁清理失败必须压过可隔离 atomic EIO 并整轮 fail closed');
+      });
+    } finally {
+      fs.unlinkSync = originalLockUnlink;
+      if (fs.existsSync(sessionLockOwner)) {
+        const ownerStat = fs.lstatSync(sessionLockOwner);
+        const lockStat = fs.lstatSync(sessionLock);
+        assert(ownerStat.isFile() && !ownerStat.isSymbolicLink() && ownerStat.nlink === 1
+          && ownerStat.uid === process.geteuid() && (ownerStat.mode & 0o777) === 0o600,
+        '测试只能清理本 fixture 的受管会话锁 owner');
+        assert(lockStat.isDirectory() && !lockStat.isSymbolicLink()
+          && lockStat.uid === process.geteuid() && (lockStat.mode & 0o777) === 0o700,
+        '测试只能清理本 fixture 的受管会话锁目录');
+        originalLockUnlink(sessionLockOwner);
+        fs.rmdirSync(sessionLock);
+      }
+    }
+    assert(lockCleanupInjected >= 1, '必须真实命中会话锁 owner 清理失败');
+    assert(fs.readFileSync(lockFile).equals(lockBytes));
+    assertNoAtomicTemporary(lockCleanupFailure, lockFile);
+    assertScanDidNotComplete(lockCleanupFailure, lockCleanupBaseline);
+
+    const replacementFailure = fixture('scan-session-temp-replaced-eio');
+    const replacementBaseline = await establishHealthBaseline(replacementFailure);
+    const replacementSessions = ['session_temp-replaced-a', 'session_temp-replaced-b']
+      .map((session) => ({ session, key: replacementFailure.runtime.stateKey(website, session) }))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const replacementBad = replacementSessions[0];
+    const replacementHealthy = replacementSessions[1];
+    const replacementJob = jobValue(replacementFailure, 'scan-temp-replaced-bad', 1,
+      { responsibility_status: 'pending' });
+    replacementJob.data.session_id = replacementBad.session;
+    const replacementHealthyJob = jobValue(replacementFailure, 'scan-temp-replaced-healthy', 1,
+      { responsibility_status: 'pending' });
+    replacementHealthyJob.data.session_id = replacementHealthy.session;
+    writeState(replacementFailure, replacementBad.session,
+      stateValue(replacementFailure, replacementBad.session, [replacementJob]));
+    writeState(replacementFailure, replacementHealthy.session,
+      stateValue(replacementFailure, replacementHealthy.session, [replacementHealthyJob]));
+    const replacementFile = stateFile(replacementFailure, replacementBad.session);
+    const replacementBytes = fs.readFileSync(replacementFile);
+    const replacementTarget = path.resolve(replacementFile);
+    const originalReplacementRename = fs.renameSync;
+    let replacementInjected = 0;
+    let replacedTemporary = '';
+    let originalTemporary = '';
+    fs.renameSync = function (source, destination) {
+      if (replacementInjected === 0 && path.resolve(String(destination)) === replacementTarget
+        && path.resolve(String(source)).startsWith(replacementTarget + '.tmp-')) {
+        replacementInjected += 1;
+        replacedTemporary = path.resolve(String(source));
+        originalTemporary = replacedTemporary + '.fixture-owned-original';
+        originalReplacementRename(replacedTemporary, originalTemporary);
+        fs.writeFileSync(replacedTemporary, 'fixture-owned-replacement', { flag: 'wx', mode: 0o600 });
+        const error = new Error('受控发布前 rename 失败且临时路径被换代');
+        error.code = 'EIO';
+        throw error;
+      }
+      return originalReplacementRename.apply(this, arguments);
+    };
+    try {
+      await assert.rejects(replacementFailure.runtime.scan(), (error) => error?.code === 'EIO',
+        '临时路径身份换代时必须拒绝删除并整轮 fail closed');
+    } finally { fs.renameSync = originalReplacementRename; }
+    assert.equal(replacementInjected, 1);
+    assert(fs.existsSync(replacedTemporary), '生产不得删除身份不匹配的替换文件');
+    assert(fs.existsSync(originalTemporary), '夹具移动的原始临时文件必须仍可核验');
+    assert.notEqual(fs.lstatSync(replacedTemporary).ino, fs.lstatSync(originalTemporary).ino,
+      '夹具必须真实建立不同 inode 的临时路径换代');
+    for (const owned of [replacedTemporary, originalTemporary]) {
+      const stat = fs.lstatSync(owned);
+      assert(path.dirname(owned) === path.resolve(replacementFailure.runtimeDirectory)
+        && path.basename(owned).startsWith(path.basename(replacementFile) + '.tmp-')
+        && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1
+        && stat.uid === process.geteuid() && (stat.mode & 0o777) === 0o600,
+      '测试只能清理本 fixture 精确拥有的安全临时文件');
+      fs.unlinkSync(owned);
+    }
+    assert(fs.readFileSync(replacementFile).equals(replacementBytes));
+    assertNoAtomicTemporary(replacementFailure, replacementFile);
+    assertScanDidNotComplete(replacementFailure, replacementBaseline);
+
+    for (const code of ['ENOSPC', 'EDQUOT', 'EROFS', 'EACCES', 'EPERM']) {
       const fatal = fixture('scan-session-fatal-' + code.toLowerCase());
       const session = 'session_fatal-' + code.toLowerCase();
       const job = jobValue(fatal, 'scan-fatal-' + code, 1, { responsibility_status: 'pending' });
@@ -3264,8 +3424,44 @@ const test = async (name, action) => {
     assert(fs.readFileSync(stateFile(rootFailure, rootSession)).equals(rootBytes));
     assert.equal(fs.existsSync(path.join(rootFailure.runtimeDirectory, 'scheduler-health.json')), false);
 
-    // scan lock 的 EIO 继续由下方 claim/heartbeat 原子发布用例直接断言 reject；
-    // 这里不重复或放宽全局锁语义。
+    const scanLockFailure = fixture('scan-global-lock-cleanup-eio');
+    const scanLockBaseline = await establishHealthBaseline(scanLockFailure);
+    const globalScanLock = path.join(scanLockFailure.runtimeDirectory, 'scheduler-scan.lock');
+    const globalScanOwner = path.join(globalScanLock, 'owner.json');
+    const originalGlobalUnlink = fs.unlinkSync;
+    let globalLockCleanupInjected = 0;
+    fs.unlinkSync = function (target) {
+      if (path.resolve(String(target)) === path.resolve(globalScanOwner)) {
+        globalLockCleanupInjected += 1;
+        const error = new Error('受控全局扫描锁清理失败'); error.code = 'EIO'; throw error;
+      }
+      return originalGlobalUnlink.apply(this, arguments);
+    };
+    try {
+      await assert.rejects(scanLockFailure.runtime.scan(),
+        (error) => error?.code === 'SCAN_LOCK_CLEANUP_FAILED',
+        '全局扫描锁清理失败必须拒绝本轮结果');
+    } finally { fs.unlinkSync = originalGlobalUnlink; }
+    assert.equal(globalLockCleanupInjected, 1);
+    assert(fs.existsSync(globalScanOwner), '全局锁清理失败必须保留可见 owner 证据');
+    const failedLockHealth = readJson(path.join(scanLockFailure.runtimeDirectory, 'scheduler-health.json'));
+    assert.equal(failedLockHealth.isolated_sessions.reasons.io_error, 0,
+      '全局锁清理失败不得冒充单会话 io_error');
+    assert(failedLockHealth.completed_at >= scanLockBaseline,
+      '全局锁失败前已发布的心跳只能作为失败现场，不能替代调用方 reject');
+    const globalOwnerStat = fs.lstatSync(globalScanOwner);
+    const globalLockStat = fs.lstatSync(globalScanLock);
+    assert(globalOwnerStat.isFile() && !globalOwnerStat.isSymbolicLink()
+      && globalOwnerStat.nlink === 1 && globalOwnerStat.uid === process.geteuid()
+      && (globalOwnerStat.mode & 0o777) === 0o600,
+    '测试只能清理本 fixture 的全局扫描锁 owner');
+    assert(globalLockStat.isDirectory() && !globalLockStat.isSymbolicLink()
+      && globalLockStat.uid === process.geteuid() && (globalLockStat.mode & 0o777) === 0o700,
+    '测试只能清理本 fixture 的全局扫描锁目录');
+    originalGlobalUnlink(globalScanOwner);
+    fs.rmdirSync(globalScanLock);
+    assert.deepEqual(await scanLockFailure.runtime.scan(), [],
+      '安全移除夹具残锁后下一轮扫描必须恢复');
   });
 
   await test('safe_error 的坏 outgoing.body 只隔离所属会话', async () => {
@@ -3284,7 +3480,7 @@ const test = async (name, action) => {
     assert(!scheduled.some((entry) => entry.key === fx.runtime.stateKey(website, bad)));
     const health = JSON.parse(fs.readFileSync(path.join(fx.runtimeDirectory, 'scheduler-health.json'), 'utf8'));
     assert.deepEqual(health.isolated_sessions,
-      { count: 1, reasons: { too_large: 0, invalid_json: 0, invalid_state: 1 } });
+      { count: 1, reasons: { too_large: 0, invalid_json: 0, invalid_state: 1, io_error: 0 } });
   });
 
   await test('operator 归属连续不明时保持持久屏障，精确确认自动消息后才放行', async () => {

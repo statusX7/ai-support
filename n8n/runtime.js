@@ -170,17 +170,29 @@ function createRuntime(env = {}, options = {}) {
     if (result > 0 && result < 100000000000) result *= 1000;
     return Number.isFinite(result) && result > 0 ? result : 0;
   };
+  const bindManagedIoError = (error, file, operation, phase) => {
+    if (error && typeof error === 'object') {
+      error.managedFile = file;
+      error.managedOperation = operation;
+      error.managedPhase = phase;
+    }
+    return error;
+  };
   const safeRead = (file, fallback, maximum = stateMaximumBytes) => {
     try {
-      const stat = fs.lstatSync(file);
+      let stat;
+      try { stat = fs.lstatSync(file); }
+      catch (error) { throw bindManagedIoError(error, file, 'managed_read', 'lstat'); }
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maximum) {
         const error = new Error('受管文件格式不安全');
         error.code = stat.size > maximum ? 'MANAGED_FILE_TOO_LARGE' : 'MANAGED_FILE_UNSAFE';
         error.managedFile = file;
         throw error;
       }
-      try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-      catch (error) {
+      let content;
+      try { content = fs.readFileSync(file, 'utf8'); }
+      catch (error) { throw bindManagedIoError(error, file, 'managed_read', 'read'); }
+      try { return JSON.parse(content); } catch (error) {
         if (error?.name === 'SyntaxError') { error.code = 'MANAGED_FILE_INVALID_JSON'; error.managedFile = file; }
         throw error;
       }
@@ -1326,7 +1338,50 @@ function createRuntime(env = {}, options = {}) {
     }
     return content;
   };
-  const atomic = (file, value, maximum) => {
+  const managedFileProof = (file, maximum) => {
+    if (!Number.isSafeInteger(maximum) || maximum < 1
+      || !Number.isInteger(fs.constants?.O_NOFOLLOW)) throw new Error('受管文件证明参数无效');
+    let descriptor;
+    let primary;
+    let proof;
+    try {
+      descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const before = fs.fstatSync(descriptor);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+        || before.uid !== process.geteuid() || (before.mode & 0o777) !== 0o600
+        || before.size > maximum) throw new Error('受管文件证明不安全');
+      const bytes = fs.readFileSync(descriptor);
+      const after = fs.fstatSync(descriptor);
+      if (bytes.length !== before.size || !after.isFile() || after.isSymbolicLink()
+        || after.nlink !== 1 || after.uid !== process.geteuid() || (after.mode & 0o777) !== 0o600
+        || after.size > maximum) throw new Error('受管文件证明已变化');
+      const fields = ['dev', 'ino', 'uid', 'mode', 'nlink', 'size', 'mtimeMs', 'ctimeMs'];
+      if (!fields.every((name) => before[name] === after[name])) throw new Error('受管文件证明已变化');
+      proof = { identity: Object.fromEntries(fields.map((name) => [name, before[name]])), bytes };
+    } catch (error) { primary = error; }
+    finally {
+      if (descriptor !== undefined) {
+        const current = descriptor;
+        descriptor = undefined;
+        try { fs.closeSync(current); }
+        catch (error) { if (!primary) primary = error; }
+      }
+    }
+    if (primary) throw primary;
+    if (!proof) throw new Error('受管文件证明未完成');
+    return proof;
+  };
+  const sameManagedFileProof = (left, right) => Boolean(left && right
+    && Object.keys(left.identity || {}).length === 8
+    && Object.keys(right.identity || {}).length === 8
+    && Object.keys(left.identity).every((name) => left.identity[name] === right.identity[name])
+    && Buffer.isBuffer(left.bytes) && Buffer.isBuffer(right.bytes) && left.bytes.equals(right.bytes));
+  const sameTemporaryIdentity = (identity, stat) => {
+    const fields = ['dev', 'ino', 'uid', 'mode', 'nlink'];
+    return identity && Object.keys(identity).length === fields.length
+      && fields.every((name) => identity[name] === stat[name]);
+  };
+  const atomic = (file, value, maximum, options = {}) => {
     if (!Number.isSafeInteger(maximum) || maximum < 1) throw new Error('受管文件字节上限无效');
     // 必须在创建临时文件前完成字节计数；超限事务不留下
     // 候选文件，也不会替换上一个可读的活动状态。
@@ -1335,19 +1390,92 @@ function createRuntime(env = {}, options = {}) {
     catch (error) { error.managedFile = file; throw error; }
     const temporary = file + '.tmp-' + crypto.randomBytes(8).toString('hex');
     let descriptor;
+    let descriptorClosed = true;
+    let temporaryOwned = false;
+    let temporaryIdentity = null;
+    let temporaryAbsent = false;
+    let primary = null;
+    let cleanupError = null;
+    const phase = (name, action) => {
+      try { return action(); }
+      catch (error) { throw bindManagedIoError(error, file, 'atomic_write', name); }
+    };
     try {
-      descriptor = fs.openSync(temporary, 'wx', 0o600);
-      fs.writeFileSync(descriptor, content);
-      fs.fsyncSync(descriptor);
-      fs.closeSync(descriptor);
+      descriptor = phase('temporary_open', () => fs.openSync(temporary, 'wx', 0o600));
+      temporaryOwned = true;
+      descriptorClosed = false;
+      const temporaryStat = phase('temporary_open', () => fs.fstatSync(descriptor));
+      if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() || temporaryStat.nlink !== 1
+        || temporaryStat.uid !== process.geteuid() || (temporaryStat.mode & 0o777) !== 0o600) {
+        const error = new Error('受管临时文件身份不安全');
+        error.code = 'MANAGED_TEMPORARY_UNSAFE';
+        throw bindManagedIoError(error, file, 'atomic_write', 'temporary_open');
+      }
+      temporaryIdentity = Object.fromEntries(['dev', 'ino', 'uid', 'mode', 'nlink']
+        .map((name) => [name, temporaryStat[name]]));
+      phase('temporary_write', () => fs.writeFileSync(descriptor, content));
+      phase('temporary_fsync', () => fs.fsyncSync(descriptor));
+      const temporaryDescriptor = descriptor;
       descriptor = undefined;
-      fs.renameSync(temporary, file);
-      const parent = fs.openSync(directory, 'r');
-      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
-    } finally {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
-      try { fs.unlinkSync(temporary); } catch (_) {}
+      phase('temporary_close', () => fs.closeSync(temporaryDescriptor));
+      descriptorClosed = true;
+      phase('publish_rename', () => fs.renameSync(temporary, file));
+      temporaryOwned = false;
+      temporaryAbsent = true;
+      let parent;
+      let directoryPrimary = null;
+      try {
+        parent = phase('directory_open', () => fs.openSync(directory, 'r'));
+        phase('directory_fsync', () => fs.fsyncSync(parent));
+      } catch (error) { directoryPrimary = error; }
+      if (parent !== undefined) {
+        const parentDescriptor = parent;
+        parent = undefined;
+        try { phase('directory_close', () => fs.closeSync(parentDescriptor)); }
+        catch (error) { if (!directoryPrimary) directoryPrimary = error; }
+      }
+      if (directoryPrimary) throw directoryPrimary;
+    } catch (error) { primary = primary || error; }
+    if (descriptor !== undefined) {
+      const temporaryDescriptor = descriptor;
+      descriptor = undefined;
+      try { fs.closeSync(temporaryDescriptor); descriptorClosed = true; }
+      catch (error) {
+        descriptorClosed = false;
+        cleanupError = bindManagedIoError(error, file, 'atomic_write', 'cleanup_close');
+      }
     }
+    if (temporaryOwned) {
+      try {
+        const current = fs.lstatSync(temporary);
+        if (!current.isFile() || current.isSymbolicLink()
+          || !sameTemporaryIdentity(temporaryIdentity, current)) {
+          const error = new Error('受管临时文件身份已变化');
+          error.code = 'MANAGED_TEMPORARY_UNSAFE';
+          throw error;
+        }
+        fs.unlinkSync(temporary);
+        temporaryAbsent = true;
+      }
+      catch (error) {
+        if (error?.code === 'ENOENT') temporaryAbsent = true;
+        else if (!cleanupError) cleanupError = bindManagedIoError(error, file, 'atomic_write', 'cleanup_unlink');
+      }
+    }
+    if (primary) {
+      primary.managedCleanupComplete = descriptorClosed && temporaryAbsent;
+      primary.atomicTargetUnchanged = false;
+      if (primary.code === 'EIO' && options.targetProof
+        && primary.managedPhase === 'publish_rename'
+        && primary.managedCleanupComplete) {
+        try {
+          primary.atomicTargetUnchanged = sameManagedFileProof(
+            options.targetProof, managedFileProof(file, maximum));
+        } catch (_) { primary.atomicTargetUnchanged = false; }
+      }
+      throw primary;
+    }
+    if (cleanupError) throw cleanupError;
   };
   const stateKey = (website, session) => hash(website + '\0' + session);
   const createAbortController = () => {
@@ -2168,7 +2296,7 @@ function createRuntime(env = {}, options = {}) {
     }
     return fresh;
   };
-  const transaction = async (key, mutate, website, session) => {
+  const transaction = async (key, mutate, website, session, options = {}) => {
     ensureDirectory();
     const file = statePath(key);
     const lock = file + '.lock';
@@ -2180,7 +2308,10 @@ function createRuntime(env = {}, options = {}) {
     }
     if (!owner) throw new Error('会话状态忙，请重试');
     pruneScanArtifacts(lock);
+    let failure = null;
     try {
+      const targetProof = options.scannerStateProof === true
+        ? managedFileProof(file, stateMaximumBytes) : null;
       const state = expire(readState(key, website, session));
       const previousMode = state.mode;
       const previousGeneration = state.generation;
@@ -2190,14 +2321,25 @@ function createRuntime(env = {}, options = {}) {
       // 所有权，防止旧 runner 在人工接管或新 job 已提交后覆盖会话。
       if (!refreshScanLock(lock, owner)) throw new Error('会话状态所有权已变化');
       state.updated_at = clock();
-      atomic(file, state, stateMaximumBytes);
+      atomic(file, state, stateMaximumBytes, targetProof ? { targetProof } : {});
       if (state.generation !== previousGeneration
         || state.mode === 'human' && previousMode !== 'human') {
         cancelOutbound(key);
         cancelProcessing(key, 'conversation_state_changed');
       }
       return result;
-    } finally { removeOwnedScanLock(lock, owner.token); }
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      const removed = removeOwnedScanLock(lock, owner.token);
+      if (failure && typeof failure === 'object') failure.sessionLockCleanupComplete = removed;
+      if (!removed && options.scannerStateProof === true && !failure) {
+        const error = new Error('会话状态锁清理失败');
+        error.code = 'SESSION_LOCK_CLEANUP_FAILED';
+        throw error;
+      }
+    }
   };
   const pause = (state, eventId, eventTime, reason) => {
     if (eventTime <= Math.max(state.last_human_at || 0, state.control_watermark || 0)) return false;
@@ -6808,22 +6950,44 @@ function createRuntime(env = {}, options = {}) {
         || record.body && typeof record.body === 'object' && !Array.isArray(record.body)))
     && Array.isArray(state.uncertain_events)
     && (state.worker === null || state.worker === undefined || state.worker && typeof state.worker === 'object' && !Array.isArray(state.worker));
-  const emptyScanIsolation = () => ({ count: 0, reasons: { too_large: 0, invalid_json: 0, invalid_state: 0 } });
+  const emptyScanIsolation = () => ({ count: 0,
+    reasons: { too_large: 0, invalid_json: 0, invalid_state: 0, io_error: 0 } });
   const scanIsolation = (value) => {
     const reasons = value?.reasons;
-    if (!value || !Number.isSafeInteger(value.count) || value.count < 0 || !reasons
-      || !['too_large', 'invalid_json', 'invalid_state'].every((name) => Number.isSafeInteger(reasons[name]) && reasons[name] >= 0)
-      || value.count !== reasons.too_large + reasons.invalid_json + reasons.invalid_state) return emptyScanIsolation();
+    const legacy = ['invalid_json', 'invalid_state', 'too_large'];
+    const current = ['invalid_json', 'invalid_state', 'io_error', 'too_large'];
+    const keys = reasons && typeof reasons === 'object' && !Array.isArray(reasons)
+      ? Object.keys(reasons).sort() : [];
+    const validKeys = [legacy, current].some((expected) => expected.length === keys.length
+      && expected.every((name, index) => name === keys[index]));
+    const valueKeys = value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.keys(value).sort() : [];
+    if (valueKeys.length !== 2 || valueKeys[0] !== 'count' || valueKeys[1] !== 'reasons'
+      || !Number.isSafeInteger(value.count) || value.count < 0 || !validKeys
+      || !keys.every((name) => Number.isSafeInteger(reasons[name]) && reasons[name] >= 0)
+      || value.count !== keys.reduce((total, name) => total + reasons[name], 0)) return emptyScanIsolation();
     return { count: value.count, reasons: { too_large: reasons.too_large,
-      invalid_json: reasons.invalid_json, invalid_state: reasons.invalid_state } };
+      invalid_json: reasons.invalid_json, invalid_state: reasons.invalid_state,
+      io_error: reasons.io_error || 0 } };
   };
   const recordScanIsolation = (aggregate, error) => {
     const reason = error?.code === 'MANAGED_FILE_TOO_LARGE' ? 'too_large'
-      : error?.code === 'MANAGED_FILE_INVALID_JSON' || error?.name === 'SyntaxError' ? 'invalid_json'
-        : 'invalid_state';
+      : error?.code === 'MANAGED_FILE_INVALID_JSON' ? 'invalid_json'
+        : error?.code === 'SESSION_STATE_INVALID' || error?.code === 'MANAGED_FILE_UNSAFE' ? 'invalid_state'
+          : error?.code === 'EIO' ? 'io_error' : '';
+    if (!reason) throw error;
     aggregate.count += 1;
     aggregate.reasons[reason] += 1;
   };
+  const isolatableSessionStateEio = (error, key, transactionOwned = false) => Boolean(error?.code === 'EIO'
+    && error.managedFile === statePath(key)
+    && (transactionOwned
+      ? error.sessionLockCleanupComplete === true
+      : error.sessionLockCleanupComplete === undefined)
+    && (error.managedOperation === 'managed_read' && ['lstat', 'read'].includes(error.managedPhase)
+      || transactionOwned && error.managedOperation === 'atomic_write'
+        && error.managedPhase === 'publish_rename'
+        && error.managedCleanupComplete === true && error.atomicTargetUnchanged === true));
   const processIdentity = (pid = 'self') => {
     try {
       const value = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
@@ -7156,6 +7320,7 @@ function createRuntime(env = {}, options = {}) {
     const startedAt = clock();
     const heartbeat = setInterval(() => { try { refreshScanLock(scanLock, owner); } catch (_) {} }, 10000);
     if (typeof heartbeat.unref === 'function') heartbeat.unref();
+    let scanFailure = null;
     try {
       atomic(healthPath, { schema_version: 1, started_at: startedAt, completed_at: previousHealth.completed_at || 0,
         control_cursor: controlCursor, ordinary_cursor: ordinaryCursor, isolated_sessions: previousIsolation,
@@ -7173,7 +7338,9 @@ function createRuntime(env = {}, options = {}) {
         let snapshot;
         try { snapshot = safeRead(statePath(key), null, stateMaximumBytes); }
         catch (error) {
-          if (!['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code)) throw error;
+          if (!isolatableSessionStateEio(error, key)
+            && (error?.managedFile !== statePath(key)
+              || !['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code))) throw error;
           recordScanIsolation(isolated, error);
           continue;
         }
@@ -7237,11 +7404,12 @@ function createRuntime(env = {}, options = {}) {
             const retirement = retirementDue.sort((left, right) => left.sequence - right.sequence)[0];
             const candidate = priority || control || retirement || reconciliation || settlement || ordinary;
             return candidate ? { key, jobId: candidate.id, control: candidate.control === true } : null;
-          });
+          }, undefined, undefined, { scannerStateProof: true });
           if (selected) jobs.push(selected);
         } catch (error) {
-          if (error?.managedFile !== statePath(key)
-            || !['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code)) throw error;
+          if (!isolatableSessionStateEio(error, key, true)
+            && (error?.managedFile !== statePath(key)
+              || !['MANAGED_FILE_TOO_LARGE', 'MANAGED_FILE_UNSAFE', 'MANAGED_FILE_INVALID_JSON'].includes(error?.code))) throw error;
           recordScanIsolation(isolated, error);
         }
       }
@@ -7260,9 +7428,24 @@ function createRuntime(env = {}, options = {}) {
         control_cursor: nextControlCursor, ordinary_cursor: nextOrdinaryCursor, isolated_sessions: isolated,
         health_recovered: healthRecovered, crisp_rest_catchup: crispRestCatchupHealth() }, 65536);
       return selected;
+    } catch (error) {
+      scanFailure = error;
+      throw error;
     } finally {
       clearInterval(heartbeat);
-      removeOwnedScanLock(scanLock, owner.token);
+      let removed = false;
+      let cleanupFailure = null;
+      try { removed = removeOwnedScanLock(scanLock, owner.token); }
+      catch (error) { cleanupFailure = error; }
+      if (!removed) {
+        if (scanFailure && typeof scanFailure === 'object') {
+          scanFailure.globalScanLockCleanupComplete = false;
+        } else {
+          const error = cleanupFailure || new Error('调度锁清理失败');
+          error.code = error.code || 'SCAN_LOCK_CLEANUP_FAILED';
+          throw error;
+        }
+      }
     }
   };
   const pruneAnalytics = () => {

@@ -2957,7 +2957,7 @@ doctor_runtime_permits_check() {
 
 doctor_runtime_scheduler_check() {
   local start file now started completed age lock_state lock_file
-  local isolated_count isolated_too_large isolated_invalid_json isolated_invalid_state
+  local isolated_count isolated_too_large isolated_invalid_json isolated_invalid_state isolated_io_error
   local recovered_at recovered_age recovered_reason recovered_reason_cn recovered_status recovered_summary
   local catchup_status catchup_checked catchup_watermark catchup_age catchup_lag catchup_pending
   local catchup_recovered catchup_conversations catchup_unresolved catchup_unresolved_since
@@ -2999,7 +2999,7 @@ doctor_runtime_scheduler_check() {
   if [[ ! -f "$file" || -L "$file" ]] \
     || ! jq -e '
       def nonnegative_integer:
-        type == "number" and . >= 0 and floor == .;
+        type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
       .schema_version == 1 and
       (.started_at | type == "number") and
       (.completed_at | type == "number") and
@@ -3007,16 +3007,25 @@ doctor_runtime_scheduler_check() {
         if has("isolated_sessions") then
           (.isolated_sessions | type == "object") and
           (.isolated_sessions as $isolated |
+            (($isolated | keys | sort) == ["count", "reasons"]) and
             ($isolated.count | nonnegative_integer) and
             ($isolated.reasons | type == "object") and
-            ($isolated.reasons.too_large | nonnegative_integer) and
-            ($isolated.reasons.invalid_json | nonnegative_integer) and
-            ($isolated.reasons.invalid_state | nonnegative_integer) and
-            ($isolated.count == (
-              $isolated.reasons.too_large +
-              $isolated.reasons.invalid_json +
-              $isolated.reasons.invalid_state
-            ))
+            (($isolated.reasons | keys | sort) as $reason_keys |
+              if $reason_keys == ["invalid_json", "invalid_state", "too_large"] then
+                ($isolated.reasons.too_large | nonnegative_integer) and
+                ($isolated.reasons.invalid_json | nonnegative_integer) and
+                ($isolated.reasons.invalid_state | nonnegative_integer) and
+                ($isolated.count == ($isolated.reasons.too_large +
+                  $isolated.reasons.invalid_json + $isolated.reasons.invalid_state))
+              elif $reason_keys == ["invalid_json", "invalid_state", "io_error", "too_large"] then
+                ($isolated.reasons.too_large | nonnegative_integer) and
+                ($isolated.reasons.invalid_json | nonnegative_integer) and
+                ($isolated.reasons.invalid_state | nonnegative_integer) and
+                ($isolated.reasons.io_error | nonnegative_integer) and
+                ($isolated.count == ($isolated.reasons.too_large +
+                  $isolated.reasons.invalid_json + $isolated.reasons.invalid_state +
+                  $isolated.reasons.io_error))
+              else false end)
           )
         else
           true
@@ -3203,8 +3212,9 @@ doctor_runtime_scheduler_check() {
     isolated_too_large=$(jq -r '.isolated_sessions.reasons.too_large' "$file")
     isolated_invalid_json=$(jq -r '.isolated_sessions.reasons.invalid_json' "$file")
     isolated_invalid_state=$(jq -r '.isolated_sessions.reasons.invalid_state' "$file")
+    isolated_io_error=$(jq -r '.isolated_sessions.reasons.io_error // 0' "$file")
     doctor_add runtime.scheduler_isolation '会话状态隔离' FAIL critical \
-      "最近完成的扫描隔离 ${isolated_count} 个异常会话状态（文件过大 ${isolated_too_large}、JSON 无效 ${isolated_invalid_json}、状态无效 ${isolated_invalid_state}）；异常会话未参与处理，其他合法会话继续扫描" \
+      "最近完成的扫描隔离 ${isolated_count} 个异常会话状态（文件过大 ${isolated_too_large}、JSON 无效 ${isolated_invalid_json}、状态无效 ${isolated_invalid_state}、状态 I/O 错误 ${isolated_io_error}）；异常会话未参与处理，其他合法会话继续扫描" \
       filesystem '从受限备份逐一核对并恢复异常状态；自检及 --fix 不会删除状态、解除人工或补发历史消息' "$start"
   fi
   if jq -e 'has("health_recovered") and .health_recovered != null' "$file" >/dev/null 2>&1; then

@@ -1431,7 +1431,7 @@ jq -M -n --argjson now "$(date -u '+%s%3N')" \
 unset DOCTOR_TEST_PRESERVE_HEARTBEAT
 pass '独立 scheduler 心跳区分无流量健康、延迟警告和扫描停滞'
 
-# 旧 runtime 没有 isolated_sessions 字段时继续兼容；新字段为零时不得增加结果或改变退出码。
+# 旧三键 runtime 心跳继续兼容；当前四键全零时不得增加结果或改变退出码。
 export DOCTOR_TEST_PRESERVE_HEARTBEAT=1
 jq -M -n --argjson now "$(date -u '+%s%3N')" '{
   schema_version:1,started_at:($now - 10),completed_at:$now,
@@ -1447,7 +1447,21 @@ jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null 
   || fail '隔离计数全零时不应增加诊断结果'
 jq -e 'all(.results[]; .id != "runtime.scheduler_health_recovery")' "$OUT" >/dev/null \
   || fail '空恢复记录不应增加诊断结果'
-pass 'scheduler 隔离字段全零、空恢复记录及公平游标兼容，且不改变既有健康结果'
+pass 'scheduler 旧三键隔离字段全零、空恢复记录及公平游标兼容'
+
+jq -M -n --argjson now "$(date -u '+%s%3N')" '{
+  schema_version:1,started_at:($now - 10),completed_at:$now,
+  control_cursor:7,ordinary_cursor:9,
+  isolated_sessions:{count:0,reasons:{too_large:0,invalid_json:0,invalid_state:0,io_error:0}},
+  health_recovered:null
+}' > "${DEPLOY}/data/runtime/scheduler-health.json"
+chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+invoke --local
+(( LAST_RC == 0 )) || fail '当前四键隔离计数全零的扫描心跳不应改变健康退出码'
+assert_result runtime.scheduler PASS
+jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null \
+  || fail '当前四键隔离计数全零时不应增加诊断结果'
+pass 'scheduler 当前四键隔离字段全零保持健康结果'
 
 # REST 漏收补偿事实来自同一 scheduler 心跳，只展示匿名水位、结果和计数。
 # doctor 不发网络请求、不补消息，也不能接受可夹带会话身份的扩展字段。
@@ -1581,6 +1595,28 @@ invoke --local
 assert_result runtime.scheduler FAIL
 pass 'scheduler 隔离统计拒绝负数及总数不守恒的畸形状态'
 
+for malformed_isolation in \
+  '{"count":0,"reasons":{"too_large":0,"invalid_json":0,"invalid_state":0,"io_error":-1}}' \
+  '{"count":0,"reasons":{"too_large":0,"invalid_json":0,"invalid_state":0,"io_error":0.5}}' \
+  '{"count":0,"reasons":{"too_large":0,"invalid_json":0,"invalid_state":0,"io_error":0,"session_marker":"session_schema_must_not_escape"}}' \
+  '{"count":0,"reasons":{"too_large":0,"invalid_json":0,"invalid_state":0,"io_error":0},"session_marker":"session_outer_must_not_escape"}'
+do
+  jq -M -n --argjson now "$(date -u '+%s%3N')" --argjson isolated "$malformed_isolation" '{
+    schema_version:1,started_at:($now - 10),completed_at:$now,isolated_sessions:$isolated
+  }' > "${DEPLOY}/data/runtime/scheduler-health.json"
+  chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
+  invoke --local
+  (( LAST_RC == 1 )) || fail '当前四键隔离统计含负数、小数或额外字段时应判扫描心跳无效'
+  assert_result runtime.scheduler FAIL
+  jq -e 'all(.results[]; .id != "runtime.scheduler_isolation")' "$OUT" >/dev/null \
+    || fail '畸形当前隔离统计不应生成可信隔离结果'
+  ! grep -Fq 'session_schema_must_not_escape' "$OUT" \
+    || fail '隔离原因额外字段泄漏到诊断输出'
+  ! grep -Fq 'session_outer_must_not_escape' "$OUT" \
+    || fail '隔离外层额外字段泄漏到诊断输出'
+done
+pass 'scheduler 当前四键隔离统计拒绝负数、小数和额外字段且保持脱敏'
+
 # 心跳自恢复记录只接受匿名、固定原因的正整数毫秒时间；近期恢复警告，历史恢复不永久降级。
 jq -M -n --argjson now "$(date -u '+%s%3N')" '{
   schema_version:1,started_at:($now - 10),completed_at:$now,
@@ -1648,7 +1684,7 @@ pass '心跳自恢复 schema 严格，近期匿名警告且 --fix 只读，历�
 # 非零隔离是关键故障：报告仅给匿名分类计数；doctor --fix 和兼容门禁均不得清理状态。
 jq -M -n --argjson now "$(date -u '+%s%3N')" '{
   schema_version:1,started_at:($now - 10),completed_at:$now,
-  isolated_sessions:{count:3,reasons:{too_large:1,invalid_json:1,invalid_state:1}},
+  isolated_sessions:{count:4,reasons:{too_large:1,invalid_json:1,invalid_state:1,io_error:1}},
   health_recovered:null
 }' > "${DEPLOY}/data/runtime/scheduler-health.json"
 chmod 0600 "${DEPLOY}/data/runtime/scheduler-health.json"
@@ -1660,7 +1696,8 @@ invoke --local
 assert_result runtime.scheduler PASS
 assert_result runtime.scheduler_isolation FAIL
 jq -e 'any(.results[]; .id == "runtime.scheduler_isolation" and .severity == "critical" and
-  (.summary | contains("隔离 3 个异常会话状态") and contains("其他合法会话继续扫描")))' "$OUT" >/dev/null \
+  (.summary | contains("隔离 4 个异常会话状态") and contains("状态 I/O 错误 1") and
+    contains("其他合法会话继续扫描")))' "$OUT" >/dev/null \
   || fail '非零隔离没有生成关键、匿名且说明继续扫描的诊断结果'
 ! grep -Eq 'session[-_][[:alnum:]_-]+|data/runtime/session-' "$OUT" \
   || fail '会话隔离诊断泄漏了会话身份或状态路径'
