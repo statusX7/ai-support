@@ -3675,6 +3675,8 @@ const abortablePending = (signal, started) => {
   await test('P0 普通推理失去许可立即中止，不计业务失败且可有界恢复', async () => {
     const session = 'session_permit-lost-provider';
     const beforeSent = sent.filter((entry) => entry.session_id === session).length;
+    const beforeModels = modelRequests.length;
+    const beforePosts = sendAttempts;
     let startedResolve;
     const started = new Promise((resolve) => { startedResolve = resolve; });
     const guarded = createRuntime(env, { ...runtimeOptions, processingPermitHeartbeatMilliseconds: 10,
@@ -3703,6 +3705,9 @@ const abortablePending = (signal, started) => {
       assert.equal(stored.processing_permit_losses, 1);
       assert.equal(stored.retry_at, now + 1000);
       assert.equal(stored.execution_token, undefined);
+      assert(stored.inference, '已发起的 Provider 代次必须保留到精确结果对账');
+      assert.equal(stored.provider_result_receipt?.state, 'requesting');
+      assert.equal(stored.provider_result_receipt?.stage, 'answer');
       assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
       assert.equal(JSON.parse(fs.readFileSync(path.join(replacement.slotPath, 'owner.json'), 'utf8')).token,
         replacement.token, '旧执行 finally 不得删除新持有者');
@@ -3711,12 +3716,60 @@ const abortablePending = (signal, started) => {
     }
 
     now += 1001;
-    const recovered = createRuntime(env, runtimeOptions);
+    let replayCalls = 0;
+    let routeCalls = 0;
+    let settlementCalls = 0;
+    const recovered = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        if (parsed.hostname === 'provider.invalid') {
+          if (parsed.pathname === '/proxy/internal/provider/replay') replayCalls += 1;
+          else if (parsed.pathname === '/proxy/internal/provider/settle') settlementCalls += 1;
+          else if (/\/(?:chat\/completions|responses)$/.test(parsed.pathname)) routeCalls += 1;
+        }
+        return request(url, options);
+      } });
+    const replayed = await recovered.process(entry.key, entry.jobId);
+    assert.equal(replayed.status, 'unresolved',
+      '许可丢失后的第一轮恢复必须先只读确认旧 Provider 请求没有结果');
+    stored = recovered.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'question_result_absent');
+    assert.equal(stored.retry_at, now);
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_migration_from, undefined);
+    assert.equal(stored.provider_settlement, undefined);
+    assert.equal(stored.provider_retirement, undefined);
+    assert.equal(stored.plan, undefined);
+    assert.equal(stored.failure_rounds, undefined,
+      '精确阴性对账不是新的业务失败轮');
+    assert.equal(stored.processing_permit_losses, undefined);
+    assert.equal(stored.data?.content, body.data.content, '同一访客责任必须保留原始问题');
+    assert.equal(replayCalls, 1);
+    assert.equal(routeCalls, 0, '只读对账轮不得递归发起第二次推理');
+    assert.equal(settlementCalls, 0);
+    assert.equal(modelRequests.length, beforeModels);
+    assert.equal(sendAttempts, beforePosts);
+    assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent);
+
+    now += 1;
     assert.equal((await recovered.process(entry.key, entry.jobId)).status, 'sent');
     stored = recovered.readState(entry.key).jobs.find((job) => job.id === entry.jobId);
     assert.equal(stored.status, 'done');
+    assert.equal(stored.responsibility_status, 'answered_confirmed');
     assert.equal(stored.processing_permit_losses, undefined);
+    assert.equal(replayCalls, 1);
+    assert.equal(routeCalls, 1, '精确确认旧结果不存在后只允许一个 successor 推理');
+    assert.equal(settlementCalls, 1);
+    assert.equal(modelRequests.length, beforeModels + 1);
+    assert.equal(sendAttempts, beforePosts + 1);
     assert.equal(sent.filter((item) => item.session_id === session).length, beforeSent + 1);
+    const outgoing = Object.values(recovered.readState(entry.key).outgoing)
+      .filter((record) => record.job_id === entry.jobId);
+    assert.equal(outgoing.length, 1, '同一访客责任只能存在一个出站记录');
+    assert.equal(outgoing[0].status, 'sent', '唯一出站必须已经得到明确发送回执');
   });
   await test('P0 忽略取消的旧请求返回后仍被 fence 丢弃，不覆盖新执行代次', async () => {
     const session = 'session_permit-lost-superseded';
