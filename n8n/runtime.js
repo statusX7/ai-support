@@ -482,6 +482,10 @@ function createRuntime(env = {}, options = {}) {
     try { return hash(canonical({ type: String(type || ''), content: content ?? null })); }
     catch (_) { return ''; }
   };
+  const frozenOutboundPurpose = (value) => typeof value === 'string'
+    && /^[a-z][a-z0-9_]{0,79}$/.test(value);
+  const frozenOutboundMessageType = (value) => typeof value === 'string'
+    && ['text', 'picker'].includes(value);
   // v1.2.x 的部分 sent 记录已经删除正文与 plan，只留下冻结摘要。仅对项目历史
   // 明确生成过的整条 generic 文案计算摘要；不能凭模糊文本或旧 positive 标记
   // 猜测普通业务固定回复的语义。
@@ -511,6 +515,84 @@ function createRuntime(env = {}, options = {}) {
     }
     return plan;
   };
+  const freezeUncertainDeliveryIdentity = (key, job, fingerprint, record) => {
+    // v1.2.1 的 unknown/sending 记录尚未冻结语义身份，答案用途只存在于同一
+    // job.plan。政策取消必须在删除 plan 前完成一次严格、幂等的身份升级；
+    // 已经丢 plan/body 或任一字段冲突时继续 fail closed，绝不能凭正文猜答案。
+    if (!job || !record || !['unknown', 'sending'].includes(record.status)) return 'not_applicable';
+    const unresolved = (result) => {
+      // 冲突字段必须留下不可重发、不可推断的持久边界。保留原字段供诊断，
+      // 但后续即使远端正文精确命中，也只能收敛为 semantic_unknown。
+      record.receipt_identity_unbound = true;
+      record.semantic_status = 'semantic_unknown';
+      return result;
+    };
+    if (record.receipt_identity_unbound === true) return 'conflicting';
+    const legacyJobBindingMissing = !Object.hasOwn(record, 'job_id');
+    if (!legacyJobBindingMissing && record.job_id !== job.id) return unresolved('conflicting');
+    if (!record.body || typeof record.body !== 'object' || Array.isArray(record.body)) {
+      return unresolved('insufficient');
+    }
+    if (!Number.isSafeInteger(job.generation) || !Number.isSafeInteger(record.generation)
+      || record.generation !== job.generation
+      || String(record.body.fingerprint ?? '') !== String(fingerprint)) return unresolved('conflicting');
+    const explicitJobResponseGeneration = job.response_generation !== undefined;
+    if (explicitJobResponseGeneration && (!Number.isSafeInteger(job.response_generation)
+      || job.response_generation < 0 || job.response_generation > 1000000)) return unresolved('conflicting');
+    const generation = explicitJobResponseGeneration ? job.response_generation : 0;
+    if (record.delivery_identity_version !== undefined && record.delivery_identity_version !== 1) {
+      return unresolved('conflicting');
+    }
+    if (record.delivery_identity_version === 1) {
+      const frozenType = String(record.message_type || '');
+      const frozenDigest = outboundContentSha256(record.body.type || 'text', record.body.content);
+      if (legacyJobBindingMissing
+        || !frozenOutboundPurpose(record.purpose) || !frozenOutboundMessageType(frozenType)
+        || !['answer', 'non_answer', 'control'].includes(record.semantic_intent)
+        || record.body.from !== 'operator' || record.body.origin !== 'chat'
+        || String(record.body.type || '') !== frozenType || !frozenDigest
+        || record.content_sha256 !== frozenDigest
+        || record.semantic_status !== undefined
+        || !Number.isSafeInteger(record.response_generation)
+        || record.response_generation < 0 || record.response_generation > 1000000
+        || record.response_generation !== generation) return unresolved('conflicting');
+      return 'matched';
+    }
+    if (!job.plan || typeof job.plan !== 'object' || Array.isArray(job.plan)) {
+      return unresolved('insufficient');
+    }
+    const plan = job.plan;
+    const plannedFingerprint = plan.fingerprint ?? responseFingerprint(key, job, plan.purpose);
+    if (String(plannedFingerprint) !== String(fingerprint)) return unresolved('conflicting');
+    const messageType = String(plan.type || 'text');
+    const purpose = String(plan.purpose || '');
+    const semanticIntent = planSemanticIntent(job, plan);
+    const contentSha256 = outboundContentSha256(messageType, plan.content);
+    if (!frozenOutboundPurpose(plan.purpose) || !frozenOutboundMessageType(plan.type)
+      || !contentSha256 || !['answer', 'non_answer', 'control'].includes(semanticIntent)
+      || record.body.from !== 'operator' || record.body.origin !== 'chat'
+      || String(record.body.type || '') !== messageType
+      || outboundContentSha256(record.body.type, record.body.content) !== contentSha256
+      || record.purpose !== undefined && record.purpose !== purpose
+      || record.message_type !== undefined && record.message_type !== messageType
+      || record.semantic_intent !== undefined && record.semantic_intent !== semanticIntent
+      || record.content_sha256 !== undefined && record.content_sha256 !== contentSha256
+      || record.semantic_status !== undefined) return unresolved('conflicting');
+    if (record.response_generation === undefined) {
+      // 旧版只可能表示初始回答代；非零恢复代若缺字段无法证明对应哪次正文。
+      if (generation !== 0) return unresolved('conflicting');
+    } else if (!Number.isSafeInteger(record.response_generation)
+      || record.response_generation < 0 || record.response_generation > 1000000
+      || record.response_generation !== generation) return unresolved('conflicting');
+    record.delivery_identity_version = 1;
+    if (legacyJobBindingMissing) record.job_id = job.id;
+    record.purpose = purpose;
+    record.message_type = messageType;
+    record.semantic_intent = semanticIntent;
+    record.content_sha256 = contentSha256;
+    record.response_generation = generation;
+    return 'matched';
+  };
   const outgoingNonAnswerEvidence = (key, job, record, fingerprint) => {
     const plan = matchingOutgoingPlan(key, job, record, fingerprint);
     if (plan && planSemanticIntent(job, plan) === 'non_answer') return true;
@@ -526,6 +608,7 @@ function createRuntime(env = {}, options = {}) {
       && legacyGenericOutboundDigests.has(String(record?.content_sha256 || ''));
   };
   const outgoingSemanticIntent = (key, job, record, fingerprint) => {
+    if (record?.receipt_identity_unbound === true) return 'unknown';
     // 可核验的正文/plan/hash 是更强证据；旧版错误写入的 answer 不能覆盖它。
     if (outgoingNonAnswerEvidence(key, job, record, fingerprint)) return 'non_answer';
     if (['answer', 'non_answer', 'control', 'unknown'].includes(record?.semantic_intent)) {
@@ -540,6 +623,7 @@ function createRuntime(env = {}, options = {}) {
     return 'unknown';
   };
   const receiptSemanticStatus = (key, job, record, fingerprint) => {
+    if (record?.receipt_identity_unbound === true) return 'semantic_unknown';
     const intent = outgoingSemanticIntent(key, job, record, fingerprint);
     if (intent === 'non_answer') return 'delivered_non_answer';
     if (['valid_answer', 'delivered_non_answer', 'control_delivered', 'semantic_unknown']
@@ -882,9 +966,20 @@ function createRuntime(env = {}, options = {}) {
     && signedKnowledgeAnswerState(plan) !== true
     && !['keyword_reply', 'menu', 'welcome', 'handoff_offer', 'handoff_offer_reminder', 'handoff_ack', 'operator', 'safe_error', 'technical_unresolved'].includes(plan.purpose)
     && (plan.ai === true || ['ai_text', 'vision', 'admin_query'].includes(plan.purpose)));
+  const legacyUnboundDeliveryCandidates = (state, fingerprint, record) => {
+    if (!record || Object.hasOwn(record, 'job_id')
+      || record.receipt_identity_unbound === true) return [];
+    return (state?.jobs || []).filter((entry) => entry?.plan
+      && Object.hasOwn(entry.plan, 'fingerprint')
+      && String(entry.plan.fingerprint) === String(fingerprint));
+  };
+  const uniquelyMatchesLegacyUnboundDelivery = (state, job, fingerprint, record) => {
+    const candidates = legacyUnboundDeliveryCandidates(state, fingerprint, record);
+    return candidates.length === 1 && candidates[0].id === job.id;
+  };
   const uncertainDeliveriesFor = (state, job) => Object.entries(state.outgoing || {}).filter(([fingerprint, record]) =>
     ['unknown', 'sending'].includes(record.status) && (record.job_id === job.id
-      || !record.job_id && job.plan?.fingerprint && String(job.plan.fingerprint) === fingerprint));
+      || uniquelyMatchesLegacyUnboundDelivery(state, job, fingerprint, record)));
   const uncertainDeliveryFor = (state, job) => uncertainDeliveriesFor(state, job).length > 0;
   // Provider 已生成且 runtime 已原子持久化的正文，之后只剩 Crisp 投递责任。
   // 配置换代不得删除正文再调用 Provider；结构损坏也必须 fail closed。
@@ -1581,9 +1676,9 @@ function createRuntime(env = {}, options = {}) {
       || job.provider_migration_from !== undefined || hasLegacyV121PendingOrigin(job)
       || providerSettlementOutstanding(job) || providerRetirementOutstanding(job)));
   const recoverableDeliveryOutstandingForPolicy = (state, job) => Boolean(job
-    && (job.delivery_receipt_unknown
+    && (job.delivery_receipt_unknown || uncertainDeliveryFor(state, job)
       || Object.values(state?.outgoing || {}).some((record) => record?.job_id === job.id
-        && ['sending', 'unknown', 'rate_limited', 'rejected'].includes(record.status))));
+        && ['rate_limited', 'rejected'].includes(record.status))));
   // failed/done 只是旧执行轮的终态，不代表访客责任已经终结。只要该责任仍为
   // unresolved 且持有 Provider/投递恢复身份，真人接管或总关就必须覆盖它；
   // 已经发送的历史 P0 若没有任何活动恢复身份则继续留给诊断，不能顺手洗成静默。
@@ -1777,9 +1872,31 @@ function createRuntime(env = {}, options = {}) {
   };
   const settleUncertainDeliveries = (state, job, reason = '') => {
     if (!job || job.status !== 'cancelled') return;
-    for (const record of Object.values(state.outgoing || {})) {
-      if (!record || record.job_id !== job.id
+    const key = stateKey(state.website_id, state.session_id);
+    for (const [fingerprint, record] of Object.entries(state.outgoing || {})) {
+      // 缺 job_id 的 v1.2.1 遗留记录只能靠当时明确持久化的 fingerprint 绑定；
+      // 不能用当前代码重新推导一个身份后接管未知出站。
+      const legacyCandidates = legacyUnboundDeliveryCandidates(state, fingerprint, record);
+      if (['unknown', 'sending'].includes(record?.status) && legacyCandidates.length > 1
+        && legacyCandidates.some((candidate) => candidate.id === job.id)) {
+        // 相同 fingerprint 同时指向多个活动计划时，遍历顺序不能决定归属。
+        // 一旦发现歧义就持久失败关闭，避免前一计划退休后被下一计划接管。
+        record.receipt_identity_unbound = true;
+        record.semantic_status = 'semantic_unknown';
+        record.delivery_uncertain = true;
+        record.resend_forbidden = true;
+        record.recovery_deferred = true;
+        if (!Number.isFinite(record.next_action_at)) record.next_action_at = clock() + 5000;
+        continue;
+      }
+      const related = record?.job_id === job.id
+        || ['unknown', 'sending'].includes(record?.status)
+          && uniquelyMatchesLegacyUnboundDelivery(state, job, fingerprint, record);
+      if (!record || !related
         || !['unknown', 'sending', 'rate_limited', 'rejected'].includes(record.status)) continue;
+      if (['unknown', 'sending'].includes(record.status)) {
+        freezeUncertainDeliveryIdentity(key, job, fingerprint, record);
+      }
       if (['rate_limited', 'rejected'].includes(record.status)) {
         // 420/429 及明确 HTTP 拒绝都证明本次正文未被接收，不需要按未知
         // 回执查询；人工接管或总关后只保留禁止重发的最小审计。
@@ -2106,12 +2223,12 @@ function createRuntime(env = {}, options = {}) {
         // 再恢复或补答，立即释放其正文和推理计划，避免旧版接近 2 MiB 的
         // 合法状态因本次控制事件新增少量元数据而拒绝提交。
         delete job.data;
+        settleUncertainDeliveries(state, job, 'conversation_state_changed');
         retireProviderAttempt(key, job, 'conversation_cancelled');
         delete job.deferred_configuration;
         delete job.deferred_control;
         delete job.execution_token;
         cancelled.add(job.id);
-        settleUncertainDeliveries(state, job, 'conversation_state_changed');
       }
     }
     if (state.worker && cancelled.has(state.worker.job)) state.worker = null;
@@ -5600,6 +5717,7 @@ function createRuntime(env = {}, options = {}) {
         const contentSha256 = outboundContentSha256(body.type, body.content);
         const semanticIntent = planSemanticIntent(job, plan);
         if (!contentSha256 || semanticIntent === 'unknown'
+          || !frozenOutboundPurpose(plan.purpose) || !frozenOutboundMessageType(body.type)
           || previous?.content_sha256 && previous.content_sha256 !== contentSha256
           || previous?.job_id && previous.job_id !== job.id
           || previous?.message_type && previous.message_type !== body.type
@@ -5614,6 +5732,7 @@ function createRuntime(env = {}, options = {}) {
           attempts: Math.min(1000000,
             bounded(previous?.attempts, 0, 1000000) + 1), job_id: job.id,
           generation: current.generation, response_generation: responseGeneration(job),
+          delivery_identity_version: 1,
           purpose: String(plan.purpose || ''), message_type: body.type,
           semantic_intent: semanticIntent,
           content_sha256: contentSha256, attempt_token: attemptToken,
@@ -6431,12 +6550,12 @@ function createRuntime(env = {}, options = {}) {
                 ? 'global_disabled' : state.mode === 'human' ? 'human_handoff'
                   : 'conversation_state_changed');
               delete stored.data;
+              settleUncertainDeliveries(state, stored, reason);
               retireProviderAttempt(key, stored, reason === 'global_disabled'
                 ? 'global_disabled' : 'conversation_cancelled');
               delete stored.deferred_configuration;
               delete stored.deferred_control;
               delete stored.execution_token;
-              settleUncertainDeliveries(state, stored, reason);
             }
             if (state.worker?.token === token) state.worker = null;
           }); } catch (_) {}
@@ -7177,9 +7296,9 @@ function createRuntime(env = {}, options = {}) {
       job.lease_until = 0;
       markIntentionalSilence(job, 'conversation_state_changed');
       delete job.data;
+      settleUncertainDeliveries(state, job, 'conversation_state_changed');
       retireProviderAttempt(key, job, 'conversation_cancelled');
       delete job.execution_token;
-      settleUncertainDeliveries(state, job, 'conversation_state_changed');
     }
     return { key, mode: state.mode, generation: state.generation };
   });

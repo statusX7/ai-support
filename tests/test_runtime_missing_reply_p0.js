@@ -2324,21 +2324,445 @@ const test = async (name, action) => {
     assert.equal(record.delivery_uncertain, true);
     assert.equal(record.resend_forbidden, true, '人工接管后必须持久禁止重发');
     assert.equal(record.attempt_token, outgoing.attempt_token);
+    assert.equal(record.purpose, plan.purpose, '删除旧 plan 前必须冻结可证明的用途');
+    assert.equal(record.message_type, plan.type);
+    assert.equal(record.semantic_intent, 'answer');
+    assert.equal(record.content_sha256, digest(canonical({ type: plan.type, content: plan.content })));
+    assert.equal(record.response_generation, 0);
 
     fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
       content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
     fx.tick(5000);
     const reconciled = await fx.runtime.process(control.key, job.id);
-    assert(['sent', 'dispatched_after_cancel'].includes(reconciled.status));
+    assert.equal(reconciled.status, 'dispatched_after_cancel');
     current = fx.runtime.readState(control.key);
     record = current.outgoing[String(fingerprint)];
     assert.equal(record.status, 'sent');
+    assert.equal(record.receipt_current, false);
     assert.equal(record.state_changed_before_receipt, true);
+    assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+      'intentional_silence');
     assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1,
       '人工接管后的未知发送只能进行一次受控精确对账');
     assert.equal(fx.postAttempts.length, 0, '人工接管后的未知发送绝不能重发');
     assert.equal(fx.sent.length, 0);
     assert.equal(fx.runtime.readState(control.key).mode, 'human');
+  });
+
+  await test('计划已缺失但正文仍在的遗留未知出站保持语义未知，绝不凭正文猜答案', async () => {
+    const fx = fixture('delivery-legacy-plan-lost');
+    const session = 'session_legacy-plan-lost';
+    const fingerprint = 95605;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '旧版已经取消后只剩下的正文。', fingerprint };
+    const job = jobValue(fx, 'legacy-plan-lost', 1);
+    job.data.session_id = session;
+    const outgoing = outgoingValue(fx, job, plan);
+    outgoing.semantic_intent = 'answer';
+    outgoing.semantic_status = 'valid_answer';
+    writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+    const control = await webhook(fx, session, '真人已接管', 95606,
+      { event: 'message:received', from: 'operator', automated: false });
+    let current = fx.runtime.readState(control.key);
+    let record = current.outgoing[String(fingerprint)];
+    assert.equal(record.semantic_intent, 'answer', '冲突字段只保留审计，不得当作可信答案');
+    assert.equal(record.semantic_status, 'semantic_unknown');
+    assert.equal(record.receipt_identity_unbound, true);
+    assert.equal(record.content_sha256, undefined);
+    assert.equal(record.response_generation, undefined);
+    assert.equal(record.resend_forbidden, true);
+
+    fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
+      content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
+    fx.tick(5000);
+    const reconciled = await fx.runtime.process(control.key, job.id);
+    assert.equal(reconciled.status, 'delivery_semantic_unknown');
+    current = fx.runtime.readState(control.key);
+    record = current.outgoing[String(fingerprint)];
+    assert.equal(record.status, 'sent');
+    assert.equal(record.semantic_status, 'semantic_unknown');
+    assert.equal(record.state_changed_before_receipt, true);
+    assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+      'intentional_silence');
+    assert.equal(current.mode, 'human');
+    assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
+  });
+
+  await test('缺失旧 job_id 的未知出站仅凭完整计划身份原子绑定，人工后只精确对账', async () => {
+    const fx = fixture('delivery-legacy-job-binding');
+    const session = 'session_legacy-job-binding';
+    const fingerprint = 95607;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '缺失旧任务绑定但其余身份完整的答案。', fingerprint };
+    const job = jobValue(fx, 'legacy-job-binding', 1, { plan });
+    job.data.session_id = session;
+    const outgoing = outgoingValue(fx, job, plan);
+    delete outgoing.job_id;
+    writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+    const control = await webhook(fx, session, '真人已接管', 95608,
+      { event: 'message:received', from: 'operator', automated: false });
+    let current = fx.runtime.readState(control.key);
+    let record = current.outgoing[String(fingerprint)];
+    assert.equal(record.job_id, job.id);
+    assert.equal(record.delivery_identity_version, 1);
+    assert.equal(record.semantic_intent, 'answer');
+    assert.equal(record.receipt_identity_unbound, undefined);
+    assert.equal(record.resend_forbidden, true);
+
+    fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
+      content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
+    fx.tick(5000);
+    const reconciled = await fx.runtime.process(control.key, job.id);
+    assert.equal(reconciled.status, 'dispatched_after_cancel');
+    current = fx.runtime.readState(control.key);
+    record = current.outgoing[String(fingerprint)];
+    assert.equal(record.status, 'sent');
+    assert.equal(record.receipt_current, false);
+    assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+      'intentional_silence');
+    assert.equal(current.mode, 'human');
+    assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
+  });
+
+  await test('存在但冲突或畸形的 job_id 永不被当前计划接管或改写', async () => {
+    const cases = [
+      { name: 'different', value: digest('different-job') },
+      { name: 'empty', value: '' },
+      { name: 'null', value: null },
+      { name: 'zero', value: 0 },
+      { name: 'false', value: false },
+      { name: 'object', value: { unexpected: true } },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const fx = fixture('delivery-conflicting-job-binding-' + item.name);
+      const session = 'session_conflicting-job-' + item.name;
+      const fingerprint = 95640 + index;
+      const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+        content: '冲突任务绑定不得被当前任务接管。', fingerprint };
+      const job = jobValue(fx, 'conflicting-job-binding-' + item.name, 1, { plan });
+      job.data.session_id = session;
+      const outgoing = outgoingValue(fx, job, plan, { job_id: item.value });
+      writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+      const control = await webhook(fx, session, '真人已接管', 95650 + index,
+        { event: 'message:received', from: 'operator', automated: false });
+      const current = fx.runtime.readState(control.key);
+      const record = current.outgoing[String(fingerprint)];
+      assert.deepEqual(record.job_id, item.value, item.name + ' 不得改写已存在的 job_id');
+      assert.equal(record.status, 'unknown');
+      assert.equal(record.delivery_identity_version, undefined);
+      assert.equal(record.receipt_identity_unbound, undefined);
+      assert.equal(record.semantic_intent, undefined);
+      assert.equal(record.resend_forbidden, undefined);
+      assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+      assert.equal(current.mode, 'human');
+      assert.equal(fx.exactRequests.length, 0);
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+    }
+  });
+
+  await test('缺 job_id 的同 fingerprint 多计划歧义永久失败关闭，不随遍历顺序接管', async () => {
+    const fx = fixture('delivery-ambiguous-job-binding');
+    const session = 'session_ambiguous-job';
+    const fingerprint = 95658;
+    const firstPlan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '第一份歧义计划。', fingerprint };
+    const secondPlan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '第二份歧义计划。', fingerprint };
+    const first = jobValue(fx, 'ambiguous-job-binding-a', 1, { plan: firstPlan });
+    const second = jobValue(fx, 'ambiguous-job-binding-b', 2, { plan: secondPlan });
+    first.data.session_id = session;
+    second.data.session_id = session;
+    const outgoing = outgoingValue(fx, first, firstPlan);
+    delete outgoing.job_id;
+    writeState(fx, session, stateValue(fx, session, [first, second], {
+      outgoing: { [fingerprint]: outgoing },
+    }));
+
+    const control = await webhook(fx, session, '真人已接管', 95659,
+      { event: 'message:received', from: 'operator', automated: false });
+    const current = fx.runtime.readState(control.key);
+    const record = current.outgoing[String(fingerprint)];
+    assert.equal(Object.hasOwn(record, 'job_id'), false);
+    assert.equal(record.delivery_identity_version, undefined);
+    assert.equal(record.receipt_identity_unbound, true);
+    assert.equal(record.semantic_status, 'semantic_unknown');
+    assert.equal(record.resend_forbidden, true);
+    for (const id of [first.id, second.id]) {
+      assert.equal(current.jobs.find((entry) => entry.id === id).responsibility_status,
+        'intentional_silence');
+    }
+    assert.equal(current.mode, 'human');
+    assert.equal(fx.exactRequests.length, 0);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
+  });
+
+  await test('缺 job_id 的限流或拒绝记录不能仅凭 fingerprint 被当前任务接管', async () => {
+    for (const [index, status] of ['rate_limited', 'rejected'].entries()) {
+      const fx = fixture('delivery-unbound-' + status);
+      const session = 'session_unbound-' + status;
+      const fingerprint = 95662 + index;
+      const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+        content: '没有任务身份的已拒绝发送记录。', fingerprint };
+      const job = jobValue(fx, 'unbound-' + status, 1, { plan });
+      job.data.session_id = session;
+      const outgoing = outgoingValue(fx, job, plan, {
+        status, failure: status === 'rate_limited' ? 'crisp_rate_limited' : 'crisp_http_401',
+        recovery_deferred: true, next_action_at: fx.now() + 60000,
+      });
+      delete outgoing.job_id;
+      writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+      const control = await webhook(fx, session, '真人已接管', 95664 + index,
+        { event: 'message:received', from: 'operator', automated: false });
+      const current = fx.runtime.readState(control.key);
+      const record = current.outgoing[String(fingerprint)];
+      assert.equal(Object.hasOwn(record, 'job_id'), false);
+      assert.equal(record.status, status);
+      assert.equal(record.body.content, plan.content);
+      assert.equal(record.delivery_identity_version, undefined);
+      assert.equal(record.receipt_identity_unbound, undefined);
+      assert.equal(record.resend_forbidden, undefined);
+      assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+      assert.equal(current.mode, 'human');
+      assert.equal(fx.exactRequests.length, 0);
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+    }
+  });
+
+  await test('旧出站身份只有全部证据一致时冻结，冲突字段与恢复代保持失败关闭', async () => {
+    const cases = [
+      { name: 'body-mismatch', mutate: ({ outgoing }) => { outgoing.body.content = '与计划不一致的正文'; } },
+      { name: 'purpose-conflict', mutate: ({ outgoing }) => { outgoing.purpose = 'welcome'; } },
+      { name: 'semantic-conflict', mutate: ({ outgoing }) => { outgoing.semantic_intent = 'control'; } },
+      { name: 'digest-conflict', mutate: ({ outgoing }) => { outgoing.content_sha256 = 'b'.repeat(64); } },
+      { name: 'conversation-generation-conflict', mutate: ({ outgoing }) => { outgoing.generation = 1; } },
+      { name: 'response-generation-unbound', mutate: ({ job }) => { job.response_generation = 1; } },
+      { name: 'response-generation-malformed', mutate: ({ job }) => { job.response_generation = '0'; } },
+      { name: 'purpose-missing', mutate: ({ plan }) => { delete plan.purpose; } },
+      { name: 'type-missing', mutate: ({ plan }) => { delete plan.type; } },
+      { name: 'origin-conflict', mutate: ({ outgoing }) => { outgoing.body.origin = 'email'; } },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const fx = fixture('delivery-legacy-identity-' + item.name);
+      const session = 'session_legacy-' + item.name;
+      const fingerprint = 95610 + index;
+      const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+        content: '只有完整身份一致才允许迁移。', fingerprint };
+      const job = jobValue(fx, 'legacy-identity-' + item.name, 1, { plan });
+      job.data.session_id = session;
+      const outgoing = outgoingValue(fx, job, plan);
+      item.mutate({ job, outgoing, plan });
+      writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+      const control = await webhook(fx, session, '真人已接管', 95620 + index,
+        { event: 'message:received', from: 'operator', automated: false });
+      const current = fx.runtime.readState(control.key);
+      const record = current.outgoing[String(fingerprint)];
+      const expectedDigest = digest(canonical({ type: plan.type, content: plan.content }));
+      assert.notEqual(record.semantic_intent, 'answer', item.name + ' 不得猜测答案语义');
+      assert.notEqual(record.content_sha256, expectedDigest, item.name + ' 不得冻结冲突摘要');
+      assert.notEqual(record.response_generation, 0, item.name + ' 不得绑定不明恢复代');
+      assert.equal(record.resend_forbidden, true);
+      assert.equal(record.receipt_identity_unbound, true, item.name + ' 必须冻结冲突身份边界');
+      assert.equal(record.semantic_status, 'semantic_unknown');
+      assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+      assert.equal(current.mode, 'human');
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+
+      fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
+        content: record.body.content, fingerprint, timestamp: fx.now() - 1000 });
+      fx.tick(5000);
+      const reconciled = await fx.runtime.process(control.key, job.id);
+      if (item.name === 'digest-conflict') assert.equal(reconciled.status, 'retry');
+      else assert.equal(reconciled.status, 'delivery_semantic_unknown');
+      const settled = fx.runtime.readState(control.key);
+      const settledRecord = settled.outgoing[String(fingerprint)];
+      assert.equal(settledRecord.semantic_status, 'semantic_unknown');
+      assert.equal(settledRecord.receipt_identity_unbound, true);
+      assert(['unknown', 'sent'].includes(settledRecord.status));
+      assert.equal(settled.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+      assert.equal(settled.mode, 'human');
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+    }
+  });
+
+  await test('当前完整未知出站身份在政策取消时幂等保留', async () => {
+    const fx = fixture('delivery-current-identity-idempotent');
+    const session = 'session_current-identity';
+    const fingerprint = 95628;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '当前完整身份不得被迁移逻辑改写。', fingerprint };
+    const job = jobValue(fx, 'current-identity-idempotent', 1, { plan });
+    job.data.session_id = session;
+    const contentSha256 = digest(canonical({ type: plan.type, content: plan.content }));
+    const outgoing = outgoingValue(fx, job, plan, {
+      response_generation: 0, purpose: plan.purpose, message_type: plan.type,
+      semantic_intent: 'answer', content_sha256: contentSha256,
+      delivery_identity_version: 1,
+    });
+    writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+    const control = await webhook(fx, session, '真人已接管', 95629,
+      { event: 'message:received', from: 'operator', automated: false });
+    const current = fx.runtime.readState(control.key);
+    const record = current.outgoing[String(fingerprint)];
+    assert.deepEqual({ response_generation: record.response_generation, purpose: record.purpose,
+      message_type: record.message_type, semantic_intent: record.semantic_intent,
+      content_sha256: record.content_sha256 }, {
+      response_generation: 0, purpose: plan.purpose, message_type: plan.type,
+      semantic_intent: 'answer', content_sha256: contentSha256,
+    });
+    assert.equal(record.resend_forbidden, true);
+    assert.equal(record.delivery_identity_version, 1);
+    assert.equal(record.receipt_identity_unbound, undefined);
+    assert.equal(current.mode, 'human');
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
+    await fx.runtime.scan();
+    const repeated = fx.runtime.readState(control.key).outgoing[String(fingerprint)];
+    assert.equal(repeated.delivery_identity_version, 1);
+    assert.equal(repeated.receipt_identity_unbound, undefined,
+      '重复 expire/settle 不得把已经冻结的当前身份降为未知');
+  });
+
+  await test('起始 version1 身份字段冲突且计划已丢失时永久保持语义未知', async () => {
+    const cases = [
+      { name: 'semantic-prewritten', mutate: ({ outgoing }) => { outgoing.semantic_status = 'valid_answer'; } },
+      { name: 'origin-conflict', mutate: ({ outgoing }) => { outgoing.body.origin = 'email'; } },
+      { name: 'purpose-invalid', mutate: ({ outgoing }) => { outgoing.purpose = 'bad-purpose'; } },
+      { name: 'type-conflict', exactMismatch: true,
+        mutate: ({ outgoing }) => { outgoing.message_type = 'picker'; } },
+      { name: 'response-generation-conflict', mutate: ({ outgoing }) => { outgoing.response_generation = 1; } },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const fx = fixture('delivery-current-identity-' + item.name);
+      const session = 'session_current-identity-' + item.name;
+      const fingerprint = 95670 + index;
+      const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+        content: '计划已退休的当前格式未知出站。', fingerprint };
+      const job = jobValue(fx, 'current-identity-' + item.name, 1);
+      job.data.session_id = session;
+      const outgoing = outgoingValue(fx, job, plan, {
+        delivery_identity_version: 1, response_generation: 0,
+        purpose: plan.purpose, message_type: plan.type, semantic_intent: 'answer',
+        content_sha256: digest(canonical({ type: plan.type, content: plan.content })),
+      });
+      item.mutate({ outgoing });
+      writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+      const control = await webhook(fx, session, '真人已接管', 95680 + index,
+        { event: 'message:received', from: 'operator', automated: false });
+      let current = fx.runtime.readState(control.key);
+      let record = current.outgoing[String(fingerprint)];
+      assert.equal(record.delivery_identity_version, 1);
+      assert.equal(record.receipt_identity_unbound, true, item.name + ' 必须持久失败关闭');
+      assert.equal(record.semantic_status, 'semantic_unknown');
+      assert.equal(record.resend_forbidden, true);
+      assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+
+      fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
+        content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
+      fx.tick(5000);
+      const reconciled = await fx.runtime.process(control.key, job.id);
+      assert.equal(reconciled.status, item.exactMismatch ? 'retry' : 'delivery_semantic_unknown');
+      current = fx.runtime.readState(control.key);
+      record = current.outgoing[String(fingerprint)];
+      assert.equal(record.status, item.exactMismatch ? 'unknown' : 'sent');
+      assert.equal(record.semantic_status, 'semantic_unknown');
+      assert.equal(record.receipt_identity_unbound, true);
+      assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+        'intentional_silence');
+      assert.equal(current.mode, 'human');
+      assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1);
+      assert.equal(fx.postAttempts.length, 0);
+      assert.equal(fx.sent.length, 0);
+    }
+  });
+
+  await test('完整非零恢复代身份可冻结，不能把保守门禁退化为全部拒绝', async () => {
+    const fx = fixture('delivery-legacy-response-generation');
+    const session = 'session_legacy-response-generation';
+    const fingerprint = 95660;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '非零恢复代的完整身份答案。', fingerprint };
+    const job = jobValue(fx, 'legacy-response-generation', 1, { plan, response_generation: 1 });
+    job.data.session_id = session;
+    const outgoing = outgoingValue(fx, job, plan, { response_generation: 1 });
+    writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+
+    const control = await webhook(fx, session, '真人已接管', 95661,
+      { event: 'message:received', from: 'operator', automated: false });
+    const current = fx.runtime.readState(control.key);
+    const record = current.outgoing[String(fingerprint)];
+    assert.equal(record.delivery_identity_version, 1);
+    assert.equal(record.response_generation, 1);
+    assert.equal(record.semantic_intent, 'answer');
+    assert.equal(record.receipt_identity_unbound, undefined);
+    assert.equal(record.resend_forbidden, true);
+    assert.equal(current.jobs.find((entry) => entry.id === job.id).responsibility_status,
+      'intentional_silence');
+    assert.equal(current.mode, 'human');
+    assert.equal(fx.exactRequests.length, 0);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
+  });
+
+  await test('总开关取消同样先冻结旧出站身份，精确命中后不重发也不改写静默政策', async () => {
+    const fx = fixture('delivery-unknown-global-disable');
+    const session = 'session_unknown-global-off';
+    const fingerprint = 95630;
+    const plan = { type: 'text', purpose: 'keyword_reply', ordinary: true,
+      content: '总开关关闭前可能已发送的答案。', fingerprint };
+    const job = jobValue(fx, 'unknown-global-disable', 1, { plan });
+    job.data.session_id = session;
+    const outgoing = outgoingValue(fx, job, plan);
+    const key = fx.runtime.stateKey(website, session);
+    writeState(fx, session, stateValue(fx, session, [job], { outgoing: { [fingerprint]: outgoing } }));
+    fx.publishRuntimeConfiguration({ enabled: false });
+    fx.exactMessages.set(String(fingerprint), { session_id: session, from: 'operator', type: 'text',
+      content: plan.content, fingerprint, timestamp: fx.now() - 1000 });
+
+    assert.equal((await fx.runtime.process(key, job.id)).status, 'idle');
+    let current = fx.runtime.readState(key);
+    let stored = current.jobs.find((entry) => entry.id === job.id);
+    let record = current.outgoing[String(fingerprint)];
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'global_disabled');
+    assert.equal(record.semantic_intent, 'answer');
+    assert.equal(record.content_sha256, digest(canonical({ type: plan.type, content: plan.content })));
+    assert.equal(record.response_generation, 0);
+    assert.equal(record.resend_forbidden, true);
+
+    fx.tick(5000);
+    const reconciled = await fx.runtime.process(key, job.id);
+    assert.equal(reconciled.status, 'dispatched_after_cancel');
+    current = fx.runtime.readState(key);
+    stored = current.jobs.find((entry) => entry.id === job.id);
+    record = current.outgoing[String(fingerprint)];
+    assert.equal(record.status, 'sent');
+    assert.equal(record.receipt_current, false);
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1);
+    assert.equal(fx.postAttempts.length, 0);
+    assert.equal(fx.sent.length, 0);
   });
 
   await test('128×16KiB 受字节水位限制，超限 Hook 非2xx且旧状态字节不变', async () => {
