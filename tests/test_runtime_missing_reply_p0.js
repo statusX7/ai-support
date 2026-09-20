@@ -2597,8 +2597,20 @@ const test = async (name, action) => {
       assert.equal(settledRecord.semantic_status, 'semantic_unknown');
       assert.equal(settledRecord.receipt_identity_unbound, true);
       assert(['unknown', 'sent'].includes(settledRecord.status));
-      assert.equal(settled.jobs.find((entry) => entry.id === job.id).responsibility_status,
-        'intentional_silence');
+      const settledJob = settled.jobs.find((entry) => entry.id === job.id);
+      assert.equal(settledJob.responsibility_status, 'intentional_silence');
+      if (item.name === 'response-generation-unbound') {
+        assert.equal(fx.exactRequests.filter((value) => value === String(fingerprint)).length, 1,
+          '缺恢复代的旧回执只能进行一次精确对账');
+        assert.equal(settledRecord.status, 'sent');
+        assert.equal(Object.hasOwn(settledRecord, 'response_generation'), false,
+          '不能为旧出站猜写当前恢复代');
+        assert.equal(settledJob.delivery_receipt_unknown?.response_generation, 1,
+          '权威任务必须持久保存当前代的语义未知回执');
+        assert.equal(settledJob.delivery_receipt_unknown?.semantic_status, 'semantic_unknown');
+        assert.equal(settledJob.delivery_receipt_unknown?.receipt_current, null);
+        assert.equal(settledJob.delivery_receipt_unknown?.resend_forbidden, true);
+      }
       assert.equal(settled.mode, 'human');
       assert.equal(fx.postAttempts.length, 0);
       assert.equal(fx.sent.length, 0);

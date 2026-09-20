@@ -5468,8 +5468,12 @@ function createRuntime(env = {}, options = {}) {
       }
     });
     const updated = readState(key);
-    if (uncertainDeliveriesFor(updated, job).length || pending.size) return 'retry';
-    const receipt = frozenDeliveryReceiptFor(updated, job);
+    // 对账事务可能刚把未知回执证据写入持久 job。后续判断必须把同一份
+    // state 与其中的权威 job 配对，不能继续使用事务前快照而漏掉新证据。
+    assertJobExecution(updated, job, execution);
+    const updatedJob = updated.jobs.find((entry) => entry.id === job.id);
+    if (uncertainDeliveriesFor(updated, updatedJob).length || pending.size) return 'retry';
+    const receipt = frozenDeliveryReceiptFor(updated, updatedJob);
     if (receipt.semantic_status === 'none') return 'absent';
     const verdict = receiptDelivery(receipt);
     appendEvent(verdict === 'sent' ? 'orphaned_receipt_reconciled' : 'answer_responsibility_unresolved',
@@ -6286,8 +6290,11 @@ function createRuntime(env = {}, options = {}) {
       if (!eventTimeTerminal && !job.control) {
         await reclassifyOperatorPendingReceipt(key, job, execution);
       }
+      const receiptState = eventTimeTerminal ? null : readState(key);
+      if (receiptState) assertJobExecution(receiptState, job, execution);
+      const receiptJob = receiptState?.jobs.find((entry) => entry.id === job.id);
       const frozenReceipt = eventTimeTerminal ? { semantic_status: 'none', current: null }
-        : frozenDeliveryReceiptFor(readState(key), job);
+        : frozenDeliveryReceiptFor(receiptState, receiptJob);
       if (eventTimeTerminal) delivery = 'discarded';
       else if (['sent', 'dispatched_after_cancel', 'delivered_non_answer',
         'delivery_semantic_unknown'].includes(reconciliation)) delivery = reconciliation;
