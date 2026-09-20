@@ -36,6 +36,7 @@ async function main() {
   }
   fs.writeFileSync(path.join(deploy,'config/runtime.yaml'),'schema_version: 2\nenabled: true\nrevision: 1\napplied_revision: 0\n',{mode:0o640});
   const initialPrompt='## 虚构客服规则 🙂\n\n只回答测试资料。\n';
+  const anythingKey='synthetic-materials-key';
   fs.writeFileSync(path.join(deploy,'config/prompt.md'),initialPrompt,{mode:0o640});
   fs.writeFileSync(path.join(deploy,'knowledge/catalog.json'),JSON.stringify({schema_version:2,revision:1,libraries:[]})+'\n',{mode:0o640});
   fs.writeFileSync(path.join(deploy,'data/knowledge-manifest.json'),JSON.stringify({version:1,files:{},pending_files:{},garbage_locations:[]})+'\n',{mode:0o600});
@@ -58,6 +59,7 @@ async function main() {
   let uploadFailureAfterWrite=0;
   let uploadReplyLostAfterWrite=0;
   let uploadRequests=0;
+  const uploadEvents=[];
   let uploadLocationsPerDocument=1;
   let reuseNextLocation=null;
   let applyingObservation=null;
@@ -98,6 +100,18 @@ async function main() {
       send(200,{workspace:{slug:'crisp-support',openAiPrompt:prompt}});return;
     }
     if(request.url==='/api/v1/document/upload') {
+      assert.equal(request.headers.authorization,`Bearer ${anythingKey}`,'知识上传必须携带内存配置中的虚构认证头');
+      const uploadAuthResidues=fs.readdirSync(path.join(deploy,'tmp')).filter(name=>
+        name.startsWith('knowledge-curl.')||name.startsWith('materials-retry-curl.'));
+      assert.deepEqual(uploadAuthResidues,[],'HTTP请求在途时不得存在含认证的curl配置文件');
+      for(const name of fs.readdirSync(path.join(deploy,'tmp'))) {
+        const candidate=path.join(deploy,'tmp',name);
+        const candidateStat=fs.lstatSync(candidate);
+        if(candidateStat.isFile()&&!candidateStat.isSymbolicLink()) {
+          assert.equal(fs.readFileSync(candidate).includes(Buffer.from(anythingKey)),false,
+            `受管临时文件不得落盘虚构AnythingLLM Key：${name}`);
+        }
+      }
       uploadRequests++;
       const raw=data.toString('latin1');
       const match=/filename="([^"]+)"/.exec(raw);
@@ -107,6 +121,7 @@ async function main() {
       const contentEnd=boundary&&contentStart>=4?raw.indexOf(`\r\n--${boundary}`,contentStart):-1;
       if(contentStart<4||contentEnd<contentStart){send(400,{error:true});return;}
       const pageContent=data.subarray(contentStart,contentEnd).toString('utf8');
+      uploadEvents.push({filename,pageContent});
       const uploaded=[];
       for(let index=0;index<uploadLocationsPerDocument;index++) {
         const location=index===0&&reuseNextLocation?reuseNextLocation:`custom-documents/${filename}.${++sequence}.json`;
@@ -145,7 +160,7 @@ async function main() {
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const port=server.address().port;
-  fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=synthetic-materials-key\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nANYTHINGLLM_EMBED_STATE_WAIT_SECONDS=0\n`,{mode:0o600});
+  fs.writeFileSync(path.join(deploy,'.env'),`ANYTHINGLLM_API_KEY=${anythingKey}\nANYTHINGLLM_WORKSPACE=crisp-support\nANYTHINGLLM_PORT=${port}\nANYTHINGLLM_EMBED_STATE_WAIT_SECONDS=0\n`,{mode:0o600});
   const readbackFixture=path.join(deploy,'bin/materials-readback-fixture.js');
   fs.writeFileSync(readbackFixture,`'use strict';
 const crypto=require('node:crypto'),fs=require('node:fs'),path=require('node:path');
@@ -727,34 +742,77 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const realCurl=execFileSync('sh',['-c','command -v curl'],{encoding:'utf8'}).trim();
     assert.equal(fs.existsSync(realCurl),true);
     const curlWrapper=path.join(deploy,'bin/curl');
-    const dispatchMarker=path.join(work,'kill-before-upload-dispatch');
-    fs.writeFileSync(dispatchMarker,'armed\n',{mode:0o600});
+    const dispatchArm=path.join(work,'kill-before-upload-dispatch.arm');
+    const dispatchReady=path.join(work,'kill-before-upload-dispatch.ready');
+    fs.writeFileSync(dispatchArm,'armed\n',{mode:0o600});
     fs.writeFileSync(curlWrapper,[
       '#!/usr/bin/env bash',
       'set -euo pipefail',
-      `if [[ " $* " == *"/api/v1/document/upload"* && -f ${JSON.stringify(dispatchMarker)} ]]; then`,
-      `  rm -f -- ${JSON.stringify(dispatchMarker)}`,
-      '  kill -KILL "$PPID"',
-      '  exit 137',
+      'umask 077',
+      `if [[ " $* " == *"/api/v1/document/upload"* && -f ${JSON.stringify(dispatchArm)} ]]; then`,
+      `  rm -f -- ${JSON.stringify(dispatchArm)}`,
+      `  printf 'ready\\n' > ${JSON.stringify(`${dispatchReady}.tmp`)}`,
+      `  chmod 600 ${JSON.stringify(`${dispatchReady}.tmp`)}`,
+      `  mv -f -- ${JSON.stringify(`${dispatchReady}.tmp`)} ${JSON.stringify(dispatchReady)}`,
+      '  wrapper_pid=$BASHPID',
+      '  ( sleep 20; kill -CONT "$wrapper_pid" 2>/dev/null || true ) &',
+      '  watchdog_pid=$!',
+      '  kill -STOP "$wrapper_pid"',
+      '  kill "$watchdog_pid" 2>/dev/null || true',
+      '  wait "$watchdog_pid" 2>/dev/null || true',
+      '  exit 97',
       'fi',
       `exec ${JSON.stringify(realCurl)} "$@"`,
       '',
     ].join('\n'),{mode:0o700});
+    const dispatchUploadOffset=uploadRequests;
+    const dispatchEventOffset=uploadEvents.length;
     try {
-      result=await invoke(['apply']);assert.notEqual(result.code,0);
+      result=await invokeKilledAtMarker(['apply'],dispatchReady);
+      assert.equal(result.code,null,JSON.stringify(result));
+      assert.equal(result.signal,'SIGKILL',JSON.stringify(result));
+      assert.equal(result.markerObserved,true);assert.equal(result.groupGone,true);
     } finally {
       fs.rmSync(curlWrapper,{force:true});
-      fs.rmSync(dispatchMarker,{force:true});
+      fs.rmSync(dispatchArm,{force:true});
+      fs.rmSync(dispatchReady,{force:true});
+      fs.rmSync(`${dispatchReady}.tmp`,{force:true});
     }
     const dispatchRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    assert.equal(uploadRequests,dispatchUploadOffset,'请求发出前崩溃不得到达HTTP fixture');
     assert.equal(fs.existsSync(path.join(dispatchRecovery,'upload-intent.json')),true);
+    const dispatchUploadFilename=JSON.parse(
+      fs.readFileSync(path.join(dispatchRecovery,'upload-intent.json'),'utf8')).upload_filename;
+    assert.match(dispatchUploadFilename,/^crispai-upload-[a-f0-9]{32}\.[A-Za-z0-9]{1,16}$/);
     assert.equal(fs.existsSync(path.join(dispatchRecovery,'upload-payload')),true);
+    assert.equal(fs.existsSync(path.join(dispatchRecovery,'upload-response.json')),true);
+    assert.equal(fs.statSync(path.join(dispatchRecovery,'upload-response.json')).size,0);
+    assert.equal(fs.existsSync(path.join(dispatchRecovery,'touched.json')),false);
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
+    assert.deepEqual(fs.readdirSync(path.join(deploy,'tmp')).filter(name=>
+      name.startsWith('knowledge-curl.')||name.startsWith('materials-retry-curl.')),[],
+      '请求发出前崩溃不得遗留含认证的curl配置文件');
+    assert.equal(server.listening,true,'请求前崩溃注入不得终止测试HTTP服务');
+    for(const controlFile of [curlWrapper,dispatchArm,dispatchReady,`${dispatchReady}.tmp`,
+      `${dispatchReady}.group-ready`,`${dispatchReady}.group-ready.tmp`,
+      `${dispatchReady}.group-go`,`${dispatchReady}.group-go.tmp`]) {
+      assert.equal(fs.existsSync(controlFile),false,`请求前崩溃夹具控制文件残留：${path.basename(controlFile)}`);
+    }
     await ok(['apply']);
     const dispatchRecovered=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(dispatchRecovered.state,'applied');
     assert.notEqual(dispatchRecovered.source_sha256,dispatchCrashBaseline.source_sha256);
     assert.equal(fs.existsSync(dispatchRecovery),false);
+    const dispatchEvents=uploadEvents.slice(dispatchEventOffset);
+    assert.equal(uploadRequests,dispatchUploadOffset+3,'重入必须严格完成随机alias重放、旧代重建和新候选应用三个阶段');
+    assert.equal(dispatchEvents.length,3);
+    assert.equal(new Set(dispatchEvents.map(event=>event.filename)).size,3,'三个独立上传阶段必须使用不同随机alias');
+    assert.equal(dispatchEvents[0].filename,dispatchUploadFilename,'必须先重放中断前已冻结的上传责任');
+    assert.equal(dispatchEvents.filter(event=>event.filename===dispatchUploadFilename).length,1,
+      '中断前冻结的上传责任必须且只能重放一次');
+    assert.match(dispatchEvents[0].pageContent,/金色/);
+    assert.match(dispatchEvents[1].pageContent,/银色/);
+    assert.match(dispatchEvents[2].pageContent,/金色/);
     assert.equal(locations.length,1);assert.equal(documents.size,1);
     assert.match(parsedText(locations[0]),/金色/);
     await assertProjectionArtifacts(dispatchRecovered);

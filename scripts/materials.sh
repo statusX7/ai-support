@@ -1168,21 +1168,20 @@ materials_recovery_retry_upload() {
   local deploy_dir=$1 recovery="${1}/backups/config-history/materials.recovery"
   local response="${1}/backups/config-history/materials.recovery/upload-response.json"
   local intent="${1}/backups/config-history/materials.recovery/upload-intent.json"
-  local alias upload_config status_file escaped_key status=000 curl_result=0
+  local alias status_file escaped_key status=000 curl_result=0
   python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
     --recovery "$recovery" validate >/dev/null || return 1
   alias=$(jq -M -er '.upload_filename | select(type == "string" and test("^crispai-upload-[a-f0-9]{32}\\.[A-Za-z0-9]{1,16}$"))' \
     "$intent") || return 1
-  upload_config=$(mktemp "${deploy_dir}/tmp/materials-retry-curl.XXXXXXXX") || return 1
   status_file=$(mktemp "${deploy_dir}/tmp/materials-retry-status.XXXXXXXX") \
-    || { rm -f -- "$upload_config"; return 1; }
-  chmod 600 "$upload_config" "$status_file" || { rm -f -- "$upload_config" "$status_file"; return 1; }
+    || return 1
+  chmod 600 "$status_file" || { rm -f -- "$status_file"; return 1; }
   escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
-    || { rm -f -- "$upload_config" "$status_file"; return 1; }
-  printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config" \
-    || { rm -f -- "$upload_config" "$status_file"; return 1; }
-  if (umask 077; cd "$recovery" && curl --silent --output "$response" --write-out '%{http_code}' \
-    --connect-timeout 5 --max-time 300 --config "$upload_config" \
+    || { rm -f -- "$status_file"; return 1; }
+  if (umask 077; cd "$recovery" \
+    && printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" \
+    | curl --silent --output "$response" --write-out '%{http_code}' \
+    --connect-timeout 5 --max-time 300 --config - \
     --form "file=@upload-payload;filename=${alias}" \
     "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null) > "$status_file"; then
     curl_result=0
@@ -1190,7 +1189,7 @@ materials_recovery_retry_upload() {
     curl_result=$?
   fi
   status=$(<"$status_file")
-  rm -f -- "$upload_config" "$status_file"
+  rm -f -- "$status_file"
   # 响应正文或 alias 扫描由调用方统一收口；即使 curl/HTTP
   # 失败，请求也可能已落盘，不在这里删除责任。
   [[ "$curl_result" =~ ^[0-9]+$ && "$status" =~ ^[0-9]{3}$ ]]

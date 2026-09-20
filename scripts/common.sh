@@ -2935,7 +2935,7 @@ knowledge_sync_legacy() {
   local scope=${3:-null}
   local knowledge_dir=${4:-${deploy_dir}/knowledge}
   local manifest="${deploy_dir}/data/knowledge-manifest.json"
-  local response_file manifest_temp file filename hash old_hash locations old_locations payload status=000 upload_config stale_locations garbage_locations escaped_key
+  local response_file manifest_temp file filename hash old_hash locations old_locations payload status=000 stale_locations garbage_locations escaped_key
   local upload_filename='' upload_file=''
   local curl_result=0 response_persistent=false
   local pending_hash pending_locations pending_old_locations pending_started pending_age pending_retry_after update_status
@@ -3102,33 +3102,15 @@ knowledge_sync_legacy() {
         response_file=$(mktemp "${deploy_dir}/tmp/knowledge-upload.XXXXXX") \
           || { warn "无法建立知识上传临时文件：$filename"; ((failures += 1)); continue; }
       fi
-      if ! upload_config=$(mktemp "${deploy_dir}/tmp/knowledge-curl.XXXXXX"); then
-        warn "无法建立知识上传请求配置：$filename"
-        rm -f -- "$response_file"
-        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
-        ((failures += 1))
-        continue
-      fi
-      if ! chmod 600 "$upload_config"; then
-        rm -f -- "$upload_config" "$response_file"
-        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
-        ((failures += 1))
-        continue
-      fi
       escaped_key=$(curl_config_escape "$ANYTHING_KEY") \
-        || { rm -f -- "$upload_config" "$response_file";
+        || { rm -f -- "$response_file";
           [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true;
           die "AnythingLLM API Key 无法安全写入请求配置"; }
-      if ! printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" > "$upload_config"; then
-        rm -f -- "$upload_config" "$response_file"
-        [[ "$response_persistent" == false ]] || materials_recovery_finish_upload "$deploy_dir" || true
-        ((failures += 1))
-        continue
-      fi
       if [[ "$response_persistent" == true ]]; then
         if status=$(cd "${deploy_dir}/backups/config-history/materials.recovery" \
-          && curl --silent --output "$response_file" --write-out '%{http_code}' \
-            --connect-timeout 5 --max-time 300 --config "$upload_config" \
+          && printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" \
+          | curl --silent --output "$response_file" --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 300 --config - \
             --form "file=@upload-payload;filename=${upload_filename}" \
             "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null); then
           curl_result=0
@@ -3136,8 +3118,9 @@ knowledge_sync_legacy() {
           curl_result=$?
         fi
       else
-        if status=$(curl --silent --output "$response_file" --write-out '%{http_code}' \
-          --connect-timeout 5 --max-time 300 --config "$upload_config" \
+        if status=$(printf 'header = "Authorization: Bearer %s"\n' "$escaped_key" \
+          | curl --silent --output "$response_file" --write-out '%{http_code}' \
+          --connect-timeout 5 --max-time 300 --config - \
           --form "file=@${upload_file}" \
           "http://127.0.0.1:${ANYTHING_PORT}/api/v1/document/upload" 2>/dev/null); then
           curl_result=0
@@ -3145,7 +3128,6 @@ knowledge_sync_legacy() {
           curl_result=$?
         fi
       fi
-      rm -f -- "$upload_config"
       locations=$(jq -M -ce '[.documents[]?.location | select(type == "string")] | unique' \
         "$response_file" 2>/dev/null || printf '[]')
       if [[ "$response_persistent" == true && "$locations" != '[]' ]]; then
