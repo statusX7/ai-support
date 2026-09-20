@@ -3355,69 +3355,218 @@ const abortablePending = (signal, started) => {
   await test('V122-R03 控制任务总后台限为八个，普通满载仍可控制且控制积压不阻塞接收', async () => {
     const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
     let releaseControls;
-    delayedControlLookups = new Promise((resolve) => { releaseControls = resolve; });
+    let releaseRetryLookup;
+    let controlsReleased = false;
+    let retryReleased = false;
+    const releaseControlsOnce = () => {
+      if (controlsReleased) return;
+      controlsReleased = true;
+      releaseControls?.();
+    };
+    const releaseRetryOnce = () => {
+      if (retryReleased) return;
+      retryReleased = true;
+      releaseRetryLookup?.();
+    };
+    const totalPermitCount = () => fs.existsSync(permitRoot)
+      ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length : 0;
+    const controlJob = (session, jobId) => state(session).jobs.find((job) => job.id === jobId);
     const entries = [];
-    for (let index = 0; index < 10; index += 1) {
-      const session = 'session_control-capacity-' + String(index).padStart(2, '0');
-      const body = { ...message(session, '待核验人工事件 ' + index,
-        { from: 'operator', automated: undefined }), event: 'message:received' };
-      const history = histories.get(session) || [];
-      history.push(body.data);
-      histories.set(session, history);
-      entries.push(await runtime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } }));
-      assert.equal(entries.at(-1).route, 'process');
+    const sessions = [];
+    const started = [];
+    const running = [];
+    let eighth;
+    let retryPending;
+    let accepted;
+    let settledControls = 0;
+    const trackStarted = (promise) => {
+      started.push(promise);
+      promise.catch(() => {});
+      return promise;
+    };
+    try {
+      delayedControlLookups = new Promise((resolve) => { releaseControls = resolve; });
+      for (let index = 0; index < 9; index += 1) {
+        const session = 'session_control-capacity-' + String(index).padStart(2, '0');
+        sessions.push(session);
+        const body = { ...message(session, '待核验人工事件 ' + index,
+          { from: 'operator', automated: undefined }), event: 'message:received' };
+        const history = histories.get(session) || [];
+        history.push(body.data);
+        histories.set(session, history);
+        entries.push(await runtime.receive({ body, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } }));
+        assert.equal(entries.at(-1).route, 'process');
+      }
+      const workers = Array.from({ length: 8 }, () => createRuntime(env, runtimeOptions));
+      const trackedControl = (promise) => promise.then((result) => {
+        settledControls += 1;
+        return result;
+      }, (error) => {
+        settledControls += 1;
+        throw error;
+      });
+      running.push(...entries.slice(0, 7)
+        .map((entry, index) => trackStarted(
+          trackedControl(workers[index].process(entry.key, entry.jobId)))));
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (totalPermitCount() === 7) break;
+        await wait(5);
+      }
+      assert.equal(totalPermitCount(), 7);
+
+      const ordinaryEntry = await receive(message('session_control-capacity-ordinary', '控制满载下的普通问题'));
+      const ordinaryPending = trackStarted(runtime.process(ordinaryEntry.key, ordinaryEntry.jobId));
+      const ordinaryResult = await Promise.race([
+        ordinaryPending,
+        wait(500).then(() => ({ status: 'timeout' })),
+      ]);
+      assert.equal(ordinaryResult.status, 'sent', '七个控制任务时仍须为普通任务保留一个后台槽');
+      assert.equal(totalPermitCount(), 7, '普通任务完成后必须释放普通许可，七个控制任务仍在等待精确回查');
+
+      eighth = trackStarted(trackedControl(workers[7].process(entries[7].key, entries[7].jobId)));
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (totalPermitCount() === 8) break;
+        await wait(5);
+      }
+      assert.equal(totalPermitCount(), 8, '控制任务最多占八个后台许可');
+      assert.equal(settledControls, 0, '精确回查门释放前八个控制任务都必须仍在处理');
+
+      const capacityPending = trackStarted(runtime.process(entries[8].key, entries[8].jobId));
+      const deferred = await Promise.race([
+        capacityPending,
+        wait(500).then(() => ({ status: 'timeout' })),
+      ]);
+      assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
+      let deferredJob = controlJob(sessions[8], entries[8].jobId); assert(deferredJob);
+      assert(deferredJob.data);
+      const deferredData = structuredClone(deferredJob.data);
+      assert.equal(deferredJob.status, 'received');
+      assert.equal(deferredJob.responsibility_status, 'pending');
+      assert.equal(deferredJob.attempts, 0, '容量延期不得冒充一次控制处理尝试');
+      assert.equal(deferredJob.failure_code, undefined);
+      assert.equal(deferredJob.operator_resolution, undefined);
+      assert.equal(deferredJob.lease_until, 0);
+      assert.equal(deferredJob.retry_at, now + 1000);
+      assert.deepEqual(deferredJob.data, deferredData, '容量延期必须保留同一控制责任');
+      assert.equal(state(sessions[8]).worker, null);
+      assert.equal(totalPermitCount(), 8, '第九个容量延期不得改变前八个在途许可');
+
+      const acceptedPending = trackStarted(
+        receive(message('session_control-capacity-receive', '控制积压期间的新消息')));
+      accepted = await Promise.race([
+        acceptedPending,
+        wait(500).then(() => ({ status: 'timeout' })),
+      ]);
+      assert.notEqual(accepted.status, 'timeout');
+      assert.equal(accepted.accepted, true);
+      assert.equal(accepted.route, 'process');
+      assert.equal(settledControls, 0, '控制积压期间新消息持久接收不能释放或取代在途控制任务');
+      assert.equal(totalPermitCount(), 8, '持久接收不得占用后台处理许可');
+
+      releaseControlsOnce();
+      const firstResults = await Promise.all([...running, eighth]);
+      assert.equal(settledControls, 8);
+      assert(firstResults.every((result) => result.status === 'deferred'
+        && result.reason === 'operator_identity_pending'),
+      '精确身份仍未知时必须保留控制责任，不能猜测真人或自动消息');
+      delayedControlLookups = null;
+      assert.equal(totalPermitCount(), 0, '首批八个控制任务结算后必须释放全部后台许可');
+      for (let index = 0; index < 8; index += 1) {
+        const pending = controlJob(sessions[index], entries[index].jobId); assert(pending);
+        assert.equal(pending.status, 'received');
+        assert.equal(pending.responsibility_status, 'unresolved_failure');
+        assert.equal(pending.failure_code, 'operator_identity_pending');
+        assert.equal(pending.operator_resolution, undefined);
+        assert.equal(pending.attempts, 1);
+        assert.equal(pending.lease_until, 0);
+        assert(Number.isFinite(pending.retry_at) && pending.retry_at > now);
+        assert.equal(pending.execution_token, undefined);
+        assert(pending.data, '身份待确认时不得删除控制责任原始数据');
+        assert(state(sessions[index]).uncertain_events.includes(entries[index].jobId));
+        assert.equal(state(sessions[index]).mode, 'ai');
+        assert.equal(state(sessions[index]).worker, null);
+        assert.equal(Object.values(state(sessions[index]).outgoing || {})
+          .filter((record) => record.job_id === entries[index].jobId).length, 0);
+        assert.equal(sent.filter((entry) => entry.session_id === sessions[index]).length, 0);
+      }
+
+      now += 1001;
+      delayedControlLookups = new Promise((resolve) => { releaseRetryLookup = resolve; });
+      retryPending = trackStarted(runtime.process(entries[8].key, entries[8].jobId));
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (totalPermitCount() === 1) break;
+        await wait(5);
+      }
+      assert.equal(totalPermitCount(), 1, '第九个控制任务必须在容量恢复后真实重获唯一许可');
+      const retryOwner = JSON.parse(fs.readFileSync(path.join(permitRoot, 'slot-7/owner.json'), 'utf8'));
+      assert.equal(retryOwner.slot, 7);
+      assert.equal(retryOwner.kind, 'control');
+      deferredJob = controlJob(sessions[8], entries[8].jobId); assert(deferredJob);
+      assert.equal(deferredJob.status, 'processing');
+      assert.equal(deferredJob.attempts, 1);
+      assert.equal(deferredJob.operator_resolution, undefined);
+      assert.equal(typeof deferredJob.execution_token, 'string');
+      assert.deepEqual(deferredJob.data, deferredData);
+      assert(state(sessions[8]).uncertain_events.includes(entries[8].jobId));
+      assert.equal(state(sessions[8]).mode, 'ai');
+      assert.equal(state(sessions[8]).worker, null);
+
+      releaseRetryOnce();
+      const retryResult = await retryPending;
+      assert.deepEqual(retryResult, { status: 'deferred', reason: 'operator_identity_pending' });
+      delayedControlLookups = null;
+      deferredJob = controlJob(sessions[8], entries[8].jobId); assert(deferredJob);
+      assert.equal(deferredJob.status, 'received');
+      assert.equal(deferredJob.responsibility_status, 'unresolved_failure');
+      assert.equal(deferredJob.failure_code, 'operator_identity_pending');
+      assert.equal(deferredJob.operator_resolution, undefined);
+      assert.equal(deferredJob.attempts, 1);
+      assert.equal(deferredJob.lease_until, 0);
+      assert.equal(deferredJob.execution_token, undefined);
+      assert(Number.isFinite(deferredJob.retry_at) && deferredJob.retry_at > now);
+      assert.deepEqual(deferredJob.data, deferredData, '身份延期必须保留同一控制责任');
+      assert(state(sessions[8]).uncertain_events.includes(entries[8].jobId));
+      assert.equal(state(sessions[8]).mode, 'ai');
+      assert.equal(state(sessions[8]).worker, null);
+      assert.equal(Object.values(state(sessions[8]).outgoing || {})
+        .filter((record) => record.job_id === entries[8].jobId).length, 0);
+      assert.equal(sent.filter((entry) => entry.session_id === sessions[8]).length, 0);
+      assert.equal(totalPermitCount(), 0, '身份延期结算后必须再次释放控制许可');
+
+      for (let index = 0; index < entries.length; index += 1) {
+        const history = histories.get(sessions[index]) || [];
+        histories.set(sessions[index], history.map((item) =>
+          String(item.fingerprint) === String(controlJob(sessions[index], entries[index].jobId).data.fingerprint)
+            ? { ...item, automated: true } : item));
+      }
+      now = Math.max(now, ...entries.map((entry, index) =>
+        controlJob(sessions[index], entry.jobId).retry_at || now));
+      for (let index = 0; index < entries.length; index += 1) {
+        const resolved = await runtime.process(entries[index].key, entries[index].jobId);
+        assert.equal(resolved.status, 'none');
+        const completed = controlJob(sessions[index], entries[index].jobId); assert(completed);
+        assert.equal(completed.status, 'done');
+        assert.equal(completed.responsibility_status, 'control_handled');
+        assert.equal(completed.responsibility_reason, 'operator_identity_resolved');
+        assert.equal(completed.operator_resolution.result, 'not-human');
+        assert.equal(completed.failure_code, undefined);
+        assert.equal(state(sessions[index]).uncertain_events.includes(entries[index].jobId), false);
+        assert.equal(state(sessions[index]).mode, 'ai');
+        assert.equal(sent.filter((entry) => entry.session_id === sessions[index]).length, 0);
+      }
+      const acceptedResult = await runtime.process(accepted.key, accepted.jobId);
+      assert.equal(acceptedResult.status, 'sent', '容量恢复后必须继续处理积压期间已持久接收的普通问题');
+      const acceptedJob = controlJob('session_control-capacity-receive', accepted.jobId); assert(acceptedJob);
+      assert.equal(acceptedJob.status, 'done');
+      assert.equal(acceptedJob.responsibility_status, 'answered_confirmed');
+      assert.equal(sent.filter((entry) => entry.session_id === 'session_control-capacity-receive').length, 1);
+      assert.equal(totalPermitCount(), 0, '本场全部责任收口后不得遗留后台许可');
+    } finally {
+      releaseControlsOnce();
+      releaseRetryOnce();
+      await Promise.allSettled(started);
+      delayedControlLookups = null;
     }
-    const workers = Array.from({ length: 8 }, () => createRuntime(env, runtimeOptions));
-    const running = entries.slice(0, 7).map((entry, index) => workers[index].process(entry.key, entry.jobId));
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const count = fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length;
-      if (count === 7) break;
-      await wait(5);
-    }
-    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 7);
-
-    const ordinaryEntry = await receive(message('session_control-capacity-ordinary', '控制满载下的普通问题'));
-    const ordinaryResult = await Promise.race([
-      runtime.process(ordinaryEntry.key, ordinaryEntry.jobId),
-      wait(500).then(() => ({ status: 'timeout' })),
-    ]);
-    assert.equal(ordinaryResult.status, 'sent', '七个控制任务时仍须为普通任务保留一个后台槽');
-
-    const eighth = workers[7].process(entries[7].key, entries[7].jobId);
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const count = fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length;
-      if (count === 8) break;
-      await wait(5);
-    }
-    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 8,
-      '控制任务最多占八个后台许可');
-
-    const deferredStarted = Date.now();
-    const deferred = await Promise.race([
-      runtime.process(entries[8].key, entries[8].jobId),
-      wait(500).then(() => ({ status: 'timeout' })),
-    ]);
-    assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
-    assert(Date.now() - deferredStarted < 500, '第九个控制任务不得在 Code node 内等待');
-    const deferredJob = state('session_control-capacity-08').jobs.find((job) => job.id === entries[8].jobId);
-    assert.equal(deferredJob.status, 'received');
-    assert.equal(deferredJob.retry_at, now + 1000);
-
-    const receiveStarted = Date.now();
-    const accepted = await Promise.race([
-      receive(message('session_control-capacity-receive', '控制积压期间的新消息')),
-      wait(500).then(() => ({ status: 'timeout' })),
-    ]);
-    assert.notEqual(accepted.status, 'timeout');
-    assert.equal(accepted.accepted, true);
-    assert(Date.now() - receiveStarted < 500, '控制积压时持久接收仍须迅速完成');
-
-    releaseControls();
-    await Promise.all([...running, eighth]);
-    delayedControlLookups = null;
-    now += 1001;
-    assert.notEqual((await runtime.process(entries[8].key, entries[8].jobId)).status, 'deferred');
-    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length, 0);
   });
   await test('V122-R03 过期许可续租竞态不误删，稳定过期可回收且异常链接失败关闭', async () => {
     const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
