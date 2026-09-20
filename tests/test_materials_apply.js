@@ -24,6 +24,7 @@ async function main() {
   fs.mkdirSync(evidenceRoot, {recursive:true});
   const work = fs.mkdtempSync(path.join(evidenceRoot, 'materials-'));
   const deploy = path.join(work, 'deploy');
+  const projectionPath=path.join(deploy,'config/materials-applied.json');
   for (const directory of ['config','knowledge','tmp','data/runtime','data/anythingllm/documents/custom-documents','data/anythingllm/vector-cache','backups/config-history','bin']) {
     fs.mkdirSync(path.join(deploy, directory), {recursive:true});
   }
@@ -638,7 +639,6 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     assert.equal(fs.statSync(semanticDirectory).isDirectory(),true);
     pass('投影摘要与目录调和在 Bash 条件上下文中显式传播 Python 校验失败');
 
-    const projectionPath=path.join(deploy,'config/materials-applied.json');
     const stableHash=sha(projectionPath);
     fs.writeFileSync(path.join(deploy,'config/prompt.md'),'   \n',{mode:0o640});
     result=await invoke(['apply']);
