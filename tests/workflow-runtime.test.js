@@ -3248,61 +3248,109 @@ const abortablePending = (signal, started) => {
   await test('V122-R03 普通长任务跨执行限为七个，Webhook/人工控制不等待并保留扫描公平性', async () => {
     const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
     let releaseSlow;
+    let slowReleased = false;
+    let runningSettled = 0;
+    let running = [];
     delayedAll = new Promise((resolve) => { releaseSlow = resolve; });
+    const releaseSlowOnce = () => {
+      if (slowReleased) return;
+      slowReleased = true;
+      releaseSlow();
+    };
+    const permitCount = () => fs.existsSync(permitRoot)
+      ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length : 0;
+    const totalPermitCount = () => fs.existsSync(permitRoot)
+      ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)).length : 0;
     const entries = [];
-    for (let index = 0; index < 15; index += 1) {
-      entries.push(await receive(message('session_capacity-' + String(index).padStart(2, '0'), '容量测试问题 ' + index)));
+    try {
+      for (let index = 0; index < 15; index += 1) {
+        entries.push(await receive(message('session_capacity-' + String(index).padStart(2, '0'), '容量测试问题 ' + index)));
+      }
+      const workers = Array.from({ length: 7 }, () => createRuntime(env, runtimeOptions));
+      running = entries.slice(0, 7).map((entry, index) =>
+        workers[index].process(entry.key, entry.jobId).finally(() => { runningSettled += 1; }));
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (permitCount() === 7) break;
+        await wait(5);
+      }
+      assert.equal(permitCount(), 7, '七个不同 runtime 实例必须共享同一许可容量');
+      assert.equal(totalPermitCount(), 7, '普通任务占满时不得提前占用控制保留槽');
+
+      const deferred = await Promise.race([
+        runtime.process(entries[7].key, entries[7].jobId),
+        wait(500).then(() => ({ status: 'timeout' })),
+      ]);
+      assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
+      assert.equal(runningSettled, 0, '容量延期返回时七个普通任务必须仍被慢上游阻塞');
+      assert.equal(permitCount(), 7, '容量延期不得释放或窃取其它普通任务许可');
+      assert.equal(totalPermitCount(), 7, '普通任务容量延期不得遗留控制许可');
+      const deferredState = state('session_capacity-07');
+      const deferredJob = deferredState.jobs.find((job) => job.id === entries[7].jobId);
+      assert.equal(deferredJob.status, 'received');
+      assert.equal(deferredJob.lease_until, 0);
+      assert.equal(deferredState.worker, null);
+      assert.equal(deferredJob.retry_at, now + 1000);
+
+      const controlSession = 'session_capacity-control';
+      const controlVisibleBefore = sent.filter((entry) => entry.session_id === controlSession).length;
+      const visibleBeforeControl = sent.length;
+      const control = await Promise.race([
+        operator(controlSession),
+        wait(500).then(() => ({ status: 'timeout' })),
+      ]);
+      assert.notEqual(control.status, 'timeout', '人工控制不得被普通任务许可阻塞');
+      assert.equal(control.status, 'none');
+      assert.equal(control.key, key(controlSession));
+      assert.match(control.jobId, /^[a-f0-9]{64}$/);
+      assert.equal(runningSettled, 0, '人工控制完成时七个普通任务必须仍未结算');
+      assert.equal(permitCount(), 7, '人工控制必须使用保留容量，不能抢占普通许可');
+      assert.equal(totalPermitCount(), 7, '人工控制完成后必须释放控制保留槽');
+      const controlState = state(controlSession);
+      assert.equal(controlState.mode, 'human');
+      assert.equal(controlState.pause_reason, 'operator_reply');
+      assert.equal(controlState.last_human_at, now);
+      assert.equal(controlState.control_watermark, now);
+      assert.equal(controlState.human_event_id, control.jobId);
+      assert.equal(controlState.generation, 1);
+      assert.equal(controlState.worker, null);
+      const controlJobs = controlState.jobs.filter((job) => job.id === control.jobId);
+      assert.equal(controlJobs.length, 1);
+      assert.equal(controlJobs[0].control, true);
+      assert.equal(controlJobs[0].action, 'operator');
+      assert.equal(controlJobs[0].status, 'done');
+      assert.equal(controlJobs[0].responsibility_status, 'control_handled');
+      assert.equal(controlJobs[0].responsibility_reason, 'operator');
+      assert.equal(sent.length, visibleBeforeControl,
+        '真人控制完成不得向任何会话错误路由可见出站');
+      assert.equal(sent.filter((entry) => entry.session_id === controlSession).length,
+        controlVisibleBefore, '真人公开回复只提交控制状态，不产生本项目可见出站');
+
+      now += 1001;
+      const firstOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
+      const secondOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
+      assert(firstOrdinary.length > 0 && firstOrdinary.length <= 7, '每轮扫描最多返回许可容量个普通任务');
+      assert(secondOrdinary.length > 0 && secondOrdinary.length <= 7);
+      assert(new Set([...firstOrdinary, ...secondOrdinary].map((entry) => entry.key)).size > firstOrdinary.length,
+        '公平游标必须让上轮未选中的普通任务进入下一轮');
+
+      releaseSlowOnce();
+      const runningResults = await Promise.all(running);
+      assert.equal(runningSettled, 7);
+      assert(runningResults.every((result) => result.status === 'sent'));
+      delayedAll = null;
+      assert.equal((await runtime.process(entries[7].key, entries[7].jobId)).status, 'sent');
+      const remaining = await Promise.all(entries.slice(8)
+        .map((entry) => runtime.process(entry.key, entry.jobId)));
+      assert(remaining.every((result) => result.status === 'sent'));
+      assert.equal(permitCount(), 0, '完成后必须释放全部普通任务许可');
+      assert.equal(totalPermitCount(), 0, '完成后不得遗留控制保留槽');
+      assert.equal(sent.filter((entry) => entry.session_id === controlSession).length,
+        controlVisibleBefore, '普通任务恢复后也不得给人工控制事件生成回复');
+    } finally {
+      releaseSlowOnce();
+      await Promise.allSettled(running);
+      delayedAll = null;
     }
-    const workers = Array.from({ length: 7 }, () => createRuntime(env, runtimeOptions));
-    const running = entries.slice(0, 7).map((entry, index) => workers[index].process(entry.key, entry.jobId));
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const count = fs.existsSync(permitRoot)
-        ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length : 0;
-      if (count === 7) break;
-      await wait(5);
-    }
-    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length, 7,
-      '七个不同 runtime 实例必须共享同一许可容量');
-
-    const deferredStarted = Date.now();
-    const deferred = await Promise.race([
-      runtime.process(entries[7].key, entries[7].jobId),
-      wait(500).then(() => ({ status: 'timeout' })),
-    ]);
-    const deferredElapsed = Date.now() - deferredStarted;
-    assert.deepEqual(deferred, { status: 'deferred', reason: 'processing_capacity' });
-    assert(deferredElapsed < 500, '拿不到许可时不得在 Code node 内等待');
-    const deferredState = state('session_capacity-07');
-    const deferredJob = deferredState.jobs.find((job) => job.id === entries[7].jobId);
-    assert.equal(deferredJob.status, 'received');
-    assert.equal(deferredJob.lease_until, 0);
-    assert.equal(deferredState.worker, null);
-    assert.equal(deferredJob.retry_at, now + 1000);
-
-    const controlStarted = Date.now();
-    const control = await Promise.race([
-      operator('session_capacity-control'),
-      wait(500).then(() => ({ status: 'timeout' })),
-    ]);
-    assert.notEqual(control.status, 'timeout', '人工控制不得被普通任务许可阻塞');
-    assert(Date.now() - controlStarted < 500);
-    assert.equal(state('session_capacity-control').mode, 'human');
-
-    now += 1001;
-    const firstOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
-    const secondOrdinary = (await runtime.scan()).filter((entry) => !entry.control);
-    assert(firstOrdinary.length > 0 && firstOrdinary.length <= 7, '每轮扫描最多返回许可容量个普通任务');
-    assert(secondOrdinary.length > 0 && secondOrdinary.length <= 7);
-    assert(new Set([...firstOrdinary, ...secondOrdinary].map((entry) => entry.key)).size > firstOrdinary.length,
-      '公平游标必须让上轮未选中的普通任务进入下一轮');
-
-    releaseSlow();
-    await Promise.all(running);
-    delayedAll = null;
-    assert.equal((await runtime.process(entries[7].key, entries[7].jobId)).status, 'sent');
-    await Promise.all(entries.slice(8).map((entry) => runtime.process(entry.key, entry.jobId)));
-    assert.equal(fs.readdirSync(permitRoot).filter((name) => /^slot-[0-6]$/.test(name)).length, 0,
-      '完成后必须释放全部普通任务许可');
   });
   await test('V122-R03 控制任务总后台限为八个，普通满载仍可控制且控制积压不阻塞接收', async () => {
     const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
