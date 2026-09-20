@@ -1153,19 +1153,30 @@ const test = async (name, action) => {
 
       fx.tick(16000);
       let clockRewound = false;
-      const content = variant === 'too_large' ? 'x'.repeat(263000) : {
-        // catchupMessage 已完成结构校验后，在内部 receive 计算请求字节时模拟
-        // 本机时钟突然回拨，使同一个候选被 receive 以 400 拒绝。
-        toJSON() {
-          if (!clockRewound) { fx.tick(-120000); clockRewound = true; }
-          return { text: '受控时间边界消息' };
-        },
-      };
+      const content = variant === 'too_large' ? 'x'.repeat(262100) : '受控时间边界消息';
       fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
         updated_at: coveredWatermark + 1000 }]);
-      fx.catchupMessages.set(session, [{ website_id: website, session_id: session,
+      const candidate = { website_id: website, session_id: session,
         from: 'user', type: 'text', content, fingerprint: variant === 'too_large' ? 95514 : 95513,
-        timestamp: coveredWatermark + 1000 }]);
+        timestamp: coveredWatermark + 1000 };
+      if (variant === 'invalid_after_validation') {
+        // catchupMessage 已完成 event_time 与字符串正文校验后才读取可选 origin。
+        // 此处只回拨一次受控时钟，使随后内部 receive 的未来时间保护返回400。
+        Object.defineProperty(candidate, 'origin', { enumerable: true, get() {
+          if (!clockRewound) { fx.tick(-120000); clockRewound = true; }
+          return 'chat';
+        } });
+      } else {
+        const internalBody = { website_id: website, event: 'message:send',
+          timestamp: candidate.timestamp, data: { session_id: session, from: candidate.from,
+            type: candidate.type, content: candidate.content, fingerprint: candidate.fingerprint,
+            timestamp: candidate.timestamp } };
+        assert(Buffer.byteLength(content, 'utf8') <= 262144,
+          '413 夹具正文自身必须先通过 catchup 内容校验');
+        assert(Buffer.byteLength(JSON.stringify(internalBody), 'utf8') > 262144,
+          '413 夹具完整 internal receive 请求必须超过持久化入口上限');
+      }
+      fx.catchupMessages.set(session, [candidate]);
 
       const result = await fx.runtime.catchup();
       if (clockRewound) fx.tick(120000);
