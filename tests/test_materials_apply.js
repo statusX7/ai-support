@@ -190,6 +190,117 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
+  const delay=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+  const processGroupId=pid=>{
+    const value=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
+    const close=value.lastIndexOf(') ');
+    if(close<0)throw new Error(`无法解析进程状态：${pid}`);
+    const suffix=value.slice(close+2).trim().split(/\s+/);
+    if(suffix.length<3||!/^\d+$/.test(suffix[2]))throw new Error(`无法读取进程组：${pid}`);
+    return Number(suffix[2]);
+  };
+  const processGroupAlive=pgid=>{
+    try { process.kill(-pgid,0);return true; }
+    catch(error) { if(error.code==='ESRCH')return false;throw error; }
+  };
+  const invokeKilledAtMarker=async(args,readyMarker,extra={})=>{
+    const ownPgid=processGroupId(process.pid);
+    const groupReady=`${readyMarker}.group-ready`;
+    const groupGo=`${readyMarker}.group-go`;
+    const groupReadyTmp=`${groupReady}.tmp`;
+    const groupGoTmp=`${groupGo}.tmp`;
+    for(const file of [groupReady,groupGo,groupReadyTmp,groupGoTmp])fs.rmSync(file,{force:true});
+    const launcher=[
+      'set -euo pipefail',
+      'group_ready=$1',
+      'group_go=$2',
+      'shift 2',
+      'umask 077',
+      'printf "%s\\n" "$BASHPID" > "${group_ready}.tmp"',
+      'mv -f -- "${group_ready}.tmp" "$group_ready"',
+      'deadline=$((SECONDS+10))',
+      'while [[ ! -f "$group_go" ]]; do',
+      '  (( SECONDS < deadline )) || exit 96',
+      '  sleep 0.02',
+      'done',
+      'exec bash "$@"',
+    ].join('\n');
+    const child=spawn('bash',['-c',launcher,'materials-crash-group',groupReady,groupGo,
+      path.join(root,'scripts/materials.sh'),'--deploy-dir',deploy,...args],{
+      cwd:work,detached:true,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`,...extra}
+    });
+    let stdout='',stderr='',closedResult=null,spawnError=null,pgid=null;
+    child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    const closed=new Promise(resolve=>{
+      child.on('error',error=>{spawnError=error;});
+      child.on('close',(code,signal)=>{closedResult={code,signal,stdout,stderr};resolve(closedResult);});
+    });
+    const waitForClose=async(timeout,message)=>{
+      const timeoutValue=Symbol('close-timeout');
+      const value=await Promise.race([closed,delay(timeout).then(()=>timeoutValue)]);
+      if(value===timeoutValue)throw new Error(message);
+      return value;
+    };
+    const killAndDrainGroup=async()=>{
+      if(pgid===null||pgid!==child.pid||pgid===ownPgid)throw new Error('拒绝清理未经核验的测试进程组');
+      if(processGroupAlive(pgid))process.kill(-pgid,'SIGKILL');
+      const result=await waitForClose(3000,`崩溃测试主进程未退出：${child.pid}`);
+      const goneDeadline=Date.now()+3000;
+      while(processGroupAlive(pgid)&&Date.now()<goneDeadline)await delay(20);
+      if(processGroupAlive(pgid)) {
+        process.kill(-pgid,'SIGKILL');
+        const finalDeadline=Date.now()+1000;
+        while(processGroupAlive(pgid)&&Date.now()<finalDeadline)await delay(20);
+      }
+      if(processGroupAlive(pgid))throw new Error(`崩溃测试进程组未退出：${pgid}`);
+      return result;
+    };
+    try {
+      const groupDeadline=Date.now()+3000;
+      while(!fs.existsSync(groupReady)) {
+        if(closedResult)throw new Error(`隔离进程组尚未就绪，apply 已退出：${JSON.stringify(closedResult)}`);
+        if(Date.now()>=groupDeadline)throw new Error('未在时限内建立隔离测试进程组');
+        await delay(20);
+      }
+      if(spawnError)throw spawnError;
+      const announcedPid=fs.readFileSync(groupReady,'utf8').trim();
+      if(!/^\d+$/.test(announcedPid)||Number(announcedPid)!==child.pid) {
+        throw new Error(`隔离进程组身份不一致：child=${child.pid} announced=${announcedPid}`);
+      }
+      const observedPgid=processGroupId(child.pid);
+      if(observedPgid!==child.pid||observedPgid===ownPgid) {
+        throw new Error(`拒绝向未隔离进程组发送信号：child=${child.pid} pgrp=${observedPgid} own=${ownPgid}`);
+      }
+      pgid=observedPgid;
+      fs.writeFileSync(groupGoTmp,'go\n',{mode:0o600});
+      fs.renameSync(groupGoTmp,groupGo);
+      const markerDeadline=Date.now()+20000;
+      while(!fs.existsSync(readyMarker)) {
+        if(closedResult)throw new Error(`崩溃窗口尚未建立，apply 已退出：${JSON.stringify(closedResult)}`);
+        if(Date.now()>=markerDeadline)throw new Error('未在时限内观察到持久上传回执崩溃窗口');
+        await delay(20);
+      }
+      if(spawnError)throw spawnError;
+      const result=await killAndDrainGroup();
+      return {...result,markerObserved:true,groupGone:true};
+    } catch(error) {
+      try {
+        if(pgid!==null)await killAndDrainGroup();
+        else if(!closedResult) {
+          child.kill('SIGKILL');
+          await waitForClose(3000,`未核验的测试启动进程未退出：${child.pid}`);
+          const startupGoneDeadline=Date.now()+1000;
+          while(processGroupAlive(child.pid)&&Date.now()<startupGoneDeadline)await delay(20);
+          if(processGroupAlive(child.pid))throw new Error(`未核验的测试启动进程组仍存在：${child.pid}`);
+        }
+      } catch(cleanupError) {
+        if(cleanupError.code!=='ESRCH')error.cleanupError=cleanupError.message;
+      }
+      throw error;
+    } finally {
+      for(const file of [groupReady,groupGo,groupReadyTmp,groupGoTmp])fs.rmSync(file,{force:true});
+    }
+  };
   const ok=async(args)=>{const result=await invoke(args);assert.equal(result.code,0,`${args.join(' ')}\n${result.stderr}\n${result.stdout}`);return result;};
   const invokeReadback=()=>new Promise(resolve=>{
     const child=spawn('bash',['-c','source "$1"; materials_projection_readback "$2"','materials-readback',path.join(root,'scripts/materials.sh'),deploy],{
@@ -481,31 +592,65 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     const responseCrashBaseline=JSON.parse(fs.readFileSync(projectionPath));
     const responseCrashLocations=[...locations];
     const responseCrashRecovery=path.join(deploy,'backups/config-history/materials.recovery');
-    const responseCrashMarker=path.join(work,'kill-after-upload-response');
-    const responseCrashCurl=path.join(deploy,'bin/curl');
-    const responseCrashRealCurl=execFileSync('sh',['-c','command -v curl'],{encoding:'utf8'}).trim();
-    fs.writeFileSync(responseCrashMarker,'armed\n',{mode:0o600});
-    fs.writeFileSync(responseCrashCurl,[
+    const responseCrashArm=path.join(work,'kill-after-upload-response.arm');
+    const responseCrashReady=path.join(work,'kill-after-upload-response.ready');
+    const responseCrashJq=path.join(deploy,'bin/jq');
+    const responseCrashFile=path.join(responseCrashRecovery,'upload-response.json');
+    const responseCrashRealJq=execFileSync('sh',['-c','command -v jq'],{encoding:'utf8'}).trim();
+    fs.writeFileSync(responseCrashArm,'armed\n',{mode:0o600});
+    fs.writeFileSync(responseCrashJq,[
       '#!/usr/bin/env bash',
       'set -euo pipefail',
-      `${JSON.stringify(responseCrashRealCurl)} "$@"`,
-      `if [[ " $* " == *"/api/v1/document/upload"* && -f ${JSON.stringify(responseCrashMarker)} ]]; then`,
-      `  rm -f -- ${JSON.stringify(responseCrashMarker)}`,
-      '  kill -KILL "$PPID"',
+      'umask 077',
+      'jq_rc=0',
+      `${JSON.stringify(responseCrashRealJq)} "$@" || jq_rc=$?`,
+      'saw_filter=false',
+      'saw_response=false',
+      'for argument in "$@"; do',
+      `  [[ "$argument" == '[.documents[]?.location | select(type == "string")] | unique' ]] && saw_filter=true`,
+      `  [[ "$argument" == ${JSON.stringify(responseCrashFile)} ]] && saw_response=true`,
+      'done',
+      `if (( jq_rc == 0 )) && [[ "$saw_filter" == true && "$saw_response" == true && -f ${JSON.stringify(responseCrashArm)} ]]; then`,
+      `  rm -f -- ${JSON.stringify(responseCrashArm)}`,
+      `  printf 'ready\\n' > ${JSON.stringify(`${responseCrashReady}.tmp`)}`,
+      `  chmod 600 ${JSON.stringify(`${responseCrashReady}.tmp`)}`,
+      `  mv -f -- ${JSON.stringify(`${responseCrashReady}.tmp`)} ${JSON.stringify(responseCrashReady)}`,
+      '  wrapper_pid=$BASHPID',
+      '  ( sleep 20; kill -CONT "$wrapper_pid" 2>/dev/null || true ) &',
+      '  watchdog_pid=$!',
+      '  kill -STOP "$wrapper_pid"',
+      '  kill "$watchdog_pid" 2>/dev/null || true',
+      '  wait "$watchdog_pid" 2>/dev/null || true',
+      '  exit 97',
       'fi',
+      'exit "$jq_rc"',
       '',
     ].join('\n'),{mode:0o700});
     reuseNextLocation=responseCrashLocations[0];
     try {
-      result=await invoke(['apply','--force-knowledge']);assert.notEqual(result.code,0);
+      result=await invokeKilledAtMarker(['apply','--force-knowledge'],responseCrashReady);
+      assert.equal(result.code,null,JSON.stringify(result));
+      assert.equal(result.signal,'SIGKILL',JSON.stringify(result));
+      assert.equal(result.markerObserved,true);assert.equal(result.groupGone,true);
     } finally {
-      fs.rmSync(responseCrashCurl,{force:true});
-      fs.rmSync(responseCrashMarker,{force:true});
+      fs.rmSync(responseCrashJq,{force:true});
+      fs.rmSync(responseCrashArm,{force:true});
+      fs.rmSync(responseCrashReady,{force:true});
+      fs.rmSync(`${responseCrashReady}.tmp`,{force:true});
     }
     assert.equal(fs.existsSync(path.join(responseCrashRecovery,'upload-response.json')),true);
     assert.equal(fs.existsSync(path.join(responseCrashRecovery,'upload-intent.json')),true);
+    assert.equal(fs.existsSync(path.join(responseCrashRecovery,'upload-payload')),true);
     assert.equal(fs.existsSync(path.join(responseCrashRecovery,'touched.json')),false,
       '测试必须停在HTTP回执已落盘但恢复账本尚未写入的崩溃窗口');
+    assert.deepEqual(fs.readdirSync(path.join(deploy,'tmp')).filter(name=>name.startsWith('knowledge-curl.')),[],
+      '持久回执崩溃窗口必须位于含认证curl配置删除之后');
+    assert.equal(server.listening,true,'崩溃注入不得终止测试HTTP服务');
+    for(const controlFile of [responseCrashJq,responseCrashArm,responseCrashReady,`${responseCrashReady}.tmp`,
+      `${responseCrashReady}.group-ready`,`${responseCrashReady}.group-ready.tmp`,
+      `${responseCrashReady}.group-go`,`${responseCrashReady}.group-go.tmp`]) {
+      assert.equal(fs.existsSync(controlFile),false,`崩溃夹具控制文件残留：${path.basename(controlFile)}`);
+    }
     assert.equal(JSON.parse(fs.readFileSync(projectionPath)).state,'applying');
     const responseCrashUploadOffset=uploadRequests;
     await ok(['apply']);
