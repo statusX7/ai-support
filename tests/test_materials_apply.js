@@ -595,6 +595,22 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
     child.on('close',code=>resolve({code,stdout,stderr}));
   });
+  const publishInterruptedProjection=revision=>new Promise(resolve=>{
+    const effective=path.join(deploy,'tmp','materials-effective.fixture');
+    assert.equal(fs.existsSync(effective),false,'中断夹具不得覆盖已有受管临时文件');
+    fs.copyFileSync(projectionPath,effective);fs.chmodSync(effective,0o600);
+    const child=spawn('bash',['-c',[
+      'set -euo pipefail',
+      'source "$1"',
+      'materials_recovery_capture "$2" "$3" "$4" verified',
+      'materials_publish_old_generation "$2" "$3" "$5" applying',
+    ].join('\n'),'materials-interruption-fixture',path.join(root,'scripts/materials.sh'),deploy,
+    effective,path.join(deploy,'backups/config-history/materials.applied.tar.gz'),String(revision)],{
+      cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}
+    });
+    let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    child.on('close',code=>{fs.rmSync(effective,{force:true});resolve({code,stdout,stderr});});
+  });
   const assertProjectionArtifacts=async projection=>{
     const files={manifest:'data/knowledge-manifest.json',map:'data/runtime/knowledge-map.json',
       settings:'data/runtime/knowledge-settings.json',profile:'data/runtime/knowledge-profile.json',
@@ -1354,18 +1370,46 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
 
     const interrupted=JSON.parse(fs.readFileSync(projectionPath));
     const interruptedAppliedRevision=interrupted.revision;
-    interrupted.revision+=1;interrupted.state='applying';
-    interrupted.configuration.runtime.revision=interrupted.revision;
-    interrupted.configuration.runtime.applied_revision=interruptedAppliedRevision;
-    fs.writeFileSync(projectionPath,JSON.stringify(interrupted)+'\n',{mode:0o640});
+    const interruptedRevision=interruptedAppliedRevision+1;
+    const interruptedRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    assert.equal(fs.existsSync(interruptedRecovery),false,'建立中断夹具前不得沿用旧恢复事务');
+    result=await publishInterruptedProjection(interruptedRevision);
+    assert.equal(result.code,0,result.stderr||result.stdout);
+    const interruptedBarrier=JSON.parse(fs.readFileSync(projectionPath));
+    assert.equal(interruptedBarrier.state,'applying');
+    assert.equal(interruptedBarrier.revision,interruptedRevision);
+    assert.equal(interruptedBarrier.configuration.runtime.revision,interruptedRevision);
+    assert.equal(interruptedBarrier.configuration.runtime.applied_revision,interruptedAppliedRevision);
+    assert.equal(fs.statSync(interruptedRecovery).mode&0o777,0o700);
+    for(const name of ['complete.json','projection.json','source.tar.gz']) {
+      assert.equal(fs.statSync(path.join(interruptedRecovery,name)).mode&0o777,0o600,
+        `中断恢复成员权限：${name}`);
+    }
+    const interruptedComplete=JSON.parse(
+      fs.readFileSync(path.join(interruptedRecovery,'complete.json'),'utf8'));
+    assert.equal(interruptedComplete.schema_version,2);
+    assert.equal(interruptedComplete.capture_mode,'verified');
+    assert.equal(interruptedComplete.projection_sha256,
+      sha(path.join(interruptedRecovery,'projection.json')));
+    assert.equal(interruptedComplete.source_sha256,
+      sha(path.join(interruptedRecovery,'source.tar.gz')));
+    assert.deepEqual([...interruptedComplete.managed_locations].sort(),[...locations].sort());
+    assert.deepEqual([...interruptedComplete.observed_workspace_locations].sort(),[...locations].sort());
+    assert.deepEqual([...interruptedComplete.protected_workspace_locations].sort(),[...locations].sort());
+    assert.deepEqual([...interruptedComplete.deletable_managed_locations].sort(),[...locations].sort());
+    assert.deepEqual(interruptedComplete.missing_managed_locations,[]);
+    assert.equal(typeof interruptedComplete.inventory,'object');
+    let interruptedHelper=await invokeRecovery(interruptedRecovery,['validate']);
+    assert.equal(interruptedHelper.code,0,interruptedHelper.stderr);
     result=await invoke(['status']);assert.notEqual(result.code,0);assert.equal(JSON.parse(result.stdout).pending,true);
     const beforeRecovery={promptUpdates,embeddingUpdates};
     await ok(['apply']);
     const recovered=JSON.parse(fs.readFileSync(projectionPath));
     assert.equal(recovered.state,'applied');
-    assert.equal(recovered.revision,interrupted.revision+1);
+    assert.equal(recovered.revision,interruptedRevision+1);
     assert.equal(recovered.configuration.runtime.applied_revision,recovered.revision);
     assert.ok(promptUpdates>beforeRecovery.promptUpdates);assert.ok(embeddingUpdates>beforeRecovery.embeddingUpdates);
+    assert.equal(fs.existsSync(interruptedRecovery),false,'完成恢复后必须退役受限事务目录');
     pass('中断遗留 applying 即使原文哈希相同也会重做外部同步与回读后才解除停发');
 
     const validProjection=fs.readFileSync(projectionPath);
