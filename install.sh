@@ -578,7 +578,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     AI_API_KEY=$(jq -er '.provider.api_key | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     AI_MODEL=$(jq -er '.provider.model | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     AI_API_MODE=$(jq -er '.provider.api_mode | select(. == "chat_completions" or . == "responses")' "$WIZARD_RESULT")
-    AI_SUPPORTS_VISION=$(jq -er '.provider.capabilities.vision | select(type == "boolean")' "$WIZARD_RESULT")
+    AI_SUPPORTS_VISION=$(jq -er '.provider.capabilities.vision | select(type == "boolean") | tostring' "$WIZARD_RESULT")
     PUBLIC_URL_VALUE=$(jq -er '.webhook.public_base_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     WEBHOOK_PRODUCTION_VALUE=$(jq -er '.webhook.production_url | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     WEBHOOK_MODE_VALUE=$(jq -er '.webhook.mode | select(type == "string" and length > 0)' "$WIZARD_RESULT")

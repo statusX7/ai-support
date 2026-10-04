@@ -4,6 +4,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 ORIGINAL_PATH=$PATH
+
+# 读取生产安装器的实际表达式；合法 false 不应触发 set -e，非法类型仍拒绝。
+python3 - "$PROJECT_ROOT/install.sh" <<'PY'
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).read_text()
+match = re.search(r'''AI_SUPPORTS_VISION=\$\(jq -er '([^']+)' "\$WIZARD_RESULT"\)''', source)
+if match is None:
+    raise SystemExit("缺少交互安装的图片能力读取")
+expression = match.group(1)
+for value in (True, False, None, "false", 0, [], {}):
+    result = subprocess.run(
+        ["jq", "-er", expression],
+        input=json.dumps({"provider": {"capabilities": {"vision": value}}}).encode(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+    )
+    if type(value) is bool:
+        if result.returncode != 0 or result.stdout.strip() != str(value).lower().encode():
+            raise SystemExit("合法布尔能力未原样读出")
+    elif result.returncode == 0:
+        raise SystemExit("图片能力错误类型未拒绝")
+print("通过：[UNIT/CONTRACT] 交互安装接受 true/false，拒绝非布尔能力类型")
+PY
+if [[ "${AI_SUPPORT_INSTALL_VISION_CONTRACT_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
 WORK=$(mktemp -d "${PROJECT_ROOT}/.test-runtime.install-resume.XXXXXX")
 
 cleanup() {
