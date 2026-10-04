@@ -103,6 +103,12 @@ validate_preserved_installation() {
   if [[ -f "$env_file" && ! -L "$env_file" ]]; then
     for key in "${required_env_keys[@]}"; do
       value=$(env_get "$env_file" "$key" 2>/dev/null || true)
+      # 新装的内部 API Key 在组件启动后自动生成，未完成安装可以继续该步骤。
+      if [[ "$key" == ANYTHINGLLM_API_KEY && "$value" == pending-anythingllm-api-key ]]; then
+        case "$(installation_state "$deploy_dir")" in
+          installing|staged) continue ;;
+        esac
+      fi
       if is_placeholder "$value" || ! validate_env_value "$value"; then
         reconfigure_reasons+=(".env:${key}")
       fi

@@ -143,6 +143,68 @@ secret_before=$(digest "${DEPLOY}/secrets/provider/generations/${generation}.jso
 adapter_key_before=$(sed -n 's/^PROVIDER_ADAPTER_KEY=//p' "${DEPLOY}/.env")
 [[ -n "$adapter_key_before" ]] || fail 'staged 部署缺少内部 Provider 认证'
 
+# 使用完整生产校验函数检查原生内部密钥的恢复范围，不替换读取或校验逻辑。
+PRESERVED_VALIDATOR=$(sed -n '/^validate_preserved_installation() {$/,/^installation_config_is_reusable() {$/p' \
+  "$PROJECT_ROOT/install.sh" | sed '$d')
+[[ -n "$PRESERVED_VALIDATOR" ]] || fail '缺少生产保留配置校验'
+install -m 0600 -- "${DEPLOY}/.crisp-ai-installation" "${WORK}/staged.marker"
+pending_cases=0
+assert_pending_key_case() {
+  local label=$1 state=$2 key=$3 value=$4 expected=$5 status=0 before after
+  install -m 0600 -- "${WORK}/staged.env" "${DEPLOY}/.env"
+  bash -c '
+    set -euo pipefail
+    source "$1/scripts/common.sh"
+    if [[ "$3" == ANYTHINGLLM_API_KEY && -z "$4" ]]; then
+      # 故障输入只写入隔离夹具；正常 env_set 应继续拒绝空密钥。
+      sed -i 's/^ANYTHINGLLM_API_KEY=.*/ANYTHINGLLM_API_KEY=/' "$2/.env"
+    else
+      env_set "$2/.env" "$3" "$4"
+    fi
+    write_installation_marker "$2" "$1" "$5" "$6"
+  ' -- "$PROJECT_ROOT" "$DEPLOY" "$key" "$value" "$(<"${PROJECT_ROOT}/VERSION")" "$state"
+  before=$(sha256sum -- "${DEPLOY}/.env" "${DEPLOY}/.crisp-ai-installation")
+  bash -c '
+    set -euo pipefail
+    source "$1/scripts/common.sh"
+    source "$1/scripts/configuration.sh"
+    eval "$3"
+    validate_preserved_installation "$2"
+  ' -- "$PROJECT_ROOT" "$DEPLOY" "$PRESERVED_VALIDATOR" \
+    > "${WORK}/pending-${label}.log" 2>&1 || status=$?
+  if [[ "$expected" == accepted ]]; then
+    (( status == 0 )) || fail "合法保留配置被拒绝：${label}"
+  else
+    (( status != 0 )) || fail "无效保留配置未拒绝：${label}"
+    grep -Fq -- ".env:${key}" "${WORK}/pending-${label}.log" \
+      || fail "未按实际无效字段拒绝：${label}"
+  fi
+  after=$(sha256sum -- "${DEPLOY}/.env" "${DEPLOY}/.crisp-ai-installation")
+  [[ "$after" == "$before" ]] || fail "只读恢复校验改写保存配置：${label}"
+  pending_cases=$((pending_cases + 1))
+}
+for pending_state in installing staged; do
+  assert_pending_key_case "$pending_state" "$pending_state" \
+    ANYTHINGLLM_API_KEY pending-anythingllm-api-key accepted
+done
+for pending_state in ready local-ready collecting uninstalled-data-kept; do
+  assert_pending_key_case "$pending_state" "$pending_state" \
+    ANYTHINGLLM_API_KEY pending-anythingllm-api-key rejected
+done
+assert_pending_key_case empty staged ANYTHINGLLM_API_KEY '' rejected
+assert_pending_key_case different-placeholder staged ANYTHINGLLM_API_KEY pending-other-key rejected
+assert_pending_key_case provider staged AI_API_KEY pending-provider-key rejected
+assert_pending_key_case crisp staged CRISP_TOKEN_KEY pending-crisp-key rejected
+assert_pending_key_case saved-key-staged staged ANYTHINGLLM_API_KEY synthetic-resume-anything-key accepted
+assert_pending_key_case saved-key-ready ready ANYTHINGLLM_API_KEY synthetic-resume-anything-key accepted
+install -m 0600 -- "${WORK}/staged.env" "${DEPLOY}/.env"
+install -m 0600 -- "${WORK}/staged.marker" "${DEPLOY}/.crisp-ai-installation"
+[[ "$pending_cases" == 12 ]] || fail '内部密钥恢复边界未完整执行'
+printf '通过：[UNIT/CONTRACT] 内部待生成密钥仅允许未启动阶段恢复，12项边界及只读配置保持。\n'
+if [[ "${AI_SUPPORT_INSTALL_PENDING_CONTRACT_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
 resume_status=0
 "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
   --non-interactive > "${WORK}/resume.log" 2>&1 || resume_status=$?
