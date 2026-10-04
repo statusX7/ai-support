@@ -21,11 +21,19 @@ const LEGACY_GENERIC_NON_ANSWERS = new Set([
   '目前知识还不足以确认，请补充您遇到的具体情况。',
   '当前答案可信度不足，请补充更多问题细节。',
   '现有资料还不足以确定答案，请补充更多细节。',
-].map((value) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ')));
+]);
+
+// 识别时允许 Unicode 兼容等价，避免旧正文仅因空白或全角标点差异逃逸；
+// 摘要迁移则必须使用上面的实际历史 wire 字节。不能把归一化后的新字符串
+// 当作项目曾经发送过的正文，否则只有摘要、没有 plan/body 的普通业务消息
+// 可能被误判为旧 generic。
+const NORMALIZED_LEGACY_GENERIC_NON_ANSWERS = new Set([...LEGACY_GENERIC_NON_ANSWERS]
+  .map((value) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ')));
 
 function legacyGenericNonAnswer(value) {
   return typeof value === 'string'
-    && LEGACY_GENERIC_NON_ANSWERS.has(value.normalize('NFKC').trim().replace(/\s+/gu, ' '));
+    && NORMALIZED_LEGACY_GENERIC_NON_ANSWERS.has(
+      value.normalize('NFKC').trim().replace(/\s+/gu, ' '));
 }
 
 function visitorFallbackFor(purpose, context = 'text') {

@@ -286,6 +286,8 @@ async function fixture(label, behavior) {
   let armRetirementWritebackFailure = false;
   let failNextSessionCommit = false;
   let sessionCommitFailureKind = '';
+  let failNextInvalidSettlementCommit = false;
+  let failNextInvalidRetirementCommit = false;
   let settlementWritebackFailures = 0;
   let retirementWritebackFailures = 0;
   let settlementTransportFailures = 0;
@@ -294,6 +296,7 @@ async function fixture(label, behavior) {
   let activeRetirementResponseGate = null;
   const ragVectorClientFailures = [];
   let activeRagVectorClientFailure = null;
+  let ragKnowledgeText = '受控资料要求先描述具体问题。';
   let upstreamPhase = 'runtime';
   let now = Date.now();
   for (const name of ['config', 'data/runtime', 'data/analytics', 'tmp']) {
@@ -309,10 +312,11 @@ async function fixture(label, behavior) {
   fs.writeFileSync(path.join(root, 'config/prompt.md'), prompt, { mode: 0o600 });
   writeJson(path.join(root, 'config/runtime.yaml'), { schema_version: 2, enabled: true, revision: 1, applied_revision: 1 });
   const projection = 'kb_1111111111111111_doc_2222222222222222.md';
+  const knowledgeLocation = `custom-documents/${projection}-33333333-3333-4333-8333-333333333333.json`;
   const mapPath = path.join(root, 'data/runtime/knowledge-map.json');
   writeJson(mapPath, { schema_version: 2, revision: 1, documents: [{
     library_id: 'kb_1111111111111111', library_name: '受控资料', document_id: 'doc_2222222222222222', projection,
-    location: `custom-documents/${projection}-33333333-3333-4333-8333-333333333333.json`,
+    location: knowledgeLocation,
   }] });
   const settingsPath = path.join(root, 'data/runtime/knowledge-settings.json');
   writeJson(settingsPath, { schema_version: 1, workspace_slug: 'synthetic', temperature: 0.25, observed_at: now });
@@ -348,8 +352,11 @@ async function fixture(label, behavior) {
     for await (const chunk of request) raw += chunk;
     const index = Number(/^\/p(\d+)\//.exec(request.url)?.[1]);
     const body = JSON.parse(raw || '{}');
-    calls.push({ index, at: Date.now(), path: request.url,
-      authorization: request.headers.authorization, phase: upstreamPhase, body });
+    const call = { index, at: Date.now(), path: request.url,
+      authorization: request.headers.authorization, phase: upstreamPhase, body };
+    calls.push(call);
+    if (typeof upstreamBehavior === 'function'
+      && await upstreamBehavior(call, response) === true) return;
     if (upstreamBehavior === 'hang') return;
     response.setHeader('content-type', 'application/json');
     if (upstreamBehavior === '401') {
@@ -482,7 +489,7 @@ async function fixture(label, behavior) {
     assert.equal(typeof JSON.parse(raw).query, 'string');
     observation.response_started = true;
     response.end(JSON.stringify({ results: [{
-      id: '44444444-4444-4444-8444-444444444444', text: '受控资料要求先描述具体问题。',
+      id: '44444444-4444-4444-8444-444444444444', text: ragKnowledgeText,
       metadata: { title: projection }, distance: 0.1, score: 0.9,
     }] }));
   });
@@ -529,6 +536,7 @@ async function fixture(label, behavior) {
           path: parsed.pathname,
           token: String(token),
           token_length: String(token).length,
+          request_body: options.body === undefined ? null : structuredClone(options.body),
           payload: JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')),
         });
       }
@@ -647,13 +655,30 @@ async function fixture(label, behavior) {
     }
     return response;
   };
-  // 只在 router 已确认 settle 之后，让紧接着的一次会话原子替换失败。
-  // 外层恢复事务可以正常写回，精确覆盖“答案已结算、局部状态回写失败”的崩溃点。
+  // 精确命中 Provider 远端成功后的本地写回，或本地 invalid+failure 原子
+  // 收敛写回；领取 lease 的前一事务保持正常，避免把错误注入到其它阶段。
   const originalRenameSync = fs.renameSync;
   fs.renameSync = function(source, destination) {
-    if (failNextSessionCommit
-      && String(destination).startsWith(path.join(root, 'data/runtime/session-'))
-      && String(source).startsWith(String(destination) + '.tmp-')) {
+    const sessionCommit = String(destination).startsWith(
+      path.join(root, 'data/runtime/session-'))
+      && String(source).startsWith(String(destination) + '.tmp-');
+    if (sessionCommit && (failNextInvalidSettlementCommit
+      || failNextInvalidRetirementCommit)) {
+      let candidate = null;
+      try { candidate = JSON.parse(fs.readFileSync(source, 'utf8')); } catch (_) {}
+      if (failNextInvalidSettlementCommit && candidate?.jobs?.some((entry) =>
+        entry?.provider_settlement?.state === 'invalid')) {
+        failNextInvalidSettlementCommit = false;
+        failNextSessionCommit = true;
+        sessionCommitFailureKind = 'settlement';
+      } else if (failNextInvalidRetirementCommit && candidate?.jobs?.some((entry) =>
+        entry?.provider_retirement?.state === 'invalid')) {
+        failNextInvalidRetirementCommit = false;
+        failNextSessionCommit = true;
+        sessionCommitFailureKind = 'retirement';
+      }
+    }
+    if (failNextSessionCommit && sessionCommit) {
       failNextSessionCommit = false;
       const kind = sessionCommitFailureKind;
       sessionCommitFailureKind = '';
@@ -740,7 +765,7 @@ async function fixture(label, behavior) {
     await Promise.all([rag, upstream].map((server) => new Promise((resolve) => server.close(resolve))));
   };
   return {
-    root, prompt, pool, providerConfiguration, internal, calls, sent, adapterResponses, signedProviderPayloads,
+    root, prompt, pool, providerConfiguration, knowledgeLocation, internal, calls, sent, adapterResponses, signedProviderPayloads,
     ragServerRequests, ragClientResults,
     crispPostAttempts,
     event, receive, deliver, state,
@@ -771,8 +796,10 @@ async function fixture(label, behavior) {
     },
     dropNextAdapterResponse() { dropNextAdapterResponse = true; },
     failNextSettlementWriteback() { armSettlementWritebackFailure = true; },
+    failNextInvalidSettlementWriteback() { failNextInvalidSettlementCommit = true; },
     failNextSettlementRequest() { settlementTransportFailures += 1; },
     failNextRetirementWriteback() { armRetirementWritebackFailure = true; },
+    failNextInvalidRetirementWriteback() { failNextInvalidRetirementCommit = true; },
     failNextRetirementRequest() { retirementTransportFailures += 1; },
     holdNextRetirementResponse() {
       if (pendingRetirementResponseGate || activeRetirementResponseGate) {
@@ -793,6 +820,7 @@ async function fixture(label, behavior) {
     settlementWritebackFailures: () => settlementWritebackFailures,
     retirementWritebackFailures: () => retirementWritebackFailures,
     advance(milliseconds) { now += milliseconds; },
+    synchronizeClock() { now = Math.max(now, Date.now()); },
     now: () => now,
     async killAdapter() { await stopAdapter('SIGKILL'); },
     async restartAdapter() { await startAdapter(); restartRuntime(); },
@@ -814,6 +842,35 @@ async function fixture(label, behavior) {
         disable_epoch: enabled ? previousEpoch : previousEpoch + 1,
         revision: current.revision, applied_revision: current.revision };
       writeJson(materialsPath, sealMaterials(current));
+      return currentProviderConfiguration();
+    },
+    publishConfiguration(mutator) {
+      const current = readJson(materialsPath);
+      current.revision += 1;
+      mutator(current.configuration);
+      current.configuration.runtime = { ...current.configuration.runtime,
+        revision: current.revision, applied_revision: current.revision };
+      for (const name of ['runtime', 'handoff', 'keyword', 'menu', 'tags', 'feedback']) {
+        writeJson(path.join(root, `config/${name}.yaml`), current.configuration[name]);
+      }
+      writeJson(materialsPath, sealMaterials(current));
+      assertReplyReadyMaterials(root, current);
+      return currentProviderConfiguration();
+    },
+    publishKnowledge(text) {
+      ragKnowledgeText = String(text);
+      const current = readJson(materialsPath);
+      current.revision += 1;
+      current.configuration.runtime = { ...current.configuration.runtime,
+        revision: current.revision, applied_revision: current.revision };
+      current.knowledge.catalog_revision = Number(current.knowledge.catalog_revision || 0) + 1;
+      current.knowledge.catalog_sha256 = digest(canonical({ fixture: 'catalog',
+        revision: current.knowledge.catalog_revision, text: ragKnowledgeText }));
+      current.knowledge.manifest_sha256 = digest(canonical({ fixture: 'manifest',
+        projection, revision: current.knowledge.catalog_revision }));
+      writeJson(path.join(root, 'config/runtime.yaml'), current.configuration.runtime);
+      writeJson(materialsPath, sealMaterials(current));
+      assertReplyReadyMaterials(root, current);
       return currentProviderConfiguration();
     },
     postAdapter,
@@ -1277,6 +1334,47 @@ async function test(name, action) {
     assertNoVisibleFailureReply(f);
   });
 
+  await test('合法vision阶段精确阴性释放旧推理身份并保留原图片责任', async (f) => {
+    const event = f.event('absent-current-vision-stage');
+    event.data.type = 'file';
+    event.data.content = { type: 'image/png', name: '受控图片.png', url: 'https://example.invalid/image.png' };
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.inference_generation = 1;
+      job.inference = { ...f.providerConfiguration, deadline_at: f.now() + 7000,
+        attempt_generation: 1, provider_receipt_protocol_version: 1 };
+      job.provider_result_receipt = {
+        state: 'absent', stage: 'vision', reason: 'question_result_absent', attempt_generation: 1,
+        configuration_binding: f.providerConfiguration.configuration_binding,
+        request_contract_version: 1, request_sha256: 'd'.repeat(64),
+        plan_context_sha256: digest(canonical(null)), plan_context: null,
+        first_unknown_at: f.now(), last_checked_at: f.now(), next_action_at: 0, checks: 1,
+      };
+      job.plan = { type: 'internal', ordinary: true, purpose: 'technical_unresolved',
+        safe_error_context: 'image', content: '', answer_responsibility: 'unresolved_failure',
+        diagnostic_code: 'question_result_absent', tags: [] };
+    });
+    const roundsBefore = Number(pendingJob(f, event, accepted.jobId).failure_rounds || 0);
+    const result = await f.process(accepted.key, accepted.jobId);
+    assert.equal(result.status, 'unresolved');
+    const stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'question_result_absent');
+    assert.equal(stored.failure_rounds, roundsBefore + 1,
+      'vision精确阴性仍是本轮真实失败，不能获得answer阶段的零增量特权');
+    assert.equal(stored.inference, undefined,
+      '同一vision阶段的完整精确阴性必须释放旧推理身份以建立有界后继');
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.data?.type, 'file');
+    assert.equal(stored.data?.content?.type, 'image/png');
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+  });
+
   await test('现代推理无回执时的检索故障必须增加一轮并退避，不能被当作router阴性对账', async (f) => {
     f.queueRagVectorClientFailures(2);
     const event = f.event('no-receipt-retrieval-failure');
@@ -1482,6 +1580,19 @@ async function test(name, action) {
       job.provider_settlement = { schema_version: 1, state: 'deferred' };
       delete job.provider_result_receipt;
     });
+    f.failNextInvalidSettlementWriteback();
+    const interrupted = await f.process(accepted.key, accepted.jobId);
+    assert.equal(interrupted.status, 'deferred');
+    assert.equal(interrupted.reason, 'provider_settlement_owner_changed');
+    let stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.provider_settlement?.state, 'deferred',
+      'invalid原子提交失败不得留下半次invalid记录');
+    assert.equal(stored.provider_settlement_failure_code, undefined);
+    assert(stored.provider_settlement?.lease_until > f.now());
+    assert.equal(f.settlementWritebackFailures(), 1);
+    const leaseUntil = stored.provider_settlement.lease_until;
+    f.restartRuntime();
+    f.advance(Math.max(1, leaseUntil - f.now() + 1));
     const result = await f.process(accepted.key, accepted.jobId);
     assert.equal(result.status, 'unresolved');
     assert.equal(result.reason, 'provider_settlement_identity_unresolved');
@@ -1490,7 +1601,7 @@ async function test(name, action) {
       ['/v1/chat/completions', '/internal/provider/replay', '/internal/provider/settle']
         .includes(entry.path)).length, 0);
     assertNoVisibleFailureReply(f);
-    const stored = pendingJob(f, event, accepted.jobId);
+    stored = pendingJob(f, event, accepted.jobId);
     assert.equal(stored.status, 'received');
     assert.equal(stored.responsibility_status, 'unresolved_failure');
     assert.equal(stored.failure_code, 'provider_settlement_identity_unresolved');
@@ -1501,6 +1612,77 @@ async function test(name, action) {
     assert.equal(stored.provider_settlement?.state, 'invalid');
     assert.equal(stored.provider_settlement?.reason, 'settlement_invalid');
     assert.equal(stored.data?.content, event.data.content);
+  });
+
+  await test('v1.2.1旧推理混入falsy迁移字段时按字段存在性隔离', async (f) => {
+    const event = f.event('legacy-inference-with-null-migration');
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    const legacyInference = { pool_revision: f.providerConfiguration.pool_revision,
+      deadline_at: f.now() + 7000 };
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.inference_generation = 1;
+      job.inference = { ...legacyInference };
+      job.provider_migration_from = null;
+      delete job.provider_result_receipt;
+    });
+    const result = await f.process(accepted.key, accepted.jobId);
+    assert.equal(result.status, 'unresolved');
+    const stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
+    assert.deepEqual(stored.inference, legacyInference);
+    assert.equal(stored.provider_migration_from, null,
+      'falsy迁移字段也必须逐字保留，不能被当作缺失');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 0);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      ['/v1/chat/completions', '/internal/provider/replay',
+        '/internal/provider/settle', '/internal/provider/retire'].includes(entry.path)).length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assert.equal(f.sent.length, 0);
+  });
+
+  await test('崩溃遗留processing旧直连推理的falsy迁移字段不得取得新请求权', async (f) => {
+    const event = f.event('legacy-processing-with-null-migration');
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    const legacyInference = { pool_revision: null, deadline_at: f.now() - 1 };
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.status = 'processing';
+      job.lease_until = f.now() - 1;
+      job.execution_token = 'a'.repeat(24);
+      job.inference_generation = 1;
+      job.inference = { ...legacyInference };
+      job.provider_migration_from = null;
+      delete job.provider_result_receipt;
+      delete job.plan;
+      state.worker = { job: job.id, token: job.execution_token, until: f.now() - 1 };
+    });
+    const result = await f.process(accepted.key, accepted.jobId);
+    assert.equal(result.status, 'unresolved');
+    const stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'provider_receipt_identity_unresolved');
+    assert.deepEqual(stored.inference, legacyInference,
+      '崩溃恢复不得删除旧直连推理身份');
+    assert.equal(Object.hasOwn(stored, 'provider_migration_from'), true);
+    assert.equal(stored.provider_migration_from, null,
+      'processing路径也必须逐字保留falsy迁移字段');
+    assert.equal(stored.inference_generation, 1,
+      '损坏迁移字段不得建立attempt generation 2');
+    assert.equal(f.ragServerRequests.filter((entry) =>
+      ['workspace_read', 'vector_search'].includes(entry.kind)).length, 0,
+    '身份隔离必须发生在检索之前');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 0);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      ['/v1/chat/completions', '/internal/provider/replay',
+        '/internal/provider/settle', '/internal/provider/retire'].includes(entry.path)).length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assert.equal(f.sent.length, 0);
   });
 
   await test('v1.2.1旧推理混入伪完成结算时不得迁移或采用未知结果', async (f) => {
@@ -1617,6 +1799,85 @@ async function test(name, action) {
     assert.equal(f.sent.length, 1);
   });
 
+  await test('v1.2.1旧缓存先cleanup再由新本地规则接管，同一责任零重复Provider且只出站一次', async (f) => {
+    const event = f.event('legacy-cleanup-local-successor');
+    const accepted = await f.receive(event);
+    assert.equal(accepted.accepted, true);
+    const legacyDeadline = f.now() - 1;
+    const legacyFingerprint = 901050;
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+      job.inference_generation = 1;
+      job.inference = { pool_revision: f.providerConfiguration.pool_revision,
+        deadline_at: legacyDeadline };
+      job.plan = { type: 'text', purpose: 'ai_text', ordinary: true, ai: true,
+        content: '尚未取得投递权的旧缓存答案', fingerprint: legacyFingerprint };
+      delete job.provider_result_receipt;
+      const binding = digest(JSON.stringify(['conversation', accepted.key, state.generation,
+        job.revision, f.providerConfiguration.pool_revision, legacyDeadline]));
+      writeJson(path.join(f.root, 'data/provider-router/questions', `${accepted.jobId}.json`), {
+        id: accepted.jobId, binding, attempt_generation: 1,
+        revision: f.providerConfiguration.pool_revision, deadline: legacyDeadline,
+        attempts: 1, round_attempts: 1,
+        stages: { answer: { tried: [f.pool.primary_id],
+          result: { choices: [{ message: { role: 'assistant',
+            content: '尚未取得投递权的旧缓存答案' } }] } } },
+        created_at: f.now() - 1000,
+      });
+    });
+
+    const marker = path.join(f.root, 'config/provider-pool-transaction.json');
+    writeJson(marker, { schema_version: 1, token: 'a'.repeat(32), phase: 'applying' });
+    const frozen = await f.process(accepted.key, accepted.jobId);
+    assert.equal(frozen.status, 'idle');
+    let stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.deferred_configuration, true);
+    assert(stored.plan && stored.inference,
+      '维护窗口必须保留旧计划及其精确cleanup身份');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+
+    fs.unlinkSync(marker);
+    f.publishConfiguration((configuration) => {
+      configuration.keyword.rules.unshift({
+        id: 'synthetic-local-successor', name: '受控本地后继', enabled: true,
+        match_mode: 'exact', keywords: [event.data.content], exclude_keywords: [],
+        priority: 1000, action: 'reply', text: '受控本地规则答案。', cooldown_seconds: 0,
+      });
+    });
+    f.restartRuntime();
+    f.advance(Math.max(1, stored.retry_at - f.now() + 1));
+
+    const retired = await f.process(accepted.key, accepted.jobId);
+    assert.equal(retired.status, 'provider_retirement_retired', f.adapterErrors());
+    stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.provider_retirement?.state, 'retired');
+    assert.equal(stored.provider_retirement?.purpose, 'legacy_unsettled_retired');
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(fs.existsSync(f.questionPath(accepted.jobId)), false,
+      'cleanup-only确认后必须删除旧router缓存');
+
+    const delivered = await f.process(accepted.key, accepted.jobId);
+    assert.equal(delivered.status, 'sent', f.adapterErrors());
+    stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.responsibility_status, 'answered_confirmed');
+    assert.equal(stored.provider_retirement, undefined,
+      '本地后继规划前必须释放已完成退休摘要');
+    assert.equal(stored.provider_retirement_failure_code, undefined);
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 0,
+      '本地规则后继不得重新调用Provider');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/v1/chat/completions').length, 0);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/retire').length, 1);
+    assert.equal(f.crispPostAttempts.length, 1);
+    assertSingleBusinessReply(f, '受控本地规则答案。');
+    assert.equal((await f.process(accepted.key, accepted.jobId)).status, 'idle');
+    assert.equal(f.crispPostAttempts.length, 1);
+  });
+
   await test('v1.2.1旧问题先遇接口A到B换代仍保留责任，四类缓存均只采用B代新答案', async (f) => {
     const legacyCases = [
       { name: '无阶段', stages: {}, attempts: 0 },
@@ -1674,9 +1935,43 @@ async function test(name, action) {
       '冻结旧来源的维护轮不得调用任何第三方接口');
     f.advance(Math.max(1, latestRetryAt - f.now() + 1));
     for (const item of pending) {
+      // 这一矩阵顺序执行四个独立责任；TARGET-A 整套回归处于高负载时，
+      // adapter 使用的真实墙钟会继续前进，而夹具时钟此前停在第一次 retry。
+      // 每个 successor 应像生产 runtime 一样从实际开始处理的时刻取得本题预算，
+      // 不能让前面三个样例的真实耗时挤掉第四个样例的合成 deadline。
+      f.synchronizeClock();
       const result = await f.process(item.accepted.key, item.accepted.jobId);
-      assert.equal(result.status, 'sent', `${item.name}: ${f.adapterErrors()}`);
       const stored = pendingJob(f, item.event, item.accepted.jobId);
+      const diagnostic = {
+        case: item.name,
+        result,
+        job: stored && {
+          status: stored.status,
+          responsibility_status: stored.responsibility_status,
+          failure_code: stored.failure_code,
+          retry_at: stored.retry_at,
+          deferred_configuration: stored.deferred_configuration,
+          inference_generation: stored.inference_generation,
+          inference: stored.inference,
+          provider_result_receipt: stored.provider_result_receipt,
+          provider_settlement: stored.provider_settlement,
+          legacy_v121_pending_origin: stored.legacy_v121_pending_origin,
+        },
+        adapter_responses: f.adapterResponses.slice(-4).map((entry) => ({
+          status: entry?.status,
+          code: entry?.body?.error?.code,
+          state: entry?.body?.state,
+        })),
+        runtime_provider_indexes: f.calls.filter((call) => call.phase === 'runtime')
+          .map((call) => call.index),
+        signed_routes: f.signedProviderPayloads.slice(-8).map((entry) => ({
+          path: entry.path,
+          attempt_generation: entry.payload?.attempt_generation,
+          stage: entry.payload?.stage,
+        })),
+        adapter_stderr: f.adapterErrors(),
+      };
+      assert.equal(result.status, 'sent', JSON.stringify(diagnostic));
       assert.equal(stored.status, 'done', item.name);
       assert.equal(stored.responsibility_status, 'answered_confirmed', item.name);
       assert.equal(stored.inference_generation, 2, item.name);
@@ -1772,6 +2067,21 @@ async function test(name, action) {
     assert.equal(stored.provider_result_receipt?.state, 'unknown');
     assert.equal(stored.inference?.attempt_generation, 1,
       '回程未知必须保留同代信封，不得直接新建一次推理');
+    const knowledgeMarker = '受控资料要求先描述具体问题。';
+    const planContext = { outcome: 'knowledge_hit',
+      sources: [f.knowledgeLocation], tags: ['ai_replied'] };
+    assert.equal(JSON.stringify(f.calls[0].body.messages).includes(knowledgeMarker), true,
+      '首次真实上游请求必须包含当前知识片段，而不是固定返回答案假绿');
+    assert.deepEqual(stored.provider_result_receipt?.plan_context, planContext);
+    const routeRequest = f.signedProviderPayloads.find((entry) => entry.path === '/v1/chat/completions');
+    const originalContract = requestContract(routeRequest?.request_body, planContext);
+    const routePayload = routeRequest?.payload;
+    assert(routePayload && routeRequest.request_body,
+      '首次 route 必须冻结正文与 plan_context 契约');
+    assert.equal(JSON.stringify(routeRequest.request_body.messages).includes(knowledgeMarker), true);
+    assert.deepEqual({ request_contract_version: routePayload.request_contract_version,
+      request_sha256: routePayload.request_sha256,
+      plan_context_sha256: routePayload.plan_context_sha256 }, originalContract);
     let question = f.question(first.jobId);
     assert.equal(question.stages.answer.result.choices[0].message.content, '受控正常答案。');
     assert.deepEqual([question.attempt_generation, question.round_attempts, question.attempts], [1, 1, 1]);
@@ -1802,6 +2112,10 @@ async function test(name, action) {
         'scope', 'secrets_generation', 'session_key', 'stage', 'version',
       ].sort());
       assert.equal(signed.payload.stage, 'answer');
+      assert.equal(signed.payload.request_sha256, originalContract.request_sha256,
+        `${route} 必须保持首次含知识正文的请求摘要`);
+      assert.equal(signed.payload.plan_context_sha256, originalContract.plan_context_sha256,
+        `${route} 必须保持首次来源/outcome上下文摘要`);
       for (const forbidden of ['plan_context', 'state', 'first_unknown_at', 'checks', 'reason']) {
         assert.equal(Object.hasOwn(signed.payload, forbidden), false,
           `${route} 不得把本地回执或知识上下文放入 HTTP Header`);
@@ -2131,6 +2445,51 @@ async function test(name, action) {
       '退休传输恢复不得重新调用 Provider');
     assert.equal(f.sent.length, 0);
     assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/retire').length, 2);
+
+    f.dropNextAdapterResponse();
+    const malformedEvent = f.event('retirement-null-migration-binding');
+    const malformedFirst = await f.deliver(malformedEvent);
+    assert.equal(malformedFirst.status, 'unresolved');
+    const malformedOperator = {
+      website_id: malformedEvent.website_id, event: 'message:received', timestamp: f.now() + 2,
+      data: { session_id: malformedEvent.data.session_id, from: 'operator', type: 'text',
+        content: '受控人工已接管。', fingerprint: 900112, timestamp: f.now() + 2,
+        automated: false },
+    };
+    const malformedControl = await f.receive(malformedOperator);
+    assert.equal(malformedControl.accepted, true);
+    assert.equal((await f.process(malformedControl.key, malformedControl.jobId)).status, 'none');
+    f.failNextRetirementRequest();
+    const malformedDeferred = await f.process(malformedFirst.key, malformedFirst.jobId);
+    assert.equal(malformedDeferred.status, 'deferred');
+    assert.equal(malformedDeferred.reason, 'provider_retirement_deferred');
+    let malformedStored = pendingJob(f, malformedEvent, malformedFirst.jobId);
+    assert.equal(malformedStored.provider_retirement?.state, 'deferred');
+    const malformedRetryAt = malformedStored.provider_retirement.next_action_at;
+    await f.mutateState(malformedEvent.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === malformedFirst.jobId);
+      job.provider_migration_from = null;
+    });
+    malformedStored = pendingJob(f, malformedEvent, malformedFirst.jobId);
+    const malformedFrozen = structuredClone(malformedStored);
+    const malformedProtocolCalls = f.signedProviderPayloads.length;
+    const malformedRuntimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+    const malformedCrispPosts = f.crispPostAttempts.length;
+    f.advance(Math.max(1, malformedRetryAt - f.now() + 1));
+    const malformedSelected = await f.scan();
+    assert.equal(malformedSelected.some((entry) => entry.key === malformedFirst.key
+      && entry.jobId === malformedFirst.jobId), false,
+    '本地显式null迁移字段与退休信封不匹配时不得进入调度');
+    assert.equal((await f.process(malformedFirst.key, malformedFirst.jobId)).status, 'idle');
+    malformedStored = pendingJob(f, malformedEvent, malformedFirst.jobId);
+    assert.deepEqual(malformedStored, malformedFrozen,
+      '损坏迁移绑定必须原样保留供人工审查');
+    assert.equal(f.signedProviderPayloads.length, malformedProtocolCalls,
+      '损坏迁移绑定不得调用retire或其他Provider协议端点');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      malformedRuntimeCalls, '损坏退休绑定不得重新推理');
+    assert.equal(f.crispPostAttempts.length, malformedCrispPosts,
+      '损坏退休绑定不得产生访客POST');
   });
 
   await test('router已退休但会话写回失败时，重启以 absent 幂等收敛且不重新推理', async (f) => {
@@ -2194,10 +2553,23 @@ async function test(name, action) {
       }));
     });
 
+    f.failNextInvalidRetirementWriteback();
+    const interrupted = await f.process(first.key, first.jobId);
+    assert.equal(interrupted.status, 'deferred');
+    assert.equal(interrupted.reason, 'provider_retirement_owner_changed');
+    let stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.provider_retirement?.state, 'pending',
+      'invalid退休原子提交失败不得留下半次invalid记录');
+    assert.equal(stored.provider_retirement_failure_code, undefined);
+    assert(stored.provider_retirement?.lease_until > f.now());
+    assert.equal(f.retirementWritebackFailures(), 1);
+    const leaseUntil = stored.provider_retirement.lease_until;
+    f.restartRuntime();
+    f.advance(Math.max(1, leaseUntil - f.now() + 1));
     const rejected = await f.process(first.key, first.jobId);
     assert.equal(rejected.status, 'unresolved');
     assert.equal(rejected.reason, 'provider_retirement_identity_unresolved');
-    const stored = pendingJob(f, event, first.jobId);
+    stored = pendingJob(f, event, first.jobId);
     assert.equal(stored.status, 'cancelled');
     assert.equal(stored.responsibility_status, 'intentional_silence');
     assert.equal(stored.responsibility_reason, 'human_reply');
@@ -2386,6 +2758,113 @@ async function test(name, action) {
       '迟到退休响应和真人接管均不得重新推理');
     assert.equal(f.crispPostAttempts.length, 0);
     assert.equal(f.sent.length, 0);
+
+    f.dropNextAdapterResponse();
+    const expiredEvent = f.event('retirement-expired-lease-writeback');
+    const expiredFirst = await f.deliver(expiredEvent);
+    assert.equal(expiredFirst.status, 'unresolved');
+    const expiredRequest = f.signedProviderPayloads.find((entry) =>
+      entry.path === '/v1/chat/completions'
+      && entry.payload.question_id === expiredFirst.jobId);
+    assert(expiredRequest);
+    await f.mutateState(expiredEvent.data.session_id, (state) => {
+      const current = state.jobs.find((entry) => entry.id === expiredFirst.jobId);
+      current.provider_retirement = {
+        schema_version: 1, state: 'pending', purpose: 'non_answer_retired',
+        envelope: structuredClone(expiredRequest.payload), identity_sha256: '',
+        attempts: 0, first_recorded_at: f.now(), next_action_at: 0,
+      };
+      current.provider_retirement.identity_sha256 = digest(canonical({
+        envelope: current.provider_retirement.envelope, purpose: 'non_answer_retired',
+      }));
+    });
+    const expiredGate = f.holdNextRetirementResponse();
+    const expiredProcess = f.process(expiredFirst.key, expiredFirst.jobId);
+    await Promise.race([expiredGate.arrived, wait(5000).then(() => {
+      throw new Error('过期lease场景未在期限内取得受控HTTP响应');
+    })]);
+    let expiredStored = pendingJob(f, expiredEvent, expiredFirst.jobId);
+    const expiredIdentity = expiredStored.provider_retirement.identity_sha256;
+    const leaseUntil = expiredStored.provider_retirement.lease_until;
+    assert(leaseUntil > f.now());
+    assert.equal(fs.existsSync(f.questionPath(expiredFirst.jobId)), false,
+      '受控迟到响应前router必须已完成精确退休');
+    f.advance(leaseUntil - f.now() + 1);
+    expiredGate.release();
+    const expiredWriteback = await expiredProcess;
+    assert.equal(expiredWriteback.status, 'deferred');
+    assert.equal(expiredWriteback.reason, 'provider_retirement_owner_changed');
+    expiredStored = pendingJob(f, expiredEvent, expiredFirst.jobId);
+    assert.equal(expiredStored.provider_retirement?.state, 'pending');
+    assert.equal(expiredStored.provider_retirement?.identity_sha256, expiredIdentity);
+    const expiredRecovered = await f.process(expiredFirst.key, expiredFirst.jobId);
+    assert.equal(expiredRecovered.status, 'provider_retirement_absent');
+    expiredStored = pendingJob(f, expiredEvent, expiredFirst.jobId);
+    assert.equal(expiredStored.provider_retirement?.state, 'absent');
+    assert.equal(expiredStored.inference, undefined);
+    assert.equal(expiredStored.provider_result_receipt, undefined);
+    assert.equal(f.sent.length, 0,
+      '过期退休写回与幂等恢复不得产生访客消息');
+  });
+
+  await test('退休HTTP在途时插入falsy故障标记必须拒绝写回并保留本地身份', async (f) => {
+    f.dropNextAdapterResponse();
+    const event = f.event('retirement-inflight-falsy-marker');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'unresolved');
+    const originalRequest = f.signedProviderPayloads.find((entry) =>
+      entry.path === '/v1/chat/completions');
+    assert(originalRequest);
+    await f.mutateState(event.data.session_id, (state) => {
+      const stored = state.jobs.find((entry) => entry.id === first.jobId);
+      stored.provider_retirement = {
+        schema_version: 1, state: 'pending', purpose: 'non_answer_retired',
+        envelope: structuredClone(originalRequest.payload), identity_sha256: '',
+        attempts: 0, first_recorded_at: f.now(), next_action_at: 0,
+      };
+      stored.provider_retirement.identity_sha256 = digest(canonical({
+        envelope: stored.provider_retirement.envelope, purpose: 'non_answer_retired',
+      }));
+    });
+
+    const gate = f.holdNextRetirementResponse();
+    const staleProcess = f.process(first.key, first.jobId);
+    await Promise.race([gate.arrived, wait(5000).then(() => {
+      throw new Error('退休请求未在期限内取得受控HTTP响应');
+    })]);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), false,
+      '远端退休已经完成，测试必须命中本地写回前的TOCTOU窗口');
+    await f.mutateState(event.data.session_id, (state) => {
+      const stored = state.jobs.find((entry) => entry.id === first.jobId);
+      stored.provider_retirement_failure_code = '';
+    });
+    let stored = pendingJob(f, event, first.jobId);
+    const frozenRetirement = structuredClone(stored.provider_retirement);
+    const frozenInference = structuredClone(stored.inference);
+    const frozenReceipt = structuredClone(stored.provider_result_receipt);
+    const protocolCalls = f.signedProviderPayloads.length;
+    const runtimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+    const crispPosts = f.crispPostAttempts.length;
+
+    gate.release();
+    const stale = await staleProcess;
+    assert.equal(stale.status, 'deferred');
+    assert.equal(stale.reason, 'provider_retirement_owner_changed');
+    stored = pendingJob(f, event, first.jobId);
+    assert.deepEqual(stored.provider_retirement, frozenRetirement,
+      '无效写回不得覆盖在途lease或原retirement身份');
+    assert.equal(stored.provider_retirement_failure_code, '',
+      'falsy故障标记也必须按字段存在性逐字保留');
+    assert.deepEqual(stored.inference, frozenInference);
+    assert.deepEqual(stored.provider_result_receipt, frozenReceipt);
+    assert.equal((await f.process(first.key, first.jobId)).status, 'idle',
+      '损坏标记存在时不得自动重试或洗白');
+    assert.equal(f.signedProviderPayloads.length, protocolCalls,
+      '拒绝本地写回后不得追加route/replay/settle/retire');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      runtimeCalls, '退休TOCTOU不得重新推理');
+    assert.equal(f.crispPostAttempts.length, crispPosts);
+    assert.equal(f.sent.length, 0);
   });
 
   await test('旧非答案清理已完成后再遇人工只转换业务静默，不伪造第二次退休损坏', async (f) => {
@@ -2438,7 +2917,7 @@ async function test(name, action) {
     assert.equal(f.sent.length, 0);
   });
 
-  await test('已完成退休摘要与失败码并存时必须fail closed且不重新推理', async (f) => {
+  await test('已完成退休摘要与畸形sent并存时保留原证据且不重新推理', async (f) => {
     const event = f.event('finished-retirement-with-failure-code');
     const accepted = await f.receive(event);
     assert.equal(accepted.accepted, true);
@@ -2463,16 +2942,16 @@ async function test(name, action) {
       };
     });
 
+    const before = f.state(event.data.session_id);
+    const beforeJob = structuredClone(before.jobs.find((entry) => entry.id === accepted.jobId));
+    const beforeOutgoing = structuredClone(before.outgoing[String(fingerprint)]);
+
     assert.equal((await f.process(accepted.key, accepted.jobId)).status, 'idle');
     const stored = pendingJob(f, event, accepted.jobId);
-    assert.equal(stored.status, 'failed');
-    assert.equal(stored.responsibility_status, 'unresolved_failure');
-    assert.equal(stored.failure_code, 'legacy_non_answer_requires_review');
-    assert.equal(stored.provider_retirement?.state, 'retired');
-    assert.equal(stored.provider_retirement_failure_code,
-      'provider_retirement_identity_unresolved');
-    assert.equal(stored.data?.content, event.data.content,
-      '损坏组合不得清除原始访客责任');
+    assert.deepEqual(stored, beforeJob,
+      '缺 token/v1/完整回执的 sent 不能凭当前 plan 或正文摘要改写历史终态');
+    assert.deepEqual(f.state(event.data.session_id).outgoing[String(fingerprint)], beforeOutgoing,
+      '畸形 sent 必须原样保留供诊断，不能补造身份或语义');
     assert.equal(f.calls.length, 0);
     assert.equal(f.signedProviderPayloads.length, 0);
     assert.equal(f.crispPostAttempts.length, 0);
@@ -2676,6 +3155,611 @@ async function test(name, action) {
     assert.equal(f.sent.length, 1);
   });
 
+  await test('pooled完成结算的缓存计划遇falsy迁移字段时不得出站', async (f) => {
+    f.failNextSettlementRequest();
+    f.queueCrispPostResponse({ status: 401, headers: {},
+      body: { error: true, reason: 'synthetic_rejection' } });
+    const event = f.event('pooled-finished-plan-null-migration');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'rejected');
+    assertNoVisibleFailureReply(f);
+    let stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.provider_settlement?.state, 'deferred');
+    assert(stored.retry_at > stored.provider_settlement.next_action_at,
+      '夹具必须先命中settlement已到期、业务重试尚未到期的ready窗口');
+    const firstOutgoing = Object.entries(f.state(event.data.session_id).outgoing)
+      .filter(([, record]) => record?.job_id === first.jobId);
+    assert.equal(firstOutgoing.length, 1);
+    const [outgoingFingerprint, outgoingBefore] = firstOutgoing[0];
+    const earlyProtocolCalls = f.signedProviderPayloads.length;
+    const earlyRuntimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+    const earlyCrispPosts = f.crispPostAttempts.length;
+    f.advance(Math.max(1, stored.provider_settlement.next_action_at - f.now() + 1));
+    assert.equal((await f.process(first.key, first.jobId)).status, 'idle',
+      'ready计划在业务重试到期前不得绕过backoff只执行settlement');
+    assert.equal(f.signedProviderPayloads.length, earlyProtocolCalls);
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      earlyRuntimeCalls);
+    assert.equal(f.crispPostAttempts.length, earlyCrispPosts);
+
+    stored = pendingJob(f, event, first.jobId);
+    f.queueCrispPostResponse({ status: 401, headers: {},
+      body: { error: true, reason: 'synthetic_rejection' } });
+    f.advance(Math.max(1, Math.max(stored.retry_at,
+      stored.provider_settlement.next_action_at) - f.now() + 1));
+    assert.equal((await f.process(first.key, first.jobId)).status, 'rejected');
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    assert(stored.plan, '明确未接收的原计划必须保留至恢复边界');
+    assert.equal(stored.inference, undefined,
+      '正常答案结算完成后应按既有契约释放活动推理身份');
+    assert.equal(stored.provider_result_receipt, undefined);
+    const secondOutgoing = Object.entries(f.state(event.data.session_id).outgoing)
+      .filter(([, record]) => record?.job_id === first.jobId);
+    assert.equal(secondOutgoing.length, 1);
+    assert.equal(secondOutgoing[0][0], outgoingFingerprint,
+      '业务重试必须沿用同一出站fingerprint');
+    assert.deepEqual(secondOutgoing[0][1].body, outgoingBefore.body,
+      '业务重试不得改写原计划正文');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 1,
+      '完成settlement和重试Crisp不得重新推理');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/settle').length, 2);
+    assert.equal(f.crispPostAttempts.length, 2);
+    assert.equal(f.sent.length, 0);
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      job.provider_migration_from = null;
+    });
+    stored = pendingJob(f, event, first.jobId);
+    const frozenPlan = structuredClone(stored.plan);
+    const frozenSettlement = structuredClone(stored.provider_settlement);
+    const protocolCalls = f.signedProviderPayloads.length;
+    const runtimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+    const crispPosts = f.crispPostAttempts.length;
+    f.advance(Math.max(1, stored.retry_at - f.now() + 1));
+    const blocked = await f.process(first.key, first.jobId);
+    assert.equal(blocked.status, 'deferred');
+    assert.equal(blocked.reason, 'answer_responsibility_unresolved');
+    stored = pendingJob(f, event, first.jobId);
+    assert.deepEqual(stored.plan, frozenPlan,
+      '损坏迁移字段不得删除或替换原缓存计划');
+    assert.deepEqual(stored.provider_settlement, frozenSettlement,
+      '损坏迁移字段不得重建或删除finished settlement');
+    assert.equal(Object.hasOwn(stored, 'provider_migration_from'), true);
+    assert.equal(stored.provider_migration_from, null);
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'persisted_plan_delivery_pending');
+    assert.equal(f.signedProviderPayloads.length, protocolCalls,
+      '缓存计划身份冲突不得追加route/replay/settle/retire');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      runtimeCalls, '缓存计划身份冲突不得重新推理');
+    assert.equal(f.crispPostAttempts.length, crispPosts,
+      '缓存计划身份冲突不得再次POST');
+    assert.equal(f.sent.length, 0);
+    assertNoVisibleFailureReply(f);
+  });
+
+  await test('遗留裸clarification先完成Provider结算，再迁移同一责任并仅发送一份后继答案', async (f) => {
+    f.failNextSettlementRequest();
+    f.queueCrispPostResponse({ status: 401, headers: {},
+      body: { error: true, reason: 'synthetic_rejection' } });
+    const event = f.event('bare-clarification-settlement-first');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'rejected');
+    assertNoVisibleFailureReply(f);
+
+    let stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'crisp_http_401');
+    assert.equal(stored.provider_settlement?.state, 'deferred');
+    assert.equal(stored.provider_settlement?.attempts, 1);
+    assert.equal(stored.provider_result_receipt?.state, 'available');
+    assert(stored.data && stored.plan && stored.inference,
+      '真实首次调用必须持久化原问题、计划和Provider身份');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 1);
+    assert.equal(f.crispPostAttempts.length, 1);
+    assert.equal(f.sent.length, 0);
+
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      assert(job?.plan, '只能给真实持久计划补入遗留声明');
+      job.plan = { ...job.plan, answer_responsibility: 'clarification_confirmed' };
+    });
+    stored = pendingJob(f, event, first.jobId);
+    const rejectedEntry = Object.entries(f.state(event.data.session_id).outgoing)
+      .find(([, record]) => record?.job_id === first.jobId && record.status === 'rejected');
+    assert(rejectedEntry, '首次明确拒绝必须留下当前代可核验的未发送记录');
+    const [rejectedFingerprint, rejectedRecord] = rejectedEntry;
+    const frozen = {
+      data: structuredClone(stored.data),
+      plan: structuredClone(stored.plan),
+      inference: structuredClone(stored.inference),
+      receipt: structuredClone(stored.provider_result_receipt),
+      settlement: structuredClone(stored.provider_settlement),
+      rejected: structuredClone(rejectedRecord),
+      generation: stored.generation,
+      responseGeneration: Number(stored.response_generation || 0),
+      retryAt: stored.retry_at,
+      failureAudit: failureAudit(stored),
+      runtimeCalls: f.calls.filter((call) => call.phase === 'runtime').length,
+      routeCalls: f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions').length,
+      replayCalls: f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/replay').length,
+      settlementCalls: f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/settle').length,
+      retirementCalls: f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/retire').length,
+      crispPosts: f.crispPostAttempts.length,
+    };
+    assert.equal(frozen.settlement.state, 'deferred');
+    assert(Number.isFinite(frozen.settlement.next_action_at));
+    assert(Number.isFinite(frozen.retryAt));
+    assert(Number.isSafeInteger(frozen.failureAudit.failure_rounds));
+    assert(Number.isFinite(frozen.failureAudit.failure_since));
+    assert(Number.isFinite(frozen.failureAudit.last_failure_at));
+
+    f.advance(Math.max(1, frozen.settlement.next_action_at - f.now() + 1));
+    const selected = await f.scan();
+    assert.equal(selected.some((entry) => entry.key === first.key && entry.jobId === first.jobId), true,
+      '裸声明不得把到期结算责任挡在scanner之外');
+    const scheduled = pendingJob(f, event, first.jobId);
+    assert.deepEqual(scheduled.data, frozen.data);
+    assert.deepEqual(scheduled.plan, frozen.plan);
+    assert.deepEqual(scheduled.inference, frozen.inference);
+    assert.deepEqual(scheduled.provider_result_receipt, frozen.receipt);
+    assert.deepEqual(scheduled.provider_settlement, frozen.settlement);
+    assert.equal(scheduled.generation, frozen.generation);
+    assert.equal(Number(scheduled.response_generation || 0), frozen.responseGeneration);
+    assert.deepEqual(failureAudit(scheduled), frozen.failureAudit,
+      'scanner选择settlement-only不得提前改写业务或失败责任');
+    const settlement = await f.process(first.key, first.jobId);
+    assert.equal(settlement.status, 'provider_settlement_settled', f.adapterErrors());
+
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'received');
+    assert.deepEqual(stored.data, frozen.data);
+    assert.deepEqual(stored.plan, frozen.plan,
+      'settlement-only不得提前删除或改写失权计划');
+    assert.equal(stored.generation, frozen.generation);
+    assert.equal(Number(stored.response_generation || 0), frozen.responseGeneration);
+    assert.equal(stored.retry_at, frozen.retryAt);
+    assert.deepEqual(failureAudit(stored), frozen.failureAudit,
+      '结算清理不是新的业务失败，不得改写失败审计');
+    assert.deepEqual(stored.inference, frozen.inference,
+      '裸声明尚未取得回答权威，结算后必须保留精确推理身份供cleanup-only退休');
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    assert.equal(stored.provider_settlement?.attempts, 2);
+    assert.deepEqual(f.state(event.data.session_id).outgoing[rejectedFingerprint], frozen.rejected,
+      'settlement-only不得触碰Crisp明确未接收的记录');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, frozen.runtimeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions').length,
+      frozen.routeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/replay').length,
+      frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/settle').length,
+      frozen.settlementCalls + 1, '恢复轮只允许一次exact settlement调用');
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts,
+      '结算轮不得提前重投失权正文');
+    assertNoVisibleFailureReply(f);
+
+    f.advance(Math.max(1, frozen.retryAt - f.now() + 1));
+    const migrationNow = f.now();
+    const migrated = await f.process(first.key, first.jobId);
+    assert.equal(migrated.status, 'answer_evidence_unavailable');
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.id, first.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'answer_evidence_unavailable');
+    assert.equal(stored.plan, undefined);
+    assert.deepEqual(stored.data, frozen.data);
+    assert.equal(stored.generation, frozen.generation);
+    assert.equal(Number(stored.response_generation || 0), frozen.responseGeneration + 1);
+    assert.equal(stored.provider_settlement, undefined,
+      '精确完成的旧计划结算身份应随失权计划一同收口');
+    assert.equal(stored.provider_retirement?.state, 'pending',
+      '已结算但失权的旧Provider结果必须先建立签名退休责任');
+    assert.equal(stored.provider_retirement?.purpose, 'non_answer_retired');
+    assert.deepEqual(stored.inference, frozen.inference);
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), true,
+      '本地迁移完成前，router中的settled question必须仍由签名退休责任保护');
+    assert.equal(stored.failure_rounds, frozen.failureAudit.failure_rounds,
+      '回答权威迁移不得放大既有外部故障轮次');
+    assert.equal(stored.failure_since, frozen.failureAudit.failure_since);
+    assert.equal(stored.last_failure_at, migrationNow);
+    assert.equal(stored.retry_at, migrationNow,
+      '迁移必须登记同一责任的下一步资格，实际重规划仍由retirement门禁阻止至清理完成');
+    const retired = f.state(event.data.session_id).outgoing[rejectedFingerprint];
+    assert.equal(retired.status, 'cancelled');
+    assert.equal(retired.cancellation_reason, 'answer_evidence_unavailable');
+    assert.equal(retired.resend_forbidden, true);
+    assert.equal(retired.recovery_deferred, false);
+    assert.equal(retired.next_action_at, null);
+    assert.equal(retired.body, undefined);
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, frozen.runtimeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions').length,
+      frozen.routeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/replay').length,
+      frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/settle').length,
+      frozen.settlementCalls + 1);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/retire').length,
+      frozen.retirementCalls);
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts);
+    assertNoVisibleFailureReply(f);
+
+    f.advance(1);
+    const retirement = await f.process(first.key, first.jobId);
+    assert.equal(retirement.status, 'provider_retirement_retired', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.responsibility_status, 'unresolved_failure');
+    assert.equal(stored.failure_code, 'answer_evidence_unavailable');
+    assert.equal(stored.provider_retirement?.state, 'retired');
+    assert.equal(stored.provider_retirement?.purpose, 'non_answer_retired');
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement, undefined);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), false,
+      'cleanup-only退休确认后必须实际删除旧settled question');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, frozen.runtimeCalls,
+      '退休轮不得重新调用Provider生成');
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions').length,
+      frozen.routeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/replay').length,
+      frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/settle').length,
+      frozen.settlementCalls + 1);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/retire').length,
+      frozen.retirementCalls + 1, '退休轮只允许一次exact cleanup-only调用');
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts,
+      '退休轮不得向访客发送任何正文');
+    assert.deepEqual(f.state(event.data.session_id).outgoing[rejectedFingerprint], retired,
+      '退休Provider缓存不得改写已经冻结的Crisp未发送审计');
+    assertNoVisibleFailureReply(f);
+
+    f.advance(1);
+    const recovered = await f.process(first.key, first.jobId);
+    assert.equal(recovered.status, 'sent', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.responsibility_status, 'answered_confirmed');
+    assert.equal(stored.failure_code, undefined);
+    assert.equal(stored.response_generation, frozen.responseGeneration + 1);
+    assert.equal(stored.inference_generation, 2);
+    assert.equal(stored.data, undefined);
+    assert.equal(stored.plan, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    assert.equal(f.state(event.data.session_id).jobs.filter((entry) => entry.id === first.jobId).length, 1,
+      '恢复必须沿用同一持久job');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, frozen.runtimeCalls + 1);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions').length,
+      frozen.routeCalls + 1);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/replay').length,
+      frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/settle').length,
+      frozen.settlementCalls + 2);
+    assert.equal(f.signedProviderPayloads.filter((entry) => entry.path === '/internal/provider/retire').length,
+      frozen.retirementCalls + 1);
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts + 1,
+      '只允许首次明确拒绝与后继成功各一次Crisp尝试');
+    assertSingleBusinessReply(f);
+    const finalOutgoing = Object.values(f.state(event.data.session_id).outgoing)
+      .filter((entry) => entry?.job_id === first.jobId);
+    assert.equal(finalOutgoing.filter((entry) => entry.status === 'sent').length, 1);
+    assert.equal((await f.process(first.key, first.jobId)).status, 'idle');
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts + 1);
+    assert.equal(f.sent.length, 1);
+  });
+
+  await test('裸clarification结算退避期遇真人接管后只结算并签名退休旧结果', async (f) => {
+    f.failNextSettlementRequest();
+    f.queueCrispPostResponse({ status: 401, headers: {},
+      body: { error: true, reason: 'synthetic_rejection' } });
+    const event = f.event('bare-clarification-settlement-human');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'rejected');
+    assertNoVisibleFailureReply(f);
+
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      assert(job?.plan && job.provider_settlement?.state === 'deferred');
+      job.plan = { ...job.plan, answer_responsibility: 'clarification_confirmed' };
+    });
+    let stored = pendingJob(f, event, first.jobId);
+    const settlementDue = stored.provider_settlement.next_action_at;
+    const frozen = {
+      inference: structuredClone(stored.inference),
+      receipt: structuredClone(stored.provider_result_receipt),
+      routeCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/v1/chat/completions').length,
+      replayCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/replay').length,
+      settlementCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/settle').length,
+      retirementCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/retire').length,
+      runtimeCalls: f.calls.filter((call) => call.phase === 'runtime').length,
+      crispPosts: f.crispPostAttempts.length,
+    };
+
+    const operator = {
+      website_id: event.website_id, event: 'message:received', timestamp: f.now() + 1,
+      data: { session_id: event.data.session_id, from: 'operator', type: 'text',
+        content: '受控人工已接管。', fingerprint: 900311, timestamp: f.now() + 1,
+        automated: false },
+    };
+    const received = await f.receive(operator);
+    assert.equal(received.accepted, true);
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'human_reply');
+    assert.equal(stored.plan, undefined);
+    assert.equal(stored.provider_settlement?.state, 'deferred');
+    assert.deepEqual(stored.inference, frozen.inference);
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+    assert.equal(stored.provider_retirement, undefined,
+      'settlement尚未完成时不得伪造可执行退休身份');
+
+    f.advance(Math.max(1, settlementDue - f.now() + 1));
+    const settled = await f.process(first.key, first.jobId);
+    assert.equal(settled.status, 'provider_settlement_settled', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'human_reply');
+    assert.equal(stored.provider_settlement, undefined,
+      '政策终态下完成的settlement必须原子转为退休责任');
+    assert.equal(stored.provider_retirement?.state, 'pending');
+    assert.equal(stored.provider_retirement?.purpose, 'conversation_cancelled');
+    assert.deepEqual(stored.inference, frozen.inference);
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), true);
+
+    const retired = await f.process(first.key, first.jobId);
+    assert.equal(retired.status, 'provider_retirement_retired', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'human_reply');
+    assert.equal(stored.provider_retirement?.state, 'retired');
+    assert.equal(stored.provider_retirement?.purpose, 'conversation_cancelled');
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), false);
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      frozen.runtimeCalls, '人工终态结算/退休不得重新推理');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/v1/chat/completions').length, frozen.routeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/replay').length, frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/settle').length, frozen.settlementCalls + 1);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/retire').length, frozen.retirementCalls + 1);
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts);
+    assert.equal(f.sent.length, 0);
+    assertNoVisibleFailureReply(f);
+  });
+
+  await test('裸clarification已完成结算但尚未迁移时遇真人仍只签名退休', async (f) => {
+    f.failNextSettlementRequest();
+    f.queueCrispPostResponse({ status: 401, headers: {},
+      body: { error: true, reason: 'synthetic_rejection' } });
+    const event = f.event('bare-clarification-settled-then-human');
+    const first = await f.deliver(event);
+    assert.equal(first.status, 'rejected');
+    assertNoVisibleFailureReply(f);
+
+    await f.mutateState(event.data.session_id, (state) => {
+      const job = state.jobs.find((entry) => entry.id === first.jobId);
+      assert(job?.plan && job.provider_settlement?.state === 'deferred');
+      job.plan = { ...job.plan, answer_responsibility: 'clarification_confirmed' };
+    });
+    let stored = pendingJob(f, event, first.jobId);
+    const settlementDue = stored.provider_settlement.next_action_at;
+    const frozen = {
+      inference: structuredClone(stored.inference),
+      receipt: structuredClone(stored.provider_result_receipt),
+      routeCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/v1/chat/completions').length,
+      replayCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/replay').length,
+      settlementCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/settle').length,
+      retirementCalls: f.signedProviderPayloads.filter((entry) =>
+        entry.path === '/internal/provider/retire').length,
+      runtimeCalls: f.calls.filter((call) => call.phase === 'runtime').length,
+      crispPosts: f.crispPostAttempts.length,
+    };
+    f.advance(Math.max(1, settlementDue - f.now() + 1));
+    const settled = await f.process(first.key, first.jobId);
+    assert.equal(settled.status, 'provider_settlement_settled', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'received');
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    assert.deepEqual(stored.inference, frozen.inference);
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), true);
+
+    const operator = {
+      website_id: event.website_id, event: 'message:received', timestamp: f.now() + 1,
+      data: { session_id: event.data.session_id, from: 'operator', type: 'text',
+        content: '受控人工已接管。', fingerprint: 900312, timestamp: f.now() + 1,
+        automated: false },
+    };
+    const received = await f.receive(operator);
+    assert.equal(received.accepted, true);
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.responsibility_reason, 'human_reply');
+    assert.equal(stored.plan, undefined);
+    assert.equal(stored.provider_settlement, undefined,
+      '完整settlement必须在政策退休事务中原子释放');
+    assert.equal(stored.provider_retirement?.state, 'pending');
+    assert.equal(stored.provider_retirement?.purpose, 'conversation_cancelled');
+    assert.deepEqual(stored.inference, frozen.inference);
+    assert.deepEqual(stored.provider_result_receipt, frozen.receipt);
+
+    const retired = await f.process(first.key, first.jobId);
+    assert.equal(retired.status, 'provider_retirement_retired', f.adapterErrors());
+    stored = pendingJob(f, event, first.jobId);
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.responsibility_status, 'intentional_silence');
+    assert.equal(stored.provider_retirement?.state, 'retired');
+    assert.equal(stored.provider_retirement?.purpose, 'conversation_cancelled');
+    assert.equal(stored.inference, undefined);
+    assert.equal(stored.provider_result_receipt, undefined);
+    assert.equal(fs.existsSync(f.questionPath(first.jobId)), false);
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+      frozen.runtimeCalls, 'settled后真人接管不得重新推理');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/v1/chat/completions').length, frozen.routeCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/replay').length, frozen.replayCalls);
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/settle').length, frozen.settlementCalls + 1,
+      '完成settlement不得因真人接管再次调用');
+    assert.equal(f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/internal/provider/retire').length, frozen.retirementCalls + 1);
+    assert.equal(f.crispPostAttempts.length, frozen.crispPosts);
+    assert.equal(f.sent.length, 0);
+    assertNoVisibleFailureReply(f);
+  });
+
+  await test('结算与退休混代或部分身份损坏时原样保留且零协议调用', async (f) => {
+    const pendingVariants = [
+      { name: 'retirement-null', mutate: (job) => { job.provider_retirement = null; } },
+      { name: 'migration-null', mutate: (job) => { job.provider_migration_from = null; } },
+      { name: 'retirement-finished', mutate: (job) => {
+        job.provider_retirement = { schema_version: 1, state: 'retired',
+          purpose: 'conversation_cancelled', attempts: 1, retired_at: f.now(),
+          identity_sha256: 'f'.repeat(64) };
+      } },
+      { name: 'retirement-failure-empty', mutate: (job) => {
+        job.provider_retirement_failure_code = '';
+      } },
+      { name: 'settlement-failure-empty', mutate: (job) => {
+        job.provider_settlement_failure_code = '';
+      } },
+    ];
+    for (const variant of pendingVariants) {
+      f.failNextSettlementRequest();
+      const event = f.event('mixed-pending-' + variant.name);
+      const first = await f.deliver(event);
+      assert.equal(first.status, 'sent', variant.name);
+      let stored = pendingJob(f, event, first.jobId);
+      assert.equal(stored.provider_settlement?.state, 'deferred', variant.name);
+      const settlementDue = stored.provider_settlement.next_action_at;
+      await f.mutateState(event.data.session_id, (state) => {
+        const job = state.jobs.find((entry) => entry.id === first.jobId);
+        variant.mutate(job);
+      });
+      stored = pendingJob(f, event, first.jobId);
+      const frozenJob = structuredClone(stored);
+      const protocolCalls = f.signedProviderPayloads.length;
+      const runtimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+      const crispPosts = f.crispPostAttempts.length;
+      const sent = f.sent.length;
+      f.advance(Math.max(1, settlementDue - f.now() + 1));
+      assert.equal((await f.process(first.key, first.jobId)).status, 'idle', variant.name);
+      stored = pendingJob(f, event, first.jobId);
+      assert.deepEqual(stored, frozenJob,
+        variant.name + ':混代字段及原任务证据必须逐字保留');
+      assert.equal(f.signedProviderPayloads.length, protocolCalls,
+        variant.name + ':混代状态不得调用route/replay/settle/retire');
+      assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+        runtimeCalls, variant.name + ':不得调用上游Provider');
+      assert.equal(f.crispPostAttempts.length, crispPosts,
+        variant.name + ':不得增加Crisp POST');
+      assert.equal(f.sent.length, sent, variant.name);
+    }
+
+    const finishedVariants = [
+      { name: 'settlement-failure-empty', mutate: (job) => {
+        job.provider_settlement_failure_code = '';
+      }, expectedRetirementFailure: false },
+      { name: 'retirement-null', mutate: (job) => {
+        job.provider_retirement = null;
+      }, expectedRetirementFailure: false },
+      { name: 'partial-receipt', mutate: (job) => {
+        delete job.provider_result_receipt.request_sha256;
+      }, expectedRetirementFailure: true },
+    ];
+    for (const [index, variant] of finishedVariants.entries()) {
+      f.failNextSettlementRequest();
+      f.queueCrispPostResponse({ status: 401, headers: {},
+        body: { error: true, reason: 'synthetic_rejection' } });
+      const event = f.event('mixed-finished-' + variant.name);
+      const first = await f.deliver(event);
+      assert.equal(first.status, 'rejected', variant.name);
+      await f.mutateState(event.data.session_id, (state) => {
+        const job = state.jobs.find((entry) => entry.id === first.jobId);
+        assert(job?.plan && job.provider_settlement?.state === 'deferred');
+        job.plan = { ...job.plan, answer_responsibility: 'clarification_confirmed' };
+      });
+      let stored = pendingJob(f, event, first.jobId);
+      f.advance(Math.max(1, stored.provider_settlement.next_action_at - f.now() + 1));
+      assert.equal((await f.process(first.key, first.jobId)).status,
+        'provider_settlement_settled', variant.name);
+      await f.mutateState(event.data.session_id, (state) => {
+        const job = state.jobs.find((entry) => entry.id === first.jobId);
+        variant.mutate(job);
+      });
+      stored = pendingJob(f, event, first.jobId);
+      const frozenSettlement = structuredClone(stored.provider_settlement);
+      const frozenInference = structuredClone(stored.inference);
+      const frozenReceipt = structuredClone(stored.provider_result_receipt);
+      const protocolCalls = f.signedProviderPayloads.length;
+      const runtimeCalls = f.calls.filter((call) => call.phase === 'runtime').length;
+      const crispPosts = f.crispPostAttempts.length;
+      const sent = f.sent.length;
+      const operator = {
+        website_id: event.website_id, event: 'message:received', timestamp: f.now() + 1,
+        data: { session_id: event.data.session_id, from: 'operator', type: 'text',
+          content: '受控人工已接管。', fingerprint: 900320 + index,
+          timestamp: f.now() + 1, automated: false },
+      };
+      const operatorReceived = await f.receive(operator);
+      assert.equal(operatorReceived.accepted, true, variant.name);
+      assert.equal((await f.process(operatorReceived.key,
+        operatorReceived.jobId)).status, 'none', variant.name);
+      stored = pendingJob(f, event, first.jobId);
+      assert.equal(stored.status, 'cancelled', variant.name);
+      assert.equal(stored.responsibility_status, 'intentional_silence', variant.name);
+      assert.equal(stored.responsibility_reason, 'human_reply', variant.name);
+      assert.deepEqual(stored.provider_settlement, frozenSettlement,
+        variant.name + ':finished settlement不得先删后验');
+      assert.deepEqual(stored.inference, frozenInference,
+        variant.name + ':原推理身份必须保留');
+      assert.deepEqual(stored.provider_result_receipt, frozenReceipt,
+        variant.name + ':原回执证据必须保留');
+      if (variant.expectedRetirementFailure) {
+        assert.equal(stored.provider_retirement_failure_code,
+          'provider_retirement_identity_unresolved', variant.name);
+      } else if (variant.name === 'retirement-null') {
+        assert.equal(stored.provider_retirement, null, variant.name);
+      } else {
+        assert.equal(stored.provider_settlement_failure_code, '', variant.name);
+      }
+      assert.equal(stored.recovery_requires_review, true, variant.name);
+      assert.equal(fs.existsSync(f.questionPath(first.jobId)), true,
+        variant.name + ':fail-closed不得删除router原问题');
+      assert.equal((await f.process(first.key, first.jobId)).status, 'idle', variant.name);
+      assert.equal(f.signedProviderPayloads.length, protocolCalls,
+        variant.name + ':政策接管后的损坏身份不得调用协议端点');
+      assert.equal(f.calls.filter((call) => call.phase === 'runtime').length,
+        runtimeCalls, variant.name + ':不得重新推理');
+      assert.equal(f.crispPostAttempts.length, crispPosts,
+        variant.name + ':不得增加Crisp POST');
+      assert.equal(f.sent.length, sent, variant.name);
+    }
+  });
+
   await test('损坏的伪结算完成记录保留终态责任，只有完整完成记录到期后才允许清理', async (f) => {
     const event = f.event('settlement-retention');
     const first = await f.deliver(event);
@@ -2742,6 +3826,120 @@ async function test(name, action) {
     assert.equal((await f.process(accepted.key, accepted.jobId)).status, 'idle');
     assert.equal(f.calls.length, 1);
     assert.equal(f.sent.length, 1);
+  });
+
+  await test('pool结算但零outgoing时资料换代必须废止旧答案，主备仅用新知识重规划一次', async (f) => {
+    const factA = '唯一知识事实A：旧入口位于虚构北门。';
+    const factB = '唯一知识事实B：当前入口已经改为虚构南门。';
+    const answerA = '基于知识事实A的旧答案。';
+    const answerB = '基于知识事实B的当前答案。';
+    f.publishKnowledge(factA);
+    f.setBehavior(async (call, response) => {
+      const serialized = JSON.stringify(call.body.messages || []);
+      const currentAnswer = serialized.includes(factB) ? answerB : answerA;
+      response.setHeader('content-type', 'application/json');
+      if (call.index === 0) {
+        response.writeHead(503);
+        response.end(JSON.stringify({ error: { code: 'synthetic_primary_unavailable' } }));
+      } else {
+        response.end(JSON.stringify({ choices: [{ message: {
+          role: 'assistant', content: currentAnswer }, finish_reason: 'stop' }] }));
+      }
+      return true;
+    });
+    f.failNextSettlementWriteback();
+    const event = f.event('settled-zero-outgoing-materials-change');
+    const accepted = await f.receive(event);
+    const first = await f.process(accepted.key, accepted.jobId);
+    assert.equal(first.status, 'deferred');
+    assert.equal(f.settlementWritebackFailures(), 1);
+    let stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.plan?.content, answerA);
+    assert(stored.provider_settlement, '零outgoing窗口必须仍有可审计的旧结算责任');
+    assert.equal(Object.values(f.state(event.data.session_id).outgoing || {}).length, 0);
+    assert.equal(f.crispPostAttempts.length, 0);
+    assertNoVisibleFailureReply(f);
+    const callsA = f.calls.filter((call) => call.phase === 'runtime');
+    assert.deepEqual(callsA.map((call) => call.index), [0, 1]);
+    assert(callsA.every((call) => JSON.stringify(call.body.messages).includes(factA)));
+    assert.deepEqual({ ...callsA[0].body, model: '<candidate>' },
+      { ...callsA[1].body, model: '<candidate>' },
+      '主失败与备用成功必须复用逐字相同的知识/历史/问题正文');
+    const healthAResponse = await fetchJson(`${f.adapterBase}/internal/provider/status`, {
+      timeout: 1000, headers: { authorization: `Bearer ${f.internal}` },
+    });
+    assert.equal(healthAResponse.status, 200);
+    const primaryHealthA = healthAResponse.body?.entries?.find((entry) =>
+      entry.id === f.pool.primary_id);
+    assert(primaryHealthA);
+    assert(primaryHealthA.cooldown_until > 0);
+    assert.equal(typeof primaryHealthA.last_error, 'string');
+    assert(primaryHealthA.last_error);
+
+    const configurationB = f.publishKnowledge(factB);
+    const healthBResponse = await fetchJson(`${f.adapterBase}/internal/provider/status`, {
+      timeout: 1000, headers: { authorization: `Bearer ${f.internal}` },
+    });
+    assert.equal(healthBResponse.status, 200);
+    const primaryHealthB = healthBResponse.body?.entries?.find((entry) =>
+      entry.id === f.pool.primary_id);
+    assert(primaryHealthB);
+    assert.equal(primaryHealthB.cooldown_until, primaryHealthA.cooldown_until,
+      '资料换代不得重置Provider主接口冷却期限');
+    assert.equal(primaryHealthB.last_error, primaryHealthA.last_error,
+      '资料换代不得清除Provider主接口失败分类');
+    advancePastRetry(f, event, accepted.jobId);
+    const deferred = await f.process(accepted.key, accepted.jobId);
+    assert.equal(deferred.status, 'deferred');
+    stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.data?.content, event.data.content,
+      '旧答案失权时原访客责任与输入必须保留');
+    assert.equal(stored.plan, undefined,
+      '尚未向Crisp登记的旧资料答案必须在换代后失权');
+    assert.equal(stored.provider_settlement, undefined,
+      '旧pool settlement不得挡住新材料代重规划');
+    assert.equal(f.calls.filter((call) => call.phase === 'runtime').length, 2,
+      '配置延期本身不得增加Provider调用');
+    assert.equal(f.crispPostAttempts.length, 0,
+      '旧知识答案在首次POST前必须被发送栅栏拦住');
+
+    const cooldownRemaining = primaryHealthA.cooldown_until - Date.now();
+    if (cooldownRemaining >= 0) await wait(cooldownRemaining + 25);
+    advancePastRetry(f, event, accepted.jobId);
+    const completed = await f.process(accepted.key, accepted.jobId);
+    assert.equal(completed.status, 'sent', f.adapterErrors());
+    const businessCalls = f.calls.filter((call) => call.phase === 'runtime');
+    const callsB = businessCalls.slice(2);
+    assert.deepEqual(callsB.map((call) => call.index), [0, 1],
+      '主接口冷却自然结束后新材料代必须按原池顺序执行主备');
+    assert(callsB.every((call) => JSON.stringify(call.body.messages).includes(factB)));
+    assert(callsB.every((call) => !JSON.stringify(call.body.messages).includes(factA)));
+    for (const call of callsB.slice(1)) {
+      assert.deepEqual({ ...callsB[0].body, model: '<candidate>' },
+        { ...call.body, model: '<candidate>' },
+        '新代主备仍须共用完整知识正文，只有候选model可以变化');
+    }
+    assertSingleBusinessReply(f, answerB);
+    assert.equal(f.crispPostAttempts.length, 1);
+    assert.equal(f.sent.some((message) => message.content === answerA), false,
+      '旧知识答案不得产生任何可见消息');
+    stored = pendingJob(f, event, accepted.jobId);
+    assert.equal(stored.status, 'done');
+    assert.equal(stored.responsibility_status, 'answered_confirmed');
+    assert.equal(stored.provider_settlement?.state, 'settled');
+    const question = f.question(accepted.jobId);
+    assert.equal(question.configuration.materials_source_sha256,
+      configurationB.materials_source_sha256);
+    const planContext = { outcome: 'knowledge_hit',
+      sources: [f.knowledgeLocation], tags: ['ai_replied'] };
+    const routeB = f.signedProviderPayloads.filter((entry) =>
+      entry.path === '/v1/chat/completions').at(-1);
+    assert(routeB?.request_body, '新材料代必须冻结runtime发给adapter的原始完整正文');
+    const expectedContract = requestContract(routeB.request_body, planContext);
+    assert.equal(question.settlement?.request_contract?.request_sha256,
+      expectedContract.request_sha256);
+    assert.equal(question.settlement?.request_contract?.plan_context_sha256,
+      expectedContract.plan_context_sha256);
   });
 
   await test('Crisp限流后接口池换代与runtime重启只重投已持久答案，不再次推理', async (f) => {

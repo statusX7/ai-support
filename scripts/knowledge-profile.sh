@@ -119,8 +119,12 @@ knowledge_profile_recover_incomplete_pointer() {
 knowledge_profile_restore() {
   local deploy=$1 backup=$2 previous old revision state schema current_revision old_revision revision_base
   local old_editable='' live_editable='' editable_matches=false editable_status=0
+  local pointer="${1}/data/runtime/knowledge-migration.json"
   knowledge_profile_backup_path_valid "$deploy" "$backup" \
     && [[ -f "${backup}/complete.json" && ! -L "${backup}/complete.json" ]] || return 1
+  [[ -f "$pointer" && ! -L "$pointer" \
+    && $(jq -M -er 'select(.schema_version == 1) | .backup' "$pointer" 2>/dev/null || true) == "$backup" ]] \
+    || return 1
   previous=$(jq -er '.previous_model' "${backup}/plan.json") || return 1
   knowledge_profile_valid_model "$previous" || return 1
   docker_compose "$deploy" stop --timeout 30 anythingllm >/dev/null || return 1
@@ -170,11 +174,11 @@ knowledge_profile_restore() {
       # 旧 schema 升级必须消费 live 原文；若已出现 B，宁可保留
       # applying 现场而不把 B 隐式发布。当前 v1.2.x 正式投影为 schema 2。
       [[ "$editable_matches" == true ]] || return 1
-      materials_initialize "$deploy" >/dev/null || return 1
+      materials_initialize "$deploy" true >/dev/null || return 1
     fi
     materials_applied_external_readback "$deploy" \
       "${deploy}/backups/config-history/materials.applied.tar.gz" \
-      "${deploy}/config/materials-applied.json" || return 1
+      "${deploy}/config/materials-applied.json" true || return 1
   elif [[ -e "${deploy}/config/materials-applied.json" \
     || -L "${deploy}/config/materials-applied.json" \
     || -e "${deploy}/backups/config-history/materials.applied.tar.gz" \
@@ -205,9 +209,11 @@ knowledge_profile_ensure() (
     ' "$pointer") || return 1
     knowledge_profile_backup_path_valid "$deploy" "$backup" || return 1
     if [[ -e "${backup}/complete.json" || -L "${backup}/complete.json" ]]; then
-      [[ -f "${backup}/complete.json" && ! -L "${backup}/complete.json" ]] \
-        && knowledge_profile_restore "$deploy" "$backup" \
-        || { configuration_error '上次知识迁移尚未成套恢复，自动回复保持受阻止；未强启混合索引'; return 1; }
+      if [[ ! -f "${backup}/complete.json" || -L "${backup}/complete.json" ]] \
+        || ! knowledge_profile_restore "$deploy" "$backup"; then
+        configuration_error '上次知识迁移尚未成套恢复，自动回复保持受阻止；未强启混合索引'
+        return 1
+      fi
     else
       knowledge_profile_recover_incomplete_pointer "$deploy" "$pointer" "$backup" \
         || { configuration_error '上次知识迁移在完整保全前中断，旧服务尚未确认恢复；自动回复保持受阻止'; return 1; }
@@ -279,15 +285,17 @@ knowledge_profile_ensure() (
   chmod 700 "${deploy}/backups/knowledge-profiles" \
     || { rm -f -- "$frozen_editable" "$projection_editable" "$observed" "$plan"; return 1; }
   if [[ -f "${deploy}/config/materials-applied.json" ]]; then
-    [[ -f "${deploy}/backups/config-history/materials.applied.tar.gz" \
-      && ! -L "${deploy}/backups/config-history/materials.applied.tar.gz" ]] \
-      && materials_snapshot_validate_generation "$deploy" \
+    if [[ ! -f "${deploy}/backups/config-history/materials.applied.tar.gz" \
+      || -L "${deploy}/backups/config-history/materials.applied.tar.gz" ]] \
+      || ! materials_snapshot_validate_generation "$deploy" \
         "${deploy}/backups/config-history/materials.applied.tar.gz" \
         "${deploy}/config/materials-applied.json" \
-      && materials_applied_external_readback "$deploy" \
+      || ! materials_applied_external_readback "$deploy" \
         "${deploy}/backups/config-history/materials.applied.tar.gz" \
-        "${deploy}/config/materials-applied.json" \
-      || { configuration_error '当前资料原文、索引与投影不是同一已应用代；未开始知识迁移'; return 1; }
+        "${deploy}/config/materials-applied.json"; then
+      configuration_error '当前资料原文、索引与投影不是同一已应用代；未开始知识迁移'
+      return 1
+    fi
     old=$(mktemp "${deploy}/tmp/knowledge-old-projection.XXXXXXXX") \
       || return 1
     install -m 600 -- "${deploy}/config/materials-applied.json" "$old" \
@@ -350,7 +358,8 @@ knowledge_profile_ensure() (
     fi
   fi
   if (( result == 0 )); then
-    knowledge_sync_catalog "$deploy" 1 all true || result=1
+    # 模型迁移只更换运行索引代；catalog 是可编辑原文，不在此处发布状态。
+    knowledge_sync_catalog "$deploy" 1 all true false || result=1
   fi
   if (( result == 0 )); then
     if materials_editable_identity_compare_live "$deploy" "$frozen_editable"; then :; else
@@ -372,7 +381,8 @@ knowledge_profile_ensure() (
     fi
   fi
   if (( result == 0 )); then
-    knowledge_catalog_readback "$deploy" all true || result=1
+    knowledge_catalog_readback "$deploy" all true \
+      "${deploy}/knowledge/catalog.json" false || result=1
   fi
   if (( result == 0 )); then
     if materials_editable_identity_compare_live "$deploy" "$frozen_editable"; then :; else
@@ -409,13 +419,13 @@ knowledge_profile_ensure() (
   if (( result == 0 )) && [[ -n "$old" ]]; then
     materials_snapshot_create "$deploy" "${stage}/materials.applied.tar.gz" \
       && materials_snapshot_validate_generation "$deploy" "${stage}/materials.applied.tar.gz" \
-        "${stage}/materials-applied.json" \
+        "${stage}/materials-applied.json" true \
       && materials_snapshot_publish "$deploy" "${stage}/materials.applied.tar.gz" \
         "${deploy}/backups/config-history/materials.applied.tar.gz" \
       && materials_projection_write_current "$deploy" "${stage}/materials-applied.json" \
       && materials_applied_external_readback "$deploy" \
         "${deploy}/backups/config-history/materials.applied.tar.gz" \
-        "${deploy}/config/materials-applied.json" || result=1
+        "${deploy}/config/materials-applied.json" true || result=1
   fi
   if (( result != 0 )) && [[ "$editable_changed" == false ]]; then
     if materials_editable_identity_compare_live "$deploy" "$frozen_editable"; then :; else

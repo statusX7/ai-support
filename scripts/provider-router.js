@@ -44,12 +44,33 @@ const validQuestionSettlement = (value,question) => Boolean(value
   && sameRequestContract(requestContract(question.stages.answer.request_contract),
     requestContract(value.request_contract)));
 
+function hasUnsupportedToolInvocation(message) {
+  const toolCalls = message?.tool_calls;
+  const functionCall = message?.function_call;
+  const noToolCalls = toolCalls === undefined || toolCalls === null
+    || Array.isArray(toolCalls) && toolCalls.length === 0;
+  const noFunctionCall = functionCall === undefined || functionCall === null;
+  // 空 tool_calls 是多个 OpenAI-compatible 服务的合法序列化结果。除此之外，
+  // 非空数组、对象、字符串及任何 function_call 都失败关闭；本项目不执行参数。
+  return !noToolCalls || !noFunctionCall;
+}
+
+function chatFinishDisposition(value) {
+  if (value === undefined || value === null || value === '' || value === 'stop' || value === 'length') return 'complete';
+  if (value === 'content_filter') return 'safety_refusal';
+  if (value === 'insufficient_system_resource' || value === 'aborted') return 'retryable_failure';
+  if (value === 'tool_calls') return 'tool_invocation';
+  return 'invalid';
+}
+
 function cachedResultDisposition(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'invalid';
   const choice = result.choices?.[0], message = choice?.message;
   const refusal = typeof message?.refusal === 'string' && Boolean(message.refusal.trim());
-  if (refusal || choice?.finish_reason === 'content_filter') return 'safety_refusal';
-  if (!message || message.tool_calls || message.function_call
+  const finish = chatFinishDisposition(choice?.finish_reason);
+  if (finish !== 'complete' && finish !== 'safety_refusal') return 'invalid';
+  if (refusal || finish === 'safety_refusal') return 'safety_refusal';
+  if (!message || hasUnsupportedToolInvocation(message)
     || typeof message.content !== 'string' || !message.content.trim()) return 'invalid';
   return mechanicalFailureAnswer(message.content) || legacyGenericNonAnswer(message.content)
     ? 'non_answer' : 'answer';
@@ -189,6 +210,7 @@ function classifyFailure(status, body, headers = {}) {
   const category = String(detail.type || '').toLowerCase();
   const message = String(detail.message || '').toLowerCase();
   const retryAfter = retryAfterMilliseconds(typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']);
+  if (status === 402) return {kind:'quota_exhausted',fallback:true,scope:'authScope',retryAfter,status};
   if (/content_filter|content_policy|safety|moderation|policy_violation/.test(code + ' ' + category) || /safety system|content policy/.test(message)) return {kind:'safety_refusal',fallback:false,status:400};
   if (/model_not_found|invalid_model|model_not_exist|model_not_available/.test(code) || /model.*(?:does not exist|not found|not available)/.test(message)) return {kind:'model_unavailable',fallback:true,scope:'modelScope',retryAfter,status};
   if (status === 401 || status === 403 || /invalid_api_key|authentication_error|invalid_authentication/.test(code)) return {kind:'authentication_failed',fallback:true,scope:'authScope',retryAfter,status};
@@ -401,6 +423,18 @@ function createRouter(environment, invoke) {
     && left.secrets_generation === right.secrets_generation
     && String(left.pool_sha256 || '') === String(right.pool_sha256 || '')
     && String(left.materials_source_sha256 || '') === String(right.materials_source_sha256 || ''));
+  const completeMigrationConfiguration = value => Boolean(value
+    && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === [
+      'runtime_revision','pool_revision','secrets_generation','pool_sha256',
+      'materials_source_sha256','attempt_generation',
+    ].sort().join(',')
+    && Number.isSafeInteger(value.runtime_revision) && value.runtime_revision >= 0
+    && Number.isSafeInteger(value.pool_revision) && value.pool_revision >= 1
+    && /^[a-f0-9]{32}$/.test(value.secrets_generation || '')
+    && /^[a-f0-9]{64}$/.test(value.pool_sha256 || '')
+    && /^[a-f0-9]{64}$/.test(value.materials_source_sha256 || '')
+    && Number.isSafeInteger(value.attempt_generation) && value.attempt_generation >= 1);
   const assertCurrent = (envelope, pool, deadline, options = {}) => {
     if (options.ignoreDeadline !== true && Date.now() >= deadline) throw terminal('question_timeout','本次问题的总处理时间已用尽');
     const current = loadPool(environment);
@@ -423,7 +457,9 @@ function createRouter(environment, invoke) {
       || envelope.materials_source_sha256 !== undefined
         && envelope.materials_source_sha256 !== materialsSourceSha256) throw terminal('question_cancelled','应用配置身份已变更，本次问题已取消');
     if (envelope.scope === 'admin') {
-      if (envelope.migration_from) throw terminal('invalid_envelope','管理员问题不能携带配置迁移凭证');
+      if (Object.hasOwn(envelope,'migration_from')) {
+        throw terminal('invalid_envelope','管理员问题不能携带配置迁移凭证');
+      }
       return;
     }
     const session = readJson(path.join(root,'data/runtime/session-' + envelope.session_key + '.json'));
@@ -435,6 +471,7 @@ function createRouter(environment, invoke) {
       && envelope.configuration_binding !== currentConfigurationBinding) {
       throw terminal('question_cancelled','应用配置身份已变更，本次问题已取消');
     }
+    const expectedMigrationPresent = Object.hasOwn(envelope,'migration_from');
     const expectedMigration = envelope.migration_from;
     if (session.schema_version !== 2 || session.mode !== 'ai' || session.generation !== envelope.generation || session.uncertain_events?.length
       || !Array.isArray(session.jobs) || !session.jobs.some(job => {
@@ -453,8 +490,12 @@ function createRouter(environment, invoke) {
           || !strictBinding && inference.secrets_generation !== undefined
             && inference.secrets_generation !== currentConfiguration.secrets_generation
           || ['cancelled','failed','done'].includes(job.status)) return false;
-        if (!expectedMigration) return !job.provider_migration_from;
-        return sameConfiguration(job.provider_migration_from,expectedMigration)
+        const localMigrationPresent = Object.hasOwn(job,'provider_migration_from');
+        if (!expectedMigrationPresent) return !localMigrationPresent;
+        return localMigrationPresent
+          && completeMigrationConfiguration(expectedMigration)
+          && completeMigrationConfiguration(job.provider_migration_from)
+          && sameConfiguration(job.provider_migration_from,expectedMigration)
           && job.provider_migration_from.attempt_generation === expectedMigration.attempt_generation;
       })) throw terminal('question_cancelled','会话状态已变更，本次问题已取消');
   };
@@ -530,6 +571,13 @@ function createRouter(environment, invoke) {
         && ['intentional_silence','control_handled'].includes(job.responsibility_status)
         && ['non_visitor_message','before_catchup_bootstrap','before_control_watermark']
           .includes(job.responsibility_reason);
+    }
+    if (purpose === 'legacy_unsettled_retired') {
+      return ['received','failed'].includes(job.status)
+        && job.responsibility_status === 'unresolved_failure'
+        && job.failure_code === 'legacy_unsettled_plan_migrated'
+        && Number.isSafeInteger(job.legacy_unsettled_plan_migrated_at)
+        && job.legacy_unsettled_plan_migrated_at >= 0;
     }
     return purpose === 'non_answer_retired'
       && ['received','failed'].includes(job.status)
@@ -1044,7 +1092,15 @@ function createRouter(environment, invoke) {
         if (!entry.enabled || !entry.capabilities[entry.mode] || visual && !entry.capabilities.vision || phase.tried.includes(entry.id)) continue;
         const requestedOutput = Number(body.max_completion_tokens ?? body.max_tokens ?? body.max_output_tokens) || entry.max_output_tokens;
         const maxOutput = Math.min(entry.max_output_tokens,Math.max(1,requestedOutput));
-        if (inputTokens + maxOutput > entry.context_window) continue;
+        const requiredTokens = inputTokens + maxOutput;
+        if (requiredTokens > entry.context_window) {
+          bestEffortState(() => record({at:Date.now(),question_id:id,stage,entry_id:entry.id,
+            pool_revision:pool.revision,outcome:'skipped',error_class:'context_window_insufficient',
+            input_tokens_estimate:inputTokens,requested_output_tokens:maxOutput,required_tokens:requiredTokens,
+            context_window:entry.context_window,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),
+            attempt:question.attempts,duration_ms:0}));
+          continue;
+        }
         candidates += 1;
         if (!reserve(entry,pool.policy,Date.now(),visual)) continue;
         phase.tried.push(entry.id); question.attempts += 1; question.round_attempts += 1; persistQuestion(question,lock);
@@ -1214,7 +1270,7 @@ function createRouter(environment, invoke) {
   };
   const retire = async (envelope,value={}) => {
     const purposes = new Set(['conversation_cancelled','global_disabled','input_retired',
-      'non_answer_retired']);
+      'non_answer_retired','legacy_unsettled_retired']);
     if (!envelope?.question_id || envelope.scope !== 'conversation'
       || !value || typeof value !== 'object' || Array.isArray(value)
       || Object.keys(value).sort().join(',') !== 'outcome,purpose'
@@ -1319,4 +1375,5 @@ function createRouter(environment, invoke) {
 }
 
 module.exports = {createRouter,loadPool,validateEntry,validatePolicy,normalizeApiBase,parseHeaders,DEFAULT_POLICY,
-  RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens};
+  RouterError,terminal,classifyFailure,retryAfterMilliseconds,cooldownMilliseconds,readJson,estimateTextTokens,
+  hasUnsupportedToolInvocation,chatFinishDisposition};

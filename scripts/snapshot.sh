@@ -209,11 +209,12 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
   [[ ! -e "${DEPLOY_DIR}/backups/config-history/materials.recovery" \
     && ! -L "${DEPLOY_DIR}/backups/config-history/materials.recovery" ]] \
     || die '资料应用事务尚未收口；不能建立会丢失恢复责任的版本快照'
-  [[ -f "${DEPLOY_DIR}/config/materials-applied.json" \
-    && ! -L "${DEPLOY_DIR}/config/materials-applied.json" ]] \
-    && jq -e '.schema_version == 2 and .state == "applied"' \
-      "${DEPLOY_DIR}/config/materials-applied.json" >/dev/null \
-    || die '资料投影尚未完整应用；不能建立版本快照'
+  if [[ ! -f "${DEPLOY_DIR}/config/materials-applied.json" \
+    || -L "${DEPLOY_DIR}/config/materials-applied.json" ]] \
+    || ! jq -e '.schema_version == 2 and .state == "applied"' \
+      "${DEPLOY_DIR}/config/materials-applied.json" >/dev/null; then
+    die '资料投影尚未完整应用；不能建立版本快照'
+  fi
   [[ ! -e "${DEPLOY_DIR}/backups/config-history/materials.initialize" \
     && ! -L "${DEPLOY_DIR}/backups/config-history/materials.initialize" ]] \
     || die '资料初始化事务尚未收口；不能建立混合代快照'
@@ -224,6 +225,16 @@ if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
     "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
     "${DEPLOY_DIR}/config/materials-applied.json" \
     || die '资料原文、知识索引、投影或运行回读不同代；拒绝快照'
+fi
+
+SNAPSHOT_HAS_MATERIALS_CANONICAL=0
+if snapshot_version_at_least "$VERSION_VALUE" 1 3 0 \
+  || [[ -e "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    || -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" ]]; then
+  [[ -f "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+    && ! -L "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" ]] \
+    || die '资料规范原文包缺失或不安全'
+  SNAPSHOT_HAS_MATERIALS_CANONICAL=1
 fi
 
 snapshot_validate_file() {
@@ -401,7 +412,7 @@ SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/postgres")
 for name in "${OPTIONAL_DATA_FILES[@]}"; do
   [[ ! -f "${DEPLOY_DIR}/data/${name}" ]] || SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/data/${name}")
 done
-if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
+if (( SNAPSHOT_HAS_MATERIALS_CANONICAL )); then
   SNAPSHOT_SOURCE_PATHS+=("${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz")
 fi
 
@@ -566,8 +577,9 @@ for name in "${OPTIONAL_DATA_FILES[@]}"; do
     install -m 0600 -- "${DEPLOY_DIR}/data/${name}" "$STAGING/payload/data/${name}"
   fi
 done
-if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
-  install -m 0600 -- "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+if (( SNAPSHOT_HAS_MATERIALS_CANONICAL )); then
+  # 已有 v1.2.x 的资料应用也需要它自己的原文包，必须与旧投影一并保全。
+  install -D -m 0600 -- "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
     "$STAGING/payload/backups/config-history/materials.applied.tar.gz"
 fi
 
@@ -598,7 +610,7 @@ chmod 600 "$STAGING/payload/data/postgres/n8n.dump"
 # 重新核对 canonical、投影、manifest/map/profile/cache 与词法索引，避免
 # 把各自正确但彼此不同代的文件冻结成“可恢复”快照。editable Prompt/知识
 # 可以合法领先于 applied 代，因此本门禁只用 canonical 作为运行代依据。
-mkdir -m 0700 -p -- "$STAGING/payload/tmp"
+mkdir -m 0700 -- "$STAGING/payload/tmp"
 if snapshot_version_at_least "$VERSION_VALUE" 1 3 0; then
   materials_snapshot_validate_generation "$STAGING/payload" \
     "$STAGING/payload/backups/config-history/materials.applied.tar.gz" \

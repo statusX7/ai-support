@@ -44,6 +44,7 @@ LIBRARY_TWO = 'kb_' + '3' * 16
 DOCUMENT_TWO = 'doc_' + '4' * 16
 PROJECTION = LIBRARY + '_' + DOCUMENT + '.md'
 LOCATION = 'custom-documents/' + PROJECTION + '.fixture.json'
+DRIVER_TIMEOUT_SECONDS = 180
 PROFILE = 'data/runtime/knowledge-profile.json'
 SETTINGS = 'data/runtime/knowledge-settings.json'
 LEXICAL = 'data/runtime/knowledge-lexical.json'
@@ -388,7 +389,8 @@ elif mode == 'api':
     output = pathlib.Path(args[5])
     if output.parent != D / 'tmp': reject()
     state = read(S)
-    workspace = {'slug': 'synthetic_workspace', 'openAiPrompt': (D / 'config/prompt.md').read_text(),
+    # 组件回读只反映已应用运行代，不得直接读取尚未应用的可编辑原文。
+    workspace = {'slug': 'synthetic_workspace', 'openAiPrompt': state['open_ai_prompt'],
                  'openAiTemp': state['temperature'], 'documents': [{'docpath': p} for p in state['locations']]}
     case = control.get('api_case', '')
     if case == 'wrong_slug': workspace['slug'] = 'other_synthetic_workspace'
@@ -582,6 +584,7 @@ class Integration(unittest.TestCase):
             target.chmod(0o640)
         write(self.deploy / 'config/runtime.yaml', 'schema_version: 2\nenabled: true\nrevision: 3\napplied_revision: 3\n', 0o640)
         write(self.deploy / 'config/prompt.md', '# 合成客服规则\n只回答本测试文档；此处没有客户资料。\n', 0o640)
+        self.set_state(open_ai_prompt=(self.deploy / 'config/prompt.md').read_text())
         raw = self.deploy / 'knowledge' / LIBRARY / 'sources' / (DOCUMENT + '.md')
         write(raw, '# 纯虚构说明\n测试灯亮时设备就绪。\n', 0o640)
         shutil.copy2(raw, self.deploy / 'knowledge' / PROJECTION)
@@ -589,15 +592,18 @@ class Integration(unittest.TestCase):
             'id': LIBRARY, 'name': '合成库', 'enabled': True, 'revision': 1, 'status': 'indexed',
             'last_sync': 1000, 'error': None, 'documents': [{'id': DOCUMENT, 'name': '合成说明.md',
             'source': 'sources/' + DOCUMENT + '.md', 'projection': PROJECTION, 'sha256': sha(raw)}]}]}, 0o640)
-        save(self.deploy / 'data/knowledge-manifest.json', {'version': 1, 'files': {
-            PROJECTION: {'sha256': sha(raw), 'locations': [LOCATION]}}, 'pending_files': {}, 'garbage_locations': []})
-        save(self.deploy / 'data/knowledge-projection.json', [PROJECTION])
-        save(self.deploy / LEXICAL, {'schema_version': 1, 'fixture': 'old-lexical', 'documents': []}, 0o640)
         old_profile = {'engine': 'native', 'model': MINI, 'chunk_size': 1000, 'chunk_overlap': 20,
                        'passage_prefix': '', 'query_prefix': '', 'component_version': '1.16.1',
                        'splitter': 'AnythingLLM-1.16.1-TextSplitter'}
+        old_fingerprint = json_digest(old_profile)
+        save(self.deploy / 'data/knowledge-manifest.json', {'version': 1, 'files': {
+            PROJECTION: {'sha256': sha(raw), 'locations': [LOCATION],
+                         'embedding_profile': old_fingerprint}}, 'pending_files': {},
+             'garbage_locations': [], 'embedding_profile': old_fingerprint})
+        save(self.deploy / 'data/knowledge-projection.json', [PROJECTION])
+        save(self.deploy / LEXICAL, {'schema_version': 1, 'fixture': 'old-lexical', 'documents': []}, 0o640)
         save(self.deploy / PROFILE, {'schema_version': 1, 'state': 'applied', 'profile': old_profile,
-             'fingerprint': json_digest(old_profile), 'applied_at': 1000}, 0o640)
+             'fingerprint': old_fingerprint, 'applied_at': 1000}, 0o640)
         for relative in PROTECTED:
             save(self.deploy / relative, {'generation': 4, 'mode': 'human', 'resume_at': 0,
                                          'event': 'before-migration', 'jobs': ['old']})
@@ -621,8 +627,18 @@ class Integration(unittest.TestCase):
 
     def call(self, action):
         self.call_sequence += 1
-        result = subprocess.run(['bash', str(DRIVER), action], cwd=self.deploy,
-                                env=self.environment, capture_output=True, text=True, timeout=50, check=False)
+        try:
+            result = subprocess.run(['bash', str(DRIVER), action], cwd=self.deploy,
+                                    env=self.environment, capture_output=True, text=True,
+                                    timeout=DRIVER_TIMEOUT_SECONDS, check=False)
+        except subprocess.TimeoutExpired as error:
+            timeline = [{key: item[key] for key in
+                         ('event', 'profile', 'materials', 'complete', 'running', 'code')
+                         if key in item} for item in self.events()[-16:]]
+            raise AssertionError(
+                '合成命令超时：action=%s，limit=%s；最后事件=%s' %
+                (action, DRIVER_TIMEOUT_SECONDS,
+                 json.dumps(timeline, ensure_ascii=False, sort_keys=True))) from error
         write(self.fixture / ('command-%02d-%s.log' % (self.call_sequence, action)),
               'exit=' + str(result.returncode) + '\n' + result.stdout + result.stderr)
         return result
@@ -753,6 +769,7 @@ class Integration(unittest.TestCase):
                 'settings': (self.deploy / SETTINGS).read_bytes(),
                 'lexical': (self.deploy / LEXICAL).read_bytes(),
                 'profile': (self.deploy / PROFILE).read_bytes(),
+                'catalog': (self.deploy / 'knowledge/catalog.json').read_bytes(),
                 'canonical': (self.deploy / 'backups/config-history/materials.applied.tar.gz').read_bytes(),
                 'projection': load(self.deploy / 'config/materials-applied.json')}
 
@@ -804,10 +821,15 @@ class Integration(unittest.TestCase):
         self.assertEqual(load(self.deploy / SETTINGS)['temperature'], 0.25)
         self.assertNotEqual((self.deploy / LEXICAL).read_bytes(), before['lexical'])
         self.assertEqual(load(self.deploy / LEXICAL)['algorithm'], 'crispai-lexical-v2')
+        self.assertEqual((self.deploy / 'knowledge/catalog.json').read_bytes(), before['catalog'])
         self.assertFalse((self.deploy / 'data/runtime/knowledge-migration.json').exists())
         refreshes = [event['arguments'] for event in events if event['event'] == 'python_refresh-bindings_before']
-        self.assertEqual(refreshes, [['--allow-migration', '--validate-only'],
-                                     ['--allow-migration'], ['--allow-migration']])
+        self.assertEqual(refreshes, [['--validate-only', '--require-complete'],
+                                     ['--validate-only', '--require-complete'],
+                                     ['--allow-migration', '--validate-only'],
+                                     ['--allow-migration'], ['--allow-migration'],
+                                     ['--allow-migration', '--validate-only', '--require-complete'],
+                                     ['--allow-migration', '--validate-only', '--require-complete']])
         self.assert_hashes()
         self.assert_protected()
 
@@ -829,7 +851,12 @@ class Integration(unittest.TestCase):
         self.set_control(editable_edit_phase=phase, editable_edit_consumed=False)
         result = self.call('ensure')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('新编辑保留为待应用', result.stderr)
+        timeline = [{key: item[key] for key in
+                     ('event', 'profile', 'materials', 'complete', 'running',
+                      'code', 'edit_phase') if key in item}
+                    for item in self.events()[-24:]]
+        self.assertIn('新编辑保留为待应用', result.stderr,
+                      json.dumps(timeline, ensure_ascii=False, sort_keys=True))
         self.assertEqual([event['edit_phase'] for event in self.events()
                           if event['event'] == 'editable_edit'], [phase])
         names = [event['event'] for event in self.events()]
@@ -1124,6 +1151,8 @@ class Integration(unittest.TestCase):
         self.assert_protected()
 
     def test_four_gib_preserves_legacy_model_but_builds_first_binding(self):
+        initial = load(self.deploy / 'data/knowledge-manifest.json')['files'][PROJECTION]
+        self.assertEqual(len(initial['cache_bindings']), len(initial['locations']))
         self.set_control(memory_kib=4 * 1024 * 1024)
         self.ok('capture-start')
         self.assertEqual(self.env_value('KNOWLEDGE_EMBEDDING_MODEL'), MINI)
@@ -1131,7 +1160,7 @@ class Integration(unittest.TestCase):
         self.ok('ensure')
         self.assertEqual(load(self.deploy / PROFILE)['profile']['model'], MINI)
         self.assertEqual(load(self.deploy / PROFILE)['profile']['chunk_size'], 1000)
-        self.assertEqual(load(self.control)['syncs'], 1)
+        self.assertEqual(load(self.control)['syncs'], 0)
         self.assert_hashes()
         self.assert_protected()
 
@@ -1422,6 +1451,8 @@ class Integration(unittest.TestCase):
         self.assert_protected()
 
     def test_restore_env_write_failure_keeps_pointer_and_service_blocked_then_recovers(self):
+        # 先通过生产 capture 建立 active/desired，再将第二次写故障精确放在恢复旧模型处。
+        self.ok('capture')
         self.set_control(fault='configure', env_set_move_count=0, env_set_failure_at=2)
         result = self.call('ensure')
         self.assertNotEqual(result.returncode, 0)
@@ -1568,6 +1599,12 @@ receipt = {
 }
 save(WORK / 'result.json', receipt)
 print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
-print('合成证据目录：' + str(WORK.relative_to(ROOT)))
+evidence_relative = str(WORK.relative_to(ROOT))
+try:
+    shutil.rmtree(WORK)
+except OSError:
+    print('合成测试目录清理失败：' + evidence_relative, file=sys.stderr)
+    raise SystemExit(1)
+print('合成测试目录已清理：' + evidence_relative)
 raise SystemExit(0 if result.wasSuccessful() else 1)
 PY

@@ -278,8 +278,17 @@ class ProfileFixture(unittest.TestCase):
         cache.write_bytes(before)
 
         migration = self.root / "data/runtime/knowledge-migration.json"
+        self.backup.mkdir(parents=True)
         save(migration, {"schema_version": 1, "backup": str(self.backup)})
         self.rejects("refresh-bindings", "--validate-only", "--require-complete")
+        checked = self.succeeds("refresh-bindings", "--allow-migration",
+                                "--validate-only", "--require-complete")
+        self.assertEqual(checked["reason"], "migration_committed")
+
+        cache.write_bytes(before + b"tampered-again")
+        self.rejects("refresh-bindings", "--allow-migration",
+                     "--validate-only", "--require-complete")
+        cache.write_bytes(before)
 
     def test_refresh_bindings_never_replaces_an_existing_cache_digest(self):
         self.applied_profile()
@@ -954,6 +963,16 @@ if __name__ == "__main__":
     (EVIDENCE / "transcript.log").chmod(0o600)
     print(transcript.getvalue(), end="")
     save(EVIDENCE / "result.json", summary)
+    evidence_relative = str(EVIDENCE.relative_to(ROOT))
+    cleanup_error = None
+    try:
+        shutil.rmtree(EVIDENCE)
+    except Exception as error:  # pragma: no cover - 由外层门禁作为失败处理
+        cleanup_error = type(error).__name__
+    cleanup_ok = cleanup_error is None and not EVIDENCE.exists()
+    summary["synthetic_evidence_cleaned"] = cleanup_ok
+    if cleanup_error:
+        summary["synthetic_evidence_cleanup_error"] = cleanup_error
     print(json.dumps(summary, ensure_ascii=False))
-    print("合成证据目录：" + str(EVIDENCE.relative_to(ROOT)))
-    sys.exit(0 if result.wasSuccessful() else 1)
+    print(("合成证据目录已清理：" if cleanup_ok else "合成证据目录清理失败：") + evidence_relative)
+    sys.exit(0 if result.wasSuccessful() and cleanup_ok else 1)

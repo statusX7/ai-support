@@ -5,6 +5,24 @@ if [[ -n "${MOCK_DOCKER_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 fi
 
+mock_configuration_readback_should_fail() {
+  local marker=${MOCK_CONFIGURATION_READBACK_FAIL_ONCE_FILE:-}
+  [[ "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" == 1 ]] && return 0
+  [[ -n "$marker" ]] || return 1
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    return 1
+  fi
+  [[ -f "$marker" && ! -L "$marker" \
+    && "$(stat -c '%a:%h:%u' -- "$marker" 2>/dev/null || true)" == "600:1:${EUID}" ]] \
+    || return 2
+  [[ -f "${MOCK_PROJECT_DIR}/VERSION" \
+    && "$(<"${MOCK_PROJECT_DIR}/VERSION")" == "${MOCK_CONFIGURATION_READBACK_FAIL_VERSION:-v1.3.0}" ]] \
+    || return 1
+  rm -f -- "$marker" || return 2
+  [[ ! -e "$marker" && ! -L "$marker" ]] || return 2
+  return 0
+}
+
 if [[ "${1:-}" == context ]]; then
   case "${2:-}" in
     show) printf 'default\n'; exit 0 ;;
@@ -300,14 +318,22 @@ PY
 }
 
 mock_provider_status() {
-  local configuration_state=applied
+  local configuration_state=applied applied pool_sha generation
   [[ "${MOCK_ADAPTER_STATUS_FAIL:-0}" != 1 ]] || return 1
   if [[ -e "${MOCK_PROJECT_DIR}/config/provider-pool-transaction.json" \
     || -L "${MOCK_PROJECT_DIR}/config/provider-pool-transaction.json" ]]; then
     configuration_state=applying
   fi
+  applied="${MOCK_PROJECT_DIR}/config/provider-pool-applied.json"
+  [[ -f "$applied" && ! -L "$applied" ]] || return 1
+  pool_sha=$(sha256sum -- "$applied" | cut -d ' ' -f 1)
+  [[ "$pool_sha" =~ ^[a-f0-9]{64}$ ]] || return 1
+  generation=$(jq -er '.secrets_generation
+    | select(type == "string" and test("^[a-f0-9]{32}$"))' "$applied") || return 1
   python3 "${MOCK_PROJECT_DIR}/scripts/provider-pool.py" --deploy-dir "$MOCK_PROJECT_DIR" list \
-    | jq --arg state "$configuration_state" '{ok,revision,configuration_state:$state,pool_cooldown_until:0,
+    | jq --arg state "$configuration_state" --arg generation "$generation" --arg sha "$pool_sha" \
+      '{ok,readback_contract_version:1,revision,secrets_generation:$generation,pool_sha256:$sha,
+        configuration_state:$state,pool_cooldown_until:0,
         entries:[.entries[] | {id,enabled,health:(if .enabled then "unknown" else "disabled" end),
           cooldown_until:0,last_error:"",vision_health:(if .enabled and .capabilities.vision then "unknown" else "disabled" end),
           vision_cooldown_until:0,vision_last_error:""}]}'
@@ -432,7 +458,34 @@ case "$COMMAND" in
     exit 0
     ;;
   pull)
-    [[ "${MOCK_DOCKER_FAIL_PULL:-0}" != 1 ]]
+    if [[ -n "${MOCK_EXPECT_PREFLIGHT_ENV_KEY:-}${MOCK_EXPECT_PREFLIGHT_ENV_KEY_SECONDARY:-}" ]]; then
+      [[ -f "$MOCK_ENV_FILE" && ! -L "$MOCK_ENV_FILE" \
+        && "$MOCK_ENV_FILE" != "${MOCK_PROJECT_DIR}/.env" ]] || exit 2
+      for expected_key in "${MOCK_EXPECT_PREFLIGHT_ENV_KEY:-}" "${MOCK_EXPECT_PREFLIGHT_ENV_KEY_SECONDARY:-}"; do
+        [[ -z "$expected_key" ]] && continue
+        grep -Eq "^${expected_key}=" "$MOCK_ENV_FILE" || exit 2
+        ! grep -Eq "^${expected_key}=" "${MOCK_PROJECT_DIR}/.env" || exit 2
+      done
+    fi
+    if [[ -n "${MOCK_UPDATE_PULL_GATE_READY:-}${MOCK_UPDATE_PULL_GATE_RELEASE:-}" ]]; then
+      [[ -n "${MOCK_UPDATE_PULL_GATE_READY:-}" && -n "${MOCK_UPDATE_PULL_GATE_RELEASE:-}" \
+        && ! -e "$MOCK_UPDATE_PULL_GATE_READY" && ! -L "$MOCK_UPDATE_PULL_GATE_READY" \
+        && ! -L "$MOCK_UPDATE_PULL_GATE_RELEASE" ]] || exit 2
+      : > "$MOCK_UPDATE_PULL_GATE_READY"
+      chmod 0600 "$MOCK_UPDATE_PULL_GATE_READY"
+      gate_deadline=$((SECONDS + 30))
+      while [[ ! -f "$MOCK_UPDATE_PULL_GATE_RELEASE" ]]; do
+        (( SECONDS < gate_deadline )) || exit 124
+        sleep 0.05
+      done
+      [[ ! -L "$MOCK_UPDATE_PULL_GATE_RELEASE" ]] || exit 2
+    fi
+    [[ "${MOCK_DOCKER_FAIL_PULL:-0}" != 1 ]] || exit 1
+    if [[ -n "${MOCK_UPDATE_PULL_COMPLETED_MARKER:-}" ]]; then
+      [[ ! -e "$MOCK_UPDATE_PULL_COMPLETED_MARKER" && ! -L "$MOCK_UPDATE_PULL_COMPLETED_MARKER" ]] || exit 2
+      : > "$MOCK_UPDATE_PULL_COMPLETED_MARKER"
+      chmod 0600 "$MOCK_UPDATE_PULL_COMPLETED_MARKER"
+    fi
     ;;
   down)
     [[ "${MOCK_DOCKER_FAIL_DOWN:-0}" != 1 ]]
@@ -662,7 +715,8 @@ case "$COMMAND" in
       expected=''
       IFS= read -r expected || [[ -n "$expected" ]]
       actual=$(sha256sum -- "${MOCK_PROJECT_DIR}/config/materials-applied.json" | cut -d ' ' -f 1)
-      [[ "$expected" =~ ^[a-f0-9]{64}$ && "$actual" == "$expected" && "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      [[ "$expected" =~ ^[a-f0-9]{64}$ && "$actual" == "$expected" ]] || exit 1
+      if mock_configuration_readback_should_fail; then exit 1; else readback_status=$?; (( readback_status == 1 )) || exit 2; fi
       printf 'matched\n'
     elif [[ "$*" == *'EXECUTIONS_DATA_PRUNE'* && "$*" == *'save_success:'* ]]; then
       jq -cn --arg hours "${MOCK_LOG_RETENTION_HOURS:-168}" \
@@ -671,7 +725,7 @@ case "$COMMAND" in
       printf 'ready\n'
     elif [[ "$*" == *' n8n '* && "$*" == *'/opt/crisp-ai/config/materials-applied.json'* && "$*" == *'crypto.createHash("sha256")'* ]]; then
       [[ -f "${MOCK_PROJECT_DIR}/config/materials-applied.json" && ! -L "${MOCK_PROJECT_DIR}/config/materials-applied.json" ]] || exit 1
-      [[ "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      if mock_configuration_readback_should_fail; then exit 1; else readback_status=$?; (( readback_status == 1 )) || exit 2; fi
       if [[ "$*" == *'digest(projectionRaw)+":"+value.revision+":ready"'* ]]; then
         mock_materials_projection_readback
       else
@@ -680,7 +734,7 @@ case "$COMMAND" in
     elif [[ "$*" == *'crypto.createHash("sha256")'* && "$*" == *'/opt/crisp-ai/config/'* ]]; then
       CONFIG_NAME=${!#}
       [[ "$CONFIG_NAME" =~ ^[a-z][a-z0-9_-]*\.(yaml|md)$ && -f "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" ]] || exit 1
-      [[ "${MOCK_CONFIGURATION_READBACK_FAIL:-0}" != 1 ]] || exit 1
+      if mock_configuration_readback_should_fail; then exit 1; else readback_status=$?; (( readback_status == 1 )) || exit 2; fi
       sha256sum -- "${MOCK_PROJECT_DIR}/config/${CONFIG_NAME}" | cut -d ' ' -f 1
     elif [[ "$*" == *'GENERIC_OPEN_AI_BASE_PATH'* && "$*" == *'fetch('* ]]; then
       [[ -f "${MOCK_PROJECT_DIR}/.env" && "${MOCK_PROVIDER_FAIL:-0}" != 1 && "${MOCK_PROVIDER_SOFT_ERROR:-0}" != 1 ]] || exit 1

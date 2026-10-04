@@ -54,6 +54,7 @@ async function main() {
   const removePayloads=[];
   const httpEvents=[];
   let workspaceReads=0;
+  let workspaceSourceTitles=false;
   let promptGate=null;
   let failReadAfterNextEmbedding=false;
   let workspaceReadFailureCountdown=0;
@@ -91,7 +92,9 @@ async function main() {
       httpEvents.push('workspace_get');
       workspaceReads++;
       if(workspaceReadFailureCountdown>0&&--workspaceReadFailureCountdown===0){send(500,{error:true});return;}
-      send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({docpath}))}]});return;
+      send(200,{workspace:[{slug:'crisp-support',openAiPrompt:prompt,documents:locations.map(docpath=>({
+        docpath,...(workspaceSourceTitles?{metadata:JSON.stringify({title:(documents.get(docpath)?.filename||docpath)+'.backend-title'})}:{})
+      }))}]});return;
     }
     if(request.url==='/api/v1/workspace/crisp-support/update') {
       assert.equal(request.headers.authorization,`Bearer ${anythingKey}`,
@@ -679,6 +682,49 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
   };
   writeProfile();
   try {
+  // 使用当前生产 helper 验证组件按需创建目录，不预造上传缓存。
+  const firstUploadRoot=path.join(work,'first-upload-contract');
+  fs.mkdirSync(firstUploadRoot,{mode:0o700});
+  const firstUploadContract=String.raw`
+import importlib.util, json, os, pathlib, sys
+spec=importlib.util.spec_from_file_location('materials_recovery_contract',sys.argv[1])
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+root=pathlib.Path(sys.argv[2]);storage=root/'data/anythingllm';storage.mkdir(parents=True)
+documents=storage/'documents';target=documents/'custom-documents'
+filename='crispai-upload-'+('1'*32)+'.md'
+facts={}
+facts['absent_documents']=module.upload_matches(root,filename)==[]
+documents.mkdir()
+facts['absent_custom_documents']=module.upload_matches(root,filename)==[]
+target.mkdir()
+facts['empty_existing_directory']=module.upload_matches(root,filename)==[]
+(target/(filename+'.json')).write_text('{}\n')
+(target/'other-document.json').write_text('{}\n')
+facts['existing_regular_match']=module.upload_matches(root,filename)==['custom-documents/'+filename+'.json']
+def rejected():
+    try:module.upload_matches(root,filename)
+    except module.RecoveryError:return True
+    return False
+saved=root/'saved-custom-documents';target.rename(saved)
+target.write_text('not a directory\n')
+facts['regular_file_directory_rejected']=rejected();target.unlink()
+target.symlink_to(saved,target_is_directory=True)
+facts['linked_directory_rejected']=rejected();target.unlink()
+documents.rmdir();documents.symlink_to(saved,target_is_directory=True)
+facts['linked_parent_rejected']=rejected();documents.unlink()
+target.mkdir(parents=True)
+original=target/'ordinary.json';original.write_text('{}\n')
+os.link(original,target/'duplicate.json')
+facts['hardlinked_member_rejected']=rejected()
+assert all(type(value) is bool and value for value in facts.values()),facts
+print(json.dumps(facts,sort_keys=True))
+`;
+  const firstUploadFacts=JSON.parse(execFileSync('python3',['-B','-c',firstUploadContract,
+    path.join(root,'scripts/materials-recovery.py'),firstUploadRoot],{encoding:'utf8'}));
+  assert.equal(Object.keys(firstUploadFacts).length,8);
+  assert.ok(Object.values(firstUploadFacts).every(value=>value===true));
+  process.stdout.write('观察首份上传：'+JSON.stringify(firstUploadFacts)+'\n');
+  pass('首份知识上传空目录基线正常，既有普通文档与异常路径边界保持');
     prompt='## 尚未同步的远端 Prompt\n';
     let result=await invoke(['initialize']);
     assert.notEqual(result.code,0);assert.equal(fs.existsSync(path.join(deploy,'config/materials-applied.json')),false);
@@ -1624,6 +1670,93 @@ process.stdout.write(digest(raw)+':'+value.revision+':ready');
     });
     assert.equal(bytesResult.code,0);assert.equal(bytesResult.stdout.trim(),'12');
     pass('字符串限制明确按 UTF-8 字节计算（人工客服为12字节）');
+
+    workspaceSourceTitles=true;
+    result=await invoke(['apply','--sync-knowledge']);assert.equal(result.code,0,result.stderr||result.stdout);
+    const titleProjection=JSON.parse(fs.readFileSync(projectionPath));
+    const titleMapPath=path.join(deploy,'data/runtime/knowledge-map.json');
+    const titleMap=JSON.parse(fs.readFileSync(titleMapPath));
+    assert.ok(titleMap.documents.length>0);
+    for(const document of titleMap.documents) {
+      assert.equal(document.source_title,(documents.get(document.location)?.filename||document.location)+'.backend-title');
+    }
+    await assertProjectionArtifacts(titleProjection);
+    const titleEffective=path.join(deploy,'tmp','materials-effective.'+crypto.randomBytes(8).toString('hex'));
+    fs.copyFileSync(projectionPath,titleEffective,fs.constants.COPYFILE_EXCL);fs.chmodSync(titleEffective,0o600);
+    let titleCapture;
+    try {
+      titleCapture=await new Promise(resolve=>{
+        const child=spawn('bash',['-c','set -euo pipefail; source "$1"; materials_recovery_capture "$2" "$3" "$4" verified',
+          'materials-title-capture',path.join(root,'scripts/materials.sh'),deploy,titleEffective,appliedSnapshotPath],
+          {cwd:work,env:{...process.env,PATH:`${deploy}/bin:${process.env.PATH}`}});
+        let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+        child.on('close',code=>resolve({code,stdout,stderr}));
+      });
+    } finally {
+      fs.rmSync(titleEffective,{force:true});
+    }
+    assert.equal(titleCapture.code,0,titleCapture.stderr||titleCapture.stdout);
+    pass('真实工作区标题与规范投影不同仍可原生发布、完整回读并冻结同代恢复材料');
+
+    const titleRecovery=path.join(deploy,'backups/config-history/materials.recovery');
+    const titleContract=String.raw`
+import importlib.util,json,sys
+from pathlib import Path
+module_path,recovery_path,projection_path=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('current_materials_recovery',module_path)
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+recovery=Path(recovery_path)
+projection=json.loads(Path(projection_path).read_text())
+manifest=module.read_json(recovery/'metadata/data/knowledge-manifest.json')
+map_path=recovery/'metadata/data/runtime/knowledge-map.json'
+lexical_path=recovery/'metadata/data/runtime/knowledge-lexical.json'
+saved_map,saved_lexical=map_path.read_bytes(),lexical_path.read_bytes()
+baseline=json.loads(saved_map);lexical_base=json.loads(saved_lexical)
+def check(mapping,accepted):
+    map_path.write_text(json.dumps(mapping,ensure_ascii=False)+'\n')
+    lexical=json.loads(json.dumps(lexical_base))
+    lexical['map_sha256']=module.file_hash(map_path)
+    lexical['payload_sha256']=module.value_hash({key:value for key,value in lexical.items() if key!='payload_sha256'})
+    lexical_path.write_text(json.dumps(lexical,ensure_ascii=False)+'\n')
+    try:
+        module.generation_contract(recovery,projection,manifest)
+        actual=True
+    except module.RecoveryError:
+        actual=False
+    return actual is accepted
+facts={}
+try:
+    facts['valid_alias_accepted']=check(baseline,True)
+    legacy=json.loads(json.dumps(baseline))
+    for document in legacy['documents']:document.pop('source_title',None)
+    facts['legacy_without_alias_accepted']=check(legacy,True)
+    cases=[('null_title',None),('numeric_title',7),('empty_title',''),('whitespace_title','   '),
+        ('tab_title','可见\t标题'),('del_title','可见\x7f标题'),('overlong_title','中'*400)]
+    for name,title in cases:
+        changed=json.loads(json.dumps(baseline));changed['documents'][0]['source_title']=title
+        facts[name+'_rejected']=check(changed,False)
+    for name,field,value in [('unknown_field','unexpected',True),('wrong_library','library_id','kb_missing'),
+        ('wrong_document','document_id','doc_missing'),('wrong_location','location','custom-documents/foreign.json'),
+        ('wrong_projection','projection','foreign.txt')]:
+        changed=json.loads(json.dumps(baseline));changed['documents'][0][field]=value
+        facts[name+'_rejected']=check(changed,False)
+    changed=json.loads(json.dumps(baseline));changed['revision']+=1
+    facts['wrong_revision_rejected']=check(changed,False)
+    assert len(facts)==15 and all(type(value) is bool and value for value in facts.values()),facts
+finally:
+    map_path.write_bytes(saved_map);lexical_path.write_bytes(saved_lexical)
+facts['original_metadata_bytes_restored']=(map_path.read_bytes()==saved_map and lexical_path.read_bytes()==saved_lexical)
+assert facts['original_metadata_bytes_restored'] is True
+print(json.dumps(facts,sort_keys=True))
+`;
+    const titleFacts=JSON.parse(execFileSync('python3',['-B','-c',titleContract,
+      path.join(root,'scripts/materials-recovery.py'),titleRecovery,projectionPath],{encoding:'utf8'}));
+    assert.equal(Object.keys(titleFacts).length,16);assert.ok(Object.values(titleFacts).every(value=>value===true));
+    process.stdout.write('观察来源标题恢复合同：'+JSON.stringify(titleFacts)+'\n');
+    result=await invoke(['apply']);assert.equal(result.code,0,result.stderr||result.stdout);
+    assert.equal(fs.existsSync(titleRecovery),false,'同代已完成捕获必须经原生回读退休，不重放外部变更');
+    await assertProjectionArtifacts(JSON.parse(fs.readFileSync(projectionPath)));
+    pass('来源标题可选且受类型内容约束，核心归属或代次篡改仍拒绝并保持原始完整摘要');
 
     const finalStatus=JSON.parse((await invoke(['status'])).stdout);
     assert.equal(finalStatus.source_valid,true);assert.equal(finalStatus.projection_valid,true);

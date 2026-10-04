@@ -18,6 +18,7 @@ WRITE_OUT=""
 URL=""
 FAIL_ON_HTTP=0
 FORM_FILE=""
+FORM_FILENAME=""
 CONFIG_FILE=""
 CONFIG_CONTENT=""
 DATA_FILE=""
@@ -39,6 +40,10 @@ while (( $# > 0 )); do
     --form|-F)
       if [[ "$2" == file=@* ]]; then
         FORM_FILE=${2#file=@}
+        if [[ "$FORM_FILE" == *";filename="* ]]; then
+          FORM_FILENAME=${FORM_FILE#*;filename=}
+          FORM_FILE=${FORM_FILE%%;filename=*}
+        fi
       fi
       shift 2
       ;;
@@ -252,7 +257,11 @@ PY
     fi
     ;;
   */api/v1/document/upload)
-    DOCUMENT_NAME=$(basename -- "${FORM_FILE:-test-knowledge}")
+    if [[ -n "$FORM_FILENAME" ]]; then
+      DOCUMENT_NAME=$FORM_FILENAME
+    else
+      DOCUMENT_NAME=$(basename -- "${FORM_FILE:-test-knowledge}")
+    fi
     BODY=$(jq -cn --arg location "custom-documents/${DOCUMENT_NAME}.json" \
       '{success:true,documents:[{location:$location}]}')
     if [[ -n "${MOCK_ANYTHING_STATE:-}" ]]; then

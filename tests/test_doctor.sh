@@ -112,6 +112,59 @@ invoke() {
   fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --json "$@" > "$OUT" 2> "$ERR" || LAST_RC=$?
 }
 
+doctor_failure_snapshot() {
+  local target=$1 stdout_state=empty files_status=MISSING
+  local summary_fail=INVALID summary_warn=INVALID stderr_class=empty stderr_bytes=0 value
+  local target_absent=false version_v130=false marker_v130=false
+
+  if [[ -s "$OUT" ]]; then
+    if jq -e 'type == "object" and (.results | type == "array") and (.summary | type == "object")' \
+        "$OUT" >/dev/null 2>&1; then
+      stdout_state=valid_report
+      value=$(jq -M -r '[.results[] | select(.id == "installation.files")][-1].status // "MISSING"' \
+        "$OUT" 2>/dev/null || true)
+      case "$value" in
+        PASS|WARN|FAIL|SKIP|MISSING) files_status=$value ;;
+        *) files_status=INVALID ;;
+      esac
+      value=$(jq -M -r \
+        'if ((.summary.fail | type) == "number") and .summary.fail >= 0 and ((.summary.fail | floor) == .summary.fail) then .summary.fail else "INVALID" end' \
+        "$OUT" 2>/dev/null || true)
+      [[ "$value" =~ ^[0-9]+$ ]] && summary_fail=$value
+      value=$(jq -M -r \
+        'if ((.summary.warn | type) == "number") and .summary.warn >= 0 and ((.summary.warn | floor) == .summary.warn) then .summary.warn else "INVALID" end' \
+        "$OUT" 2>/dev/null || true)
+      [[ "$value" =~ ^[0-9]+$ ]] && summary_warn=$value
+    else
+      stdout_state=invalid
+      files_status=INVALID
+    fi
+  fi
+
+  stderr_bytes=$(LC_ALL=C wc -c < "$ERR" | tr -d '[:space:]')
+  [[ "$stderr_bytes" =~ ^[0-9]+$ ]] || stderr_bytes=INVALID
+  if [[ -s "$ERR" ]]; then
+    if grep -Eq '^jq: [0-9]+ compile errors?$|^jq: error: .* at <top-level>' "$ERR"; then
+      stderr_class=jq_compile
+    elif grep -Eqi '^jq: error \(at |^parse error:|invalid numeric literal' "$ERR"; then
+      stderr_class=jq_runtime
+    elif grep -Eqi 'unbound variable' "$ERR"; then
+      stderr_class=unbound
+    else
+      stderr_class=other
+    fi
+  fi
+
+  [[ ! -e "$target" && ! -L "$target" ]] && target_absent=true
+  [[ $(sed -n '1p' "${DEPLOY}/VERSION" 2>/dev/null || true) == v1.3.0 ]] && version_v130=true
+  grep -Fxq -- 'installed_version=v1.3.0' "${DEPLOY}/.crisp-ai-installation" 2>/dev/null \
+    && marker_v130=true
+
+  printf 'rc=%s;stdout=%s;installation.files=%s;summary.fail=%s;summary.warn=%s;stderr_bytes=%s;stderr_class=%s;target_absent=%s;version_v130=%s;marker_v130=%s' \
+    "$LAST_RC" "$stdout_state" "$files_status" "$summary_fail" "$summary_warn" \
+    "$stderr_bytes" "$stderr_class" "$target_absent" "$version_v130" "$marker_v130"
+}
+
 business_hash() {
   (
     cd -- "$DEPLOY"
@@ -456,7 +509,8 @@ elif case in ("missing-referenced", "legacy"):
         materials["knowledge"]["manifest_sha256"] = module.digest(root / paths["manifest"])
 module.atomic(root / paths["materials"], materials, 0o640)
 PY
-    [[ "$case_name" == legacy ]] || reseal_materials_fixture
+    [[ "$case_name" == legacy ]] \
+      || reseal_materials_fixture "${DEPLOY}/config/materials-applied.json"
     changed_hash=$(business_hash)
     cache_hash=$(find "${DEPLOY}/data/anythingllm/vector-cache" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')
     invoke --offline
@@ -529,7 +583,8 @@ elif case in ("lexical-missing", "lexical-legacy"):
         materials["knowledge"]["lexical_sha256"] = ""
 projection.write_text(json.dumps(materials, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 PY
-    [[ "$case_name" == lexical-legacy ]] || reseal_materials_fixture
+    [[ "$case_name" == lexical-legacy ]] \
+      || reseal_materials_fixture "${DEPLOY}/config/materials-applied.json"
     changed_hash=$(business_hash)
     source_hash=$(sha256sum "${DEPLOY}/data/anythingllm/documents/custom-documents/fixture.json" | awk '{print $1}')
     invoke --offline
@@ -768,7 +823,7 @@ doctor_permit_cases() {
 }
 
 doctor_atomic_config_cases() {
-  local name marker before_digest
+  local name marker before_digest diagnostic
   local -a modules=(provider-router.js provider-envelope.js provider-pool.py
     menu-display.py menu-provider-ui.sh materials-recovery.py atomic-config.py)
   local -a temporary_modules=(provider-router.js provider-envelope.js provider-pool.py
@@ -786,7 +841,10 @@ doctor_atomic_config_cases() {
   for name in materials-recovery.py atomic-config.py; do
     rm -f -- "${DEPLOY}/scripts/${name}"
     invoke --local
-    (( LAST_RC == 1 )) || fail "v1.3.0 缺少 ${name} 时必须退出 1"
+    if (( LAST_RC != 1 )); then
+      diagnostic=$(doctor_failure_snapshot "${DEPLOY}/scripts/${name}")
+      fail "v1.3.0 缺少 ${name} 时必须退出 1；安全诊断：${diagnostic}"
+    fi
     assert_result installation.files FAIL
     cp -p -- "${PROJECT_ROOT}/scripts/${name}" "${DEPLOY}/scripts/${name}"
   done
@@ -1071,6 +1129,8 @@ pass 'AnythingLLM Prompt 只读取完整验证后的 schema v2 私有投影，�
 rm_failure_bin="${TEST_ROOT}/rm-failure-bin"
 rm_failure_count="${TEST_ROOT}/rm-failure-count"
 mkdir -m 0700 -- "$rm_failure_bin"
+# 变量由生成的 rm mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -1962,6 +2022,46 @@ invoke_query() {
   ' doctor-query "${DEPLOY}/scripts" "$DEPLOY" "$budget" > "$OUT" 2> "$ERR" || LAST_RC=$?
 }
 
+admin_query_failure_snapshot() {
+  local stdout_state=empty error_code=NONE stderr_class=empty stderr_bytes=0 value
+  local exec_count input_count settings_count vector_count generation_count scope_count
+  if [[ -s "$OUT" ]]; then
+    if jq -e '.verified == true and (.answer | type == "string") and (.sources | type == "array")' \
+        "$OUT" >/dev/null 2>&1; then
+      stdout_state=valid_success
+    elif jq -e '.verified == false and (.error.code | type == "string")' \
+        "$OUT" >/dev/null 2>&1; then
+      stdout_state=valid_error
+      value=$(jq -M -r '.error.code' "$OUT" 2>/dev/null || true)
+      case "$value" in
+        materials_not_ready|provider_configuration_invalid|state_changed|retrieval_error|retrieval_invalid|retrieval_unavailable|source_unmapped|source_ambiguous|context_invalid|authentication_failed|rate_limited|quota_exhausted|model_unavailable|upstream_timeout|upstream_unavailable|connection_failed|invalid_response|invalid_input|context_preparation_incomplete|configuration_applying|pool_cooling|pool_exhausted|no_capable_provider|question_budget_exhausted|question_timeout|question_interrupted|question_cancelled|question_result_rejected|safety_refusal|protocol_error|provider_inference_failed|admin_query_failed)
+          error_code=$value ;;
+        *) error_code=OTHER ;;
+      esac
+    else
+      stdout_state=invalid
+    fi
+  fi
+  stderr_bytes=$(LC_ALL=C wc -c < "$ERR" | tr -d '[:space:]')
+  [[ "$stderr_bytes" =~ ^[0-9]+$ ]] || stderr_bytes=INVALID
+  if [[ -s "$ERR" ]]; then
+    if grep -Fq '接口池配置尚未完整应用' "$ERR"; then
+      stderr_class=provider_configuration_invalid
+    else
+      stderr_class=other
+    fi
+  fi
+  exec_count=$(grep -Fc 'exec -T n8n node /opt/crisp-ai/n8n/admin-query.js' "$FIXTURE_LOG" || true)
+  input_count=$(grep -Ec '^admin-query input-via-stdin=true budget_ms=10000$' "$FIXTURE_LOG" || true)
+  settings_count=$(grep -Ec '^admin-query settings-source=applied-projection$' "$FIXTURE_LOG" || true)
+  vector_count=$(grep -Ec '^admin-query vector-search pure-query=true$' "$FIXTURE_LOG" || true)
+  generation_count=$(grep -Ec '^admin-query generation ' "$FIXTURE_LOG" || true)
+  scope_count=$(grep -Ec '^admin-query generation .*scope=admin$' "$FIXTURE_LOG" || true)
+  printf 'rc=%s;stdout=%s;error_code=%s;stderr_bytes=%s;stderr_class=%s;exec=%s;input_budget_10000=%s;settings_applied=%s;vector=%s;generation=%s;scope_admin=%s' \
+    "$LAST_RC" "$stdout_state" "$error_code" "$stderr_bytes" "$stderr_class" \
+    "$exec_count" "$input_count" "$settings_count" "$vector_count" "$generation_count" "$scope_count"
+}
+
 query='这是虚构的管理员问题：请保留 "引号" 与反斜线 \\，不把问题写入命令参数。'
 export DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256
 DOCTOR_FIXTURE_ADMIN_EXPECT_QUESTION_SHA256=$(printf '%s' "$query" | sha256sum | awk '{print $1}')
@@ -1995,14 +2095,23 @@ pass '管理员检索错误及未知来源准确失败，零模型调用且不�
 # 这里仅验证生产 runtime 的签名/预算协议，不伪造完整 adapter 或模型验收。
 [[ ! -e "${DEPLOY}/config/provider-pool-applied.json" ]] || fail '管理员池协议夹具覆盖了已有配置'
 cp -p -- "$RUNTIME_ENV_FILE" "${TEST_ROOT}/admin-runtime-env.saved"
-jq -M -n '{schema_version:1,revision:9,primary_id:"p_111111111111111111111111",
-  entries:[{id:"p_111111111111111111111111",model:"synthetic-admin-model"}],policy:{question_timeout_ms:1500}}' \
+jq -M -n '{schema_version:1,revision:9,secrets_generation:"11111111111111111111111111111111",
+  primary_id:"p_111111111111111111111111",entries:[{
+    id:"p_111111111111111111111111",name:"Synthetic administrator primary",role:"primary",order:0,
+    enabled:true,base_url:"https://synthetic-admin.invalid/v1",model:"synthetic-admin-model",
+    api_mode:"chat_completions",custom_header_names:[],
+    capabilities:{chat_completions:true,responses:false,vision:false},
+    context_window:16384,max_output_tokens:1024,draft:false
+  }],policy:{question_timeout_ms:1500,call_timeout_ms:1200,connect_timeout_ms:100,
+    max_attempts:1,cooldown_initial_ms:1000,cooldown_max_ms:1000,pool_cooldown_ms:100}}' \
   > "${DEPLOY}/config/provider-pool-applied.json"
 jq '.n8n=(.n8n[0:10]+["http://provider-adapter:8787/v1","synthetic-admin-internal-key","true"])' \
   "$RUNTIME_ENV_FILE" > "${RUNTIME_ENV_FILE}.new"
 mv -f -- "${RUNTIME_ENV_FILE}.new" "$RUNTIME_ENV_FILE"
 DOCTOR_FIXTURE_ADMIN_EXPECT_BUDGET=10000 invoke_query "$query" 10000
-(( LAST_RC == 0 )) || fail '管理员新池签名或较小池预算绑定未通过'
+if (( LAST_RC != 0 )); then
+  fail "管理员新池签名或较小池预算绑定未通过；安全诊断：$(admin_query_failure_snapshot)"
+fi
 grep -q '^admin-query generation .*scope=admin$' "$FIXTURE_LOG" || fail '管理员新池没有验证 admin HMAC 及池/资料代次'
 rm -f -- "${DEPLOY}/config/provider-pool-applied.json"
 cp -p -- "${TEST_ROOT}/admin-runtime-env.saved" "$RUNTIME_ENV_FILE"

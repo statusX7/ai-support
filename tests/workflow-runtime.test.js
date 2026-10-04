@@ -590,6 +590,8 @@ const abortablePending = (signal, started) => {
 
       const smallRetryAt = jobFor(smallSession, smallEntry.jobId).retry_at;
       assert(Number.isFinite(smallRetryAt) && smallRetryAt > now);
+      assert.equal(Object.hasOwn(jobFor(smallSession, smallEntry.jobId), 'plan'), false,
+        '恢复前执行快照尚无 plan；首次成功回执必须使用随后持久的权威 plan');
       now = smallRetryAt;
       const secondSelection = await bounded(track(runtime.scan()), 'M13 小流量恢复扫描');
       assert.equal(secondSelection.length, 1);
@@ -601,6 +603,8 @@ const abortablePending = (signal, started) => {
       const completedSmall = jobFor(smallSession, smallEntry.jobId); assert(completedSmall);
       assert.equal(completedSmall.status, 'done');
       assert.equal(completedSmall.responsibility_status, 'answered_confirmed');
+      assert.equal(completedSmall.delivery_receipt_unknown, undefined,
+        '正常首次回执不得被误标为身份未解决');
       const smallOutgoing = Object.values(state(smallSession).outgoing)
         .filter((record) => record.job_id === smallEntry.jobId);
       assert.equal(smallOutgoing.length, 1);
@@ -926,20 +930,48 @@ const abortablePending = (signal, started) => {
           '确认真人后的迟到答案不得发送');
         assert.equal(sendAttempts, postCount);
         assert.equal(modelRequests.length, modelCount + 1);
-        const cleanup = await boundedResult(runtime.process(visitor.key, visitor.jobId),
+        const settlementCleanup = await boundedResult(runtime.process(visitor.key, visitor.jobId),
           '真人确认后的 Provider 清理');
-        assert(['provider_settlement_settled', 'provider_settlement_absent',
-          'provider_retirement_absent', 'provider_retirement_retired'].includes(cleanup.status),
-          '已冻结 Provider 身份必须通过独立结算或退休步骤收敛，不能静默遗失');
+        assert.equal(settlementCleanup.status, 'provider_settlement_settled',
+          '真人确认后必须先完成已在途的 Provider settlement');
+        let cleaned = state(session).jobs.find((job) => job.id === visitor.jobId); assert(cleaned);
+        assert.equal(cleaned.status, 'cancelled');
+        assert.equal(cleaned.responsibility_status, 'intentional_silence');
+        assert.equal(cleaned.responsibility_reason, 'human_reply');
+        assert.equal(cleaned.provider_settlement, undefined);
+        assert.equal(cleaned.provider_retirement?.state, 'pending');
+        assert.equal(cleaned.provider_retirement?.purpose, 'conversation_cancelled');
+        assert(cleaned.inference && cleaned.provider_result_receipt,
+          'retirement 完成前必须保留待清理的 Provider 身份');
         assert.equal(sendAttempts, postCount,
-          '真人确认后的结算或退休清理不得 POST Crisp');
-        assert.equal(modelRequests.length, modelCount + 1,
-          '真人确认后的结算或退休清理不得重新推理');
-        assert.equal((await boundedResult(runtime.process(visitor.key, visitor.jobId),
-          '真人确认后的重复原任务')).status, 'idle');
+          '真人确认后的 settlement 不得 POST Crisp');
         assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
         assert.equal(modelRequests.length, modelCount + 1,
-          '真人取消与 Provider 清理均不得重放推理');
+          '真人确认后的 settlement 不得重新推理');
+
+        const retirementCleanup = await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          '真人确认后的 Provider retirement');
+        assert.equal(retirementCleanup.status, 'provider_retirement_absent');
+        cleaned = state(session).jobs.find((job) => job.id === visitor.jobId); assert(cleaned);
+        assert.equal(cleaned.status, 'cancelled');
+        assert.equal(cleaned.responsibility_status, 'intentional_silence');
+        assert.equal(cleaned.responsibility_reason, 'human_reply');
+        assert.equal(cleaned.provider_retirement?.state, 'absent');
+        assert.equal(cleaned.provider_retirement?.purpose, 'conversation_cancelled');
+        assert.equal(cleaned.inference, undefined);
+        assert.equal(cleaned.provider_result_receipt, undefined);
+        assert.equal(sendAttempts, postCount,
+          '真人确认后的 retirement 不得 POST Crisp');
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
+        assert.equal(modelRequests.length, modelCount + 1,
+          '真人确认后的 retirement 不得重新推理');
+
+        assert.equal((await boundedResult(runtime.process(visitor.key, visitor.jobId),
+          '真人确认后的重复原任务')).status, 'idle');
+        assert.equal(sendAttempts, postCount);
+        assert.equal(sent.filter((entry) => entry.session_id === session).length, visibleCount);
+        assert.equal(modelRequests.length, modelCount + 1,
+          '真人取消与 Provider 两阶段清理均不得重放推理');
 
         const parallel = await boundedResult(deliver(message(parallelSession, '另一会话继续正常回答')),
           '另一会话独立回答');
@@ -1290,6 +1322,32 @@ const abortablePending = (signal, started) => {
     const item = await deferredOperatorCase('unknown', {});
     const previousGeneration = state(item.session).generation;
     assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'deferred');
+    let retryControl = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    assert.equal(retryControl.failure_rounds, 1, '身份失败必须进入现有退避记账，不能永久固定5秒');
+    assert.equal(retryControl.retry_at - now, 10000);
+    const originalControlInput = JSON.stringify(retryControl.data);
+    for (let round = 2; round <= 7; round += 1) {
+      now = retryControl.retry_at + 1;
+      assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'deferred');
+      retryControl = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+      assert.equal(retryControl.failure_rounds, round);
+      assert.equal(retryControl.retry_at - now, Math.min(300000, 5000 * (2 ** round)));
+      assert.equal(JSON.stringify(retryControl.data), originalControlInput);
+      assert(state(item.session).uncertain_events.includes(item.control.jobId));
+      assert.equal(item.visitorJob().status, 'received');
+    }
+    await runtime.transaction(item.control.key, (current) => {
+      const legacy = current.jobs.find((job) => job.id === item.control.jobId);
+      legacy.attempts = 13801;
+      delete legacy.failure_rounds;
+    });
+    now = retryControl.retry_at + 1;
+    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'deferred');
+    retryControl = state(item.session).jobs.find((job) => job.id === item.control.jobId);
+    assert.equal(retryControl.attempts, 13802, '旧尝试次数不得被升级或更名归零');
+    assert.equal(retryControl.failure_rounds, 13802);
+    assert.equal(retryControl.retry_at - now, 300000, '旧反复失败任务直接沿用有界退避，不重新密集试错');
+    assert.equal(JSON.stringify(retryControl.data), originalControlInput);
     assert.equal(state(item.session).generation, previousGeneration);
     assert(state(item.session).uncertain_events.includes(item.control.jobId));
     assert.equal(item.visitorJob().status, 'received');
@@ -1326,6 +1384,153 @@ const abortablePending = (signal, started) => {
     assert.equal(modelRequests.length, beforeModels + 1);
     assert.equal(sendAttempts, beforePosts + 1);
     assert.equal(sent.length, before + 1);
+  });
+  const removeSessionState = (session) => {
+    const file = path.join(root, 'data/runtime/session-' + key(session) + '.json');
+    try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  };
+  const windowOperator = (session, eventTime = now) => ({
+    website_id: env.CRISP_WEBSITE_ID, event: 'message:received', timestamp: eventTime,
+    data: { session_id: session, from: 'operator', type: 'text', content: '待核实身份的历史公开消息',
+      fingerprint: ++sequence, timestamp: eventTime, user: { type: 'website', nickname: '受控来源' } },
+  });
+  await test('OW01 过期未知控制释放窗口后的原任务，历史回查与重复事件不重建屏障', async () => {
+    const session = 'session_window-late-control';
+    const originalHandoff = readConfig('handoff');
+    const configuration = structuredClone(originalHandoff); configuration.handoff.resume_after_seconds = 3600;
+    publishConfiguration('handoff', configuration);
+    try {
+      now += 100;
+      const visitor = await receive(message(session, '窗口结束后的独立新咨询'));
+      const visitorInput = structuredClone(state(session).jobs.find((job) => job.id === visitor.jobId).data);
+      const ambiguous = windowOperator(session, now - 30 * 86400000);
+      const historicalHuman = { ...ambiguous.data, fingerprint: ++sequence, automated: false,
+        timestamp: ambiguous.data.timestamp + 180000 };
+      histories.set(session, [ambiguous.data, historicalHuman, ...(histories.get(session) || [])]);
+      const control = await receive(ambiguous);
+      const before = state(session); const generation = before.generation;
+      const original = structuredClone(before.jobs.find((job) => job.id === control.jobId));
+      assert(before.uncertain_events.includes(control.jobId));
+      const modelBaseline = modelRequests.length; const postBaseline = sendAttempts;
+      const candidates = await runtime.scan();
+      assert(candidates.some((entry) => entry.key === visitor.key && entry.jobId === visitor.jobId));
+      let snapshot = state(session); let resolved = snapshot.jobs.find((job) => job.id === control.jobId);
+      assert.equal(snapshot.generation, generation); assert.equal(snapshot.mode, 'ai');
+      assert.equal(snapshot.uncertain_events.length, 0);
+      assert.equal(resolved.operator_resolution.result, 'window-expired');
+      assert.equal(resolved.operator_resolution.human_changed, false);
+      assert.equal(resolved.operator_resolution.event_time, original.event_time);
+      assert.equal(resolved.operator_resolution.expires_at, original.event_time + 3600000);
+      assert.equal(resolved.input_identity_sha256, original.input_identity_sha256);
+      assert.deepEqual(resolved.data, original.data);
+      assert.equal(resolved.responsibility_reason, 'operator_window_expired');
+      assert.equal((await runtime.process(visitor.key, visitor.jobId)).status, 'sent');
+      assert.equal((await receive(ambiguous)).reason, '重复事件已忽略');
+      runtime = createRuntime(env, runtimeOptions);
+      await runtime.scan(); await runtime.process(visitor.key, visitor.jobId);
+      snapshot = state(session); resolved = snapshot.jobs.find((job) => job.id === control.jobId);
+      assert.equal(snapshot.uncertain_events.length, 0); assert.equal(snapshot.generation, generation);
+      assert.equal(snapshot.last_human_at, historicalHuman.timestamp);
+      assert.equal(snapshot.control_watermark, historicalHuman.timestamp + 3600000);
+      assert.equal(snapshot.mode, 'ai', '已过期真人历史不得取消窗口后的新咨询再伪装恢复');
+      assert.deepEqual(resolved.data, original.data, '历史原事件不得在普通收尾中删除');
+      assert.equal(snapshot.jobs.find((job) => job.id === visitor.jobId).responsibility_status, 'answered_confirmed');
+      assert.equal(modelRequests.length, modelBaseline + 1); assert.equal(sendAttempts, postBaseline + 1);
+      assert.equal(sent.filter((entry) => entry.session_id === session).length, 1);
+      assert.equal(Object.values(snapshot.outgoing).filter((record) => record.job_id === visitor.jobId && record.status === 'sent').length, 1);
+      assert.equal(visitorInput.content, '窗口结束后的独立新咨询');
+      process.stdout.write('观察过期窗口：' + JSON.stringify({ original_task_answered_once: true, original_control_retained: true, identity_not_assumed: true, generation_unchanged: true, duplicate_and_history_barrier_absent: true }) + '\n');
+    } finally {
+      removeSessionState(session); histories.delete(session); publishConfiguration('handoff', originalHandoff);
+    }
+  });
+  await test('OW02 有效窗口、零秒及不可信时间保持屏障，窗口内旧咨询保留复核责任', async () => {
+    const originalHandoff = readConfig('handoff');
+    const sessions = [];
+    try {
+      const configuration = structuredClone(originalHandoff); configuration.handoff.resume_after_seconds = 3600;
+      publishConfiguration('handoff', configuration);
+      const session = 'session_window-expiry-backoff'; sessions.push(session);
+      const started = now += 100; const ambiguous = windowOperator(session);
+      const control = await receive(ambiguous); histories.set(session, [ambiguous.data]);
+      now += 1; const during = await receive(message(session, '窗口内原咨询'));
+      const duringInput = structuredClone(state(session).jobs.find((job) => job.id === during.jobId).data);
+      await runtime.transaction(control.key, (current) => {
+        const job = current.jobs.find((entry) => entry.id === control.jobId);
+        job.attempts = 13801; job.failure_rounds = 13801; job.retry_at = started + 4000000;
+        job.responsibility_status = 'unresolved_failure'; job.failure_code = 'operator_identity_pending';
+      });
+      const models = modelRequests.length; const posts = sendAttempts;
+      now = started + 3599999; await runtime.scan();
+      assert(state(session).uncertain_events.includes(control.jobId));
+      assert.equal(state(session).jobs.find((job) => job.id === during.jobId).status, 'received');
+      now = started + 3600001; await runtime.scan();
+      let snapshot = state(session); const expired = snapshot.jobs.find((job) => job.id === control.jobId);
+      assert.equal(snapshot.uncertain_events.length, 0); assert.equal(expired.attempts, 13801);
+      assert.equal(expired.operator_resolution.result, 'window-expired', '到期不应等待旧五分钟重查资格');
+      const held = snapshot.jobs.find((job) => job.id === during.jobId);
+      assert.equal(held.status, 'failed'); assert.equal(held.recovery_requires_review, true);
+      assert.equal(held.failure_code, 'operator_window_review_required'); assert.deepEqual(held.data, duringInput);
+      assert.equal(modelRequests.length, models); assert.equal(sendAttempts, posts);
+      const late = await receive(message(session, '窗口内迟到咨询', { timestamp: started + 2 }));
+      assert.equal(late.route, 'ignore');
+      assert.equal(state(session).jobs.find((job) => job.id === late.jobId).recovery_requires_review, true);
+      const fresh = await receive(message(session, '窗口后的新咨询'));
+      assert.equal((await runtime.process(fresh.key, fresh.jobId)).status, 'sent');
+      assert.equal(modelRequests.length, models + 1); assert.equal(sendAttempts, posts + 1);
+      for (const variant of ['zero', 'missing-time', 'wrong-source', 'wrong-identity']) {
+        const itemSession = 'session_window-guard-' + variant; sessions.push(itemSession);
+        const config = structuredClone(originalHandoff); config.handoff.resume_after_seconds = variant === 'zero' ? 0 : 3600;
+        publishConfiguration('handoff', config); now += 100;
+        const body = windowOperator(itemSession);
+        if (variant === 'missing-time') { delete body.timestamp; delete body.data.timestamp; }
+        const entry = await receive(body); histories.set(itemSession, [body.data]);
+        await runtime.transaction(entry.key, (current) => {
+          const job = current.jobs.find((item) => item.id === entry.jobId);
+          if (variant === 'wrong-source') job.event_time_source = 'untrusted';
+          if (variant === 'wrong-identity') job.input_identity_sha256 = '0'.repeat(64);
+        });
+        const beforeModels = modelRequests.length; const beforePosts = sendAttempts;
+        now += 30 * 86400000; await runtime.scan();
+        assert(state(itemSession).uncertain_events.includes(entry.jobId), variant + ' 不能只按年龄移除屏障');
+        assert.notEqual(state(itemSession).jobs.find((job) => job.id === entry.jobId).operator_resolution?.result, 'window-expired');
+        assert.equal(modelRequests.length, beforeModels); assert.equal(sendAttempts, beforePosts);
+        removeSessionState(itemSession); histories.delete(itemSession);
+      }
+    } finally {
+      for (const session of sessions) { removeSessionState(session); histories.delete(session); }
+      publishConfiguration('handoff', originalHandoff);
+    }
+  });
+  await test('OW03 过期未知控制不改有效真人、永久人工和总关的静默', async () => {
+    const originalHandoff = readConfig('handoff'); const originalRuntime = readConfig('runtime');
+    const sessions = [];
+    try {
+      for (const variant of ['active-human', 'permanent-human', 'global-disabled']) {
+        const session = 'session_window-silence-' + variant; sessions.push(session);
+        const config = structuredClone(originalHandoff); config.handoff.resume_after_seconds = 3600;
+        publishConfiguration('handoff', config); now += 100;
+        const ambiguous = windowOperator(session, now - 30 * 86400000);
+        const control = await receive(ambiguous); histories.set(session, [ambiguous.data]);
+        await runtime.scan();
+        assert.equal(state(session).jobs.find((job) => job.id === control.jobId).operator_resolution.result, 'window-expired');
+        if (variant === 'permanent-human') { config.handoff.resume_after_seconds = 0; publishConfiguration('handoff', config); }
+        if (variant === 'global-disabled') publishConfiguration('runtime', { ...originalRuntime, enabled: false });
+        else await operator(session);
+        const snapshot = state(session); const models = modelRequests.length; const posts = sendAttempts;
+        await deliver(message(session, '必须保持静默的咨询')); await runtime.scan();
+        assert.equal(modelRequests.length, models); assert.equal(sendAttempts, posts);
+        assert.equal(state(session).mode, variant === 'global-disabled' ? 'ai' : 'human');
+        assert.equal(state(session).resume_at, snapshot.resume_at);
+        assert.equal(state(session).generation, snapshot.generation);
+        assert.equal(state(session).jobs.find((job) => job.id === control.jobId).operator_resolution.result, 'window-expired');
+        if (variant === 'permanent-human') assert.equal(snapshot.resume_at, null);
+        publishConfiguration('runtime', originalRuntime);
+      }
+    } finally {
+      for (const session of sessions) { removeSessionState(session); histories.delete(session); }
+      publishConfiguration('handoff', originalHandoff); publishConfiguration('runtime', originalRuntime);
+    }
   });
   await test('P0 同一时间戳按持久 sequence 判断先后，控制后的访客消息仍处理一次', async () => {
     const before = sent.length;
@@ -1552,8 +1757,8 @@ const abortablePending = (signal, started) => {
     assert(state(item.session).uncertain_events.includes(item.control.jobId));
     assert.equal(state(item.session).jobs.find((job) => job.id === later.jobId).deferred_control, true);
     histories.set(item.session, [{ ...originalData, automated: true }, ...(histories.get(item.session) || [])]);
-    now += 6000;
-    await runtime.process(item.control.key, item.control.jobId);
+    now = Math.max(now + 1, recovered.retry_at + 1);
+    assert.equal((await runtime.process(item.control.key, item.control.jobId)).status, 'none');
     recovered = state(item.session).jobs.find((job) => job.id === item.control.jobId);
     assert.equal(recovered.operator_resolution.result, 'not-human');
     assert.equal(state(item.session).generation, firstGeneration);
@@ -1846,6 +2051,7 @@ const abortablePending = (signal, started) => {
     assert(rejected?.body);
     const mismatchedDigest = rejected.content_sha256 === '0'.repeat(64)
       ? '1'.repeat(64) : '0'.repeat(64);
+    let frozenRecord;
     await runtime.transaction(initial.key, (current) => {
       const job = current.jobs.find((entry) => entry.id === initial.jobId); assert(job?.plan);
       const record = current.outgoing[fingerprint]; assert(record);
@@ -1866,17 +2072,23 @@ const abortablePending = (signal, started) => {
       job.lease_until = 0;
       job.responsibility_status = 'unresolved_failure';
       job.failure_code = 'operator_identity_pending';
+      frozenRecord = structuredClone(record);
     });
     const modelCount = modelRequests.length;
     const postCount = sendAttempts;
     const result = await runtime.process(initial.key, initial.jobId);
-    assert.equal(result.status, 'delivery_semantic_unknown');
+    assert.equal(result.status, 'delivery_identity_unresolved');
     snapshot = state(session);
     const unresolved = snapshot.jobs.find((job) => job.id === initial.jobId); assert(unresolved);
     const receipt = snapshot.outgoing[fingerprint]; assert(receipt);
     assert.equal(unresolved.status, 'received');
     assert.equal(unresolved.responsibility_status, 'unresolved_failure');
     assert.notEqual(unresolved.responsibility_status, 'answered_confirmed');
+    assert.equal(unresolved.failure_code, 'delivery_identity_unresolved');
+    assert(Number.isSafeInteger(unresolved.retry_at) && unresolved.retry_at > now,
+      '身份损坏的 sent 回执必须保留未来人工恢复窗口');
+    assert.deepEqual(receipt, frozenRecord,
+      '身份损坏的 sent 回执不得被重分类或静默修复');
     assert.equal(receipt.status, 'sent');
     assert.equal(receipt.receipt_current, null);
     assert.equal(receipt.receipt_state_change_reason, 'operator_identity_pending');
@@ -2021,7 +2233,16 @@ const abortablePending = (signal, started) => {
     await deliver(message('session_expired01', '人工')); const card = sent.at(-1); now += 1100; await deliver(click('session_expired01', card)); assert.equal(state('session_expired01').mode, 'ai');
     assert.equal(runtime.matchRule('不需要人工'), undefined);
     revised.rules[0].enabled = false; publishConfiguration('keyword', revised); assert.equal(runtime.matchRule('人工'), undefined); publishConfiguration('keyword', original);
-    await deliver(message('session_oldoffer1', '人工')); const stale = sent.at(-1); await runtime.resume(key('session_oldoffer1')); await deliver(click('session_oldoffer1', stale)); assert.equal(state('session_oldoffer1').mode, 'ai');
+    await deliver(message('session_oldoffer1', '人工')); const stale = sent.at(-1);
+    await deliver(click('session_oldoffer1', stale));
+    assert.equal(state('session_oldoffer1').mode, 'human', '旧按钮反例须先完成真正人工确认');
+    await runtime.resume(key('session_oldoffer1'));
+    await deliver(click('session_oldoffer1', stale)); assert.equal(state('session_oldoffer1').mode, 'ai');
+    await deliver(message('session_offer-noop1', '人工')); const live = sent.at(-1);
+    const liveGeneration = state('session_offer-noop1').generation;
+    await runtime.resume(key('session_offer-noop1'));
+    assert.equal(state('session_offer-noop1').generation, liveGeneration, '已AI恢复不得作废当前有效按钮');
+    await deliver(click('session_offer-noop1', live)); assert.equal(state('session_offer-noop1').mode, 'human');
   });
   await test('T24/T25/T26 真人公开全部类型、自己的回流和非公开事件', async () => {
     for (const type of ['text', 'file', 'audio', 'animation']) { now += 1; const session = 'session_operator-' + type; await operator(session, { type, content: type === 'text' ? '人工文本' : { type: 'application/octet-stream' } }); assert.equal(state(session).mode, 'human'); }
@@ -2113,8 +2334,12 @@ const abortablePending = (signal, started) => {
   });
   await test('P0 人工接管中止已开始的 Crisp 出站，只保留 unknown 对账且 B 独立', async () => {
     const analytics = path.join(root, 'data/analytics/events.jsonl');
-    const countEvents = type => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
-      .map(line => JSON.parse(line)).filter(event => event.type === type).length : 0;
+    const analyticsEvents = () => fs.existsSync(analytics)
+      ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
+        .map(line => JSON.parse(line)) : [];
+    const countEventsIn = (events, type) => events.filter(event => event.type === type).length;
+    const countEvents = type => countEventsIn(analyticsEvents(), type);
+    const countedFlag = value => value === undefined ? 'absent' : value === true ? 'true' : 'invalid';
     const normalReplies = countEvents('ai_reply');
     const interruptAfterPostStarted = async (session) => {
       let release;
@@ -2139,8 +2364,9 @@ const abortablePending = (signal, started) => {
         query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
       assert.equal(accepted.accepted, true);
       if (accepted.route === 'process') await controlRuntime.process(accepted.key, accepted.jobId);
+      const cancellationReason = 'conversation_state_changed';
       for (let tries = 0; tries < 100 && (!pendingSettled || !Object.values(state(session).outgoing)
-        .some(record => record.cancellation_reason === 'conversation_state_changed')); tries += 1) await wait(10);
+        .some(record => record.cancellation_reason === cancellationReason)); tries += 1) await wait(10);
       assert.equal(pendingSettled, true, '原 worker 仍存活时必须由持久状态轮询中止网络请求');
       const result = await pending;
       release();
@@ -2157,7 +2383,7 @@ const abortablePending = (signal, started) => {
       assert.equal(outgoing.resend_forbidden, true, '人工接管后未知结果只能对账，绝不能重发');
       assert.equal(outgoing.recovery_deferred, true);
       assert(outgoing.next_action_at > now, '未知回执必须登记后续只读对账时间');
-      assert.equal(outgoing.cancellation_reason, 'conversation_state_changed');
+      assert.equal(outgoing.cancellation_reason, cancellationReason);
       const fingerprint = String(outgoing.body.fingerprint);
       assert.equal(current.outgoing[fingerprint], outgoing,
         '原 fingerprint 必须继续指向同一未知出站记录');
@@ -2166,7 +2392,17 @@ const abortablePending = (signal, started) => {
       assert.equal(job.status, 'cancelled');
       assert.equal(job.responsibility_status, 'intentional_silence');
       assert.equal(job.responsibility_reason, 'human_reply');
-      return { entry, body: structuredClone(outgoing.body), fingerprint };
+      assert.equal(Object.hasOwn(job, 'plan'), false,
+        '政策取消后只能是 plan 字段确实不存在，不得用空值伪装');
+      assert.equal(job.provider_settlement?.state, 'settled',
+        '政策取消前已完成的 Provider settlement 必须保留给独立清理诊断');
+      assert.equal(job.provider_retirement_failure_code,
+        'provider_retirement_identity_unresolved',
+        '缺少推理回执时 Provider retirement 故障必须保留，不能被 Crisp 对账洗掉');
+      return { entry, body: structuredClone(outgoing.body), fingerprint,
+        cancellationReason,
+        providerSettlement: structuredClone(job.provider_settlement),
+        providerRetirementFailureCode: job.provider_retirement_failure_code };
     };
     const assertSingleJobAcrossMaintenance = async (runtimeInstance, tracked) => {
       for (let cycle = 0; cycle < 3; cycle += 1) {
@@ -2233,6 +2469,20 @@ const abortablePending = (signal, started) => {
     const foundSession = 'session_crisp-send-race-found';
     const found = await interruptAfterPostStarted(foundSession);
     const attemptsBeforeFound = sendAttempts;
+    const modelsBeforeFound = modelRequests.length;
+    const visibleBeforeFound = sent.filter((item) => item.session_id === foundSession).length;
+    const analyticsBeforeFound = analyticsEvents();
+    const lateDeliveriesBeforeFound = countEventsIn(
+      analyticsBeforeFound, 'delivery_after_state_change');
+    const permitLossesBeforeFound = countEventsIn(analyticsBeforeFound, 'processing_permit_lost');
+    const foundJobBefore = runtime.readState(found.entry.key).jobs
+      .find((item) => item.id === found.entry.jobId);
+    assert(foundJobBefore);
+    assert.equal(countedFlag(foundJobBefore.delivery_state_change_counted), 'absent',
+      '精确对账前不得预先标记迟到投递已计数');
+    const analyticsLock = path.join(root, 'data/analytics/.events.lock');
+    const analyticsLockBeforeFound = fs.existsSync(analyticsLock);
+    assert.equal(analyticsLockBeforeFound, false, '精确对账前不得遗留统计锁');
     let exactHits = 0;
     const foundRuntime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
       const parsed = new URL(url);
@@ -2253,13 +2503,564 @@ const abortablePending = (signal, started) => {
     job = current.jobs.find((item) => item.id === found.entry.jobId);
     assert.equal(exactHits, 1);
     assert.equal(record.status, 'sent');
+    assert.equal(record.delivery_identity_version, 1);
+    assert.equal(record.semantic_intent, 'answer');
+    assert.equal(record.semantic_status, 'valid_answer');
     assert.equal(record.state_changed_before_receipt, true);
+    assert.equal(record.receipt_current, false);
+    assert.equal(record.receipt_state_change_reason, 'conversation_state_changed');
+    assert.equal(record.receipt_identity_unbound, undefined);
     assert.equal(Object.hasOwn(record, 'body'), false);
     assert.equal(job.status, 'cancelled');
     assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(job.responsibility_reason, 'human_reply');
+    assert.equal(job.delivery_state_change_counted, true,
+      '迟到送达事件必须与持久一次性标志在同一责任收尾中提交');
+    assert.equal(job.delivery_state_change_counted_generation, 0,
+      '迟到送达计数必须绑定发生时的回答代');
+    assert.deepEqual(job.provider_settlement, found.providerSettlement,
+      'Crisp 精确命中不得删除或改写独立的 Provider cleanup 故障证据');
+    assert.equal(job.provider_retirement_failure_code,
+      found.providerRetirementFailureCode);
     assert.equal(sendAttempts, attemptsBeforeFound, '精确命中只能收敛原 fingerprint，不能重新 POST');
-    assert.equal(countEvents('ai_reply'), normalReplies,
+    assert.equal(modelRequests.length, modelsBeforeFound,
+      '精确命中只能收敛运输事实，不能重新推理');
+    assert.equal(sent.filter((item) => item.session_id === foundSession).length,
+      visibleBeforeFound, '人工接管后的精确命中不得新增可见消息');
+    const analyticsAfterFound = analyticsEvents();
+    assert.equal(countEventsIn(analyticsAfterFound, 'ai_reply'), normalReplies,
       '人工接管后的迟到送达不得计作正常 AI 回答');
+    const lateDeliveriesAfterFound = countEventsIn(
+      analyticsAfterFound, 'delivery_after_state_change');
+    if (lateDeliveriesAfterFound !== lateDeliveriesBeforeFound + 1) {
+      const newReasonCounts = { none: 0, attempt_superseded: 0, other: 0 };
+      const newReasons = analyticsAfterFound
+        .filter((event) => event.type === 'delivery_after_state_change')
+        .slice(lateDeliveriesBeforeFound)
+        .map((event) => event.reason === undefined ? 'none'
+          : event.reason === 'attempt_superseded' ? 'attempt_superseded' : 'other');
+      for (const reason of newReasons) newReasonCounts[reason] += 1;
+      process.stderr.write('CRISPAI_WORKFLOW_DIAGNOSTIC ' + JSON.stringify({
+        case: 'delivery_after_state_change_count',
+        before: lateDeliveriesBeforeFound,
+        after: lateDeliveriesAfterFound,
+        delta: lateDeliveriesAfterFound - lateDeliveriesBeforeFound,
+        job_flag_before: countedFlag(foundJobBefore.delivery_state_change_counted),
+        job_flag_after: countedFlag(job.delivery_state_change_counted),
+        job_status: ['cancelled', 'done', 'received', 'processing', 'failed'].includes(job.status)
+          ? job.status : 'other',
+        responsibility_status: ['intentional_silence', 'answered_confirmed',
+          'unresolved_failure', 'pending'].includes(job.responsibility_status)
+          ? job.responsibility_status : 'other',
+        record_status: ['sent', 'unknown', 'sending', 'cancelled'].includes(record.status)
+          ? record.status : 'other',
+        receipt_current: typeof record.receipt_current === 'boolean'
+          ? record.receipt_current : null,
+        permit_lost_delta: countEventsIn(
+          analyticsAfterFound, 'processing_permit_lost') - permitLossesBeforeFound,
+        analytics_lock_before: analyticsLockBeforeFound,
+        analytics_lock_after: fs.existsSync(analyticsLock),
+        exact_hits: exactHits,
+        new_reason_counts: newReasonCounts,
+      }) + '\n');
+    }
+    assert.equal(lateDeliveriesAfterFound, lateDeliveriesBeforeFound + 1,
+      '迟到送达必须只记录一次状态变化事实');
+    assert.equal((await foundRuntime.process(found.entry.key, found.entry.jobId)).status, 'idle');
+    assert.equal(exactHits, 1, '已确认的精确 wire 不得再次查询');
+    assert.equal(sendAttempts, attemptsBeforeFound);
+    assert.equal(modelRequests.length, modelsBeforeFound);
+    assert.equal(countEvents('delivery_after_state_change'), lateDeliveriesBeforeFound + 1);
+
+    // 模拟总开关曾关闭后又启用：配置已恢复，但旧任务的静默原因和
+    // 已冻结 wire 事实仍必须保留。用真实 disable_epoch crossing 让 exact-hit
+    // 自行推导回执不再属于当前责任；子例结束后逐字节恢复夹具配置。
+    const disabledSession = 'session_crisp-send-race-global-disabled';
+    const disabled = await interruptAfterPostStarted(disabledSession);
+    const runtimeConfigPath = path.join(root, 'config/runtime.yaml');
+    const runtimeConfigBeforeDisabled = fs.readFileSync(runtimeConfigPath);
+    const materialsBeforeDisabled = fs.readFileSync(materialsPath);
+    let disabledExactHits = 0;
+    try {
+      publishConfiguration('runtime', { schema_version: 2, enabled: false });
+      publishConfiguration('runtime', { schema_version: 2, enabled: true });
+      await runtime.transaction(disabled.entry.key, (currentState) => {
+        const disabledJob = currentState.jobs.find((entry) => entry.id === disabled.entry.jobId);
+        const disabledRecord = currentState.outgoing[disabled.fingerprint];
+        assert(disabledJob && disabledRecord);
+        assert.equal(Object.hasOwn(disabledJob, 'plan'), false);
+        assert((readConfig('runtime').disable_epoch || 0)
+          > (disabledJob.global_disable_epoch || 0),
+        '总关后重启必须保留已跨过的禁用代次');
+        for (const field of ['receipt_current', 'receipt_state_change_reason',
+          'state_changed_before_receipt', 'receipt_confirmed_at']) {
+          assert.equal(Object.hasOwn(disabledRecord, field), false,
+            '精确回执前不得预写回执结论 ' + field);
+        }
+        currentState.mode = 'ai';
+        currentState.generation = disabledJob.generation;
+        currentState.resume_at = null;
+        currentState.pause_reason = '';
+        disabledJob.responsibility_reason = 'global_disabled';
+        disabledRecord.cancellation_reason = 'global_disabled';
+      });
+      histories.set(disabledSession, (histories.get(disabledSession) || [])
+        .filter((entry) => entry.from !== 'operator'));
+      const attemptsBeforeDisabled = sendAttempts;
+      const modelsBeforeDisabled = modelRequests.length;
+      const visibleBeforeDisabled = sent.filter((item) => item.session_id === disabledSession).length;
+      const repliesBeforeDisabled = countEvents('ai_reply');
+      const lateDeliveriesBeforeDisabled = countEvents('delivery_after_state_change');
+      const disabledRuntime = createRuntime(env, { ...runtimeOptions,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (match && decodeURIComponent(match[1]) === disabledSession
+            && match[2] === '/message/' + disabled.fingerprint) {
+            disabledExactHits += 1;
+            return { status: 200, body: { error: false, data: {
+              ...disabled.body, fingerprint: Number(disabled.fingerprint), timestamp: now - 1000,
+            } } };
+          }
+          return request(url, options);
+        } });
+      now += 10000;
+      assert.equal((await disabledRuntime.process(
+        disabled.entry.key, disabled.entry.jobId)).status, 'dispatched_after_cancel');
+      const disabledState = disabledRuntime.readState(disabled.entry.key);
+      const disabledRecord = disabledState.outgoing[disabled.fingerprint];
+      const disabledJob = disabledState.jobs.find((item) => item.id === disabled.entry.jobId);
+      assert.equal(disabledExactHits, 1);
+      assert.equal(disabledRecord.status, 'sent');
+      assert.equal(disabledRecord.delivery_identity_version, 1);
+      assert.equal(disabledRecord.semantic_intent, 'answer');
+      assert.equal(disabledRecord.semantic_status, 'valid_answer');
+      assert.equal(disabledRecord.receipt_current, false);
+      assert.equal(disabledRecord.receipt_state_change_reason, 'global_disabled');
+      assert.equal(disabledRecord.receipt_identity_unbound, undefined);
+      assert.equal(Object.hasOwn(disabledRecord, 'body'), false);
+      assert.equal(disabledJob.status, 'cancelled');
+      assert.equal(disabledJob.responsibility_status, 'intentional_silence');
+      assert.equal(disabledJob.responsibility_reason, 'global_disabled');
+      assert.equal(disabledJob.delivery_state_change_counted, true,
+        '总关后的迟到送达也必须持久化一次性计数标志');
+      assert.equal(disabledJob.delivery_state_change_counted_generation, 0,
+        '总关后的迟到送达计数必须绑定原回答代');
+      assert.equal(Object.hasOwn(disabledJob, 'plan'), false);
+      assert.deepEqual(disabledJob.provider_settlement, disabled.providerSettlement);
+      assert.equal(disabledJob.provider_retirement_failure_code,
+        disabled.providerRetirementFailureCode);
+      assert.equal(sendAttempts, attemptsBeforeDisabled);
+      assert.equal(modelRequests.length, modelsBeforeDisabled);
+      assert.equal(sent.filter((item) => item.session_id === disabledSession).length,
+        visibleBeforeDisabled);
+      assert.equal(countEvents('ai_reply'), repliesBeforeDisabled);
+      assert.equal(countEvents('delivery_after_state_change'),
+        lateDeliveriesBeforeDisabled + 1);
+      assert.equal((await disabledRuntime.process(
+        disabled.entry.key, disabled.entry.jobId)).status, 'idle');
+      assert.equal(disabledExactHits, 1);
+    } finally {
+      fs.writeFileSync(runtimeConfigPath, runtimeConfigBeforeDisabled);
+      fs.writeFileSync(materialsPath, materialsBeforeDisabled);
+    }
+    assert(fs.readFileSync(runtimeConfigPath).equals(runtimeConfigBeforeDisabled));
+    assert(fs.readFileSync(materialsPath).equals(materialsBeforeDisabled));
+
+    const malformedPlans = [
+      { label: 'null', value: null },
+      { label: 'false', value: false },
+      { label: 'array', value: [] },
+      { label: 'empty-object', value: {} },
+      { label: 'malformed-object', value: { type: 'text', purpose: 'ai_text',
+        content: '不属于原出站的损坏计划', fingerprint: 'wrong-fingerprint' } },
+    ];
+    for (const item of malformedPlans) {
+      const claimRejected = ['null', 'false', 'array'].includes(item.label);
+      const session = 'session_crisp-send-race-plan-' + item.label;
+      let tracked;
+      try {
+        tracked = await interruptAfterPostStarted(session);
+      await runtime.transaction(tracked.entry.key, (currentState) => {
+        const stored = currentState.jobs.find((entry) => entry.id === tracked.entry.jobId);
+        assert(stored);
+        assert.equal(Object.hasOwn(stored, 'plan'), false);
+        stored.plan = structuredClone(item.value);
+      });
+      const beforeState = runtime.readState(tracked.entry.key);
+      const beforeRecord = structuredClone(beforeState.outgoing[tracked.fingerprint]);
+      const beforeProviderSettlement = structuredClone(beforeState.jobs
+        .find((entry) => entry.id === tracked.entry.jobId).provider_settlement);
+      const beforeProviderFailure = beforeState.jobs
+        .find((entry) => entry.id === tracked.entry.jobId).provider_retirement_failure_code;
+      const beforeMalformed = { posts: sendAttempts, models: modelRequests.length,
+        visible: sent.filter((entry) => entry.session_id === session).length,
+        replies: countEvents('ai_reply'),
+        lateDeliveries: countEvents('delivery_after_state_change') };
+      let exactHits = 0;
+      const malformedRuntime = createRuntime(env, { ...runtimeOptions,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (match && decodeURIComponent(match[1]) === session
+            && match[2] === '/message/' + tracked.fingerprint) {
+            exactHits += 1;
+            return { status: 200, body: { error: false, data: {
+              ...tracked.body, fingerprint: Number(tracked.fingerprint), timestamp: now - 1000,
+            } } };
+          }
+          return request(url, options);
+        } });
+      now += 10000;
+      assert.equal((await malformedRuntime.process(
+        tracked.entry.key, tracked.entry.jobId)).status,
+      claimRejected ? 'deferred' : 'delivery_identity_unresolved',
+      item.label + ': 字段存在但损坏的 plan 不得冒充政策删除');
+      let malformedState = malformedRuntime.readState(tracked.entry.key);
+      let malformedJob = malformedState.jobs.find((entry) => entry.id === tracked.entry.jobId);
+      assert.equal(exactHits, claimRejected ? 0 : 1, item.label);
+      assert.equal(malformedJob.status, 'cancelled', item.label);
+      assert.equal(malformedJob.responsibility_status, 'intentional_silence', item.label);
+      assert.equal(malformedJob.responsibility_reason, 'human_reply', item.label);
+      assert.equal(Object.hasOwn(malformedJob, 'plan'), true, item.label);
+      assert.deepEqual(malformedJob.plan, item.value, item.label);
+      assert.deepEqual(malformedJob.provider_settlement, beforeProviderSettlement, item.label);
+      assert.equal(malformedJob.provider_retirement_failure_code, beforeProviderFailure, item.label);
+      assert.deepEqual(malformedState.outgoing[tracked.fingerprint], beforeRecord,
+        item.label + ': 严格身份失败不得半迁移原 unknown 记录');
+      if (claimRejected) {
+        assert.equal(malformedJob.delivery_receipt_unknown, undefined, item.label);
+      } else {
+        assert.equal(malformedJob.delivery_receipt_unknown?.identity_status, 'unresolved', item.label);
+        assert.equal(malformedJob.delivery_receipt_unknown?.resend_forbidden, true, item.label);
+        assert.equal(malformedJob.failure_code, 'reconciliation_receipt_invalid', item.label);
+        assert.equal(malformedJob.recovery_requires_review, true, item.label);
+        assert(malformedJob.retry_at > now, item.label);
+      }
+      assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+        visible: sent.filter((entry) => entry.session_id === session).length,
+        replies: countEvents('ai_reply'),
+        lateDeliveries: countEvents('delivery_after_state_change') }, beforeMalformed, item.label);
+      assert.equal((await malformedRuntime.process(
+        tracked.entry.key, tracked.entry.jobId)).status,
+      claimRejected ? 'deferred' : 'idle', item.label);
+      malformedState = malformedRuntime.readState(tracked.entry.key);
+      malformedJob = malformedState.jobs.find((entry) => entry.id === tracked.entry.jobId);
+      assert.equal(exactHits, claimRejected ? 0 : 1,
+        item.label + ': 失败关闭后不得再查或重发');
+      assert.equal(malformedJob.status, 'cancelled', item.label);
+      assert.equal(malformedJob.responsibility_status, 'intentional_silence', item.label);
+      assert.deepEqual(malformedState.outgoing[tracked.fingerprint], beforeRecord, item.label);
+      assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+        visible: sent.filter((entry) => entry.session_id === session).length,
+        replies: countEvents('ai_reply'),
+        lateDeliveries: countEvents('delivery_after_state_change') }, beforeMalformed, item.label);
+      } finally {
+        if (tracked) {
+          const stateFile = path.join(root, 'data/runtime/session-' + tracked.entry.key + '.json');
+          const bucket = path.join(root, 'data/runtime/owned-' + tracked.entry.key + '-'
+            + (Number(tracked.fingerprint) % 256).toString(16).padStart(2, '0') + '.json');
+          for (const file of [stateFile, bucket]) {
+            if (!fs.existsSync(file)) continue;
+            const stat = fs.lstatSync(file);
+            assert(stat.isFile() && !stat.isSymbolicLink(), item.label + ': 测试清理目标必须是普通文件');
+            fs.unlinkSync(file);
+          }
+          histories.delete(session);
+          assert.equal(fs.existsSync(stateFile), false, item.label);
+          assert.equal(fs.existsSync(bucket), false, item.label);
+        }
+      }
+    }
+
+    const cleanupTrackedSession = (tracked) => {
+      const stateFile = path.join(root, 'data/runtime/session-' + tracked.entry.key + '.json');
+      const bucket = path.join(root, 'data/runtime/owned-' + tracked.entry.key + '-'
+        + (Number(tracked.fingerprint) % 256).toString(16).padStart(2, '0') + '.json');
+      for (const file of [stateFile, bucket]) {
+        if (!fs.existsSync(file)) continue;
+        const stat = fs.lstatSync(file);
+        assert(stat.isFile() && !stat.isSymbolicLink(), '故障窗口清理目标必须是普通文件');
+        fs.unlinkSync(file);
+      }
+    };
+    const reconcileWithPostCommitFailure = async (suffix, code) => {
+      const session = 'session_crisp-send-race-post-commit-' + suffix;
+      const tracked = await interruptAfterPostStarted(session);
+      const stateFile = path.join(root, 'data/runtime/session-' + tracked.entry.key + '.json');
+      const beforeState = runtime.readState(tracked.entry.key);
+      const beforeJob = beforeState.jobs.find((entry) => entry.id === tracked.entry.jobId);
+      const providerSettlement = structuredClone(beforeJob.provider_settlement);
+      const providerFailure = beforeJob.provider_retirement_failure_code;
+      const before = { posts: sendAttempts, models: modelRequests.length,
+        visible: sent.filter((entry) => entry.session_id === session).length,
+        replies: countEvents('ai_reply'), lateDeliveries: countEvents('delivery_after_state_change') };
+      let exactHits = 0;
+      let receiptCommitted = false;
+      let injected = false;
+      const originalRenameSync = fs.renameSync;
+      const originalReadFileSync = fs.readFileSync;
+      const failureRuntime = createRuntime(env, { ...runtimeOptions,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (match && decodeURIComponent(match[1]) === session
+            && match[2] === '/message/' + tracked.fingerprint) {
+            exactHits += 1;
+            return { status: 200, body: { error: false, data: {
+              ...tracked.body, fingerprint: Number(tracked.fingerprint), timestamp: now - 1000,
+            } } };
+          }
+          return request(url, options);
+        } });
+      fs.renameSync = (source, target) => {
+        if (target === stateFile) {
+          try {
+            const candidate = JSON.parse(originalReadFileSync(source, 'utf8'));
+            const stored = candidate.jobs.find((entry) => entry.id === tracked.entry.jobId);
+            const record = candidate.outgoing[tracked.fingerprint];
+            if (stored?.status === 'processing'
+              && stored.reconciliation_claim?.phase === 'settled'
+              && record?.status === 'sent' && record.receipt_current === false
+              && !Object.hasOwn(stored, 'delivery_state_change_counted')) receiptCommitted = true;
+          } catch (_) {}
+        }
+        return originalRenameSync(source, target);
+      };
+      fs.readFileSync = (target, ...args) => {
+        if (target === stateFile && receiptCommitted && !injected) {
+          injected = true;
+          const error = new Error('受控回执提交后故障');
+          error.code = code;
+          throw error;
+        }
+        return originalReadFileSync(target, ...args);
+      };
+      let result;
+      try {
+        now += 10000;
+        result = await failureRuntime.process(tracked.entry.key, tracked.entry.jobId);
+      } finally {
+        fs.renameSync = originalRenameSync;
+        fs.readFileSync = originalReadFileSync;
+      }
+      assert.equal(receiptCommitted, true, suffix + ': 必须先持久提交严格精确回执');
+      assert.equal(injected, true, suffix + ': 必须命中回执提交后的故障窗口');
+      if (code === 'PROCESSING_PERMIT_LOST') {
+        assert.equal(result.status, 'dispatched_after_cancel', suffix);
+      } else {
+        assert.deepEqual(result, { status: 'deferred', reason: 'answer_responsibility_unresolved' }, suffix);
+      }
+      const current = failureRuntime.readState(tracked.entry.key);
+      const stored = current.jobs.find((entry) => entry.id === tracked.entry.jobId);
+      const record = current.outgoing[tracked.fingerprint];
+      assert.equal(exactHits, 1, suffix);
+      assert.equal(record.status, 'sent', suffix);
+      assert.equal(record.receipt_current, false, suffix);
+      assert.equal(stored.status, 'cancelled', suffix);
+      assert.equal(stored.responsibility_status, 'intentional_silence', suffix);
+      assert.equal(stored.delivery_state_change_counted, true, suffix);
+      assert.equal(stored.delivery_state_change_counted_generation, 0, suffix);
+      assert.equal(stored.execution_token, undefined, suffix);
+      assert.equal(current.worker, null, suffix);
+      assert.deepEqual(stored.provider_settlement, providerSettlement, suffix);
+      assert.equal(stored.provider_retirement_failure_code, providerFailure, suffix);
+      assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+        visible: sent.filter((entry) => entry.session_id === session).length,
+        replies: countEvents('ai_reply') }, {
+        posts: before.posts, models: before.models, visible: before.visible, replies: before.replies,
+      }, suffix);
+      assert.equal(countEvents('delivery_after_state_change'), before.lateDeliveries + 1, suffix);
+      assert.equal((await failureRuntime.process(
+        tracked.entry.key, tracked.entry.jobId)).status, 'idle', suffix);
+      assert.equal(countEvents('delivery_after_state_change'), before.lateDeliveries + 1, suffix);
+      cleanupTrackedSession(tracked);
+      histories.delete(session);
+    };
+    await reconcileWithPostCommitFailure('permit-lost', 'PROCESSING_PERMIT_LOST');
+    await reconcileWithPostCommitFailure('generic-eio', 'EIO');
+
+    const absentPermitSession = 'session_crisp-send-race-absent-permit-lost';
+    const absentPermit = await interruptAfterPostStarted(absentPermitSession);
+    const absentPermitStateFile = path.join(root,
+      'data/runtime/session-' + absentPermit.entry.key + '.json');
+    const absentPermitBefore = { posts: sendAttempts, models: modelRequests.length,
+      visible: sent.filter((entry) => entry.session_id === absentPermitSession).length,
+      replies: countEvents('ai_reply'), lateDeliveries: countEvents('delivery_after_state_change') };
+    const absentPermitInitial = runtime.readState(absentPermit.entry.key).jobs
+      .find((entry) => entry.id === absentPermit.entry.jobId);
+    const absentPermitSettlement = structuredClone(absentPermitInitial.provider_settlement);
+    const absentPermitFailure = absentPermitInitial.provider_retirement_failure_code;
+    let absentPermitMisses = 0;
+    const absentPermitRuntime = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && decodeURIComponent(match[1]) === absentPermitSession
+          && match[2] === '/message/' + absentPermit.fingerprint) {
+          absentPermitMisses += 1;
+          return { status: 404, body: { error: true, reason: 'not_found' } };
+        }
+        return request(url, options);
+      } });
+    now += 10000;
+    assert.equal((await absentPermitRuntime.process(
+      absentPermit.entry.key, absentPermit.entry.jobId)).status, 'retry');
+    assert.equal(absentPermitMisses, 1);
+    const absentPermitRenameSync = fs.renameSync;
+    const absentPermitReadFileSync = fs.readFileSync;
+    let absentPermitCommitted = false;
+    let absentPermitInjected = false;
+    fs.renameSync = (source, target) => {
+      if (target === absentPermitStateFile) {
+        try {
+          const candidate = JSON.parse(absentPermitReadFileSync(source, 'utf8'));
+          const stored = candidate.jobs.find((entry) => entry.id === absentPermit.entry.jobId);
+          const record = candidate.outgoing[absentPermit.fingerprint];
+          if (stored?.status === 'processing'
+            && stored.reconciliation_claim?.phase === 'settled'
+            && record?.status === 'cancelled'
+            && Number.isFinite(record.confirmed_absent_at)) absentPermitCommitted = true;
+        } catch (_) {}
+      }
+      return absentPermitRenameSync(source, target);
+    };
+    fs.readFileSync = (target, ...args) => {
+      if (target === absentPermitStateFile && absentPermitCommitted && !absentPermitInjected) {
+        absentPermitInjected = true;
+        const error = new Error('受控阴性回执提交后许可丢失');
+        error.code = 'PROCESSING_PERMIT_LOST';
+        throw error;
+      }
+      return absentPermitReadFileSync(target, ...args);
+    };
+    let absentPermitResult;
+    try {
+      now += 5000;
+      absentPermitResult = await absentPermitRuntime.process(
+        absentPermit.entry.key, absentPermit.entry.jobId);
+    } finally {
+      fs.renameSync = absentPermitRenameSync;
+      fs.readFileSync = absentPermitReadFileSync;
+    }
+    assert.equal(absentPermitCommitted, true);
+    assert.equal(absentPermitInjected, true);
+    assert.equal(absentPermitResult.status, 'cancelled_reconciled');
+    assert.equal(absentPermitMisses, 2);
+    const absentPermitState = absentPermitRuntime.readState(absentPermit.entry.key);
+    const absentPermitJob = absentPermitState.jobs
+      .find((entry) => entry.id === absentPermit.entry.jobId);
+    const absentPermitRecord = absentPermitState.outgoing[absentPermit.fingerprint];
+    assert.equal(absentPermitRecord.status, 'cancelled');
+    assert.equal(Object.hasOwn(absentPermitRecord, 'body'), false);
+    assert.equal(absentPermitJob.status, 'cancelled');
+    assert.equal(absentPermitJob.responsibility_status, 'intentional_silence');
+    assert.equal(absentPermitJob.delivery_state_change_counted, undefined);
+    assert.equal(absentPermitJob.execution_token, undefined);
+    assert.equal(absentPermitState.worker, null);
+    assert.deepEqual(absentPermitJob.provider_settlement, absentPermitSettlement);
+    assert.equal(absentPermitJob.provider_retirement_failure_code, absentPermitFailure);
+    assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+      visible: sent.filter((entry) => entry.session_id === absentPermitSession).length,
+      replies: countEvents('ai_reply'), lateDeliveries: countEvents('delivery_after_state_change') },
+    absentPermitBefore);
+    assert.equal((await absentPermitRuntime.process(
+      absentPermit.entry.key, absentPermit.entry.jobId)).status, 'idle');
+    cleanupTrackedSession(absentPermit);
+    histories.delete(absentPermitSession);
+
+    const supersededSession = 'session_crisp-send-race-post-reconcile-superseded';
+    const superseded = await interruptAfterPostStarted(supersededSession);
+    const supersededStateFile = path.join(root,
+      'data/runtime/session-' + superseded.entry.key + '.json');
+    const supersededBefore = { posts: sendAttempts, models: modelRequests.length,
+      visible: sent.filter((entry) => entry.session_id === supersededSession).length,
+      replies: countEvents('ai_reply'), lateDeliveries: countEvents('delivery_after_state_change') };
+    const originalRenameSync = fs.renameSync;
+    const originalReadFileSync = fs.readFileSync;
+    let supersededCommitted = false;
+    let ownerReplaced = false;
+    let postCommitStateReads = 0;
+    let supersededExactHits = 0;
+    let replacementJob;
+    let replacementRecord;
+    let replacementWorker;
+    const newerToken = 'e'.repeat(24);
+    const supersededRuntime = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && decodeURIComponent(match[1]) === supersededSession
+          && match[2] === '/message/' + superseded.fingerprint) {
+          supersededExactHits += 1;
+          return { status: 200, body: { error: false, data: {
+            ...superseded.body, fingerprint: Number(superseded.fingerprint), timestamp: now - 1000,
+          } } };
+        }
+        return request(url, options);
+      } });
+    fs.renameSync = (source, target) => {
+      if (target === supersededStateFile) {
+        try {
+          const candidate = JSON.parse(originalReadFileSync(source, 'utf8'));
+          const stored = candidate.jobs.find((entry) => entry.id === superseded.entry.jobId);
+          const record = candidate.outgoing[superseded.fingerprint];
+          if (stored?.status === 'processing'
+            && stored.reconciliation_claim?.phase === 'settled'
+            && record?.status === 'sent' && record.receipt_current === false
+            && !Object.hasOwn(stored, 'delivery_state_change_counted')) supersededCommitted = true;
+        } catch (_) {}
+      }
+      return originalRenameSync(source, target);
+    };
+    fs.readFileSync = (target, ...args) => {
+      if (target === supersededStateFile && supersededCommitted && !ownerReplaced
+        && ++postCommitStateReads === 4) {
+        const candidate = JSON.parse(originalReadFileSync(target, 'utf8'));
+        const stored = candidate.jobs.find((entry) => entry.id === superseded.entry.jobId);
+        assert(stored && stored.execution_token !== newerToken);
+        stored.execution_token = newerToken;
+        stored.lease_until = now + 300000;
+        candidate.worker = { job: stored.id, token: newerToken, until: now + 300000 };
+        replacementJob = structuredClone(stored);
+        replacementRecord = structuredClone(candidate.outgoing[superseded.fingerprint]);
+        replacementWorker = structuredClone(candidate.worker);
+        fs.writeFileSync(target, JSON.stringify(candidate));
+        ownerReplaced = true;
+      }
+      return originalReadFileSync(target, ...args);
+    };
+    let supersededResult;
+    try {
+      now += 10000;
+      supersededResult = await supersededRuntime.process(
+        superseded.entry.key, superseded.entry.jobId);
+    } finally {
+      fs.renameSync = originalRenameSync;
+      fs.readFileSync = originalReadFileSync;
+    }
+    assert.equal(supersededCommitted, true);
+    assert.equal(ownerReplaced, true);
+    assert.equal(postCommitStateReads, 4);
+    assert.deepEqual(supersededResult,
+      { status: 'deferred', reason: 'execution_superseded',
+        key: superseded.entry.key, jobId: superseded.entry.jobId });
+    const supersededState = supersededRuntime.readState(superseded.entry.key);
+    const supersededJob = supersededState.jobs.find(
+      (entry) => entry.id === superseded.entry.jobId);
+    assert.equal(supersededExactHits, 1);
+    assert.deepEqual(supersededState.outgoing[superseded.fingerprint], replacementRecord,
+      '旧执行不得改写新 owner 接管前已冻结的 sent 回执');
+    assert.deepEqual(supersededJob, replacementJob,
+      '旧执行不得改写新 owner 持有的取消对账责任');
+    assert.deepEqual(supersededState.worker, replacementWorker,
+      '旧执行不得释放新 owner 的 worker');
+    assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+      visible: sent.filter((entry) => entry.session_id === supersededSession).length,
+      replies: countEvents('ai_reply'), lateDeliveries: countEvents('delivery_after_state_change') },
+    supersededBefore);
+    cleanupTrackedSession(superseded);
+    histories.delete(supersededSession);
 
     await deliver(message('session_crisp-send-race-b', '另一会话继续工作'));
     assert.equal(sent.at(-1).session_id, 'session_crisp-send-race-b');
@@ -2286,17 +3087,161 @@ const abortablePending = (signal, started) => {
     now += 5;
     const human = { ...message(session, '另一实例确认人工已经接管', { from: 'operator', automated: false }), event: 'message:received' };
     const history = histories.get(session) || []; history.push(human.data); histories.set(session, history);
-    await controlRuntime.receive({ body: human, query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const humanAccepted = await controlRuntime.receive({ body: human,
+      query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    assert.equal(humanAccepted.accepted, true);
+    assert.equal(humanAccepted.route, 'process');
     release();
     const result = await pending;
     ignoreCrispAbort = false;
     assert.equal(result.status, 'dispatched_after_cancel');
-    const outgoing = Object.values(state(session).outgoing).find((record) => record.job_id === entry.jobId);
+    const outgoingPair = Object.entries(state(session).outgoing)
+      .find(([, record]) => record.job_id === entry.jobId); assert(outgoingPair);
+    const [lateFingerprint, outgoing] = outgoingPair;
+    const lateJob = state(session).jobs.find((job) => job.id === entry.jobId);
     assert.equal(outgoing.status, 'sent');
     assert.equal(outgoing.state_changed_before_receipt, true);
+    assert.equal(lateJob.delivery_state_change_counted, true,
+      '原POST迟到回执必须与一次性计数标志原子提交');
+    assert.equal(lateJob.delivery_state_change_counted_generation, 0,
+      '原POST迟到回执计数必须绑定原回答代');
     assert.equal(countEvents('delivery_after_state_change'), lateDeliveries + 1);
     assert.equal(countEvents('ai_reply'), normalReplies, '状态变化后的迟到回执不能登记为正常 AI 回复');
+    const frozenLateOutgoing = structuredClone(outgoing);
+    const frozenLateSettlement = structuredClone(lateJob.provider_settlement);
+    const frozenLateRetirement = structuredClone(lateJob.provider_retirement);
+    const frozenLateRetirementFailure = lateJob.provider_retirement_failure_code;
+    const postLateBaseline = { posts: sendAttempts, models: modelRequests.length,
+      providers: providerRequests.length, retrievals: retrievalRequests.length,
+      visible: sent.filter((item) => item.session_id === session).length,
+      lateDeliveries: countEvents('delivery_after_state_change'),
+      aiReplies: countEvents('ai_reply') };
+    const controlCompletion = await runtime.process(entry.key, entry.jobId);
+    assert.equal(controlCompletion.status, 'none',
+      '旧任务已终结时应回退处理同会话尚未收尾的真人控制任务');
+    assert.equal(controlCompletion.jobId, humanAccepted.jobId);
+    let afterControl = state(session);
+    const handledControl = afterControl.jobs.find((job) => job.id === humanAccepted.jobId);
+    assert(handledControl);
+    assert.equal(handledControl.status, 'done');
+    assert.equal(handledControl.responsibility_status, 'control_handled');
+    assert.equal(handledControl.responsibility_reason, 'operator');
+    let unchangedLateJob = afterControl.jobs.find((job) => job.id === entry.jobId);
+    assert(unchangedLateJob);
+    assert.equal(unchangedLateJob.status, 'cancelled');
+    assert.equal(unchangedLateJob.responsibility_status, 'intentional_silence');
+    assert.equal(unchangedLateJob.delivery_state_change_counted, true);
+    assert.equal(unchangedLateJob.delivery_state_change_counted_generation, 0);
+    assert.deepEqual(unchangedLateJob.provider_settlement, frozenLateSettlement);
+    assert.deepEqual(unchangedLateJob.provider_retirement, frozenLateRetirement);
+    assert.equal(unchangedLateJob.provider_retirement_failure_code,
+      frozenLateRetirementFailure);
+    assert.deepEqual(afterControl.outgoing[lateFingerprint], frozenLateOutgoing);
+    assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+      providers: providerRequests.length, retrievals: retrievalRequests.length,
+      visible: sent.filter((item) => item.session_id === session).length,
+      lateDeliveries: countEvents('delivery_after_state_change'),
+      aiReplies: countEvents('ai_reply') }, postLateBaseline,
+      '真人控制任务收尾不得重放推理、检索、Provider、Crisp POST或统计事件');
+    assert.equal((await runtime.process(entry.key, entry.jobId)).status, 'idle');
+    afterControl = state(session);
+    unchangedLateJob = afterControl.jobs.find((job) => job.id === entry.jobId);
+    assert(unchangedLateJob);
+    assert.equal(unchangedLateJob.delivery_state_change_counted, true);
+    assert.equal(unchangedLateJob.delivery_state_change_counted_generation, 0);
+    assert.deepEqual(afterControl.outgoing[lateFingerprint], frozenLateOutgoing);
+    assert.deepEqual({ posts: sendAttempts, models: modelRequests.length,
+      providers: providerRequests.length, retrievals: retrievalRequests.length,
+      visible: sent.filter((item) => item.session_id === session).length,
+      lateDeliveries: countEvents('delivery_after_state_change'),
+      aiReplies: countEvents('ai_reply') }, postLateBaseline,
+      '重复处理原任务不得新增任何模型、网络、可见消息或统计事实');
+    assert.equal(countEvents('delivery_after_state_change'), lateDeliveries + 1,
+      '重复处理已收敛的迟到回执不得重复计数');
 
+    ignoreCrispAbort = true;
+    delayedCrisp = new Promise((resolve) => { release = resolve; });
+    const invalidCountSession = 'session_crisp-receipt-race-invalid-count';
+    let invalidCountAbortResolve;
+    const invalidCountAbort = new Promise((resolve) => { invalidCountAbortResolve = resolve; });
+    const invalidRuntime = createRuntime(env, { ...runtimeOptions,
+      request: async (url, options = {}) => {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+        if (match && decodeURIComponent(match[1]) === invalidCountSession
+          && match[2] === '/message' && options.method === 'POST') {
+          if (options.signal?.aborted) invalidCountAbortResolve();
+          else options.signal?.addEventListener('abort', invalidCountAbortResolve, { once: true });
+        }
+        return request(url, options);
+      } });
+    const invalidCountAttempts = sendAttempts;
+    const invalidCountReplies = countEvents('ai_reply');
+    const invalidCountLateDeliveries = countEvents('delivery_after_state_change');
+    const invalidCountBody = message(invalidCountSession, '模拟畸形迟到投递计数标志');
+    const invalidCountEntry = await invalidRuntime.receive({ body: invalidCountBody,
+      query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    const invalidCountPending = invalidRuntime.process(
+      invalidCountEntry.key, invalidCountEntry.jobId);
+    for (let tries = 0; tries < 200 && sendAttempts === invalidCountAttempts; tries += 1) await wait(5);
+    assert.equal(sendAttempts, invalidCountAttempts + 1,
+      '畸形计数子例必须先进入同一个受控 Crisp POST');
+    const invalidControlRuntime = createRuntime(env, runtimeOptions);
+    now += 5;
+    const invalidHuman = { ...message(invalidCountSession, '另一实例确认人工接管畸形计数子例', {
+      from: 'operator', automated: false,
+    }), event: 'message:received' };
+    const invalidHistory = histories.get(invalidCountSession) || [];
+    invalidHistory.push(invalidHuman.data); histories.set(invalidCountSession, invalidHistory);
+    await invalidControlRuntime.receive({ body: invalidHuman,
+      query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+    let invalidCountFingerprint;
+    await invalidRuntime.transaction(invalidCountEntry.key, (current) => {
+      const stored = current.jobs.find((job) => job.id === invalidCountEntry.jobId); assert(stored);
+      const pair = Object.entries(current.outgoing)
+        .find(([, record]) => record.job_id === invalidCountEntry.jobId); assert(pair);
+      [invalidCountFingerprint] = pair;
+      assert.equal(pair[1].status, 'unknown');
+      stored.delivery_state_change_counted = false;
+    });
+    await awaitNamedGate(invalidCountAbort,
+      '畸形计数子例的原出站已观察到人工接管取消');
+    release();
+    const invalidCountResult = await invalidCountPending;
+    ignoreCrispAbort = false;
+    assert.equal(invalidCountResult.status, 'cancelled',
+      '畸形计数标志必须回滚 sent 候选并保持政策取消');
+    const invalidCountState = invalidRuntime.readState(invalidCountEntry.key);
+    const invalidCountJob = invalidCountState.jobs.find(
+      (job) => job.id === invalidCountEntry.jobId); assert(invalidCountJob);
+    const invalidCountRecord = invalidCountState.outgoing[invalidCountFingerprint];
+    assert.equal(invalidCountJob.status, 'cancelled');
+    assert.equal(invalidCountJob.responsibility_status, 'intentional_silence');
+    assert.equal(invalidCountJob.delivery_state_change_counted, false,
+      '畸形计数标志不得被迟到回执静默改成 true');
+    assert.equal(Object.hasOwn(invalidCountJob,
+      'delivery_state_change_counted_generation'), false,
+      '畸形布尔标志不得被失败的回执事务补造代次绑定');
+    assert.equal(invalidCountRecord.status, 'unknown',
+      '计数标志畸形时 sent 候选与回执字段必须整笔回滚');
+    assert.equal(Object.hasOwn(invalidCountRecord, 'receipt_current'), false);
+    assert(invalidCountRecord.body, '失败关闭后仍须保留同 fingerprint 正文供只读对账');
+    assert.equal(countEvents('delivery_after_state_change'), invalidCountLateDeliveries);
+    assert.equal(countEvents('ai_reply'), invalidCountReplies);
+    assert.equal(sendAttempts, invalidCountAttempts + 1, '失败关闭不得发起第二次 POST');
+    const invalidCountStateFile = path.join(root,
+      'data/runtime/session-' + invalidCountEntry.key + '.json');
+    const invalidCountBucket = path.join(root, 'data/runtime/owned-' + invalidCountEntry.key + '-'
+      + (Number(invalidCountFingerprint) % 256).toString(16).padStart(2, '0') + '.json');
+    for (const file of [invalidCountStateFile, invalidCountBucket]) {
+      if (!fs.existsSync(file)) continue;
+      const stat = fs.lstatSync(file);
+      assert(stat.isFile() && !stat.isSymbolicLink(), '畸形计数子例清理目标必须是普通文件');
+      fs.unlinkSync(file);
+    }
+    histories.delete(invalidCountSession);
+
+    ignoreCrispAbort = true;
     delayedCrisp = new Promise((resolve) => { release = resolve; });
     const fencedSession = 'session_crisp-attempt-fence';
     const fencedAttempts = sendAttempts;
@@ -2353,7 +3298,7 @@ const abortablePending = (signal, started) => {
     assert.equal(fencedJob.responsibility_status, 'pending');
     assert.notEqual(fencedJob.responsibility_status, 'answered_confirmed');
   });
-  await test('P0 发送代次 token 仅兼容旧版双空，畸形或不对称值与正文错配均关闭失败', async () => {
+  await test('P0 发送代次 token 只迁移真实旧版缺字段记录，现代空值、畸形、不对称与正文错配均关闭失败', async () => {
     const analytics = path.join(root, 'data/analytics/events.jsonl');
     const events = () => fs.existsSync(analytics) ? fs.readFileSync(analytics, 'utf8').trim().split('\n')
       .filter(Boolean).map(JSON.parse) : [];
@@ -2368,33 +3313,52 @@ const abortablePending = (signal, started) => {
       return { entered, waiting, enter,
         release: () => { if (!released) { released = true; release(); } } };
     };
-    const prepareHistoryReceipt = async (session, token, hasToken = true) => {
+    const removeSessionState = (session) => {
+      const file = path.join(root, 'data/runtime/session-' + key(session) + '.json');
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+      histories.delete(session);
+    };
+    const prepareHistoryReceipt = async (session, options = {}) => {
+      const identity = options.identity || 'legacy';
+      const tokenPresent = options.tokenPresent === true;
+      const token = options.token;
+      const purpose = options.purpose || 'keyword_reply';
+      assert(['legacy', 'modern'].includes(identity));
       runtime = createRuntime(env, runtimeOptions);
-      let initial;
-      try {
-        sendRejection = 403;
-        initial = await deliver(message(session, '受控旧版回执责任'));
-      } finally { sendRejection = 0; }
-      assert.equal(initial.status, 'rejected');
-      let fingerprint;
+      const initial = await receive(message(session, '受控旧版回执责任'));
+      assert.equal(initial.accepted, true);
+      assert.equal(initial.route, 'process');
+      const fingerprint = Number.parseInt(digest('legacy-delivery|' + session).slice(0, 12), 16);
       let body;
       await runtime.transaction(initial.key, (current) => {
-        const job = current.jobs.find((item) => item.id === initial.jobId); assert(job?.plan);
-        const pair = Object.entries(current.outgoing).find(([, record]) => record.job_id === initial.jobId);
-        assert(pair, '必须先由正式出站路径建立冻结身份');
-        [fingerprint] = pair;
-        const record = pair[1]; assert(record.body);
-        record.status = 'unknown';
-        record.created_at = now - 20000;
-        delete record.failure;
-        delete record.recovery_deferred;
-        delete record.resend_forbidden;
-        delete record.next_action_at;
-        delete record.reconcile_misses;
-        delete record.reconcile_checked_at;
-        if (hasToken) record.attempt_token = token;
-        else delete record.attempt_token;
-        body = structuredClone(record.body);
+        const job = current.jobs.find((item) => item.id === initial.jobId); assert(job);
+        assert.equal(Object.keys(current.outgoing).length, 0);
+        if (options.stateGeneration !== undefined) {
+          current.generation = options.stateGeneration;
+        }
+        const content = '旧版已交给 Crisp 的确定性业务答复';
+        const plan = { type: 'text', purpose, ordinary: true,
+          ...(options.ai === true ? { ai: true } : {}), content, fingerprint };
+        job.plan = plan;
+        for (const field of ['inference', 'inference_generation', 'provider_result_receipt',
+          'provider_settlement', 'provider_settlement_failure_code', 'provider_retirement',
+          'provider_retirement_failure_code', 'provider_migration_from',
+          'delivery_receipt_unknown']) delete job[field];
+        if (options.jobExtras) Object.assign(job, structuredClone(options.jobExtras));
+        body = { type: 'text', from: 'operator', origin: 'chat', automated: true,
+          fingerprint, content };
+        if (options.bodyExtras) Object.assign(body, structuredClone(options.bodyExtras));
+        const record = { status: 'unknown', body: structuredClone(body),
+          created_at: now - 20000, attempts: 1, job_id: job.id,
+          generation: job.generation };
+        if (identity === 'modern') Object.assign(record, {
+          response_generation: 0, delivery_identity_version: 1,
+          purpose: plan.purpose, message_type: plan.type, semantic_intent: 'answer',
+          content_sha256: digest(canonical({ type: plan.type, content })),
+        });
+        if (options.recordExtras) Object.assign(record, structuredClone(options.recordExtras));
+        if (tokenPresent) record.attempt_token = structuredClone(token);
+        current.outgoing[String(fingerprint)] = record;
         job.status = 'received';
         job.responsibility_status = 'pending';
         job.retry_at = 0;
@@ -2411,56 +3375,662 @@ const abortablePending = (signal, started) => {
       return { ...initial, fingerprint, body };
     };
 
-    const legacy = await prepareHistoryReceipt('session_attempt-token-empty', '', true);
-    let snapshot = state('session_attempt-token-empty');
+    const legacy = await prepareHistoryReceipt('session_attempt-token-legacy-missing');
+    let snapshot = state('session_attempt-token-legacy-missing');
     let record = snapshot.outgoing[legacy.fingerprint];
-    assert.equal(Object.hasOwn(record, 'attempt_token'), true);
-    assert.equal(record.attempt_token, '');
+    assert.equal(Object.hasOwn(record, 'attempt_token'), false);
+    assert.equal(Object.hasOwn(record, 'delivery_identity_version'), false);
     let postBaseline = sendAttempts;
     let modelBaseline = modelRequests.length;
     assert.equal((await runtime.process(legacy.key, legacy.jobId)).status, 'sent');
-    snapshot = state('session_attempt-token-empty');
+    snapshot = state('session_attempt-token-legacy-missing');
     record = snapshot.outgoing[legacy.fingerprint];
     let job = snapshot.jobs.find((item) => item.id === legacy.jobId);
     assert.equal(record.status, 'sent');
     assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(record.delivery_identity_version, 1);
+    assert.match(record.attempt_token, /^[a-f0-9]{32}$/);
+    assert(Number.isSafeInteger(record.legacy_delivery_identity_migrated_at));
     assert.equal(job.status, 'done');
     assert.equal(job.responsibility_status, 'answered_confirmed');
-    assert.equal(sendAttempts, postBaseline, '旧版显式双空回执只能对账，不能重新 POST');
+    assert.equal(sendAttempts, postBaseline, '旧版缺 token 字段的回执只能对账，不能重新 POST');
     assert.equal(modelRequests.length, modelBaseline, '已有计划的旧版回执不得重新推理');
+    const migratedLegacyRecord = structuredClone(record);
+    assert.equal((await runtime.process(legacy.key, legacy.jobId)).status, 'idle');
+    assert.deepEqual(state('session_attempt-token-legacy-missing')
+      .outgoing[legacy.fingerprint], migratedLegacyRecord,
+      '重复处理不得改写已经严格迁移的 sent 身份');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+
+    const legacyProvider = await prepareHistoryReceipt(
+      'session_attempt-token-legacy-provider-missing', { purpose: 'ai_text', ai: true });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(legacyProvider.key, legacyProvider.jobId)).status, 'sent');
+    snapshot = state('session_attempt-token-legacy-provider-missing');
+    record = snapshot.outgoing[legacyProvider.fingerprint];
+    job = snapshot.jobs.find((item) => item.id === legacyProvider.jobId);
+    assert.equal(record.delivery_identity_version, 1);
+    assert.match(record.attempt_token, /^[a-f0-9]{32}$/);
+    assert(Number.isSafeInteger(record.legacy_delivery_identity_migrated_at));
+    assert.equal(record.status, 'sent');
+    assert.equal(Object.hasOwn(record, 'body'), false);
+    assert.equal(job.status, 'done');
+    assert.equal(job.responsibility_status, 'answered_confirmed');
+    assert.equal(sendAttempts, postBaseline,
+      '旧版已缓存 Provider 正文只能凭精确回执迁移，不能再次 POST');
+    assert.equal(modelRequests.length, modelBaseline,
+      '旧版已缓存 Provider 正文不得触发第二次推理');
+
+    const delayedLegacySession = 'session_attempt-token-legacy-provider-delayed-receipt';
+    const delayedLegacy = await prepareHistoryReceipt(
+      delayedLegacySession, { purpose: 'ai_text', ai: true });
+    histories.set(delayedLegacySession, (histories.get(delayedLegacySession) || [])
+      .filter((item) => String(item.fingerprint) !== String(delayedLegacy.fingerprint)));
+    let delayedMessageReads = 0;
+    let delayedExactReads = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === delayedLegacySession) {
+        if (match[2] === '/messages') delayedMessageReads += 1;
+        if (match[2].startsWith('/message/')) {
+          delayedExactReads += 1;
+          return { status: 404, body: { error: true } };
+        }
+      }
+      return request(url, options);
+    } });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(delayedLegacy.key, delayedLegacy.jobId)).status, 'retry');
+    snapshot = state(delayedLegacySession);
+    record = snapshot.outgoing[delayedLegacy.fingerprint];
+    assert.equal(record.delivery_identity_version, 1);
+    assert.match(record.attempt_token, /^[a-f0-9]{32}$/);
+    assert(Number.isSafeInteger(record.legacy_delivery_identity_migrated_at));
+    assert.equal(record.reconcile_misses, 1);
+    assert.equal(delayedMessageReads, 1);
+    assert.equal(delayedExactReads, 1);
+    now += 5000;
+    (histories.get(delayedLegacySession) || []).push({
+      ...delayedLegacy.body, timestamp: now });
+    assert.equal((await runtime.process(delayedLegacy.key, delayedLegacy.jobId)).status, 'sent');
+    snapshot = state(delayedLegacySession);
+    record = snapshot.outgoing[delayedLegacy.fingerprint];
+    job = snapshot.jobs.find((item) => item.id === delayedLegacy.jobId);
+    assert.equal(record.status, 'sent');
+    assert.equal(job.status, 'done');
+    assert.equal(job.responsibility_status, 'answered_confirmed');
+    assert.equal(delayedMessageReads, 2);
+    assert.equal(delayedExactReads, 1,
+      '第二轮列表已经精确命中时不得再消耗 exact GET');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    runtime = createRuntime(env, runtimeOptions);
+
+    const ambiguousProvider = await prepareHistoryReceipt(
+      'session_attempt-token-legacy-provider-ambiguous', { purpose: 'ai_text', ai: true });
+    let ambiguousOriginal;
+    await runtime.transaction(ambiguousProvider.key, (current) => {
+      const owner = current.jobs.find((item) => item.id === ambiguousProvider.jobId); assert(owner);
+      ambiguousOriginal = structuredClone(current.outgoing[ambiguousProvider.fingerprint]);
+      current.outgoing[String(ambiguousProvider.fingerprint + 1)] = {
+        status: 'cancelled', created_at: now - 10000, attempts: 1,
+        job_id: owner.id, generation: owner.generation,
+      };
+    });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(
+      ambiguousProvider.key, ambiguousProvider.jobId)).status, 'delivery_identity_unresolved');
+    snapshot = state('session_attempt-token-legacy-provider-ambiguous');
+    assert.deepEqual(snapshot.outgoing[ambiguousProvider.fingerprint], ambiguousOriginal,
+      '同一旧责任存在第二条相关出站时不得挑选 tokenless 记录迁移');
+    job = snapshot.jobs.find((item) => item.id === ambiguousProvider.jobId);
+    assert.equal(job.status, 'received');
+    assert.equal(job.responsibility_status, 'unresolved_failure');
+    assert.equal(job.failure_code, 'delivery_identity_unresolved');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState('session_attempt-token-legacy-provider-ambiguous');
+
+    const localFutureSession = 'session_attempt-token-local-future-conflict';
+    const localFuture = await prepareHistoryReceipt(localFutureSession);
+    let localFutureOriginal;
+    await runtime.transaction(localFuture.key, (current) => {
+      const owner = current.jobs.find((item) => item.id === localFuture.jobId); assert(owner);
+      localFutureOriginal = structuredClone(current.outgoing[localFuture.fingerprint]);
+      current.outgoing[String(localFuture.fingerprint + 1)] = {
+        status: 'cancelled', created_at: now - 10000, attempts: 1,
+        job_id: owner.id, generation: owner.generation, response_generation: 1,
+      };
+    });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(localFuture.key, localFuture.jobId)).status,
+      'delivery_semantic_unknown');
+    snapshot = state(localFutureSession);
+    assert.deepEqual(snapshot.outgoing[localFuture.fingerprint], localFutureOriginal,
+      '同一旧责任的未来回答代记录不得被唯一性过滤后放行 tokenless 迁移');
+    job = snapshot.jobs.find((item) => item.id === localFuture.jobId);
+    assert.equal(job.status, 'received');
+    assert.equal(job.responsibility_status, 'unresolved_failure');
+    assert.equal(job.failure_code, 'delivery_semantic_unknown');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState(localFutureSession);
+
+    for (const invalidProvider of [
+      { suffix: 'legacy-empty', identity: 'legacy', tokenPresent: true, token: '' },
+      { suffix: 'modern-missing', identity: 'modern', tokenPresent: false },
+    ]) {
+      const session = 'session_attempt-token-provider-invalid-' + invalidProvider.suffix;
+      const prepared = await prepareHistoryReceipt(session, { purpose: 'ai_text', ai: true,
+        identity: invalidProvider.identity, tokenPresent: invalidProvider.tokenPresent,
+        token: invalidProvider.token });
+      const frozen = structuredClone(state(session).outgoing[prepared.fingerprint]);
+      postBaseline = sendAttempts;
+      modelBaseline = modelRequests.length;
+      assert.equal((await runtime.process(prepared.key, prepared.jobId)).status,
+        'delivery_identity_unresolved');
+      snapshot = state(session);
+      assert.deepEqual(snapshot.outgoing[prepared.fingerprint], frozen,
+        'Provider 兼容前门不得洗白显式空值或现代缺失 token');
+      job = snapshot.jobs.find((item) => item.id === prepared.jobId);
+      assert.equal(job.status, 'received');
+      assert.equal(job.responsibility_status, 'unresolved_failure');
+      assert.equal(job.failure_code, 'delivery_identity_unresolved');
+      assert.equal(sendAttempts, postBaseline);
+      assert.equal(modelRequests.length, modelBaseline);
+      removeSessionState(session);
+    }
 
     for (const malformed of [
-      { suffix: 'null', value: null },
-      { suffix: 'object', value: { invalid: true } },
+      { suffix: 'legacy-empty', identity: 'legacy', tokenPresent: true, value: '' },
+      { suffix: 'legacy-null', identity: 'legacy', tokenPresent: true, value: null },
+      { suffix: 'legacy-object', identity: 'legacy', tokenPresent: true,
+        value: { invalid: true } },
+      { suffix: 'legacy-receipt-field', identity: 'legacy', tokenPresent: false,
+        recordExtras: { receipt_current: false } },
+      { suffix: 'legacy-feedback-marker', identity: 'legacy', tokenPresent: false,
+        recordExtras: { legacy_feedback_wire_identity: true } },
+      { suffix: 'legacy-job-generation-null', identity: 'legacy', tokenPresent: false,
+        jobExtras: { response_generation: null } },
+      { suffix: 'legacy-conversation-generation-negative', identity: 'legacy', tokenPresent: false,
+        stateGeneration: -1, jobExtras: { generation: -1 } },
+      { suffix: 'legacy-job-provider-marker', identity: 'legacy', tokenPresent: false,
+        jobExtras: { provider_settlement: null } },
+      { suffix: 'legacy-body-not-automated', identity: 'legacy', tokenPresent: false,
+        bodyExtras: { automated: false } },
+      { suffix: 'modern-missing', identity: 'modern', tokenPresent: false },
+      { suffix: 'modern-empty', identity: 'modern', tokenPresent: true, value: '' },
     ]) {
       const session = 'session_attempt-token-malformed-' + malformed.suffix;
-      const prepared = await prepareHistoryReceipt(session, malformed.value, true);
+      const prepared = await prepareHistoryReceipt(session, { identity: malformed.identity,
+        tokenPresent: malformed.tokenPresent, token: malformed.value,
+        recordExtras: malformed.recordExtras, jobExtras: malformed.jobExtras,
+        bodyExtras: malformed.bodyExtras, stateGeneration: malformed.stateGeneration });
       const before = state(session);
       const frozenRecord = structuredClone(before.outgoing[prepared.fingerprint]);
-      assert.equal(Object.hasOwn(frozenRecord, 'attempt_token'), true);
-      if (malformed.suffix === 'null') assert.equal(frozenRecord.attempt_token, null);
-      else assert.deepEqual(frozenRecord.attempt_token, { invalid: true });
+      assert.equal(Object.hasOwn(frozenRecord, 'attempt_token'), malformed.tokenPresent);
+      if (malformed.tokenPresent) assert.deepEqual(frozenRecord.attempt_token, malformed.value);
+      assert.equal(Object.hasOwn(frozenRecord, 'delivery_identity_version'),
+        malformed.identity === 'modern');
       postBaseline = sendAttempts;
       modelBaseline = modelRequests.length;
       const replies = countEvents('ai_reply');
       const result = await runtime.process(prepared.key, prepared.jobId);
-      assert.equal(result.status, 'dispatched_after_cancel');
+      assert.equal(result.status, 'delivery_semantic_unknown', malformed.suffix);
       snapshot = state(session);
       assert.deepEqual(snapshot.outgoing[prepared.fingerprint], frozenRecord,
         '畸形 token 的迟到回执不得改写持久出站记录');
       job = snapshot.jobs.find((item) => item.id === prepared.jobId);
-      assert.equal(job.status, 'done');
+      assert.equal(job.status, 'received');
       assert.equal(job.responsibility_status, 'unresolved_failure');
-      assert.equal(job.failure_code, 'delivery_after_state_change');
+      assert.equal(job.failure_code, 'delivery_semantic_unknown');
       assert(job.data, '畸形 token 不得删除原访客责任');
       assert(job.plan, '畸形 token 不得删除仍需对账的冻结计划');
       assert.equal(sendAttempts, postBaseline);
       assert.equal(modelRequests.length, modelBaseline);
       assert.equal(countEvents('ai_reply'), replies);
+      removeSessionState(session);
     }
 
+    const receiptOnlySession = 'session_attempt-token-settlement-read-only';
+    const receiptOnly = await prepareHistoryReceipt(receiptOnlySession, {
+      jobExtras: { provider_settlement: null },
+    });
+    histories.set(receiptOnlySession, (histories.get(receiptOnlySession) || [])
+      .filter((item) => String(item.fingerprint) !== String(receiptOnly.fingerprint)));
+    let receiptOnlyLists = 0;
+    let receiptOnlyExact = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === receiptOnlySession) {
+        if (match[2] === '/messages') receiptOnlyLists += 1;
+        if (match[2] === '/message/' + receiptOnly.fingerprint) {
+          receiptOnlyExact += 1;
+          return { status: 404, body: { error: true } };
+        }
+      }
+      return request(url, options);
+    } });
+    const receiptOnlyRecord = structuredClone(
+      state(receiptOnlySession).outgoing[receiptOnly.fingerprint]);
+    const receiptOnlyPlan = structuredClone(state(receiptOnlySession).jobs
+      .find((item) => item.id === receiptOnly.jobId).plan);
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const result = await runtime.process(receiptOnly.key, receiptOnly.jobId);
+      assert.equal(result.status, 'retry', '只读阴性对账第' + attempt + '轮');
+      snapshot = state(receiptOnlySession);
+      assert.deepEqual(snapshot.outgoing[receiptOnly.fingerprint], receiptOnlyRecord,
+        '连续阴性不得改写、删除或重新登记原 outgoing');
+      job = snapshot.jobs.find((item) => item.id === receiptOnly.jobId);
+      assert.equal(job.status, 'received');
+      assert.equal(job.responsibility_status, 'unresolved_failure');
+      assert.equal(job.failure_code, 'provider_settlement_identity_unresolved');
+      assert.equal(job.provider_settlement_failure_code,
+        'provider_settlement_identity_unresolved');
+      assert.equal(job.provider_settlement, null);
+      assert.deepEqual(job.plan, receiptOnlyPlan);
+      assert(job.data, '只读阴性对账不得清除原访客责任');
+      assert.equal(job.retry_at, now + 300000,
+        '坏 settlement 的只读核对必须给后续健康任务留下有界调度窗口');
+      now = job.retry_at;
+    }
+    await runtime.transaction(receiptOnly.key, (current) => {
+      const stored = current.jobs.find((item) => item.id === receiptOnly.jobId); assert(stored);
+      stored.delivery_retries = 59;
+    });
+    assert.equal((await runtime.process(
+      receiptOnly.key, receiptOnly.jobId)).status, 'unresolved');
+    snapshot = state(receiptOnlySession);
+    job = snapshot.jobs.find((item) => item.id === receiptOnly.jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.responsibility_status, 'unresolved_failure');
+    assert.equal(job.failure_code, 'provider_settlement_identity_unresolved');
+    assert.equal(job.delivery_retries, 60);
+    assert.equal(job.retry_at, null);
+    assert.equal(job.recovery_requires_review, true);
+    assert(Number.isSafeInteger(
+      job.provider_settlement_receipt_reconciliation_exhausted_at));
+    assert.deepEqual(snapshot.outgoing[receiptOnly.fingerprint], receiptOnlyRecord);
+    assert.equal(job.provider_settlement, null);
+    assert.deepEqual(job.plan, receiptOnlyPlan);
+    assert(job.data, '自动核对达到上限也必须保留原访客责任');
+    assert.equal(receiptOnlyLists, 3);
+    assert.equal(receiptOnlyExact, 3);
+    assert.equal((await runtime.process(
+      receiptOnly.key, receiptOnly.jobId)).status, 'idle');
+    assert.equal(receiptOnlyLists, 3,
+      '达到自动核对上限后显式处理也不得继续查询');
+    assert.equal(receiptOnlyExact, 3);
+    assert.equal(sendAttempts, postBaseline,
+      '三次列表和精确404也不得授予新的 Crisp POST');
+    assert.equal(modelRequests.length, modelBaseline,
+      '坏 settlement 的只读对账不得重新推理');
+    removeSessionState(receiptOnlySession);
+
+    const positiveCapSession = 'session_attempt-token-settlement-positive-cap';
+    const positiveCap = await prepareHistoryReceipt(positiveCapSession, {
+      jobExtras: { provider_settlement: null },
+    });
+    await runtime.transaction(positiveCap.key, (current) => {
+      const stored = current.jobs.find((item) => item.id === positiveCap.jobId); assert(stored);
+      stored.delivery_retries = 59;
+    });
+    let positiveCapLists = 0;
+    let positiveCapExact = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === positiveCapSession) {
+        if (match[2] === '/messages') positiveCapLists += 1;
+        if (match[2].startsWith('/message/')) positiveCapExact += 1;
+      }
+      return request(url, options);
+    } });
+    const positiveCapRecord = structuredClone(
+      state(positiveCapSession).outgoing[positiveCap.fingerprint]);
+    const positiveCapPlan = structuredClone(state(positiveCapSession).jobs
+      .find((item) => item.id === positiveCap.jobId).plan);
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    assert.equal((await runtime.process(
+      positiveCap.key, positiveCap.jobId)).status, 'unresolved');
+    snapshot = state(positiveCapSession);
+    assert.deepEqual(snapshot.outgoing[positiveCap.fingerprint], positiveCapRecord,
+      '正向 wire 无法认领时也不得半迁移原记录');
+    job = snapshot.jobs.find((item) => item.id === positiveCap.jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.responsibility_status, 'unresolved_failure');
+    assert.equal(job.failure_code, 'delivery_semantic_unknown');
+    assert.equal(job.provider_settlement_failure_code,
+      'provider_settlement_identity_unresolved');
+    assert.equal(job.delivery_retries, 60);
+    assert.equal(job.retry_at, null);
+    assert.equal(job.recovery_requires_review, true);
+    assert(Number.isSafeInteger(
+      job.provider_settlement_receipt_reconciliation_exhausted_at));
+    assert.equal(job.provider_settlement, null);
+    assert.deepEqual(job.plan, positiveCapPlan);
+    assert(job.data);
+    assert.equal(positiveCapLists, 1);
+    assert.equal(positiveCapExact, 0,
+      '列表正向命中后不得再调用精确端点');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    assert.equal((await runtime.process(
+      positiveCap.key, positiveCap.jobId)).status, 'idle');
+    const exhaustedState = structuredClone(state(positiveCapSession));
+    const exhaustedScan = await runtime.scan();
+    assert.equal(exhaustedScan.some((item) => item.key === positiveCap.key
+      && item.jobId === positiveCap.jobId), false,
+    '正向不可认领回执耗尽后 scanner 不得继续空转查询');
+    assert.deepEqual(state(positiveCapSession), exhaustedState,
+      '耗尽后的 scanner 不得再改写该会话');
+    assert.equal(positiveCapLists, 1);
+    assert.equal(positiveCapExact, 0);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState(positiveCapSession);
+
+    const invalidTokenCaps = [];
+    for (const item of [
+      { suffix: 'empty', value: '' },
+      { suffix: 'null', value: null },
+      { suffix: 'object', value: { invalid: true } },
+    ]) {
+      const session = 'session_attempt-token-settlement-invalid-cap-' + item.suffix;
+      const prepared = await prepareHistoryReceipt(session, {
+        tokenPresent: true, token: item.value,
+        jobExtras: { provider_settlement: null },
+      });
+      await runtime.transaction(prepared.key, (current) => {
+        const stored = current.jobs.find((entry) => entry.id === prepared.jobId); assert(stored);
+        stored.delivery_retries = 59;
+      });
+      invalidTokenCaps.push({ ...item, session, prepared,
+        record: structuredClone(state(session).outgoing[prepared.fingerprint]),
+        plan: structuredClone(state(session).jobs
+          .find((entry) => entry.id === prepared.jobId).plan) });
+    }
+    const invalidTokenSessions = new Set(invalidTokenCaps.map((item) => item.session));
+    let invalidTokenLists = 0;
+    let invalidTokenExact = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && invalidTokenSessions.has(decodeURIComponent(match[1]))) {
+        if (match[2] === '/messages') invalidTokenLists += 1;
+        if (match[2].startsWith('/message/')) invalidTokenExact += 1;
+      }
+      return request(url, options);
+    } });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    for (const item of invalidTokenCaps) {
+      assert.equal((await runtime.process(
+        item.prepared.key, item.prepared.jobId)).status, 'unresolved', item.suffix);
+      snapshot = state(item.session);
+      assert.deepEqual(snapshot.outgoing[item.prepared.fingerprint], item.record, item.suffix);
+      job = snapshot.jobs.find((entry) => entry.id === item.prepared.jobId);
+      assert.equal(job.status, 'failed', item.suffix);
+      assert.equal(job.responsibility_status, 'unresolved_failure', item.suffix);
+      assert.equal(job.failure_code, 'delivery_identity_unresolved', item.suffix);
+      assert.equal(job.provider_settlement_failure_code,
+        'provider_settlement_identity_unresolved', item.suffix);
+      assert.equal(job.delivery_retries, 60, item.suffix);
+      assert.equal(job.retry_at, null, item.suffix);
+      assert.equal(job.provider_settlement, null, item.suffix);
+      assert.deepEqual(job.plan, item.plan, item.suffix);
+      assert(job.data, item.suffix);
+      assert(Number.isSafeInteger(
+        job.provider_settlement_receipt_reconciliation_exhausted_at), item.suffix);
+      assert.equal((await runtime.process(
+        item.prepared.key, item.prepared.jobId)).status, 'idle', item.suffix);
+    }
+    assert.equal(invalidTokenLists, invalidTokenCaps.length);
+    assert.equal(invalidTokenExact, 0);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    const invalidTokenStates = new Map(invalidTokenCaps.map((item) =>
+      [item.session, structuredClone(state(item.session))]));
+    const invalidTokenScan = await runtime.scan();
+    assert.equal(invalidTokenCaps.some((item) => invalidTokenScan.some((candidate) =>
+      candidate.key === item.prepared.key && candidate.jobId === item.prepared.jobId)), false,
+    '显式坏 token 的正向回执耗尽后 scanner 不得继续查询');
+    for (const item of invalidTokenCaps) {
+      assert.deepEqual(state(item.session), invalidTokenStates.get(item.session), item.suffix);
+      removeSessionState(item.session);
+    }
+    assert.equal(invalidTokenLists, invalidTokenCaps.length);
+    assert.equal(invalidTokenExact, 0);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+
+    const atomicSession = 'session_attempt-token-settlement-finalization-atomic';
+    const atomicPrepared = await prepareHistoryReceipt(atomicSession, {
+      jobExtras: { provider_settlement: null },
+    });
+    histories.set(atomicSession, (histories.get(atomicSession) || [])
+      .filter((item) => String(item.fingerprint) !== String(atomicPrepared.fingerprint)));
+    const atomicStateFile = path.join(root, 'data/runtime',
+      'session-' + atomicPrepared.key + '.json');
+    const atomicRecord = structuredClone(
+      state(atomicSession).outgoing[atomicPrepared.fingerprint]);
+    const atomicPlan = structuredClone(state(atomicSession).jobs
+      .find((item) => item.id === atomicPrepared.jobId).plan);
+    let atomicClaimedState;
+    let atomicArmed = false;
+    let atomicFailuresRemaining = 2;
+    let atomicInjected = 0;
+    let atomicRenamesAfterExact = 0;
+    let atomicAllowedReclassification = 0;
+    let atomicLists = 0;
+    let atomicExact = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === atomicSession) {
+        if (match[2] === '/messages') atomicLists += 1;
+        if (match[2] === '/message/' + atomicPrepared.fingerprint) {
+          atomicExact += 1;
+          atomicClaimedState = structuredClone(state(atomicSession));
+          atomicArmed = true;
+          return { status: 404, body: { error: true } };
+        }
+      }
+      return request(url, options);
+    } });
+    const unresolvedBeforeAtomic = countEvents('answer_responsibility_unresolved');
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    const atomicRenameSync = fs.renameSync;
+    fs.renameSync = function (source, destination) {
+      if (atomicArmed && atomicFailuresRemaining > 0
+        && path.resolve(String(destination)) === path.resolve(atomicStateFile)
+        && String(source).startsWith(atomicStateFile + '.tmp-')) {
+        atomicRenamesAfterExact += 1;
+        if (atomicRenamesAfterExact === 1) {
+          atomicAllowedReclassification += 1;
+          atomicClaimedState = JSON.parse(fs.readFileSync(source, 'utf8'));
+          return atomicRenameSync.apply(this, arguments);
+        }
+        atomicFailuresRemaining -= 1;
+        atomicInjected += 1;
+        const error = new Error('受控 receipt-only 最终状态提交失败');
+        error.code = 'EIO';
+        throw error;
+      }
+      return atomicRenameSync.apply(this, arguments);
+    };
+    let atomicFailure;
+    try {
+      atomicFailure = await runtime.process(atomicPrepared.key, atomicPrepared.jobId);
+    } finally {
+      fs.renameSync = atomicRenameSync;
+    }
+    assert.deepEqual(atomicFailure,
+      { status: 'deferred', reason: 'answer_responsibility_unresolved' });
+    assert.equal(atomicInjected, 2,
+      '最终事务与异常收尾事务均须命中受控原子提交失败');
+    assert.equal(atomicRenamesAfterExact, 3,
+      '必须依次发布重分类、receipt-only 最终状态和异常收尾候选');
+    assert.equal(atomicAllowedReclassification, 1,
+      '精确放行中间无变化重分类后才可注入目标故障');
+    assert(atomicClaimedState, '必须先冻结已持久领取的 processing 状态');
+    assert.deepEqual(state(atomicSession), atomicClaimedState,
+      '状态提交失败不得留下半次 receipt-only 结果');
+    assert.equal(countEvents('answer_responsibility_unresolved'), unresolvedBeforeAtomic,
+      '状态未提交时不得预写 unresolved 统计事件');
+    now += 300001;
+    assert.equal((await runtime.process(
+      atomicPrepared.key, atomicPrepared.jobId)).status, 'retry');
+    snapshot = state(atomicSession);
+    assert.deepEqual(snapshot.outgoing[atomicPrepared.fingerprint], atomicRecord);
+    job = snapshot.jobs.find((item) => item.id === atomicPrepared.jobId);
+    assert.equal(job.status, 'received');
+    assert.equal(job.failure_code, 'provider_settlement_identity_unresolved');
+    assert.equal(job.provider_settlement, null);
+    assert.deepEqual(job.plan, atomicPlan);
+    assert(job.data);
+    assert.equal(countEvents('answer_responsibility_unresolved'),
+      unresolvedBeforeAtomic + 1,
+    '状态成功提交后才允许追加一次 unresolved 事件');
+    now = job.retry_at;
+    assert.equal((await runtime.process(
+      atomicPrepared.key, atomicPrepared.jobId)).status, 'retry');
+    assert.equal(countEvents('answer_responsibility_unresolved'),
+      unresolvedBeforeAtomic + 1,
+    '同一 failure code 的后续核对不得重复统计');
+    assert.equal(atomicLists, 3);
+    assert.equal(atomicExact, 3);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState(atomicSession);
+
+    const scannerSession = 'session_attempt-token-settlement-scanner';
+    const scannerPrepared = await prepareHistoryReceipt(scannerSession, {
+      jobExtras: { provider_settlement: null },
+    });
+    histories.set(scannerSession, (histories.get(scannerSession) || [])
+      .filter((item) => String(item.fingerprint) !== String(scannerPrepared.fingerprint)));
+    const healthy = await receive(message(scannerSession, '同会话后续健康任务'));
+    assert.equal(healthy.accepted, true);
+    assert.equal(healthy.route, 'process');
+    const scannerRecord = structuredClone(
+      state(scannerSession).outgoing[scannerPrepared.fingerprint]);
+    const scannerPlan = structuredClone(state(scannerSession).jobs
+      .find((item) => item.id === scannerPrepared.jobId).plan);
+    const scannerData = structuredClone(state(scannerSession).jobs
+      .find((item) => item.id === scannerPrepared.jobId).data);
+    let scannerLists = 0;
+    let scannerExact = 0;
+    runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+      if (match && decodeURIComponent(match[1]) === scannerSession) {
+        if (match[2] === '/messages') scannerLists += 1;
+        if (match[2] === '/message/' + scannerPrepared.fingerprint) {
+          scannerExact += 1;
+          return { status: 404, body: { error: true } };
+        }
+      }
+      return request(url, options);
+    } });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    const scannerHealth = path.join(root, 'data/runtime/scheduler-health.json');
+    const scanFor = async (targetKey, targetJobId, label) => {
+      const sessionFileCount = fs.readdirSync(path.join(root, 'data/runtime'))
+        .filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name)).length;
+      const targetIdentity = targetKey + '\0' + targetJobId;
+      const seenOrdinary = new Set();
+      const baseline = { models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length, lists: scannerLists, exact: scannerExact };
+      let selected;
+      for (let attempt = 0; attempt <= sessionFileCount && !selected; attempt += 1) {
+        const previousCursor = JSON.parse(
+          fs.readFileSync(scannerHealth, 'utf8')).ordinary_cursor;
+        const scanned = await runtime.scan();
+        const ordinary = scanned.filter((entry) => entry.control !== true);
+        const currentCursor = JSON.parse(
+          fs.readFileSync(scannerHealth, 'utf8')).ordinary_cursor;
+        assert.equal(currentCursor, previousCursor + ordinary.length,
+          label + ': 每轮必须按真实返回数推进普通公平游标');
+        assert(ordinary.length > 0,
+          label + ': 目标仍到期时必须保留至少一个普通任务槽');
+        for (const entry of ordinary) {
+          const identity = entry.key + '\0' + entry.jobId;
+          if (identity === targetIdentity) { selected = entry; break; }
+          assert(!seenOrdinary.has(identity),
+            label + ': 目标获选前公平游标不得重复普通任务');
+          seenOrdinary.add(identity);
+        }
+        const current = state(scannerSession);
+        const blocked = current.jobs.find((item) => item.id === scannerPrepared.jobId);
+        assert(blocked, label + ': 坏 settlement 责任必须持续存在');
+        assert.deepEqual(current.outgoing[scannerPrepared.fingerprint], scannerRecord,
+          label + ': 仅扫描不得改写原 outgoing');
+        assert.equal(blocked.provider_settlement, null);
+        assert.deepEqual(blocked.plan, scannerPlan);
+        assert.deepEqual(blocked.data, scannerData);
+        assert.deepEqual({ models: modelRequests.length,
+          retrievals: retrievalRequests.length, posts: sendAttempts,
+          visible: sent.length, lists: scannerLists, exact: scannerExact }, baseline,
+        label + ': 仅扫描不得检索、调用模型、读Crisp或产生出站');
+      }
+      assert.deepEqual(selected, { key: targetKey, jobId: targetJobId, control: false },
+        label + ': 目标必须在受管会话数限定的公平轮转内获选');
+      return selected;
+    };
+    let selected = await scanFor(scannerPrepared.key, scannerPrepared.jobId,
+      '坏 settlement 首轮恢复');
+    assert.equal((await runtime.process(
+      selected.key, selected.jobId)).status, 'retry');
+    snapshot = state(scannerSession);
+    assert.deepEqual(snapshot.outgoing[scannerPrepared.fingerprint], scannerRecord,
+      'scanner 恢复也不得半迁移畸形旧记录');
+    job = snapshot.jobs.find((item) => item.id === scannerPrepared.jobId);
+    assert.equal(job.provider_settlement, null);
+    assert.equal(job.responsibility_status, 'unresolved_failure');
+    assert.equal(job.failure_code, 'provider_settlement_identity_unresolved');
+    const scannerRetryAt = job.retry_at;
+    assert.equal(scannerRetryAt, now + 300000);
+    now += 5000;
+    selected = await scanFor(healthy.key, healthy.jobId,
+      '坏责任退避期间的同会话健康任务');
+    await runtime.transaction(scannerPrepared.key, (current) => {
+      const index = current.jobs.findIndex((item) => item.id === healthy.jobId);
+      assert(index >= 0);
+      current.jobs.splice(index, 1);
+    });
+    now = scannerRetryAt;
+    selected = await scanFor(scannerPrepared.key, scannerPrepared.jobId,
+      '退避结束后的坏 settlement 恢复');
+    assert.equal((await runtime.process(
+      selected.key, selected.jobId)).status, 'retry');
+    snapshot = state(scannerSession);
+    assert.deepEqual(snapshot.outgoing[scannerPrepared.fingerprint], scannerRecord);
+    job = snapshot.jobs.find((item) => item.id === scannerPrepared.jobId);
+    assert.equal(job.provider_settlement, null);
+    assert.equal(job.provider_settlement_failure_code,
+      'provider_settlement_identity_unresolved');
+    assert.equal(job.retry_at, now + 300000);
+    assert.equal(scannerLists, 2);
+    assert.equal(scannerExact, 2);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState(scannerSession);
+
     const emptyToNonemptySession = 'session_attempt-token-empty-to-nonempty';
-    const emptyToNonempty = await prepareHistoryReceipt(emptyToNonemptySession, undefined, false);
+    const emptyToNonempty = await prepareHistoryReceipt(emptyToNonemptySession);
     const historyGate = gate();
     let historyCalls = 0;
     runtime = createRuntime(env, { ...runtimeOptions, request: async (url, options = {}) => {
@@ -2493,14 +4063,14 @@ const abortablePending = (signal, started) => {
         'a'.repeat(32));
       historyGate.release();
       const result = await historyPending;
-      assert.equal(result.status, 'dispatched_after_cancel');
+      assert.equal(result.status, 'delivery_semantic_unknown');
       snapshot = state(emptyToNonemptySession);
       assert.deepEqual(snapshot.outgoing[emptyToNonempty.fingerprint], frozenRecord,
         '空 caller 不得认领后来出现的非空 token');
       job = snapshot.jobs.find((item) => item.id === emptyToNonempty.jobId);
-      assert.equal(job.status, 'done');
+      assert.equal(job.status, 'received');
       assert.equal(job.responsibility_status, 'unresolved_failure');
-      assert.equal(job.failure_code, 'delivery_after_state_change');
+      assert.equal(job.failure_code, 'delivery_semantic_unknown');
       assert(job.data);
       assert(job.plan);
       assert.equal(sendAttempts, postBaseline);
@@ -2512,14 +4082,81 @@ const abortablePending = (signal, started) => {
         '空 token 历史对账收尾', 10000);
       runtime = createRuntime(env, runtimeOptions);
     }
+    removeSessionState(emptyToNonemptySession);
+
+    const frozenLegacySession = 'session_attempt-token-legacy-policy-freeze';
+    const frozenLegacy = await prepareHistoryReceipt(frozenLegacySession);
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    const lateEvents = countEvents('delivery_after_state_change');
+    const aiReplies = countEvents('ai_reply');
+    await operator(frozenLegacySession);
+    snapshot = state(frozenLegacySession);
+    record = snapshot.outgoing[frozenLegacy.fingerprint];
+    job = snapshot.jobs.find((item) => item.id === frozenLegacy.jobId);
+    assert.equal(snapshot.mode, 'human');
+    assert.equal(record.status, 'unknown');
+    assert.equal(record.delivery_identity_version, 1);
+    assert.match(record.attempt_token, /^[a-f0-9]{32}$/);
+    assert(Number.isSafeInteger(record.legacy_delivery_identity_migrated_at));
+    assert.equal(record.delivery_uncertain, true);
+    assert.equal(record.recovery_deferred, true);
+    assert.equal(record.resend_forbidden, true);
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    now += 5000;
+    assert.equal((await runtime.process(frozenLegacy.key, frozenLegacy.jobId)).status,
+      'dispatched_after_cancel');
+    snapshot = state(frozenLegacySession);
+    record = snapshot.outgoing[frozenLegacy.fingerprint];
+    job = snapshot.jobs.find((item) => item.id === frozenLegacy.jobId);
+    assert.equal(record.status, 'sent');
+    assert.equal(record.receipt_current, false);
+    assert.equal(record.receipt_state_change_reason, 'conversation_state_changed');
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(countEvents('delivery_after_state_change'), lateEvents + 1);
+    assert.equal(countEvents('ai_reply'), aiReplies);
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    assert.equal((await runtime.process(frozenLegacy.key, frozenLegacy.jobId)).status, 'idle');
+
+    const ambiguousFreezeSession = 'session_attempt-token-legacy-policy-ambiguous';
+    const ambiguousFreeze = await prepareHistoryReceipt(ambiguousFreezeSession);
+    const secondFingerprint = ambiguousFreeze.fingerprint + 1;
+    await runtime.transaction(ambiguousFreeze.key, (current) => {
+      const duplicate = structuredClone(current.outgoing[ambiguousFreeze.fingerprint]);
+      duplicate.body.fingerprint = secondFingerprint;
+      current.outgoing[String(secondFingerprint)] = duplicate;
+    });
+    postBaseline = sendAttempts;
+    modelBaseline = modelRequests.length;
+    await operator(ambiguousFreezeSession);
+    snapshot = state(ambiguousFreezeSession);
+    for (const candidateFingerprint of [ambiguousFreeze.fingerprint, secondFingerprint]) {
+      record = snapshot.outgoing[candidateFingerprint];
+      assert.equal(Object.hasOwn(record, 'attempt_token'), false);
+      assert.equal(Object.hasOwn(record, 'delivery_identity_version'), false);
+      assert.equal(record.receipt_identity_unbound, true);
+      assert.equal(record.semantic_status, 'semantic_unknown');
+    }
+    job = snapshot.jobs.find((item) => item.id === ambiguousFreeze.jobId);
+    assert.equal(snapshot.mode, 'human');
+    assert.equal(job.status, 'cancelled');
+    assert.equal(job.responsibility_status, 'intentional_silence');
+    assert.equal(sendAttempts, postBaseline);
+    assert.equal(modelRequests.length, modelBaseline);
+    removeSessionState(ambiguousFreezeSession);
 
     const postCases = [
       { suffix: 'missing', mutate: (currentRecord) => { delete currentRecord.attempt_token; },
         assertShape: (currentRecord) => assert.equal(Object.hasOwn(currentRecord, 'attempt_token'), false),
-        expected: 'dispatched_after_cancel' },
+        expected: 'delivery_semantic_unknown' },
       { suffix: 'empty', mutate: (currentRecord) => { currentRecord.attempt_token = ''; },
         assertShape: (currentRecord) => assert.equal(currentRecord.attempt_token, ''),
-        expected: 'dispatched_after_cancel' },
+        expected: 'delivery_semantic_unknown' },
       { suffix: 'body-mismatch', mutate: (currentRecord, originalToken) => {
         currentRecord.attempt_token = originalToken === 'b'.repeat(32) ? 'c'.repeat(32) : 'b'.repeat(32);
       }, assertShape: (currentRecord) => assert.match(currentRecord.attempt_token, /^[bc]{32}$/),
@@ -2584,19 +4221,15 @@ const abortablePending = (signal, started) => {
         job = snapshot.jobs.find((candidate) => candidate.id === entry.jobId);
         assert.notEqual(job.responsibility_status, 'answered_confirmed');
         assert(job.data, '发送代次冲突不得删除原访客责任');
-        if (item.expected === 'delivery_semantic_unknown') {
-          assert.equal(job.status, 'received');
-          assert.equal(job.failure_code, 'delivery_semantic_unknown');
-        } else {
-          assert.equal(job.status, 'done');
-          assert.equal(job.failure_code, 'delivery_after_state_change');
-        }
+        assert.equal(job.status, 'received');
+        assert.equal(job.failure_code, 'delivery_semantic_unknown');
         assert.equal(postCalls, 1);
         assert.equal(sendAttempts, postBaseline + 1, '每个竞态子例只能交出一次 POST');
         assert.equal(modelRequests.length, modelBaseline + 1, '每个竞态子例只能生成一次答案');
         assert.equal(sent.filter((entry) => entry.session_id === session).length, sessionSent + 1);
         assert.equal(countEvents('ai_reply'), replies);
         assert.equal(countEvents('delivery_after_state_change', 'attempt_superseded'), superseded + 1);
+        removeSessionState(session);
       } finally {
         postGate.release();
         if (pending) await awaitNamedGate(pending.then(() => undefined, () => undefined),
@@ -2874,7 +4507,7 @@ const abortablePending = (signal, started) => {
     ]);
   });
   await test('旧版本持久人工迁移及永久模式保留', async () => {
-    const session = 'session_legacy001'; const legacy = { aiEnabled: false, aiResumeAt: 0, handoffGeneration: 3, lastOperatorAt: now, welcomeSent: true, fingerprints: [] };
+    const session = 'session_legacy001'; const legacy = { version: 1, aiEnabled: false, aiResumeAt: 0, handoffGeneration: 3, lastOperatorAt: now, welcomeSent: true, fingerprints: [] };
     const legacyFile = path.join(root, 'data', 'runtime',
       'session-' + crypto.createHash('sha256').update(session).digest('hex') + '.json');
     const currentFile = path.join(root, 'data', 'runtime', 'session-' + key(session) + '.json');
@@ -4072,6 +5705,315 @@ const abortablePending = (signal, started) => {
       replacement?.cleanup();
     }
   });
+  await test('P0 已冻结 sent 回执在外层许可丢失后按闭合矩阵收敛且不重发', async () => {
+    const cases = [
+      { suffix: 'valid-answer', semanticStatus: 'valid_answer', semanticIntent: 'answer',
+        receiptCurrent: true, expectedStatus: 'sent', ai: true, expectAiReply: true },
+      { suffix: 'control', semanticStatus: 'control_delivered', semanticIntent: 'control',
+        receiptCurrent: true, expectedStatus: 'sent', control: true },
+      { suffix: 'receipt-not-current', semanticStatus: 'valid_answer', semanticIntent: 'answer',
+        receiptCurrent: false, expectedStatus: 'dispatched_after_cancel', ai: true,
+        expectStateChange: true },
+      { suffix: 'receipt-not-current-already-counted', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'dispatched_after_cancel', ai: true,
+        countedPresent: true, countedValue: true, countedGeneration: 0 },
+      { suffix: 'receipt-not-current-legacy-counted', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'dispatched_after_cancel', ai: true,
+        countedPresent: true, countedValue: true },
+      { suffix: 'next-generation-valid-answer-after-counted-late-delivery',
+        semanticStatus: 'valid_answer', semanticIntent: 'answer', receiptCurrent: true,
+        responseGeneration: 1, expectedStatus: 'sent', ai: true, expectAiReply: true,
+        countedPresent: true, countedValue: true, countedGeneration: 0 },
+      { suffix: 'semantic-unknown', semanticStatus: 'semantic_unknown', semanticIntent: 'unknown',
+        receiptCurrent: null, expectedStatus: 'delivery_semantic_unknown', ai: true },
+      { suffix: 'legacy-bare-claim', semanticStatus: 'valid_answer', semanticIntent: 'answer',
+        receiptCurrent: true, expectedStatus: 'delivery_evidence_unavailable', bareClaim: true, ai: true },
+      { suffix: 'valid-answer-count-conflict-true', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: true,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: true,
+        expectedCountFailure: 'delivery_state_change_count_conflict' },
+      { suffix: 'valid-answer-count-conflict-false', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: true,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: false,
+        expectedCountFailure: 'delivery_state_change_count_conflict' },
+      { suffix: 'control-count-conflict-null', semanticStatus: 'control_delivered',
+        semanticIntent: 'control', receiptCurrent: true,
+        expectedStatus: 'delivery_identity_unresolved', control: true,
+        countedPresent: true, countedValue: null,
+        expectedCountFailure: 'delivery_state_change_count_conflict' },
+      { suffix: 'semantic-unknown-count-conflict-object', semanticStatus: 'semantic_unknown',
+        semanticIntent: 'unknown', receiptCurrent: null,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: { invalid: true },
+        expectedCountFailure: 'delivery_state_change_count_conflict' },
+      { suffix: 'receipt-not-current-count-invalid-false', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: false,
+        expectedCountFailure: 'delivery_state_change_count_invalid' },
+      { suffix: 'receipt-not-current-count-invalid-null', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: null,
+        expectedCountFailure: 'delivery_state_change_count_invalid' },
+      { suffix: 'receipt-not-current-count-invalid-object', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: { invalid: true },
+        expectedCountFailure: 'delivery_state_change_count_invalid' },
+      { suffix: 'receipt-not-current-count-future-generation', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: false,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedPresent: true, countedValue: true, countedGeneration: 1,
+        expectedCountFailure: 'delivery_state_change_count_invalid' },
+      { suffix: 'valid-answer-orphan-count-generation', semanticStatus: 'valid_answer',
+        semanticIntent: 'answer', receiptCurrent: true,
+        expectedStatus: 'delivery_identity_unresolved', ai: true,
+        countedGeneration: 0,
+        expectedCountFailure: 'delivery_state_change_count_conflict' },
+    ];
+    const analytics = path.join(root, 'data/analytics/events.jsonl');
+    const countEvents = (type) => fs.existsSync(analytics)
+      ? fs.readFileSync(analytics, 'utf8').trim().split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line)).filter((event) => event.type === type).length : 0;
+    const permitRoot = path.join(root, 'data/runtime/ordinary-processing-permits');
+    const permitCount = () => fs.existsSync(permitRoot)
+      ? fs.readdirSync(permitRoot).filter((name) => /^slot-[0-7]$/.test(name)
+        || /^\.stale-slot-[0-7]-[a-f0-9]{32}$/.test(name)).length : 0;
+    for (const [index, item] of cases.entries()) {
+      const session = 'session_permit-lost-frozen-' + item.suffix;
+      const content = '已冻结的受控答案 ' + item.suffix;
+      const fingerprint = Number.parseInt(digest('permit-lost-frozen|' + item.suffix).slice(0, 12), 16);
+      let startedResolve;
+      let lookupCalls = 0;
+      const started = new Promise((resolve) => { startedResolve = resolve; });
+      const frozenRuntime = createRuntime(env, { ...runtimeOptions,
+        processingPermitHeartbeatMilliseconds: 10,
+        request: async (url, options = {}) => {
+          const parsed = new URL(url);
+          const match = parsed.pathname.match(/\/conversation\/([^/]+)(\/.*)$/);
+          if (match && decodeURIComponent(match[1]) === session
+            && /^\/message\/[^/]+$/.test(match[2])) {
+            lookupCalls += 1;
+            return abortablePending(options.signal, startedResolve);
+          }
+          return request(url, options);
+        } });
+      const body = message(session, '外层许可丢失闭合矩阵回执 ' + index);
+      delete body.timestamp;
+      delete body.data.timestamp;
+      const entry = await frozenRuntime.receive({ body,
+        query: { key: env.CRISP_WEBSITE_HOOK_SECRET } });
+      assert.equal(entry.route, 'process');
+      let frozenData;
+      let frozenPlan;
+      let frozenRecord;
+      await frozenRuntime.transaction(entry.key, (current) => {
+        const stored = current.jobs.find((job) => job.id === entry.jobId); assert(stored);
+        assert.equal(stored.event_time_unverified, true);
+        if (item.control) {
+          stored.control = true;
+          stored.action = 'confirm_handoff';
+          stored.confirm_message = content;
+        }
+        const purpose = item.control ? 'handoff_ack' : 'ai_text';
+        stored.response_generation = item.responseGeneration || 0;
+        stored.plan = { type: 'text', purpose, ordinary: item.control !== true,
+          ai: item.ai === true, content, fingerprint, tags: [],
+          ...(item.bareClaim ? { answer_responsibility: 'clarification_confirmed' } : {}) };
+        if (!item.control) {
+          // ai_text 必须来自可核验的 Provider producer。这个矩阵验证的是
+          // Crisp 回执收敛，不得用缺少推理权威的伪造 plan 绕过 fail-closed。
+          stored.inference_generation = 1;
+          stored.inference = {
+            runtime_revision: stored.revision,
+            pool_revision: null,
+            deadline_at: now + 90000,
+            attempt_generation: 1,
+            provider_receipt_protocol_version: 1,
+          };
+          stored.provider_settlement = {
+            schema_version: 1,
+            state: 'settled',
+            plan_sha256: digest(canonical({
+              type: stored.plan.type || '',
+              purpose: stored.plan.purpose || '',
+              content: stored.plan.content || '',
+              outcome: stored.plan.outcome || '',
+              sources: stored.plan.sources || [],
+              tags: stored.plan.tags || [],
+            })),
+            response_generation: stored.response_generation,
+            attempts: 1,
+            settled_at: now - 1,
+          };
+          assert.deepEqual(Object.keys(stored.inference).sort(), [
+            'attempt_generation', 'deadline_at', 'pool_revision',
+            'provider_receipt_protocol_version', 'runtime_revision',
+          ].sort());
+          assert.deepEqual(Object.keys(stored.provider_settlement).sort(), [
+            'attempts', 'plan_sha256', 'response_generation', 'schema_version',
+            'settled_at', 'state',
+          ].sort());
+          assert.equal(Object.hasOwn(stored, 'provider_result_receipt'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_migration_from'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_settlement_failure_code'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_retirement'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_retirement_failure_code'), false);
+        } else {
+          assert.equal(Object.hasOwn(stored, 'inference'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_result_receipt'), false);
+          assert.equal(Object.hasOwn(stored, 'provider_settlement'), false);
+        }
+        if (item.countedPresent) {
+          stored.delivery_state_change_counted = structuredClone(item.countedValue);
+        }
+        if (Object.hasOwn(item, 'countedGeneration')) {
+          stored.delivery_state_change_counted_generation = item.countedGeneration;
+        }
+        frozenData = structuredClone(stored.data);
+        frozenPlan = structuredClone(stored.plan);
+        current.outgoing[String(fingerprint)] = {
+          status: 'sent', created_at: now - 1, sent_at: now - 1, attempts: 1,
+          job_id: stored.id, generation: stored.generation,
+          response_generation: stored.response_generation,
+          delivery_identity_version: 1, purpose, message_type: 'text',
+          semantic_intent: item.semanticIntent, semantic_status: item.semanticStatus,
+          content_sha256: digest(canonical({ type: 'text', content })),
+          attempt_token: digest('permit-lost-frozen-attempt|' + item.suffix).slice(0, 32),
+          receipt_confirmed_at: now - 1,
+          receipt_current: item.receiptCurrent,
+          ...(item.receiptCurrent === false ? {
+            receipt_state_change_reason: 'configuration_changed',
+            state_changed_before_receipt: true,
+          } : {}),
+          ...(item.semanticStatus === 'semantic_unknown' ? { resend_forbidden: true } : {}),
+        };
+        frozenRecord = structuredClone(current.outgoing[String(fingerprint)]);
+      });
+
+      const baseline = { models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length, aiReplies: countEvents('ai_reply'),
+        stateChanges: countEvents('delivery_after_state_change') };
+      const running = frozenRuntime.process(entry.key, entry.jobId);
+      running.catch(() => {});
+      const slot = item.control ? 7 : 0;
+      let replacement;
+      let result;
+      try {
+        await awaitNamedGate(started, '冻结回执的精确消息回查开始');
+        await waitForPermitSlot(slot);
+        replacement = replacePermitOwner(slot, item.control ? 'control' : 'ordinary');
+        await awaitNamedGate(running.then((value) => { result = value; }),
+          '冻结回执的外层许可丢失收敛', 10000);
+      } finally {
+        replacement?.cleanup();
+      }
+      assert.equal(result.status, item.expectedStatus);
+      assert.equal(lookupCalls, 1, '每个子例只允许一次精确消息回查');
+      assert(replacement);
+      assert.equal(fs.existsSync(replacement.slotPath), false);
+      assert.equal(fs.existsSync(replacement.quarantine), false);
+      assert.equal(permitCount(), 0, '子例收口后不得遗留普通或控制许可');
+
+      const snapshot = frozenRuntime.readState(entry.key);
+      const stored = snapshot.jobs.find((job) => job.id === entry.jobId); assert(stored);
+      const records = Object.values(snapshot.outgoing)
+        .filter((record) => record.job_id === entry.jobId);
+      assert.equal(records.length, 1, '已冻结回执不得补建第二条出站责任');
+      assert.deepEqual(snapshot.outgoing[String(fingerprint)], frozenRecord,
+        '已冻结 fingerprint 及回执身份不得在许可丢失收敛中改写');
+      assert.equal(snapshot.worker, null);
+      assert.equal(stored.execution_token, undefined);
+      assert.equal(stored.processing_permit_losses, undefined);
+      assert.equal(stored.lease_until, 0);
+
+      if (item.expectedCountFailure) {
+        assert.equal(stored.status, 'done');
+        assert.equal(stored.responsibility_status, 'unresolved_failure');
+        assert.equal(stored.failure_code, item.expectedCountFailure);
+        assert.equal(stored.recovery_requires_review, true);
+        assert.equal(stored.retry_at, null);
+        assert.deepEqual(stored.delivery_state_change_counted, item.countedValue,
+          '冲突或畸形计数标志必须原样保留供诊断');
+        if (Object.hasOwn(item, 'countedGeneration')) {
+          assert.equal(stored.delivery_state_change_counted_generation,
+            item.countedGeneration, '冲突计数代次必须原样保留供诊断');
+        }
+        assert.deepEqual(stored.data, frozenData);
+        assert.deepEqual(stored.plan, frozenPlan);
+      } else if (item.semanticStatus === 'semantic_unknown') {
+        assert.equal(stored.status, 'received');
+        assert.equal(stored.responsibility_status, 'unresolved_failure');
+        assert.equal(stored.failure_code, 'delivery_semantic_unknown');
+        assert.equal(stored.retry_at, now + 300000);
+        assert.deepEqual(stored.data, frozenData);
+        assert.deepEqual(stored.plan, frozenPlan);
+      } else if (item.bareClaim) {
+        assert.equal(stored.status, 'done');
+        assert.equal(stored.responsibility_status, 'unresolved_failure');
+        assert.equal(stored.failure_code, 'delivery_evidence_unavailable');
+        assert.equal(stored.recovery_requires_review, true);
+        assert.equal(stored.retry_at, null);
+        assert.deepEqual(stored.data, frozenData);
+        assert.equal(stored.plan, undefined);
+      } else if (item.receiptCurrent === false) {
+        assert.equal(stored.status, 'done');
+        assert.equal(stored.responsibility_status, 'unresolved_failure');
+        assert.equal(stored.failure_code, 'delivery_after_state_change');
+        assert.equal(stored.delivery_state_change_counted, true);
+        assert.equal(stored.delivery_state_change_counted_generation,
+          stored.response_generation, '一次性计数必须绑定当前回答代');
+        assert.equal(stored.data, undefined);
+        assert.equal(stored.plan, undefined);
+      } else if (item.control) {
+        assert.equal(stored.status, 'done');
+        assert.equal(stored.responsibility_status, 'control_handled');
+        assert.equal(stored.responsibility_reason, 'confirm_handoff');
+        assert.equal(stored.data, undefined);
+        assert.equal(stored.plan, undefined);
+      } else {
+        assert.equal(stored.status, 'done');
+        assert.equal(stored.responsibility_status, 'answered_confirmed');
+        assert.equal(stored.answer_metrics_counted, true);
+        assert.equal(snapshot.observations.ai_reply_sent_at, now);
+        assert.equal(stored.data, undefined);
+        assert.equal(stored.plan, undefined);
+      }
+      const expectedAiReplies = item.expectAiReply ? 1 : 0;
+      const expectedStateChanges = item.expectStateChange ? 1 : 0;
+      assert.equal(countEvents('ai_reply'), baseline.aiReplies + expectedAiReplies);
+      assert.equal(countEvents('delivery_after_state_change'),
+        baseline.stateChanges + expectedStateChanges);
+      if (!expectedAiReplies) {
+        assert.equal(stored.answer_metrics_counted, undefined);
+        assert.equal(snapshot.observations?.ai_reply_sent_at, undefined);
+      }
+      assert.deepEqual({ models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length }, {
+        models: baseline.models, retrievals: baseline.retrievals,
+        posts: baseline.posts, visible: baseline.visible,
+      },
+      '外层许可丢失只能消费已冻结回执，不得新推理或新出站');
+      assert.equal((await frozenRuntime.process(entry.key, entry.jobId)).status, 'idle');
+      assert.deepEqual({ models: modelRequests.length, retrievals: retrievalRequests.length,
+        posts: sendAttempts, visible: sent.length }, {
+        models: baseline.models, retrievals: baseline.retrievals,
+        posts: baseline.posts, visible: baseline.visible,
+      },
+      '重复执行不得重新推理或重发已冻结正文');
+      assert.equal(countEvents('ai_reply'), baseline.aiReplies + expectedAiReplies);
+      assert.equal(countEvents('delivery_after_state_change'),
+        baseline.stateChanges + expectedStateChanges);
+      assert.equal(permitCount(), 0, '重复执行后不得遗留许可');
+      assert.equal(Object.values(frozenRuntime.readState(entry.key).outgoing)
+        .filter((record) => record.job_id === entry.jobId).length, 1);
+    }
+  });
   await test('V122-R03 控制优先时仍为普通会话保留一个扫描名额', async () => {
     const ordinary = await receive(message('session_capacity-fair-ordinary', '普通待处理问题'));
     const controlKeys = new Set();
@@ -4128,5 +6070,351 @@ const abortablePending = (signal, started) => {
     }
     assert.equal(state('session_permanent1').mode, 'human');
   });
+  const savedNumericMenu = readConfig('menu');
+  const savedNumericRuntime = readConfig('runtime');
+  publishConfiguration('runtime', { ...savedNumericRuntime, enabled: true });
+  publishConfiguration('menu', { welcome: { enabled: false }, root: 'main', menus: {
+    main: { title: 'NUMERIC-ROOT', options: {
+      '1': { label: 'NUMERIC-MOBILE', action: { type: 'menu', target: 'mobile' } },
+      '2': { label: 'NUMERIC-ROOT-REPLY', action: { type: 'reply', text: 'NUMERIC-ROOT-TWO' } },
+      '0': { label: 'NUMERIC-HANDOFF', action: { type: 'show_handoff_offer' } },
+    } },
+    mobile: { title: 'NUMERIC-MOBILE', options: {
+      '1': { label: 'NUMERIC-IOS', action: { type: 'prompt', prompt: 'NUMERIC-MENU-IOS-ONLY' } },
+      '2': { label: 'NUMERIC-MOBILE-REPLY', action: { type: 'reply', text: 'NUMERIC-MOBILE-TWO' } },
+      '0': { label: 'NUMERIC-BACK', action: { type: 'menu', target: 'main' } },
+    } },
+  } });
+  const numericRoot = async (session) => {
+    await deliver(message(session, '菜单'));
+    const card = sent.at(-1);
+    assert.equal(card.type, 'picker');
+    assert.equal(card.content.text, 'NUMERIC-ROOT');
+    assert.equal(state(session).outgoing[String(card.fingerprint)].status, 'sent');
+    return card;
+  };
+  const numericMobile = async (session) => {
+    const card = await numericRoot(session);
+    await deliver(click(session, card));
+    assert.equal(sent.at(-1).content.text, 'NUMERIC-MOBILE');
+    return sent.at(-1);
+  };
+  try {
+    await test('MNU01 新主菜单数字按已送达绑定导航，子菜单数字正确且消费一次', async () => {
+      const session = 'session_numeric-fresh-01';
+      const beforeModels = modelRequests.length;
+      const rootCard = await numericRoot(session);
+      const entry = await receive(message(session, '1'));
+      const queued = state(session).jobs.find((job) => job.id === entry.jobId);
+      assert.equal(queued.action, 'menu_action');
+      assert.equal(queued.control, false, '数字业务选择仍参加普通会话调度');
+      assert.equal(queued.data.content, '1', '落盘保留真实访客原话');
+      assert.equal(queued.choice_action.option_id, '1');
+      assert.equal((await runtime.process(entry.key, entry.jobId)).status, 'sent');
+      assert.equal(sent.at(-1).content.text, 'NUMERIC-MOBILE');
+      assert(state(session).offers[rootCard.content.id].consumed_at != null);
+      const child = sent.at(-1);
+      await deliver(message(session, '2'));
+      assert.equal(sent.at(-1).content, 'NUMERIC-MOBILE-TWO');
+      assert(state(session).offers[child.content.id].consumed_at != null);
+      assert.equal(modelRequests.length, beforeModels, '本地菜单导航和固定答复不调用模型');
+    });
+    await test('MNU02 原生选择消费后旧导航不截获后续数字，当前上下文不携带旧咨询方向', async () => {
+      const session = 'session_numeric-consumed-02';
+      const card = await numericMobile(session);
+      await deliver(click(session, card));
+      assert(state(session).offers[card.content.id].consumed_at != null);
+      await deliver(message(session, '现在处理电脑上的另一个问题'));
+      const beforeModels = modelRequests.length;
+      await deliver(message(session, '2'));
+      assert.equal(modelRequests.length, beforeModels + 1);
+      assert.notEqual(sent.at(-1).content, 'NUMERIC-MOBILE-TWO');
+      assert(!textOfRequest(modelRequests.at(-1)).includes('NUMERIC-MENU-IOS-ONLY'));
+      assert.equal(textOf(messagesOf(modelRequests.at(-1)).at(-1)), '2');
+    });
+    await test('MNU03 普通咨询、过期、错代及早于菜单的数字不消费有效按钮', async () => {
+      for (const variant of ['ordinary', 'expired', 'revision', 'generation', 'older-input', 'late-sent']) {
+        const session = 'session_numeric-boundary-' + variant;
+        const card = await numericMobile(session);
+        const baselineNow = now;
+        try {
+          if (variant === 'ordinary') await deliver(message(session, '继续处理另一项电脑咨询'));
+          if (variant === 'expired') now += 601000;
+          if (['revision', 'generation', 'late-sent'].includes(variant)) {
+            await runtime.transaction(key(session), (current) => {
+              const offer = current.offers[card.content.id];
+              if (variant === 'revision') offer.revision -= 1;
+              if (variant === 'generation') offer.generation -= 1;
+              if (variant === 'late-sent') current.outgoing[String(card.fingerprint)].sent_at = now + 1;
+            });
+          }
+          const beforeModels = modelRequests.length;
+          const input = message(session, '2', variant === 'older-input' ? { timestamp: now - 60000 } : {});
+          await deliver(input);
+          assert.equal(modelRequests.length, beforeModels + 1, variant);
+          assert.notEqual(sent.at(-1).content, 'NUMERIC-MOBILE-TWO', variant);
+          assert.equal(state(session).offers[card.content.id].consumed_at, null, variant);
+        } finally { now = baselineNow; }
+      }
+    });
+    await test('MNU04 未登记、未知送达、发送中或身份不匹配的菜单不把数字登记成选择', async () => {
+      for (const variant of ['missing-outgoing', 'unknown', 'sending', 'wrong-purpose', 'wrong-fingerprint', 'unverified-time']) {
+        const session = 'session_numeric-unverified-' + variant;
+        const card = await numericMobile(session);
+        await runtime.transaction(key(session), (current) => {
+          const record = current.outgoing[String(card.fingerprint)];
+          if (variant === 'missing-outgoing') delete current.outgoing[String(card.fingerprint)];
+          if (variant === 'unknown' || variant === 'sending') record.status = variant;
+          if (variant === 'wrong-purpose') record.purpose = 'keyword_reply';
+          if (variant === 'wrong-fingerprint') current.offers[card.content.id].fingerprint += 1;
+        });
+        const input = message(session, '2');
+        if (variant === 'unverified-time') { delete input.timestamp; delete input.data.timestamp; }
+        const entry = await receive(input);
+        assert.equal(entry.accepted, true, variant);
+        const stored = state(session).jobs.find((job) => job.id === entry.jobId);
+        assert.equal(stored.action, undefined, variant);
+        assert.equal(stored.choice_action, undefined, variant);
+        assert.equal(stored.data.content, '2', variant);
+        assert.equal(state(session).offers[card.content.id].consumed_at, null, variant);
+      }
+    });
+    await test('MNU05 数字选择在前置失败及重建runtime后保留，重复事件不消费或回复两次', async () => {
+      const session = 'session_numeric-retry-05';
+      const card = await numericMobile(session);
+      const input = message(session, '1');
+      const entry = await receive(input);
+      const beforeModels = modelRequests.length;
+      let historyFailure = true;
+      const isolated = createRuntime(env, { ...runtimeOptions, request: async (url, options) => {
+        if (historyFailure && new URL(url).pathname.endsWith('/messages')) {
+          historyFailure = false; throw new Error('synthetic menu history unavailable');
+        }
+        return request(url, options);
+      } });
+      await isolated.process(entry.key, entry.jobId);
+      const stored = state(session).jobs.find((job) => job.id === entry.jobId);
+      assert.equal(stored.status, 'received');
+      assert.equal(stored.data.content, '1');
+      assert.equal(stored.choice_action.action.prompt, 'NUMERIC-MENU-IOS-ONLY');
+      assert(state(session).offers[card.content.id].consumed_at != null);
+      assert.equal(modelRequests.length, beforeModels);
+      assert.equal((await receive(input)).reason, '重复事件已忽略');
+      runtime = createRuntime(env, runtimeOptions);
+      await runtime.transaction(entry.key, (current) => {
+        current.jobs.find((job) => job.id === entry.jobId).retry_at = 0;
+      });
+      const retryRetrievals = retrievalRequests.length;
+      assert.equal((await runtime.process(entry.key, entry.jobId)).status, 'sent');
+      assert.equal(modelRequests.length, beforeModels + 1);
+      assert(textOfRequest(modelRequests.at(-1)).includes('NUMERIC-MENU-IOS-ONLY'));
+      assert.deepEqual(retrievalRequests.slice(retryRetrievals), [{ query: 'NUMERIC-IOS\nNUMERIC-MENU-IOS-ONLY' }],
+        '数字菜单在前置异常及重建后仍以已绑定方向检索，不以数字或旧导航检索');
+      const count = sent.filter((item) => item.session_id === session).length;
+      assert.equal((await receive(input)).reason, '重复事件已忽略');
+      assert.equal(sent.filter((item) => item.session_id === session).length, count);
+    });
+    await test('MNU09 菜单已送达事实进入后续上下文，未知非自有及隐私消息不伪造完成', async () => {
+      const session = 'session_menu-history-09';
+      const card = await numericMobile(session);
+      const entry = await receive(click(session, card));
+      const saved = state(session);
+      const job = saved.jobs.find(row => row.id === entry.jobId);
+      const history = structuredClone(histories.get(session));
+      const rootCard = history.find(row => row.type === 'picker' && row.fingerprint !== card.fingerprint);
+      assert(rootCard, '必须先经真实接收/规划/发送保存原生主菜单');
+      const originalSent = sent.filter(row => row.session_id === session).length;
+      const prior = runtime.transcript(history, job, saved);
+      console.log('观察菜单历史上下文：' + JSON.stringify({
+        original_navigation_retained: prior.some(row => row.role === 'user' && row.content === '菜单'),
+        confirmed_menu_display_retained: prior.some(row => row.role === 'assistant' && row.content === '已展示客服菜单。'),
+        current_selection_not_in_history: !prior.some(row => row.content.includes('NUMERIC-IOS')),
+        actual_menu_posts: originalSent,
+      }));
+      assert(prior.some(row => row.role === 'assistant' && row.content === '已展示客服菜单。'),
+        '菜单已确认送达，其展示事实必须保留在后续上下文');
+      assert(prior.some(row => row.role === 'user' && row.content === '菜单'));
+      console.log('观察菜单选择意图基线：' + JSON.stringify({
+        accepted_navigation_retained: prior.some(row => row.role === 'user' && row.content === '客户选择：NUMERIC-MOBILE'),
+        current_selection_excluded: !prior.some(row => row.content.includes('NUMERIC-IOS')),
+      }));
+      assert(prior.some(row => row.role === 'user' && row.content === '客户选择：NUMERIC-MOBILE'),
+        '已持久接受的实际手机导航选择必须作为客户事实进入后续上下文');
+      const navigation = saved.jobs.find(row => row.choice_action?.action?.target === 'mobile');
+      const rootChoiceIndex = rootCard.content.choices.findIndex(choice => choice.label === navigation?.choice_action?.label);
+      assert(rootChoiceIndex >= 0, '已验证的手机导航必须对应实际主菜单选项');
+      const nativeHistory = structuredClone(history);
+      for (const item of nativeHistory.filter(row => row.type === 'picker')) {
+        item.content = click(session, item, item.fingerprint === rootCard.fingerprint ? rootChoiceIndex : 0).data.content;
+      }
+      const nativeBefore = JSON.stringify(nativeHistory), stateBefore = JSON.stringify(saved);
+      const nativePrior = runtime.transcript(nativeHistory, job, saved);
+      console.log('观察原生已选菜单历史基线：' + JSON.stringify({
+        selected_menu_display_retained: nativePrior.some(row => row.role === 'assistant' && row.content === '已展示客服菜单。'),
+        original_menu_posts: originalSent, native_selected_marks: nativeHistory.filter(row => row.type === 'picker')
+          .reduce((total, row) => total + row.content.choices.filter(choice => choice.selected === true).length, 0),
+      }));
+      assert(nativePrior.some(row => row.role === 'assistant' && row.content === '已展示客服菜单。'),
+        '原生选择只改变selected，已确认菜单展示事实不得丢失');
+      assert(!nativePrior.some(row => row.content.includes('NUMERIC-IOS')), '当前选择不得混入历史');
+      assert.equal(JSON.stringify(nativeHistory), nativeBefore, '历史校验不改写官方picker');
+      assert.equal(JSON.stringify(saved), stateBefore, '历史校验不改写持久状态');
+      assert.equal(nativePrior.filter(row => row.role === 'user' && row.content === '客户选择：NUMERIC-MOBILE').length, 1,
+        '原生已选与未标选择的历史只恢复一次已接受导航，不恢复全菜单');
+      const selectionConflicts = [
+        ['missing-job', value => { value.jobs = value.jobs.filter(row => row.id !== navigation.id); }],
+        ['cancelled', value => { value.jobs.find(row => row.id === navigation.id).status = 'cancelled'; }],
+        ['failed', value => { value.jobs.find(row => row.id === navigation.id).status = 'failed'; }],
+        ['pending', value => { value.jobs.find(row => row.id === navigation.id).status = 'received'; }],
+        ['wrong-action', value => { value.jobs.find(row => row.id === navigation.id).action = 'invalid_choice'; }],
+        ['wrong-label', value => { value.jobs.find(row => row.id === navigation.id).choice_action.label += 'changed'; }],
+        ['wrong-binding', value => { value.jobs.find(row => row.id === navigation.id).choice_action.action.target = 'changed'; }],
+        ['missing-identity', value => { delete value.jobs.find(row => row.id === navigation.id).input_identity_sha256; }],
+        ['wrong-covered-id', value => { value.jobs.find(row => row.id === navigation.id).covered_message_ids = ['changed']; }],
+        ['unverified-time', value => { value.jobs.find(row => row.id === navigation.id).event_time_unverified = true; }],
+        ['future-selection', value => { value.jobs.find(row => row.id === navigation.id).event_time = job.event_time + 1; }],
+        ['future-sequence', value => { value.jobs.find(row => row.id === navigation.id).sequence = job.sequence + 1; }],
+        ['wrong-generation', value => { value.jobs.find(row => row.id === navigation.id).generation += 1; }],
+        ['wrong-revision', value => { value.jobs.find(row => row.id === navigation.id).revision += 1; }],
+        ['missing-offer', value => { delete value.offers[rootCard.content.id]; }],
+        ['unconsumed-offer', value => { value.offers[rootCard.content.id].consumed_at = null; }],
+        ['wrong-offer-revision', value => { value.offers[rootCard.content.id].revision += 1; }],
+        ['wrong-offer-kind', value => { value.offers[rootCard.content.id].kind = 'handoff'; }],
+        ['future-consumption', value => { value.offers[rootCard.content.id].consumed_at = job.received_at + 1; }],
+        ['duplicate-selection', value => { value.jobs.push({ ...structuredClone(value.jobs.find(row => row.id === navigation.id)), id: 'duplicate-navigation' }); }],
+      ];
+      for (const [variant, mutate] of selectionConflicts) {
+        const value = structuredClone(saved); mutate(value);
+        assert(!runtime.transcript(nativeHistory, job, value).some(row => row.content === '客户选择：NUMERIC-MOBILE'), variant);
+      }
+      const afterExpiry = structuredClone(job);
+      afterExpiry.event_time += 601000; afterExpiry.received_at += 601000;
+      assert(runtime.transcript(nativeHistory, afterExpiry, saved).some(row => row.content === '客户选择：NUMERIC-MOBILE'),
+        '菜单按钮到期不抹掉此前确已接受的客户选择事实');
+      assert(!nativePrior.some(row => row.role === 'user' && ['NUMERIC-ROOT-REPLY', 'NUMERIC-HANDOFF'].some(label => row.content.includes(label))),
+        '未选择的菜单项不能作为客户意图');
+      const numericSession = 'session_menu-history-numeric-09';
+      await numericRoot(numericSession);
+      await deliver(message(numericSession, '1'));
+      const numericCard = sent.at(-1);
+      assert.equal(numericCard.content.text, 'NUMERIC-MOBILE');
+      const numericEntry = await receive(click(numericSession, numericCard));
+      const numericState = state(numericSession), numericJob = numericState.jobs.find(row => row.id === numericEntry.jobId);
+      assert(runtime.transcript(histories.get(numericSession), numericJob, numericState)
+        .some(row => row.role === 'user' && row.content === '客户选择：NUMERIC-MOBILE'),
+        '数字选择已按真实offer接收时也要保留实际导航事实，不能信任任意数字');
+      const fingerprint = String(rootCard.fingerprint);
+      const mutations = [
+        ['unknown', (rows, value) => { value.outgoing[fingerprint].status = 'unknown'; }],
+        ['sending', (rows, value) => { value.outgoing[fingerprint].status = 'sending'; }],
+        ['missing-record', (rows, value) => { delete value.outgoing[fingerprint]; }],
+        ['wrong-content', rows => { rows.find(row => String(row.fingerprint) === fingerprint).content.text += 'changed'; }],
+        ['private', rows => { rows.find(row => String(row.fingerprint) === fingerprint).stealth = true; }],
+        ['private-properties', rows => { rows.find(row => String(row.fingerprint) === fingerprint).properties = { stealth: true }; }],
+        ['nonowned', rows => { rows.find(row => String(row.fingerprint) === fingerprint).fingerprint += 101; }],
+        ['wrong-generation', (rows, value) => { value.outgoing[fingerprint].generation += 1; }],
+        ['wrong-type', (rows, value) => { value.outgoing[fingerprint].message_type = 'text'; }],
+        ['wrong-purpose', (rows, value) => { value.outgoing[fingerprint].purpose = 'handoff_offer'; }],
+        ['wrong-semantic', (rows, value) => { value.outgoing[fingerprint].semantic_intent = 'answer'; }],
+        ['future', rows => { rows.find(row => String(row.fingerprint) === fingerprint).timestamp = job.event_time + 1; }],
+      ];
+      for (const [variant, mutate] of mutations) {
+        const rows = structuredClone(history), value = structuredClone(saved);
+        mutate(rows, value);
+        assert(!runtime.transcript(rows, job, value).some(row => row.content === '已展示客服菜单。'), variant);
+      }
+      for (const [variant, mutate] of mutations) {
+        const rows = structuredClone(nativeHistory), value = structuredClone(saved);
+        mutate(rows, value);
+        assert(!runtime.transcript(rows, job, value).some(row => row.content === '已展示客服菜单。'), '原生已选：' + variant);
+      }
+      const nativeConflicts = [
+        ['changed-label', content => { content.choices[0].label += 'changed'; }],
+        ['changed-value', content => { content.choices[0].value += 'changed'; }],
+        ['changed-text', content => { content.text += 'changed'; }],
+        ['changed-id', content => { content.id += 'changed'; }],
+        ['changed-required', content => { content.required = true; }],
+        ['changed-order', content => { content.choices.reverse(); }],
+        ['added-choice', content => { content.choices.push({ label: 'changed', value: 'changed', selected: false }); }],
+        ['added-field', content => { content.choices[0].unexpected = 'changed'; }],
+        ['removed-choice', content => { content.choices.pop(); }],
+        ['invalid-selected-type', content => { content.choices[0].selected = 'true'; }],
+        ['multiple-selected', content => { for (const choice of content.choices) choice.selected = true; }],
+      ];
+      for (const [variant, mutate] of nativeConflicts) {
+        const rows = structuredClone(nativeHistory);
+        mutate(rows.find(row => String(row.fingerprint) === fingerprint).content);
+        assert(!runtime.transcript(rows, job, saved).some(row => row.content === '已展示客服菜单。'), variant);
+      }
+      assert.equal(sent.filter(row => row.session_id === session).length, originalSent, '历史组装不触发发送');
+      histories.set(session, nativeHistory);
+      const beforeModels = modelRequests.length, beforeRetrievals = retrievalRequests.length;
+      assert.equal((await runtime.process(entry.key, entry.jobId)).status, 'sent');
+      assert.equal(modelRequests.length, beforeModels + 1);
+      const currentRetrievals = retrievalRequests.slice(beforeRetrievals);
+      console.log('观察菜单意图检索基线：' + JSON.stringify({
+        query: currentRetrievals[0]?.query, expected_query: 'NUMERIC-IOS\nNUMERIC-MENU-IOS-ONLY',
+        retrieval_calls: currentRetrievals.length, model_calls: modelRequests.length - beforeModels,
+      }));
+      assert.deepEqual(currentRetrievals, [{ query: 'NUMERIC-IOS\nNUMERIC-MENU-IOS-ONLY' }],
+        '已验证菜单咨询方向必须进入检索，不能只在模型生成时附加');
+      const requestMessages = messagesOf(modelRequests.at(-1));
+      assert(requestMessages.some(row => row.role === 'assistant' && textOf(row) === '已展示客服菜单。'));
+      assert.equal(textOf(requestMessages.at(-1)), 'NUMERIC-IOS', '实际选择不被历史导航覆盖');
+      assert.equal(requestMessages.filter(row => row.role === 'user' && textOf(row) === '客户选择：NUMERIC-MOBILE').length, 1,
+        '真实组装请求必须保留已验证的客户导航事实');
+      assert(textOfRequest(modelRequests.at(-1)).includes('NUMERIC-MENU-IOS-ONLY'));
+      const followupRetrievals = retrievalRequests.length, followupModels = modelRequests.length;
+      await deliver(message(session, '后续独立问题，不再咨询手机排障'));
+      assert.deepEqual(retrievalRequests.slice(followupRetrievals), [{ query: '后续独立问题，不再咨询手机排障' }],
+        '已消费菜单方向不能污染后续独立问题的检索');
+      assert.equal(modelRequests.length, followupModels + 1);
+      assert(messagesOf(modelRequests.at(-1)).some(row => row.role === 'user' && textOf(row) === '客户选择：NUMERIC-IOS'),
+        '消费过的实际平台选择应留在后续历史，不能把整个菜单或提示词作为客户原话');
+      console.log('观察菜单选择意图：' + JSON.stringify({
+        accepted_navigation_retained: true, selected_platform_retained_in_followup: true, current_selection_excluded: true,
+        only_selected_labels_retained: true, selection_conflicts_rejected: selectionConflicts.length,
+        numeric_navigation_retained: true, accepted_choice_retained_after_button_expiry: true,
+        official_picker_and_state_unchanged: true, additional_posts_during_history: 0,
+      }));
+      console.log('观察菜单意图检索：' + JSON.stringify({
+        validated_direction_retrieved: true, current_question_preserved: true, retrieval_calls: 1, model_calls: 1,
+        consumed_direction_absent_from_followup: true, followup_retrieval_calls: 1, followup_model_calls: 1,
+      }));
+      console.log('观察菜单历史反例：' + JSON.stringify({ variants: mutations.length, conflicts_rejected: true,
+        additional_posts_during_history: 0, model_calls_for_consultation: followupModels - beforeModels }));
+      console.log('观察原生已选菜单历史：' + JSON.stringify({
+        selected_menu_display_retained: true, native_selected_marks: 2, current_selection_not_in_history: true,
+        original_conflicts_rejected: mutations.length, immutable_conflicts_rejected: nativeConflicts.length,
+        official_picker_and_state_unchanged: true, additional_posts_during_history: 0, model_calls_for_consultation: 1,
+      }));
+    });
+    await test('MNU06 数字人工入口仅展示确认，真人确认及总关继续正确静默', async () => {
+      const session = 'session_numeric-handoff-06';
+      await numericRoot(session);
+      await deliver(message(session, '0'));
+      const card = sent.at(-1);
+      assert.equal(card.type, 'picker');
+      assert.equal(state(session).mode, 'ai');
+      await deliver(click(session, card));
+      assert.equal(state(session).mode, 'human');
+      const humanCount = sent.filter((item) => item.session_id === session).length;
+      await deliver(message(session, '2'));
+      assert.equal(sent.filter((item) => item.session_id === session).length, humanCount);
+      const disabledSession = 'session_numeric-disabled-06';
+      await numericRoot(disabledSession);
+      const currentRuntime = readConfig('runtime');
+      publishConfiguration('runtime', { ...currentRuntime, enabled: false });
+      try {
+        const count = sent.filter((item) => item.session_id === disabledSession).length;
+        await deliver(message(disabledSession, '2'));
+        assert.equal(sent.filter((item) => item.session_id === disabledSession).length, count);
+      } finally { publishConfiguration('runtime', { ...currentRuntime, enabled: true }); }
+    });
+  } finally {
+    runtime = createRuntime(env, runtimeOptions);
+    publishConfiguration('menu', savedNumericMenu);
+    publishConfiguration('runtime', savedNumericRuntime);
+  }
   process.stdout.write(JSON.stringify({ layer: 'UNIT/CONTRACT', passed, failed: 0, evidence: path.relative(project, root) }) + '\n');
 })().catch((error) => { process.stderr.write(error.stack + '\n'); process.exitCode = 1; });

@@ -115,7 +115,7 @@ function managedQuestion(value) {
   // 任意访客也可能输入相同文字，因此引用、否定或复合问句不能因为正文中
   // 碰巧包含一条 FAQ 原问就跳过向量检索。
   const matched=value.normalize('NFKC').match(/^\s*请根据现有知识库回答\s*[:：]\s*([\s\S]*?)\s*$/u);
-  return matched?matched[1]:'';
+  return matched?matched[1]:null;
 }
 const CHINESE_COMMON=/请问|告诉我|帮帮我|帮我|怎么办|怎么|如何|什么|哪个|是否|可以|需要|知道|一下|我要|咨询|问题|方法|使用|操作|为什么|谢谢|请|的|是|吗|呢|了/gu;
 const ENGLISH_COMMON=new Set(['a','an','the','and','or','i','we','you','my','your','how','do','does','did','to','of','for','in','on','is','are','can','could','would','please','help','use','it','this','that','what']);
@@ -274,11 +274,18 @@ function safeCandidateStructure(value) {
   return (homogeneous||elliptical)&&sameQuestionNumbers(parts[0],parts[1]);
 }
 
-function exactFaq(checked,query) {
+function strictFaqMatches(checked,query) {
   const managed=managedQuestion(query);
-  const target=strictQuestionKey(managed||query);
-  if(!target) return {status:'none'};
-  const matched=checked.passages.filter(passage=>passage.question&&strictQuestionKey(passage.question)===target);
+  const exactTarget=managed===null?query:managed;
+  if(!strictFaqEligible(exactTarget)) return [];
+  const target=strictQuestionKey(exactTarget);
+  return target?checked.passages.filter(passage=>passage.question&&strictQuestionKey(passage.question)===target):[];
+}
+function strictFaqEligible(value) {
+  const profile=semanticProfile(value);
+  return semanticRequirements(profile).substantive.length>0||profile.anchors.size>0;
+}
+function exactFaq(checked,matched) {
   if(!matched.length) return {status:'none'};
   if(!checked.complete) return {status:'incomplete'};
   const answers=[];
@@ -299,16 +306,34 @@ function exactFaq(checked,query) {
     sources:answers.slice(0,8).map(item=>({id:item.passage.id,title:item.passage.projection,
       docpath:item.passage.location,library_id:item.passage.library_id,document_id:item.passage.document_id}))};
 }
+function appendExactResults(base,matched,maxResults,maxBytes) {
+  let bytes=0;
+  for(const passage of matched) {
+    const size=Buffer.byteLength(passage.text);
+    if(bytes+size>maxBytes) continue;
+    base.results.push({id:passage.id,text:passage.text,
+      metadata:{title:passage.projection,docpath:passage.location,library_id:passage.library_id,document_id:passage.document_id},
+      lexical:{kind:'exact_question',overlap:1,score_basis:'lexical_not_probability'}});
+    bytes+=size;
+    if(base.results.length===maxResults) break;
+  }
+}
 
 function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RESULT_BYTES}={}) {
   if(!text(query,40000)||!Number.isInteger(maxResults)||maxResults<1||maxResults>4
     ||!Number.isInteger(maxBytes)||maxBytes<1||maxBytes>MAX_RESULT_BYTES) unavailable('query_invalid');
   const checked=checkedIndex(index,mapRaw), queryTokens=tokens(query);
   const minimum=queryTokens.chinese?3:2;
-  const base={results:[],complete:checked.complete,coverage:checked.coverage,faq_exact:exactFaq(checked,query)};
-  if(queryTokens.found.size<minimum||queryTokens.found.size>512) return base;
-  const normalized=normalize(query),managedRaw=managedQuestion(query),managed=managedRaw?normalize(managedRaw):'';
-  const strictQuery=strictQuestionKey(query),strictManaged=managedRaw?strictQuestionKey(managedRaw):'';
+  const exactMatches=strictFaqMatches(checked,query),faqExact=exactFaq(checked,exactMatches);
+  const base={results:[],complete:checked.complete,coverage:checked.coverage,faq_exact:faqExact};
+  if(queryTokens.found.size<minimum||queryTokens.found.size>512) {
+    if(faqExact.status==='unique') appendExactResults(base,exactMatches,maxResults,maxBytes);
+    return base;
+  }
+  const normalized=normalize(query),managedRaw=managedQuestion(query);
+  const strictQueryEligible=managedRaw===null&&strictFaqEligible(query);
+  const strictManagedEligible=managedRaw!==null&&strictFaqEligible(managedRaw);
+  const strictQuery=strictQuestionKey(query),strictManaged=managedRaw===null?'':strictQuestionKey(managedRaw);
   const synonymSafe=text(query,MAX_SYNONYM_BYTES)&&safeCandidateStructure(query);
   const approximateSafe=synonymSafe;
   const commaQuestion=safeCommaQuestion(query.normalize('NFKC').replace(/\p{Cf}/gu,''));
@@ -336,10 +361,9 @@ function searchKnowledgeLexical({query,index,mapRaw,maxResults=4,maxBytes=MAX_RE
     const approximateCompatible=approximateSafe&&item.approximateSafe
       &&sameQuestionNumbers(query,item.surface)&&qualifierCompatible(querySemantic,item.semantic);
     let kind, priority,semanticRank=0;
-    if(passage.question&&safeCandidateStructure(query)&&safeCandidateStructure(passage.question)
-      &&strictQuestionKey(passage.question)===strictQuery&&matched.length===queryTokens.found.size) {kind='exact_question'; priority=3;}
+    if(passage.question&&strictQueryEligible&&strictQuestionKey(passage.question)===strictQuery) {kind='exact_question'; priority=3;}
     // 固定礼貌范围说明不应稀释完整具体 FAQ；仍保留词项和全问数字约束。
-    else if(passage.question && surface.length>=6 && strictManaged===strictQuestionKey(passage.question)
+    else if(passage.question && strictManagedEligible && surface.length>=6 && strictManaged===strictQuestionKey(passage.question)
       &&safeCandidateStructure(managedRaw)&&safeCandidateStructure(passage.question)
       && item.features.size>=(/\p{Script=Han}/u.test(passage.question)?3:2)
       && [...item.features].every(token=>queryTokens.found.has(token))) {kind='exact_question'; priority=3;}

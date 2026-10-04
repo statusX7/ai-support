@@ -115,18 +115,18 @@ def lifecycle_mock_checks():
         assert help_result.returncode == 0, "无部署的能力查询不能当成实际 up"
         assert (evidence / "anything-state.json").read_bytes() == before
         root, _ = fixture("runtime")
-        assert window(root, 8192).returncode != 0, "未启动不能冒称已有运行窗口"
+        assert window(root, 6992).returncode != 0, "未启动不能冒称已有运行窗口"
         assert docker(root, "up", "-d").returncode == 0
-        assert window(root, 8192).returncode == 0, "up 后原 doctor marker 必须实际读回"
+        assert window(root, 6992).returncode == 0, "up 后原 doctor marker 必须实际读回"
         change_window(root, 16384)
         assert window(root, 16384).returncode != 0, "只改环境不能冒称容器已生效"
-        assert window(root, 8192).returncode == 0
+        assert window(root, 6992).returncode == 0
         for args in (("restart", "anythingllm"), ("up", "-d", "n8n")):
             assert docker(root, *args).returncode == 0
-            assert window(root, 8192).returncode == 0, "重启或其它组件不能更新 Anything 窗口"
+            assert window(root, 6992).returncode == 0, "重启或其它组件不能更新 Anything 窗口"
         assert docker(root, "up", "-d", "--no-deps", "--force-recreate", "anythingllm").returncode == 0
         assert window(root, 16384).returncode == 0
-        assert window(root, 8192).returncode != 0
+        assert window(root, 6992).returncode != 0
         assert docker(root, "exec", "-T", "anythingllm", "node", "-e",
                       'process.stdout.write(String(process.env.GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT || ""))').stdout.strip() == "16384"
 
@@ -134,9 +134,9 @@ def lifecycle_mock_checks():
         root, key = fixture("api", 3002)
         assert docker(root, "up", "-d").returncode == 0
         status, value = api(key, 3002)
-        assert status == "200" and value.get("settings", {}).get("GenericOpenAiTokenLimit") == "8192", "API 必须返回官方 settings 结构与运行值"
+        assert status == "200" and value.get("settings", {}).get("GenericOpenAiTokenLimit") == "6992", "API 必须返回官方 settings 结构与运行值"
         change_window(root, 32768)
-        assert api(key, 3002)[1]["settings"]["GenericOpenAiTokenLimit"] == "8192"
+        assert api(key, 3002)[1]["settings"]["GenericOpenAiTokenLimit"] == "6992"
         assert api("synthetic-wrong-key", 3002)[0] == "401"
         assert api(key, 3003)[0] == "503"
         assert api(key, 3002, "POST")[0] == "405"
@@ -161,7 +161,7 @@ def lifecycle_mock_checks():
 
         def instance(project, key, port, prompt=None):
             value = {
-                "context_window": 8192,
+                "context_window": 6992,
                 "port": port,
                 "api_key_sha256": hashlib.sha256(key.encode()).hexdigest(),
                 "knowledge_model": "Xenova/all-MiniLM-L6-v2",
@@ -387,12 +387,12 @@ def main():
         for name in ("config", "tmp", "bin"):
             (root / name).mkdir()
         (root / ".crisp-ai-installation").write_text("ai-support\nstate=local-ready\n")
-        (root / ".env").write_text("PROVIDER_RAG_CONTEXT_WINDOW=16384\nANYTHINGLLM_API_KEY=fixture-internal-key\nANYTHINGLLM_PORT=3001\n")
+        (root / ".env").write_text("PROVIDER_RAG_CONTEXT_WINDOW=6992\nANYTHINGLLM_API_KEY=fixture-internal-key\nANYTHINGLLM_PORT=3001\n")
         (root / "docker-compose.yml").write_text("services: {}\n")
         (root / "config/provider-pool-applied.json").write_text(json.dumps({"entries": [
-            {"enabled": True, "api_mode": "chat_completions", "context_window": 8192, "capabilities": {"chat_completions": True}},
-            {"enabled": True, "api_mode": "responses", "context_window": 16384, "capabilities": {"responses": True}},
-            {"enabled": False, "api_mode": "responses", "context_window": 131072, "capabilities": {"responses": True}},
+            {"enabled": True, "api_mode": "chat_completions", "context_window": 8192, "max_output_tokens": 1200, "capabilities": {"chat_completions": True}},
+            {"enabled": True, "api_mode": "responses", "context_window": 16384, "max_output_tokens": 4096, "capabilities": {"responses": True}},
+            {"enabled": False, "draft": True, "api_mode": "responses", "context_window": 1456, "max_output_tokens": 1200, "capabilities": {"responses": True}},
         ]}))
         for name in ("docker", "curl"):
             (root / "bin" / name).write_text(MOCK)
@@ -402,9 +402,9 @@ def main():
         environment = {"PATH": str(root / "bin") + ":/usr/bin:/bin", "LC_ALL": "C.UTF-8", "RAG_FIXTURE_ROOT": str(root),
                        "DEPLOY_DIR": "/opt/foreign-fixture", "PROVIDER_RAG_CONTEXT_WINDOW": "999999"}
 
-        def check(label, fault="", expected="16384", applied=False, restart=False, state="local-ready"):
+        def check(label, fault="", expected="6992", applied=False, restart=False, state="local-ready"):
             nonlocal passed
-            (root / "current").write_text("8192")
+            (root / "current").write_text("4096")
             (root / "calls").write_text("")
             (root / ".crisp-ai-installation").write_text("ai-support\nstate=" + state + "\n")
             result = subprocess.run(command + [expected], env={**environment, "RAG_FIXTURE_FAULT": fault},
@@ -421,9 +421,16 @@ def main():
             passed += 1
             print("通过：[UNIT/CONTRACT] " + label, flush=True)
 
-        check("聚合预算取启用备用，不受继承环境污染，仅重建本实例 AnythingLLM", applied=True, restart=True)
+        check("共同输入估算上限扣除候选输出并作为AnythingLLM保守预处理参数，不受继承环境污染", applied=True, restart=True)
         check("无效预算在服务动作前拒绝", expected="0")
-        check("与有效池或受管环境不同的预算拒绝", expected="8192")
+        check("裸最小窗口不能冒充扣除输出后的共同输入估算上限", expected="8192")
+        pool_file = root / "config/provider-pool-applied.json"
+        saved_pool = pool_file.read_bytes()
+        invalid_pool = json.loads(saved_pool)
+        invalid_pool["entries"][0].update(context_window=1455, max_output_tokens=1200)
+        pool_file.write_text(json.dumps(invalid_pool))
+        check("启用候选共同输入估算小于256时在服务动作前失败关闭")
+        pool_file.write_bytes(saved_pool)
         check("安装或恢复阶段不单独强启 RAG", state="installing")
         check("远程 Docker context 拒绝", fault="remote")
         check("非本实例容器拒绝", fault="foreign")

@@ -201,6 +201,17 @@ if [[ $# -eq 13 && "${8:-}" == exec && "${9:-}" == -T && "${10:-}" == n8n \
   fixture_compose_owned "$@" || exit 64
   [[ -f "$fixture_dir/config/materials-applied.json" \
     && ! -L "$fixture_dir/config/materials-applied.json" ]] || exit 1
+  marker=${CONFIGURATION_FIXTURE_READBACK_FAIL_ONCE_FILE:-}
+  if [[ -n "$marker" ]] \
+    && jq -e '.state == "applied" and .configuration.runtime.enabled == true' \
+      "$fixture_dir/config/materials-applied.json" >/dev/null 2>&1; then
+    [[ "$marker" == "$fixture_dir/tmp/"* && -f "$marker" && ! -L "$marker" \
+      && "$(stat -c '%a:%h:%u' -- "$marker" 2>/dev/null || true)" == "600:1:${EUID}" ]] \
+      || exit 64
+    rm -f -- "$marker" || exit 64
+    [[ ! -e "$marker" && ! -L "$marker" ]] || exit 64
+    exit 1
+  fi
   if [[ "${13}" == *'digest(projectionRaw)+":"+value.revision+":ready"'* ]]; then
     fixture_materials_projection_readback
   else

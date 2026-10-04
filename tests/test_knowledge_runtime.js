@@ -94,6 +94,7 @@ function fixture(label, allowAdmin = false) {
     assert.equal(suffix, '/message');
     const entry = {...structuredClone(options.body), session_id: session, timestamp: Date.now()};
     f.sent.push(entry); history.push(entry); f.history.set(session, history);
+    if (f.crispPostResponse) return structuredClone(f.crispPostResponse(entry));
     return {status: 200, body: {error: false, data: {fingerprint: entry.fingerprint}}};
   };
   let runtime;
@@ -703,7 +704,8 @@ async function test(name, action) {
     const f=fixture('faq-incomplete-vector-failure');
     const exactQuestion='虚构星河展馆周五开放吗？';
     const exactAnswer='虚构星河展馆周五只在蓝羽时段开放。';
-    const oversized='这是一段会使公开同构索引明确不完整的虚构长文。'.repeat(25000);
+    const oversized='问：另一份虚构资料的超长答案是什么？\n答：'
+      +'虚构长段。'.repeat(40000)+'\n';
     const index=f.installLexical([`问：${exactQuestion}\n答：${exactAnswer}\n`,oversized]);
     assert.equal(index.complete,false); f.applyKnowledgeSettings(0.2);
     f.retrievalResponse={results:'synthetic-invalid-vector-results'};
@@ -713,6 +715,86 @@ async function test(name, action) {
     const job=f.state('session_knowledge-incomplete-vector-failure').jobs.at(-1);
     assert.equal(job.status,'received'); assert.equal(job.responsibility_status,'unresolved_failure');
     assert.equal(job.failure_code,'retrieval_invalid'); assert(job.data?.content);
+  });
+  await test('K26 Crisp 2xx回执显式返回错误fingerprint时不得记为已回答', async () => {
+    const f=fixture('crisp-receipt-fingerprint-mismatch'); f.applyKnowledgeSettings(0.2);
+    f.crispPostResponse=entry=>({status:200,body:{error:false,reason:'dispatched',
+      data:{fingerprint:Number(entry.fingerprint)+1}}});
+    const result=await f.deliver(f.event('session_knowledge-crisp-mismatch',question));
+    assert.equal(f.generated.length,1); assert.equal(f.sent.length,1);
+    assert.equal(result.status,'retry');
+    const state=f.state('session_knowledge-crisp-mismatch');
+    const job=state.jobs.at(-1);
+    assert.equal(job.status,'received'); assert.equal(job.responsibility_status,'pending');
+    assert.equal(Object.values(state.outgoing).length,1);
+    assert.equal(Object.values(state.outgoing)[0].status,'unknown');
+  });
+  const directiveFromRequest = request => {
+    const message=request.messages.find(item=>item.role==='system'&&item.content.includes('{"directive":'));
+    assert(message,'当前模型请求必须含咨询方向');
+    return JSON.parse(message.content.slice(message.content.indexOf('{"directive":'))).directive;
+  };
+  const directiveVariants = [
+    ['boundary-1800','a'.repeat(1800-'SYNTHETIC-DIRECTIVE-TAIL'.length)+'SYNTHETIC-DIRECTIVE-TAIL'],
+    ['unicode-long','已提供合成背景🙂。'.repeat(250)+'不得删除末尾约束：SYNTHETIC-UNICODE-TAIL'],
+    ['byte-limit-10000','b'.repeat(10000-'SYNTHETIC-MAXIMUM-TAIL'.length)+'SYNTHETIC-MAXIMUM-TAIL'],
+  ];
+  const assertDirective = (f,entry,variant,directive) => {
+    assert.equal(f.generated.length,1,'必须实际走当前生产知识生成模块');
+    const actual=directiveFromRequest(f.generated[0]);
+    console.log('观察合成提示词：'+JSON.stringify({entry,variant,
+      configured_characters:directive.length,configured_bytes:Buffer.byteLength(directive),
+      provider_characters:actual.length,provider_bytes:Buffer.byteLength(actual),
+      exact_preserved:actual===directive,tail_preserved:actual.endsWith(directive.slice(-35))}));
+    assert.equal(actual,directive,'已接受的局部提示词必须完整进入当前Provider请求');
+    assert.equal(f.sent.filter(item=>item.type==='text').length,1);
+    assert.equal(f.sent.find(item=>item.type==='text').content,reference);
+  };
+  await test('K27 关键词局部提示词保持1800边界、中文Emoji和10000字节尾部', async () => {
+    for (const [variant,directive] of directiveVariants) {
+      assert(Buffer.byteLength(directive)<=10000);
+      const f=fixture('directive-keyword-'+variant);
+      f.write('config/keyword.yaml',{schema_version:2,rules:[{id:'synthetic-directive',
+        name:'合成提示词完整性',enabled:true,match_mode:'exact',keywords:['合成提示词咨询'],
+        exclude_keywords:[],priority:50,action:'prompt',prompt:directive,cooldown_seconds:0}]});
+      f.applyKnowledgeSettings(0.2);
+      const session='session_directive-keyword-'+variant;
+      const result=await f.deliver(f.event(session,'合成提示词咨询'));
+      assertDirective(f,'keyword',variant,directive);
+      const job=f.state(session).jobs.find(item=>item.id===result.jobId);
+      assert.equal(job.status,'done'); assert.equal(job.responsibility_status,'answered_confirmed');
+    }
+  });
+  await test('K28 菜单实际选择完整保留局部提示词且重复点击不重复发送', async () => {
+    for (const [variant,directive] of directiveVariants) {
+      assert(Buffer.byteLength(directive)<=10000);
+      const f=fixture('directive-menu-'+variant);
+      f.write('config/keyword.yaml',{schema_version:2,rules:[]});
+      const menu=f.read('config/menu.yaml');
+      menu.root='main';menu.menus={main:{title:'合成完整性菜单',options:{
+        '1':{label:'合成展厅咨询',action:{type:'prompt',prompt:directive}}}}};
+      f.write('config/menu.yaml',menu);f.applyKnowledgeSettings(0.2);
+      const session='session_directive-menu-'+variant;
+      await f.deliver(f.event(session,'菜单'));
+      assert.equal(f.sent.length,1); assert.equal(f.sent[0].type,'picker');
+      assert.equal(f.generated.length,0,'仅展示菜单不应调用模型');
+      const card=f.sent[0];
+      const event={website_id:'11111111-1111-4111-8111-111111111111',
+        event:'message:updated',timestamp:Date.now(),data:{session_id:session,
+        type:'picker',from:'user',fingerprint:card.fingerprint,timestamp:Date.now(),
+        content:{...structuredClone(card.content),choices:card.content.choices.map((choice,index)=>({...choice,selected:index===0}))}}};
+      const result=await f.deliver(event);
+      assertDirective(f,'menu',variant,directive);
+      const state=f.read('data/runtime/session-'+f.key(session)+'.json');
+      const job=state.jobs.find(item=>item.id===result.jobId);
+      assert.equal(job.status,'done'); assert.equal(job.responsibility_status,'control_handled');
+      const deliveries=Object.values(state.outgoing).filter(item=>item.job_id===job.id&&item.purpose==='ai_text');
+      assert.equal(deliveries.length,1);assert.equal(deliveries[0].status,'sent');
+      assert.equal(deliveries[0].semantic_intent,'control');
+      assert.equal(deliveries[0].semantic_status,'control_delivered');
+      await f.deliver(event);
+      assert.equal(f.generated.length,1);assert.equal(f.sent.filter(item=>item.type==='text').length,1);
+    }
   });
   console.log(JSON.stringify({layer: 'UNIT/PROTOCOL', passed, failed}));
   process.exitCode = failed ? 1 : 0;

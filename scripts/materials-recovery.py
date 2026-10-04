@@ -441,7 +441,22 @@ def generation_contract(recovery, projection, manifest):
             expected_map.append({"location": safe_location(location), "library_id": library["id"],
                                  "library_name": library["name"], "document_id": document["id"],
                                  "projection": document["projection"]})
-    if mapping != {"schema_version": 2, "revision": catalog["revision"], "documents": expected_map}:
+    if not isinstance(mapping, dict) or not isinstance(mapping.get("documents"), list):
+        fail("冻结的知识 map 结构无效")
+    allowed_fields = {"location", "library_id", "library_name", "document_id", "projection", "source_title"}
+    core_documents = []
+    for document in mapping["documents"]:
+        if not isinstance(document, dict) or set(document) - allowed_fields:
+            fail("冻结的知识 map 文档字段无效")
+        if "source_title" in document:
+            title = document["source_title"]
+            if not isinstance(title, str) or not title.strip() \
+                    or len(title.encode("utf-8")) > 1024 \
+                    or any(ord(character) < 32 or ord(character) == 127 for character in title):
+                fail("冻结的知识来源标题无效")
+        core_documents.append({key: value for key, value in document.items() if key != "source_title"})
+    core_mapping = dict(mapping, documents=core_documents)
+    if core_mapping != {"schema_version": 2, "revision": catalog["revision"], "documents": expected_map}:
         fail("冻结的知识 map 与 catalog/manifest 不同代")
     knowledge = projection.get("knowledge") if isinstance(projection, dict) else None
     if not isinstance(knowledge, dict) or knowledge.get("catalog_revision") != catalog["revision"] \
@@ -733,7 +748,14 @@ def validate_complete(root, recovery):
 
 def upload_matches(root, filename):
     document_root = safe_member(root, "data/anythingllm/documents/custom-documents")
-    if not document_root.is_dir() or document_root.is_symlink():
+    try:
+        document_info = document_root.lstat()
+    except FileNotFoundError:
+        # Collector 在首份写入时按需创建目录；这里只记录空基线，不断言未曾 POST。
+        return []
+    except OSError:
+        fail("知识源文档目录状态无效")
+    if not stat.S_ISDIR(document_info.st_mode) or document_root.is_symlink():
         fail("知识源文档目录无效")
     matches = []
     prefixes = (filename + ".", filename + "-")

@@ -195,8 +195,9 @@ function successful(f, session, vectorCount=0) {
 function directSuccessful(f, session, expected=answer) {
   assert.equal(f.vector.length, 0); assert.equal(f.workspaceReads, 0); assert.equal(f.generated.length, 0);
   assert.equal(f.sent.length, 1); assert.equal(f.sent[0].content, expected); assert.equal(f.sent[0].session_id, session);
-  const state = f.state(session); assert.equal(state.mode, 'ai'); assert(state.jobs.every(job => job.status === 'done'));
-  assert.equal(state.jobs[0].plan.knowledge_answer_sha256, hash(expected));
+  const state = f.state(session); assert.equal(state.mode, 'ai'); assert.equal(state.jobs.length, 1);
+  assert(state.jobs.every(job => job.status === 'done'));
+  assert.equal(Object.hasOwn(state.jobs[0], 'plan'), false);
   assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 1);
   assert.deepEqual(f.violations, []);
 }
@@ -399,9 +400,10 @@ async function test(name, action) {
   await test('H14 同一映射文档多个 parsed 位置不会误报歧义或丢掉不同片段', async () => {
     const extra = '第二页附注：先确认箱体完好。\n' + qa;
     const f = fixture('multi-location', {contents:[qa, extra], sameDocument:true});
-    assert.equal(f.search(question).results.length, 2);
+    const lexical = f.search(question);
+    assert.equal(lexical.results.length, 2); assert.equal(lexical.faq_exact.status, 'unique');
+    assert.equal(lexical.faq_exact.sources.length, 2);
     const session = 'session_hybrid-multilocation'; await f.deliver(f.event(session)); directSuccessful(f, session);
-    assert.equal(f.state(session).jobs[0].plan.sources.length, 2);
   });
   await test('H15 生成 Code 使用生产字面内置白名单完成强词法问答，源码哈希同步', async () => {
     const check = spawnSync(process.execPath, [path.join(project, 'n8n/build-workflow.js'), '--check'], {encoding:'utf8', timeout:10000});
@@ -450,7 +452,11 @@ async function test(name, action) {
       const f = fixture('prefix-negative-' + index, {contents:[qa, '问：可以吗？\n答：请先说明具体事项。\n']});
       assert.deepEqual(f.search(query).results, []);
       const session = 'session_hybrid-prefix-negative-' + index; const result = await f.deliver(f.event(session, query));
-      assert.equal(f.vector.length, 1); assert.equal(f.vector[0].query, query);
+      assert.equal(f.vector.length, 1, JSON.stringify({index, query, status:result.result.status,
+        job:f.state(session).jobs[0] ? {status:f.state(session).jobs[0].status,
+          responsibility_status:f.state(session).jobs[0].responsibility_status,
+          responsibility_reason:f.state(session).jobs[0].responsibility_reason} : null}));
+      assert.equal(f.vector[0].query, query);
       assert.equal(result.result.status, 'unresolved'); unresolved(f, session);
       assert.equal(f.events().filter(event => event.type === 'knowledge_hit').length, 0);
     }

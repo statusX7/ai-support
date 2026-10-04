@@ -314,10 +314,28 @@ def source_schema(value):
 
 
 def rag_context_window(value):
-    windows = [item["context_window"] for item in value["entries"] if item["enabled"] and not item.get("draft")
-               and item["capabilities"].get(item["api_mode"]) is True]
-    require(bool(windows), "no_capable_provider", "至少需要一个启用且协议有效的文字接口")
-    return max(windows)
+    items = value.get("entries") if isinstance(value, dict) else None
+    require(isinstance(items, list) and items, "invalid_pool", "接口池条目无效")
+    budgets = []
+    for item in items:
+        require(isinstance(item, dict) and type(item.get("enabled")) is bool
+                and type(item.get("draft", False)) is bool
+                and item.get("api_mode") in ("chat_completions", "responses")
+                and isinstance(item.get("capabilities"), dict)
+                and type(item["capabilities"].get(item["api_mode"])) is bool
+                and type(item.get("context_window")) is int
+                and 256 <= item["context_window"] <= 2097152
+                and type(item.get("max_output_tokens")) is int
+                and 1 <= item["max_output_tokens"] < item["context_window"],
+                "invalid_entry", "接口上下文或输出限制无效")
+        require(not (item["enabled"] and item.get("draft")),
+                "draft_disabled", "待补凭据的接口不能启用")
+        if item["enabled"] and not item.get("draft") and item["capabilities"][item["api_mode"]] is True:
+            budgets.append(item["context_window"] - item["max_output_tokens"])
+    require(bool(budgets), "no_capable_provider", "至少需要一个启用且协议有效的文字接口")
+    budget = min(budgets)
+    require(budget >= 256, "invalid_entry", "接口共同输入估算上限过小")
+    return budget
 
 
 class Manager:

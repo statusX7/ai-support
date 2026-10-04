@@ -350,6 +350,13 @@ async function test(name, action) {
 
   await test('缓存成功但adapter回程丢失时只读同代重放，settle后保留审计且禁止二次推理', async f => {
     const token = await f.seedLostCache();
+    const expectedRequestContract = requestContract(f.body);
+    assert.deepEqual({
+      request_contract_version:token.request_contract_version,
+      request_sha256:token.request_sha256,
+      plan_context_sha256:token.plan_context_sha256,
+    }, expectedRequestContract,
+      '夹具签名必须逐字绑定原请求正文与计划上下文');
     const before = f.question();
     assert.equal(before.responsibility_binding, f.responsibility);
     assert.equal(before.configuration_binding, f.initial.binding);
@@ -386,6 +393,7 @@ async function test(name, action) {
     assert.deepEqual([retained.round_attempts, retained.attempts], [1, 1]);
     assert.deepEqual(retained.settlement, {
       outcome:'plan_persisted', plan_sha256:planDigest,
+      request_contract:expectedRequestContract,
       response_generation:0, settled_at:retained.settlement.settled_at,
     });
     assert.equal(Number.isFinite(retained.settlement.settled_at), true);

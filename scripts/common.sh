@@ -943,6 +943,8 @@ env_set() {
     || { rm -f -- "$source"; return 1; }
   chmod 600 "$temp" || { rm -f -- "$source" "$temp"; return 1; }
 
+  # source 与 temp 是两个独立的 mktemp 文件；写失败时 unlink source 不会改写已打开的读取描述符。
+  # shellcheck disable=SC2094
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" == "${key}="* ]]; then
       if (( replaced == 0 )); then
@@ -2353,12 +2355,13 @@ anythingllm_validate_api_key() {
 }
 
 provider_rag_context_apply() (
-  # Only explicit provider configuration changes use this path. Inference and
-  # failover must never recreate a service or mutate a workspace.
+  # Only explicit provider configuration changes use this path. The configured
+  # value is a conservative AnythingLLM preprocessing parameter derived from
+  # the shared input estimate; the router remains the final per-request guard.
   local deploy_dir=${1:-} expected=${2:-} configured aggregate endpoint container ownership command_name
   local response_dir='' port key observed status remaining deadline
-  if [[ ! "$expected" =~ ^[1-9][0-9]{2,6}$ ]] || (( expected < 256 || expected > 2097152 )); then
-    warn 'RAG 上下文预算无效，未修改组件'; return 1
+  if [[ ! "$expected" =~ ^[1-9][0-9]{2,6}$ ]] || (( expected < 256 || expected >= 2097152 )); then
+    warn 'RAG 共同输入估算上限无效，未修改组件'; return 1
   fi
   deploy_dir=$(validate_deploy_dir "$deploy_dir") || return 1
   assert_managed_installation "$deploy_dir" || return 1
@@ -2371,11 +2374,30 @@ provider_rag_context_apply() (
     && -f "${deploy_dir}/config/provider-pool-applied.json" \
     && ! -L "${deploy_dir}/config/provider-pool-applied.json" ]] || return 1
   configured=$(env_get "${deploy_dir}/.env" PROVIDER_RAG_CONTEXT_WINDOW 2>/dev/null) || return 1
-  aggregate=$(jq -er '[.entries[] | . as $entry | select(.enabled == true and .draft != true
-    and $entry.capabilities[$entry.api_mode] == true) | .context_window] | max' \
+  aggregate=$(jq -er '
+    def integer: type == "number" and floor == .;
+    if (.entries | type) != "array" or (.entries | length) == 0 or
+      any(.entries[]; . as $entry |
+        ($entry.enabled | type) != "boolean" or
+        (($entry | has("draft")) and ($entry.draft | type) != "boolean") or
+        ($entry.enabled == true and $entry.draft == true) or
+        ($entry.api_mode != "chat_completions" and $entry.api_mode != "responses") or
+        ($entry.capabilities | type) != "object" or
+        ($entry.capabilities[$entry.api_mode] | type) != "boolean" or
+        (($entry.context_window | integer) | not) or $entry.context_window < 256 or $entry.context_window > 2097152 or
+        (($entry.max_output_tokens | integer) | not) or $entry.max_output_tokens < 1 or
+        $entry.max_output_tokens >= $entry.context_window)
+    then error("invalid provider budget fields")
+    else [.entries[] | . as $entry | select(.enabled == true and .draft != true
+      and $entry.capabilities[$entry.api_mode] == true) |
+      (.context_window - .max_output_tokens)] as $budgets |
+      if ($budgets | length) == 0 then error("no capable provider")
+      elif ($budgets | min) < 256 then error("provider input budget too small")
+      else ($budgets | min) end
+    end' \
     "${deploy_dir}/config/provider-pool-applied.json" 2>/dev/null) || return 1
   [[ "$configured" == "$expected" && "$aggregate" == "$expected" ]] \
-    || { warn 'RAG 预算与当前接口池不一致，未修改组件'; return 1; }
+    || { warn 'RAG 共同输入估算上限与当前接口池不一致，未修改组件'; return 1; }
   # Never use a remote daemon with local bind paths, or let inherited Compose
   # interpolation select another deployment or override the committed budget.
   [[ -z "${DOCKER_HOST:-}" || "$DOCKER_HOST" == unix://* ]] \
@@ -2425,7 +2447,7 @@ provider_rag_context_apply() (
     fi
     (( SECONDS < deadline )) && sleep 1
   done
-  warn 'AnythingLLM 上下文预算未在时限内完成运行回读；不能将已保存当成已应用'
+  warn 'AnythingLLM 保守预处理参数未在时限内完成运行回读；不能将已保存当成已应用'
   return 1
 )
 
@@ -2688,7 +2710,8 @@ anythingllm_connection() {
 }
 
 anythingllm_workspace_locations() {
-  local response_file status locations
+  local response_file status locations result_mode=${1:-locations}
+  [[ "$result_mode" == locations || "$result_mode" == documents ]] || return 1
 
   response_file=$(mktemp "${ANYTHING_DEPLOY_DIR}/tmp/workspace-documents.XXXXXX") || return 1
   status=$(anythingllm_secure_request "$ANYTHING_DEPLOY_DIR" GET \
@@ -2699,12 +2722,13 @@ anythingllm_workspace_locations() {
     rm -f -- "$response_file"
     return 1
   fi
-  locations=$(jq -c '
+  locations=$(jq -c --arg mode "$result_mode" '
     .workspace as $workspace |
     (if ($workspace | type) == "array" then $workspace
      elif ($workspace | type) == "object" then [$workspace]
      else [] end) |
-    [.[].documents[]?.docpath | select(type == "string")] | unique
+    [.[].documents[]? | select(.docpath | type == "string")] as $documents |
+    if $mode == "documents" then $documents else [$documents[].docpath] | unique end
   ' "$response_file" 2>/dev/null) || { rm -f -- "$response_file"; return 1; }
   rm -f -- "$response_file"
   printf '%s\n' "$locations"
@@ -2739,6 +2763,19 @@ anythingllm_workspace_runtime_settings() {
     return 1
   fi
   rm -f -- "$response_file"
+  # 同值回读不能仅因观测时间变化而改写已封印的运行设置；真实变化仍发布新内容。
+  if [[ -f "$target" && ! -L "$target" \
+    && "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null || true)" == '0:1000:640:1' \
+    && "$(stat -c '%s' -- "$target" 2>/dev/null || printf 65537)" -le 65536 ]] \
+    && jq -M -e --slurpfile previous "$target" '
+      . as $fresh | $previous[0] as $old |
+      ($old | keys) == ["observed_at","schema_version","temperature","workspace_slug"] and
+      ($old.observed_at | type == "number" and isfinite and floor == . and . >= 0) and
+      ($old | del(.observed_at)) == ($fresh | del(.observed_at))
+    ' "$temporary" >/dev/null 2>&1; then
+    rm -f -- "$temporary"
+    return 0
+  fi
   chmod 640 "$temporary" || { rm -f -- "$temporary"; return 1; }
   chown root:1000 "$temporary" 2>/dev/null || true
   mv -f -- "$temporary" "$target" || { rm -f -- "$temporary"; return 1; }
@@ -2749,7 +2786,7 @@ anythingllm_locations_have_state() {
   local should_exist=$2
   local actual
 
-  actual=$(anythingllm_workspace_locations) || return 1
+  actual=$(anythingllm_workspace_locations locations) || return 1
   if [[ "$should_exist" == true ]]; then
     jq -en --argjson expected "$expected" --argjson actual "$actual" \
       'all($expected[]; . as $item | $actual | index($item) != null)' >/dev/null
@@ -3227,9 +3264,10 @@ knowledge_sync_legacy() {
             knowledge_clear_pending "$manifest" "$filename" \
               || warn "源文档已清理，但知识进度记录将在下次同步继续收口：$filename"
           else
-            knowledge_record_garbage "$manifest" "$locations" \
-              && knowledge_clear_pending "$manifest" "$filename" \
-              || warn "源文档清理责任未能写回知识清单，将由资料恢复账本继续阻止发布：$filename"
+            if ! knowledge_record_garbage "$manifest" "$locations" \
+              || ! knowledge_clear_pending "$manifest" "$filename"; then
+              warn "源文档清理责任未能写回知识清单，将由资料恢复账本继续阻止发布：$filename"
+            fi
             warn "本次上传的源文档清理失败，已登记供下次同步重试：$filename"
           fi
         fi
@@ -3271,9 +3309,11 @@ knowledge_sync_legacy() {
       ((failures += 1))
       continue
     fi
-    chmod 600 "$manifest_temp" \
-      && mv -f -- "$manifest_temp" "$manifest" \
-      || { rm -f -- "$manifest_temp"; ((failures += 1)); continue; }
+    if ! chmod 600 "$manifest_temp" || ! mv -f -- "$manifest_temp" "$manifest"; then
+      rm -f -- "$manifest_temp"
+      ((failures += 1))
+      continue
+    fi
     ((uploaded += 1))
   done
 
@@ -3340,9 +3380,11 @@ knowledge_sync_legacy() {
       ((failures += 1))
       continue
     fi
-    chmod 600 "$manifest_temp" \
-      && mv -f -- "$manifest_temp" "$manifest" \
-      || { rm -f -- "$manifest_temp"; ((failures += 1)); continue; }
+    if ! chmod 600 "$manifest_temp" || ! mv -f -- "$manifest_temp" "$manifest"; then
+      rm -f -- "$manifest_temp"
+      ((failures += 1))
+      continue
+    fi
     ((removed += 1))
   done < <(jq -r '.files | keys[]' "$manifest")
 

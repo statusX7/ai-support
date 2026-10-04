@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${SCRIPT_DIR}/scripts/bootstrap.sh"
 # shellcheck source=scripts/common.sh
 source "${SCRIPT_DIR}/scripts/common.sh"
+# shellcheck source=scripts/configuration.sh
+source "${SCRIPT_DIR}/scripts/configuration.sh"
 # shellcheck source=scripts/wizard.sh
 source "${SCRIPT_DIR}/scripts/wizard.sh"
 # shellcheck source=scripts/launcher.sh
@@ -199,13 +201,22 @@ validate_preserved_installation() {
 
   for config_file in "${json_config_files[@]}"; do
     [[ -s "${deploy_dir}/config/${config_file}" ]] || continue
-    case "$config_file" in
-      keyword.yaml) jq -e '(.keywords | type == "array") or (.schema_version==2 and (.rules | type == "array"))' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
-      menu.yaml) jq -e '.menus | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
-      handoff.yaml) jq -e '.handoff | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
-      tags.yaml) jq -e '.tags | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
-      feedback.yaml) jq -e '.feedback | type == "object"' "${deploy_dir}/config/${config_file}" >/dev/null 2>&1 ;;
-    esac || invalid_config+=("config/${config_file}")
+    # 只解码检查副本，不改写保留原文；YAML/JSON 与资料管理使用同一解析合同。
+    if ! (
+      local decoded_config
+      decoded_config=$(mktemp) || exit 1
+      trap 'rm -f -- "$decoded_config"' EXIT
+      configuration_decode_file "${deploy_dir}/config/${config_file}" "$decoded_config" >/dev/null 2>&1 || exit 1
+      case "$config_file" in
+        keyword.yaml) jq -e '(.keywords | type == "array") or (.schema_version==2 and (.rules | type == "array"))' "$decoded_config" >/dev/null 2>&1 ;;
+        menu.yaml) jq -e '.menus | type == "object"' "$decoded_config" >/dev/null 2>&1 ;;
+        handoff.yaml) jq -e '.handoff | type == "object"' "$decoded_config" >/dev/null 2>&1 ;;
+        tags.yaml) jq -e '.tags | type == "object"' "$decoded_config" >/dev/null 2>&1 ;;
+        feedback.yaml) jq -e '.feedback | type == "object"' "$decoded_config" >/dev/null 2>&1 ;;
+      esac
+    ); then
+      invalid_config+=("config/${config_file}")
+    fi
   done
   if [[ -s "${deploy_dir}/config/provider.yaml" ]]; then
     if jq -e '.provider | type=="object" and (.base_url|type=="string") and (.model|type=="string") and (.api_mode=="responses" or .api_mode=="chat_completions") and (.api_key_env=="AI_API_KEY")' "${deploy_dir}/config/provider.yaml" >/dev/null 2>&1; then

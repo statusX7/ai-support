@@ -93,11 +93,106 @@ assert_file() {
   [[ -f "$1" && ! -L "$1" ]] || fail "缺少安全的普通文件：$1"
 }
 
+# 升级仅允许按真实接口池派生知识输入窗口；其他配置、凭据和注释逐字保留。
+assert_update_env_preserved() {
+  python3 -B - "$1" "$2" "$3" "$PROJECT_ROOT" <<'PY'
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import stat
+import sys
+
+previous, deploy, expected_digest, project = sys.argv[1:]
+previous, deploy, project = Path(previous), Path(deploy), Path(project)
+
+def raw(path):
+    info = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 16777216:
+        raise SystemExit('升级配置保留校验：文件身份无效')
+    return path.read_bytes()
+
+before, after = raw(previous), raw(deploy / '.env')
+if hashlib.sha256(before).hexdigest() != expected_digest:
+    raise SystemExit('升级配置保留校验：原始基线已变化')
+module_path = project / 'scripts/provider-pool.py'
+raw(module_path)
+spec = importlib.util.spec_from_file_location('update_env_current_pool', module_path)
+pool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pool)
+applied = json.loads(raw(deploy / 'config/provider-pool-applied.json'))
+expected = pool.rag_context_window(applied)
+field = b'PROVIDER_RAG_CONTEXT_WINDOW='
+def split_window(data):
+    lines = data.splitlines(keepends=True)
+    indices = [index for index, line in enumerate(lines) if line.startswith(field)]
+    if len(indices) != 1:
+        raise SystemExit('升级配置保留校验：派生字段必须唯一')
+    index = indices[0]
+    line = lines[index]
+    match = re.fullmatch(rb'PROVIDER_RAG_CONTEXT_WINDOW=([0-9]{1,8})\n', line)
+    if match is None:
+        raise SystemExit('升级配置保留校验：派生字段格式无效')
+    return b''.join(lines[:index]), b''.join(lines[index + 1:]), int(match[1])
+
+old_prefix, old_suffix, old_window = split_window(before)
+new_prefix, new_suffix, new_window = split_window(after)
+if (old_prefix, old_suffix) != (new_prefix, new_suffix):
+    raise SystemExit('升级配置保留校验：非派生配置或原始字节被改写')
+if new_window != expected:
+    raise SystemExit('升级配置保留校验：知识窗口未对应真实接口池')
+print(json.dumps({'non_derived_environment_bytes_preserved': True,
+                  'derived_window_matches_current_pool': True,
+                  'before_window': old_window, 'after_window': new_window,
+                  'original_digest_verified': True}, ensure_ascii=False, sort_keys=True))
+PY
+}
+
+# 真v1.2.1的合法YAML及自定义字段必须保留，不能用默认文案覆盖。
+assert_update_configuration_preserved() (
+  local previous=$1 current=$2 report_dir=$3 expected_sha256=$4 formatting=${5:-raw}
+  [[ "$formatting" == raw || "$formatting" == jq-json ]] || return 1
+  [[ -f "$previous" && ! -L "$previous" && -f "$current" && ! -L "$current" ]] || return 1
+  [[ "$(sha256sum "$previous" | awk '{print $1}')" == "$expected_sha256" ]] || return 1
+  mkdir -m 0700 -- "$report_dir" || return 1
+  # 在独立Bash解码，避免模块初始化覆盖测试入口变量。
+  if ! bash -s -- "${PROJECT_ROOT}/scripts/configuration.sh" "$previous" "$current" "$report_dir" <<'SH'
+set -euo pipefail
+source "$1"
+configuration_decode_file "$2" "$4/before.json"
+configuration_decode_file "$3" "$4/after.json"
+SH
+  then
+    return 1
+  fi
+  cmp -s -- "${report_dir}/before.json" "${report_dir}/after.json" || return 1
+  if ! cmp -s -- "$previous" "$current"; then
+    [[ "$formatting" == jq-json ]] || return 1
+    # 仅允许既有公共迁移器的同值jq排版，任何字段改动仍在上方被拒绝。
+    jq -M '.' "$previous" > "${report_dir}/expected-format.json" || return 1
+    cmp -s -- "${report_dir}/expected-format.json" "$current" || return 1
+  fi
+)
+
 expect_local_ready_install() {
   local status=0
   "$@" || status=$?
   (( status == 2 )) || fail "隔离测试无真实会话，安装应返回 local-ready 状态 2，实际 ${status}"
 }
+
+# 包外旧格式夹具必须是固定发布提交的原字节；不在测试中创建历史 tag。
+LEGACY_V111_BACKUP_SHA256=0b45156ad4945e77bd321faa3ccb9ed16dd35eb8fb26579835198e95b02edd15
+LEGACY_V111_BACKUP_SOURCE=${CRISPAI_TEST_V111_BACKUP_SCRIPT:-}
+if [[ -n "$LEGACY_V111_BACKUP_SOURCE" ]]; then
+  [[ "$LEGACY_V111_BACKUP_SOURCE" == /* && -f "$LEGACY_V111_BACKUP_SOURCE"
+    && ! -L "$LEGACY_V111_BACKUP_SOURCE" ]] || fail '包外 v1.1.1 备份器不是绝对路径的普通文件'
+  [[ "$(sha256sum -- "$LEGACY_V111_BACKUP_SOURCE" | cut -d ' ' -f 1)" == "$LEGACY_V111_BACKUP_SHA256" ]] \
+    || fail '包外 v1.1.1 备份器不匹配固定历史发布代码'
+else
+  git -C "$PROJECT_ROOT" cat-file -e 'v1.1.1:scripts/backup.sh' 2>/dev/null \
+    || fail '缺少真实 v1.1.1 备份器；无历史 checkout 时须提供 CRISPAI_TEST_V111_BACKUP_SCRIPT'
+fi
 
 if [[ "$TEST_SELECTION" == all ]]; then
 SHELL_FILES=(
@@ -557,6 +652,41 @@ grep -Fxq 'fact_conversation=pending' "${DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "安装未明确区分 Crisp 凭据验证与真实会话验收"
 pass "安装与 Provider 自动检测"
 
+RUNTIME_SETTINGS_FILE="${DEPLOY_DIR}/data/runtime/knowledge-settings.json"
+RUNTIME_SETTINGS_HASH=$(sha256sum "$RUNTIME_SETTINGS_FILE" | awk '{print $1}')
+RUNTIME_SETTINGS_INODE=$(/usr/bin/stat -c '%i' "$RUNTIME_SETTINGS_FILE")
+RUNTIME_SETTINGS_NEXT_TIME=$(( $(jq -r '.observed_at' "$RUNTIME_SETTINGS_FILE") + 10 ))
+bash -c 'set -euo pipefail
+  source "$1/scripts/common.sh"
+  anythingllm_connection "$2"
+  settings_next_time=$3
+  date() { if [[ $# == 1 && $1 == +%s ]]; then printf "%s\\n" "$settings_next_time"; else command date "$@"; fi; }
+  anythingllm_workspace_runtime_settings "$2"
+' -- "$PROJECT_ROOT" "$DEPLOY_DIR" "$RUNTIME_SETTINGS_NEXT_TIME"
+[[ "$(sha256sum "$RUNTIME_SETTINGS_FILE" | awk '{print $1}')" == "$RUNTIME_SETTINGS_HASH" ]] \
+  || fail '工作区同值回读因时间变化破坏了已封印的知识设置摘要'
+[[ "$(/usr/bin/stat -c '%i' "$RUNTIME_SETTINGS_FILE")" == "$RUNTIME_SETTINGS_INODE" ]] \
+  || fail '工作区同值回读无故替换了受管设置 inode'
+RUNTIME_SETTINGS_PROBE_ROOT="${TEST_ROOT}/runtime-settings-readback"
+mkdir -p -- "${RUNTIME_SETTINGS_PROBE_ROOT}/tmp" "${RUNTIME_SETTINGS_PROBE_ROOT}/data/runtime"
+RUNTIME_SETTINGS_PROBE_FILE="${RUNTIME_SETTINGS_PROBE_ROOT}/data/runtime/knowledge-settings.json"
+jq -M '.temperature=0.2 | .observed_at=1' "$RUNTIME_SETTINGS_FILE" > "$RUNTIME_SETTINGS_PROBE_FILE"
+chmod 0640 "$RUNTIME_SETTINGS_PROBE_FILE"
+/usr/bin/chown 0:1000 "$RUNTIME_SETTINGS_PROBE_FILE"
+RUNTIME_SETTINGS_PROBE_HASH=$(sha256sum "$RUNTIME_SETTINGS_PROBE_FILE" | awk '{print $1}')
+bash -c 'set -euo pipefail
+  source "$1/scripts/common.sh"
+  anythingllm_connection "$2"
+  anythingllm_workspace_runtime_settings "$3"
+' -- "$PROJECT_ROOT" "$DEPLOY_DIR" "$RUNTIME_SETTINGS_PROBE_ROOT"
+jq -M -e '.schema_version==1 and .temperature==0.7 and .observed_at>1' "$RUNTIME_SETTINGS_PROBE_FILE" >/dev/null \
+  || fail '工作区实际值变化后回读错误保留了旧设置'
+[[ "$(sha256sum "$RUNTIME_SETTINGS_PROBE_FILE" | awk '{print $1}')" != "$RUNTIME_SETTINGS_PROBE_HASH" ]] \
+  || fail '工作区实际值变化后未发布新设置摘要'
+[[ "$(sha256sum "$RUNTIME_SETTINGS_FILE" | awk '{print $1}')" == "$RUNTIME_SETTINGS_HASH" ]] \
+  || fail '独立设置回读场景污染了已应用资料代'
+pass "工作区同值回读保持摘要与 inode，实际值变化仍发布新设置"
+
 ANYTHING_HELPER="${MOCK_DIR}/anything-cache.py"
 ANYTHING_HELPER_CONFIG=$(mktemp "${DEPLOY_DIR}/tmp/helper-security.XXXXXXXX")
 printf 'header = "Authorization: Bearer %s"\n' "$TEST_ANYTHING_KEY" > "$ANYTHING_HELPER_CONFIG"
@@ -811,7 +941,11 @@ pass "未完成安装复用已验证配置及 localhost 容器映射"
 
 install -m 0600 -- "${TEST_ROOT}/before-runtime-provider.env" "${DEPLOY_DIR}/.env"
 install -m 0600 -- "${TEST_ROOT}/before-runtime-provider.yaml" "${DEPLOY_DIR}/config/provider.yaml"
-sed -i 's/^state=.*/state=ready/' "${DEPLOY_DIR}/.crisp-ai-installation"
+# 暂存恢复不会签发运行准入回执；必须由原生续装启动并回读，不能手工伪造 ready。
+expect_local_ready_install "${PROJECT_ROOT}/install.sh" \
+  --deploy-dir "$DEPLOY_DIR" --non-interactive > "${TEST_ROOT}/complete-install-retry.log" 2>&1
+grep -Fxq 'state=local-ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
+  || fail "暂存续装未完成本地运行与准入回读"
 
 "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" --offline \
   > "${TEST_ROOT}/health-offline.log" 2>&1
@@ -944,51 +1078,103 @@ if grep -Fq "$TEST_PLUGIN_SIGNING_SECRET" "${TEST_ROOT}/plugin-install.log"; the
 fi
 pass "Website URL Secret 与 Plugin Signing Secret 分离"
 
-install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
-install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt"
-install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.pdf"
-install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
+MAIN_KNOWLEDGE_GENERATION_BEFORE=$(sha256sum "${DEPLOY_DIR}/config/materials-applied.json" \
+  "${DEPLOY_DIR}/knowledge/catalog.json" "${DEPLOY_DIR}/data/knowledge-manifest.json" \
+  "${DEPLOY_DIR}/data/runtime/knowledge-"{map,settings,profile,lexical}.json)
+(
+  # 旧算法在独立、尚未封印的布局内回归，不污染当前已应用代及其恢复材料。
+  trap - EXIT
+  LEGACY_KNOWLEDGE_DEPLOY="${TEST_ROOT}/legacy-knowledge"
+  env AI_API_BASE_URL=https://provider.invalid AI_API_KEY="$TEST_PROVIDER_KEY" \
+    AI_MODEL=gpt-vision-test AI_SUPPORTS_VISION=false \
+    CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111 \
+    CRISP_TOKEN_TIER=website CRISP_TOKEN_IDENTIFIER=test-only-identifier \
+    CRISP_TOKEN_KEY="$TEST_CRISP_KEY" ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" \
+    ANYTHINGLLM_PORT=19001 N8N_PORT=19002 N8N_HOST=legacy-knowledge.example.invalid \
+    PUBLIC_WEBHOOK_URL=https://legacy-knowledge.example.invalid/ TIMEZONE=UTC \
+    "${PROJECT_ROOT}/install.sh" --deploy-dir "$LEGACY_KNOWLEDGE_DEPLOY" \
+      --command-path "${TEST_ROOT}/bin/crispai-legacy-knowledge" --non-interactive --skip-start \
+      > "${TEST_ROOT}/legacy-knowledge-setup.log" 2>&1
+  [[ ! -e "${LEGACY_KNOWLEDGE_DEPLOY}/config/materials-applied.json" ]] \
+    || fail "旧布局夹具不应含当前生效投影"
+  bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; docker_compose "$1" up -d anythingllm' \
+    -- "$LEGACY_KNOWLEDGE_DEPLOY" >> "${TEST_ROOT}/legacy-knowledge-setup.log" 2>&1
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.md"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.txt"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.pdf"
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.docx"
 bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"; knowledge_sync_legacy \"\$1\" 1" \
-  -- "$DEPLOY_DIR" > "${TEST_ROOT}/knowledge-sync.log" 2>&1
+  -- "$LEGACY_KNOWLEDGE_DEPLOY" > "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.files["test-knowledge.md"].locations | length > 0' \
-  "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "知识文件未写入同步清单"
+  "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json" >/dev/null || fail "知识文件未写入同步清单"
 jq -e '
   (.files | keys | sort) == ["test-knowledge.docx","test-knowledge.md","test-knowledge.pdf","test-knowledge.txt"] and
   ([.files[].locations | length] | all(. > 0))
-' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "四种知识文件格式未全部写入同步清单"
+' "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json" >/dev/null || fail "四种知识文件格式未全部写入同步清单"
 EXPECTED_SOURCE_LOCATIONS=$(jq -c '[.files[].locations[]] | unique' \
-  "${DEPLOY_DIR}/data/knowledge-manifest.json")
-rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.txt" \
-  "${DEPLOY_DIR}/knowledge/test-knowledge.pdf" "${DEPLOY_DIR}/knowledge/test-knowledge.docx"
+  "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json")
+rm -f -- "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.txt" \
+  "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.pdf" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.docx"
 if env MOCK_REMOVE_DOCUMENTS_FAIL=1 bash -c \
   "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"" \
-  -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1; then
+  -- "$LEGACY_KNOWLEDGE_DEPLOY" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1; then
   fail "AnythingLLM 源文档删除失败时知识同步被错误报告为成功"
 fi
-jq -e '.files | length == 0' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "删除知识文件后未清理索引清单"
+jq -e '.files | length == 0' "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json" >/dev/null || fail "删除知识文件后未清理索引清单"
 jq -e --argjson expected "$EXPECTED_SOURCE_LOCATIONS" \
   '(.garbage_locations | sort) == ($expected | sort)' \
-  "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null || fail "源文档删除失败后未登记孤立位置"
+  "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json" >/dev/null || fail "源文档删除失败后未登记孤立位置"
 bash -c "set -euo pipefail; source \"\$1/scripts/common.sh\"; knowledge_sync_legacy \"\$1\"" \
-  -- "$DEPLOY_DIR" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
-jq -e '.garbage_locations == []' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
+  -- "$LEGACY_KNOWLEDGE_DEPLOY" >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
+jq -e '.garbage_locations == []' "${LEGACY_KNOWLEDGE_DEPLOY}/data/knowledge-manifest.json" >/dev/null \
   || fail "后续知识同步未重试清理孤立源文档"
-jq -e --arg deploy "$DEPLOY_DIR" --argjson expected "$EXPECTED_SOURCE_LOCATIONS" '
+jq -e --arg deploy "$LEGACY_KNOWLEDGE_DEPLOY" --argjson expected "$EXPECTED_SOURCE_LOCATIONS" '
   ((.rag_instances[$deploy].removed_documents // []) | sort) == ($expected | sort) and
   all(.rag_instances | to_entries[] | select(.key != $deploy);
     ((.value.documents // []) | length) == 0)
 ' "$MOCK_ANYTHING_STATE" >/dev/null \
   || fail "AnythingLLM remove-documents 未清理已删除知识源文档"
-install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${DEPLOY_DIR}/knowledge/test-knowledge.md"
-# 上面独立回归仍在生产中使用的 v1.0.1 pending/garbage 算法；以下再从真实旧单库布局走新迁移。
-jq -e '.libraries | length == 0' "${DEPLOY_DIR}/knowledge/catalog.json" >/dev/null \
-  || fail "旧单库迁移夹具必须从空 catalog 开始，不能删除用户式已有库"
-rm -f -- "${DEPLOY_DIR}/knowledge/catalog.json"
-bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" sync \
-  >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
+install -m 0640 "${SCRIPT_DIR}/fixtures/knowledge.md" "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/test-knowledge.md"
+# 从未封印的旧单库数据布局走原生续装，不能删除当前已应用实例的 catalog。
+[[ ! -e "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/catalog.json" && ! -L "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/catalog.json" ]] \
+  || fail "旧布局夹具意外带有命名库，未通过删除 catalog 制造迁移"
+expect_local_ready_install "${PROJECT_ROOT}/install.sh" \
+  --deploy-dir "$LEGACY_KNOWLEDGE_DEPLOY" \
+  --command-path "${TEST_ROOT}/bin/crispai-legacy-knowledge" \
+  --non-interactive >> "${TEST_ROOT}/knowledge-sync.log" 2>&1
 jq -e '.libraries[0].id == "kb_default" and .libraries[0].documents[0].projection == "test-knowledge.md"' \
-  "${DEPLOY_DIR}/knowledge/catalog.json" >/dev/null || fail "旧单库没有迁入命名知识库"
+  "${LEGACY_KNOWLEDGE_DEPLOY}/knowledge/catalog.json" >/dev/null || fail "旧单库没有迁入命名知识库"
+)
 pass "知识旧算法四种扩展名、删除重试与命名库迁移（不验证真实解析）"
+MAIN_KNOWLEDGE_GENERATION_AFTER=$(sha256sum "${DEPLOY_DIR}/config/materials-applied.json" \
+  "${DEPLOY_DIR}/knowledge/catalog.json" "${DEPLOY_DIR}/data/knowledge-manifest.json" \
+  "${DEPLOY_DIR}/data/runtime/knowledge-"{map,settings,profile,lexical}.json)
+[[ "$MAIN_KNOWLEDGE_GENERATION_AFTER" == "$MAIN_KNOWLEDGE_GENERATION_BEFORE" ]] \
+  || fail "旧布局回归污染了当前已应用主实例的知识代"
+pass "旧布局迁移与当前已应用知识代隔离"
+
+# 缓存篡改与离线恢复需要真实受管文档；空知识代本身是合法正常反例。
+python3 -B "${DEPLOY_DIR}/scripts/knowledge-profile.py" --deploy-dir "$DEPLOY_DIR" \
+  refresh-bindings --validate-only --require-complete \
+  > "${TEST_ROOT}/restore-empty-profile.json"
+jq -e '.success == true and .changed == false and .bindings == 0' \
+  "${TEST_ROOT}/restore-empty-profile.json" >/dev/null || fail '合法空知识代不应要求不存在的缓存'
+"${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" create '恢复验收知识库' \
+  > "${TEST_ROOT}/restore-library.json" 2> "${TEST_ROOT}/restore-library.log"
+RESTORE_LIBRARY_ID=$(jq -er '.library_id | select(test("^kb_[a-f0-9]{16}$"))' \
+  "${TEST_ROOT}/restore-library.json")
+"${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" \
+  import "$RESTORE_LIBRARY_ID" "${SCRIPT_DIR}/fixtures/knowledge.md" \
+  > "${TEST_ROOT}/restore-document.json" 2> "${TEST_ROOT}/restore-document.log"
+RESTORE_KNOWLEDGE_PROJECTION=$(jq -er --arg id "$RESTORE_LIBRARY_ID" \
+  '.libraries[] | select(.id == $id) | .documents | select(length == 1) | .[0].projection | select(test("^kb_[a-f0-9]{16}_doc_[a-f0-9]{16}\\.md$"))' \
+  "${DEPLOY_DIR}/knowledge/catalog.json")
+assert_file "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}"
+python3 -B "${DEPLOY_DIR}/scripts/knowledge-profile.py" --deploy-dir "$DEPLOY_DIR" \
+  refresh-bindings --validate-only --require-complete \
+  > "${TEST_ROOT}/restore-populated-profile.json"
+jq -e '.success == true and .changed == false and .bindings == 1' \
+  "${TEST_ROOT}/restore-populated-profile.json" >/dev/null || fail '恢复夹具没有通过原生受管缓存完整性校验'
 
 printf '%s\n' \
   '{"type":"question","at":"2026-09-04T00:00:00Z"}' \
@@ -1057,14 +1243,20 @@ jq -M '.provider.restore_test_extension={preserved:true}' "${DEPLOY_DIR}/config/
 chmod 0640 "$RESTORE_EXTENSION_TEMP"
 mv -f -- "$RESTORE_EXTENSION_TEMP" "${DEPLOY_DIR}/config/provider.yaml"
 mkdir -p -- "${TEST_ROOT}/legacy-backup-tools"
-git -C "$PROJECT_ROOT" show 'v1.1.1:scripts/backup.sh' > "${TEST_ROOT}/legacy-backup-tools/backup.sh"
+if [[ -n "$LEGACY_V111_BACKUP_SOURCE" ]]; then
+  install -m 0644 -- "$LEGACY_V111_BACKUP_SOURCE" "${TEST_ROOT}/legacy-backup-tools/backup.sh"
+else
+  git -C "$PROJECT_ROOT" show 'v1.1.1:scripts/backup.sh' > "${TEST_ROOT}/legacy-backup-tools/backup.sh"
+fi
+[[ "$(sha256sum "${TEST_ROOT}/legacy-backup-tools/backup.sh" | cut -d ' ' -f 1)" == "$LEGACY_V111_BACKUP_SHA256" ]] \
+  || fail '旧格式回归使用的不是已发布 v1.1.1 原备份器'
 cp -- "${DEPLOY_DIR}/scripts/common.sh" "${TEST_ROOT}/legacy-backup-tools/common.sh"
 ARCHIVE="${DEPLOY_DIR}/backups/legacy-v1-compatibility.tar.gz"
 bash "${TEST_ROOT}/legacy-backup-tools/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$ARCHIVE" \
   > "${TEST_ROOT}/legacy-backup-create.log" 2>&1
 tar -xOzf "$ARCHIVE" ./manifest.json | jq -e '.format == "ai-support-backup-v1"' >/dev/null || fail '旧格式夹具不是真实 v1 备份'
 printf '临时 Prompt，恢复后应被替换。\n' > "${DEPLOY_DIR}/config/prompt.md"
-rm -f -- "${DEPLOY_DIR}/knowledge/test-knowledge.md"
+rm -f -- "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}"
 if "${DEPLOY_DIR}/scripts/restore.sh" \
   --deploy-dir "$DEPLOY_DIR" --input "$ARCHIVE" --skip-restart --no-safety-backup \
   > "${TEST_ROOT}/restore-running-refused.log" 2>&1; then
@@ -1136,7 +1328,7 @@ assert_legacy_restore_preflight_rejected() {
     || fail "${label} 预检失败前已覆盖 Prompt"
   [[ "$(sha256sum "${DEPLOY_DIR}/data/knowledge-manifest.json" | cut -d ' ' -f 1)" == "$RESTORE_PRECHECK_MANIFEST_HASH" ]] \
     || fail "${label} 预检失败前已覆盖知识 manifest"
-  [[ ! -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] \
+  [[ ! -f "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}" ]] \
     || fail "${label} 预检失败前已恢复知识原文"
   if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
     fail "${label} 知识代次预检失败后仍停止服务"
@@ -1168,11 +1360,19 @@ assert_legacy_restore_preflight_rejected migration-pointer
 unlink -- "${DEPLOY_DIR}/data/runtime/knowledge-migration.json"
 pass '旧格式恢复在修改前拒绝坏 profile、缓存篡改与迁移残留，失败零资料修改'
 
+# 其它实例在前面的正常旧布局场景中可以有资料；只允许当前实例发生变化。
+RESTORE_OTHER_INSTANCES_BEFORE=$(jq -M -S -c --arg deploy "$DEPLOY_DIR" \
+  '(.rag_instances // {}) | del(.[$deploy])' "$MOCK_ANYTHING_STATE")
+RESTORE_EFFECTIVE_GENERATION_BEFORE=$(sha256sum \
+  "${DEPLOY_DIR}/config/materials-applied.json" \
+  "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+  "${DEPLOY_DIR}/data/knowledge-manifest.json" \
+  "${DEPLOY_DIR}/data/runtime/knowledge-"{map,settings,profile,lexical}.json)
 env MOCK_DOCKER_NO_RUNNING=1 "${DEPLOY_DIR}/scripts/restore.sh" \
   --deploy-dir "$DEPLOY_DIR" --input "$ARCHIVE" --skip-restart --no-safety-backup \
   > "${TEST_ROOT}/restore.log" 2>&1
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$PROMPT_HASH" ]] || fail "Prompt 未恢复"
-[[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] || fail "知识文件未恢复"
+[[ -f "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}" ]] || fail "知识文件未恢复"
 [[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "恢复覆盖了 .env"
 jq -e '.handoff.restore_test_extension.preserved == true' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null \
   || fail 'handoff 现代扩展字段在候选规范化中丢失'
@@ -1192,16 +1392,31 @@ fi
 cp -- "${TEST_ROOT}/provider.safe.yaml" "${DEPLOY_DIR}/config/provider.yaml"
 pass "备份敏感字段拒绝"
 
-# 离线业务恢复有意清空实例索引映射；正常回滚夹具须先完成生产同步，
-# 不能把尚待同步的状态快照伪装成可直接恢复的已就绪实例。
-jq -e --slurpfile profile "${DEPLOY_DIR}/data/runtime/knowledge-profile.json" '
-  (.files | length) == 0 and .pending_files == {} and .garbage_locations == [] and
-  .embedding_profile == $profile[0].fingerprint
-' "${DEPLOY_DIR}/data/knowledge-manifest.json" >/dev/null \
-  || fail "离线业务恢复未失效旧实例索引映射或丢失当前知识模型代次"
+# 旧格式离线恢复只安装原文，不伪造有效代或破坏下一次应用的旧代保全。
+RESTORE_EFFECTIVE_GENERATION_AFTER=$(sha256sum \
+  "${DEPLOY_DIR}/config/materials-applied.json" \
+  "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz" \
+  "${DEPLOY_DIR}/data/knowledge-manifest.json" \
+  "${DEPLOY_DIR}/data/runtime/knowledge-"{map,settings,profile,lexical}.json)
+[[ "$RESTORE_EFFECTIVE_GENERATION_AFTER" == "$RESTORE_EFFECTIVE_GENERATION_BEFORE" ]] \
+  || fail "离线业务恢复破坏上一有效资料代或知识元数据"
+bash -c 'set -euo pipefail; source "$1/scripts/materials.sh"; materials_snapshot_validate_generation "$1" "$1/backups/config-history/materials.applied.tar.gz" "$1/config/materials-applied.json"' \
+  -- "$DEPLOY_DIR" > "${TEST_ROOT}/post-offline-generation.log" 2>&1
+POST_OFFLINE_STATUS=0
+bash "${DEPLOY_DIR}/scripts/materials.sh" --deploy-dir "$DEPLOY_DIR" status \
+  > "${TEST_ROOT}/post-offline-status.json" 2> "${TEST_ROOT}/post-offline-status.log" \
+  || POST_OFFLINE_STATUS=$?
+if (( POST_OFFLINE_STATUS != 2 )) || ! jq -e \
+  '.source_valid == true and .projection_valid == true and .state == "applied" and .pending == true' \
+  "${TEST_ROOT}/post-offline-status.json" >/dev/null; then
+  fail "离线恢复原文未标明待应用，或上一有效投影已失效"
+fi
+grep -Fq '仅完成旧格式原文离线恢复' "${TEST_ROOT}/restore.log" \
+  || fail "离线文件恢复被当成恢复原文已生效"
 bash "${DEPLOY_DIR}/scripts/knowledge.sh" --deploy-dir "$DEPLOY_DIR" sync \
   > "${TEST_ROOT}/post-offline-restore-sync.log" 2>&1
-jq -en --arg deploy "$DEPLOY_DIR" --slurpfile catalog "${DEPLOY_DIR}/knowledge/catalog.json" \
+jq -en --arg deploy "$DEPLOY_DIR" --argjson previous_others "$RESTORE_OTHER_INSTANCES_BEFORE" \
+  --slurpfile catalog "${DEPLOY_DIR}/knowledge/catalog.json" \
   --slurpfile manifest "${DEPLOY_DIR}/data/knowledge-manifest.json" \
   --slurpfile actual "$MOCK_ANYTHING_STATE" '
     all($catalog[0].libraries[] | select(.enabled) | .documents[]; . as $document |
@@ -1209,9 +1424,28 @@ jq -en --arg deploy "$DEPLOY_DIR" --slurpfile catalog "${DEPLOY_DIR}/knowledge/c
       ($manifest[0].files[$document.projection].locations | length > 0)) and
     ([$manifest[0].files[].locations[]] | unique | sort) ==
       (($actual[0].rag_instances[$deploy].documents // []) | unique | sort) and
-    all($actual[0].rag_instances | to_entries[] | select(.key != $deploy);
-      ((.value.documents // []) | length) == 0)
+    (($actual[0].rag_instances // {}) | del(.[$deploy])) == $previous_others
   ' >/dev/null || fail "离线恢复后正常回滚夹具未完成真实同步接口对账"
+bash "${DEPLOY_DIR}/scripts/materials.sh" --deploy-dir "$DEPLOY_DIR" status \
+  > "${TEST_ROOT}/post-offline-applied-status.json" 2> "${TEST_ROOT}/post-offline-applied-status.log"
+jq -e '.source_valid == true and .projection_valid == true and .state == "applied" and .pending == false' \
+  "${TEST_ROOT}/post-offline-applied-status.json" >/dev/null \
+  || fail "离线恢复后的原文同步完成却未发布一致的有效资料代"
+
+# 显式缺少受管投影的兼容夹具仍走旧映射失效分支；不删除主夹具的有效代。
+LEGACY_NO_PROJECTION_DEPLOY="${TEST_ROOT}/legacy-no-materials"
+cp -a -- "$DEPLOY_DIR" "$LEGACY_NO_PROJECTION_DEPLOY"
+unlink -- "${LEGACY_NO_PROJECTION_DEPLOY}/config/materials-applied.json"
+env MOCK_DOCKER_NO_RUNNING=1 "${PROJECT_ROOT}/scripts/restore.sh" \
+  --deploy-dir "$LEGACY_NO_PROJECTION_DEPLOY" --input "$ARCHIVE" --skip-restart --no-safety-backup \
+  > "${TEST_ROOT}/legacy-no-materials-restore.log" 2>&1
+jq -e --slurpfile profile "${LEGACY_NO_PROJECTION_DEPLOY}/data/runtime/knowledge-profile.json" '
+  .files == {} and .pending_files == {} and .garbage_locations == [] and
+  .embedding_profile == $profile[0].fingerprint
+' "${LEGACY_NO_PROJECTION_DEPLOY}/data/knowledge-manifest.json" >/dev/null \
+  || fail "旧无投影兼容恢复未失效旧映射或丢失已验证的 Embedding 代次"
+[[ ! -e "${LEGACY_NO_PROJECTION_DEPLOY}/config/materials-applied.json" ]] \
+  || fail "旧兼容离线恢复未经回读伪造有效投影"
 pass "离线业务恢复后同步并回读索引，再进入正常回滚验收"
 
 printf 'rollback-state-before\n' > "${DEPLOY_DIR}/data/anythingllm/rollback-state.txt"
@@ -1229,6 +1463,8 @@ SNAPSHOT_COUNT_AFTER=$(find "${DEPLOY_DIR}/backups/versions" -mindepth 2 -maxdep
 [[ "$SNAPSHOT_COUNT_BEFORE" == "$SNAPSHOT_COUNT_AFTER" ]] || fail "容量预检失败后留下了版本快照"
 : > "$MOCK_DOCKER_LOG"
 printf 'v0.6.9\n' > "${DEPLOY_DIR}/VERSION"
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; write_installation_marker "$1" "$2" v0.6.9 local-ready' \
+  -- "$DEPLOY_DIR" "$PROJECT_ROOT"
 if "${DEPLOY_DIR}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update-capacity-failure.log" 2>&1; then
   fail "快照空间不足时更新被错误报告为成功"
@@ -1238,6 +1474,8 @@ if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
   fail "容量预检失败后仍停止了服务"
 fi
 printf '%s\n' "$PROJECT_VERSION" > "${DEPLOY_DIR}/VERSION"
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; write_installation_marker "$1" "$2" "$3" local-ready' \
+  -- "$DEPLOY_DIR" "$PROJECT_ROOT" "$PROJECT_VERSION"
 bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; env_set "$1/.env" SNAPSHOT_MIN_FREE_MB 0' \
   -- "$DEPLOY_DIR"
 "${DEPLOY_DIR}/scripts/snapshot.sh" --deploy-dir "$DEPLOY_DIR" --check-capacity \
@@ -1319,7 +1557,28 @@ assert_rollback_mutation_failure() {
   mkdir -p -- "$case_deploy"
   chmod 0700 "$case_root"
   cp -a -- "${DEPLOY_DIR}/." "$case_deploy/"
-  cp -- "$MOCK_ANYTHING_STATE" "${case_root}/anythingllm-state.json"
+  # 本例使用复制的真实夹具状态，但 API 接线只能指向本例；
+  # 不携带原部署的同端口/同认证实例，也不从空 Prompt 伪造启动状态。
+  python3 - "$MOCK_ANYTHING_STATE" "$DEPLOY_DIR" "$case_deploy" "${case_root}/anythingllm-state.json" <<'PY'
+import copy
+import json
+import os
+import pathlib
+import sys
+
+state_path, original, cloned, target = sys.argv[1:]
+state = json.loads(pathlib.Path(state_path).read_text(encoding="utf-8"))
+instance = copy.deepcopy(state["rag_instances"][original])
+projection = json.loads((pathlib.Path(cloned) / "config/materials-applied.json").read_text(encoding="utf-8"))
+manifest = json.loads((pathlib.Path(cloned) / "data/knowledge-manifest.json").read_text(encoding="utf-8"))
+locations = sorted({location for document in manifest["files"].values() for location in document["locations"]})
+assert instance["prompt"] == projection["prompt"]["text"]
+assert sorted(instance["documents"]) == locations
+state["rag_instances"] = {cloned: instance}
+os.umask(0o077)
+with pathlib.Path(target).open("x", encoding="utf-8") as output:
+    output.write(json.dumps(state, ensure_ascii=False, sort_keys=True) + "\n")
+PY
   local MOCK_ANYTHING_STATE="${case_root}/anythingllm-state.json"
   local MOCK_DOCKER_LOG="${case_root}/docker.log"
   local MOCK_DOCKER_SERVICE_STATE="${case_root}/running-services"
@@ -1439,72 +1698,1025 @@ RETAINED_COUNT=$(find "${DEPLOY_DIR}/backups/versions" -mindepth 2 -maxdepth 2 -
 [[ -d "${DEPLOY_DIR}/backups/versions/${RETAINED_SNAPSHOT_ID}" ]] || fail "保留策略删除了最新版本快照"
 pass "版本快照历史保留数量策略"
 
-printf 'v0.6.0\n' > "${DEPLOY_DIR}/VERSION"
-printf '%s\n' '{"handoff":{"keywords":["人工","客服","真人"],"resume_keywords":["恢复AI"],"topic_keywords":{"payment":["付款"]},"resume_after_seconds":1800,"on_operator_message":true,"on_low_confidence":true,"on_no_answer":true,"confirmation":"已为您转接人工客服，AI 将暂停回复。","no_answer_message":"知识库暂时没有足够信息，已为您转接人工客服。","low_confidence_message":"当前答案可信度不足，已为您转接人工客服。","failure_message":"当前自动客服暂时不可用，已为您转接人工客服。","low_confidence":{"require_sources":true,"minimum_score":0.25}}}' \
-  > "${DEPLOY_DIR}/config/handoff.yaml"
-printf '%s\n' '{"tags":{"enabled":true,"ai_resolved":"customer_resolved","knowledge_miss":"knowledge-miss","low_confidence":"low-confidence","human_required":"human-required"}}' \
-  > "${DEPLOY_DIR}/config/tags.yaml"
-sed -i '/^SNAPSHOT_MIN_FREE_MB=/d; /^SNAPSHOT_RETENTION_COUNT=/d' "${DEPLOY_DIR}/.env"
-# 这是旧配置/缺维护器的构造夹具（真实 v1.1.0 另有独立 tag 回归）。
-# 旧代不能保留 v1.1.1 才引入的 doctor，否则会错误要求旧代缺少的新文件。
-rm -f -- "${DEPLOY_DIR}/scripts/analytics.sh" "${DEPLOY_DIR}/scripts/snapshot.sh" \
-  "${DEPLOY_DIR}/scripts/rollback.sh" "${DEPLOY_DIR}/scripts/doctor.sh" "${DEPLOY_DIR}/get.sh"
-if env MOCK_DOCKER_FAIL_PULL=1 "${DEPLOY_DIR}/update.sh" \
+# 升级测试使用真正旧版程序和原生初始化，不只将新程序的 VERSION 改旧。
+LEGACY_V121_ARCHIVE=${CRISPAI_TEST_V121_ARCHIVE:-}
+LEGACY_V121_ARCHIVE_SHA256=${CRISPAI_TEST_V121_ARCHIVE_SHA256:-}
+if [[ -n "$LEGACY_V121_ARCHIVE" && -z "$LEGACY_V121_ARCHIVE_SHA256" ]] \
+  || [[ -z "$LEGACY_V121_ARCHIVE" && -n "$LEGACY_V121_ARCHIVE_SHA256" ]]; then
+  fail 'CRISPAI_TEST_V121_ARCHIVE 与 CRISPAI_TEST_V121_ARCHIVE_SHA256 必须成对提供'
+fi
+if [[ -z "$LEGACY_V121_ARCHIVE" ]]; then
+  [[ "$(git -C "$PROJECT_ROOT" rev-parse --verify 'v1.2.1^{commit}')" == 4b923d60233f48a37d545d3f345200cfa8161266 ]] \
+    || fail '缺少固定真实 v1.2.1 提交；须提供受控源码归档及摘要'
+  LEGACY_V121_ARCHIVE="${TEST_ROOT}/v1.2.1-source.tar"
+  git -C "$PROJECT_ROOT" archive --format=tar --output "$LEGACY_V121_ARCHIVE" v1.2.1
+  chmod 0600 "$LEGACY_V121_ARCHIVE"
+  read -r LEGACY_V121_ARCHIVE_SHA256 _ < <(sha256sum -- "$LEGACY_V121_ARCHIVE")
+fi
+LEGACY_V121_SOURCE="${TEST_ROOT}/v1.2.1-source"
+LEGACY_V121_MOCK_DIR="${TEST_ROOT}/legacy-v121-mocks"
+mkdir -m 0700 -- "$LEGACY_V121_SOURCE"
+python3 "${SCRIPT_DIR}/extract_legacy_source.py" --archive "$LEGACY_V121_ARCHIVE" \
+  --sha256 "$LEGACY_V121_ARCHIVE_SHA256" --destination "$LEGACY_V121_SOURCE" \
+  --expected-version v1.2.1 || fail '真实 v1.2.1 源码校验或提取失败'
+# 旧夹具按自身文件位置定位 SOURCE；原字节复制，不放宽其路径/权限约束。
+cp -a -- "${LEGACY_V121_SOURCE}/tests/mocks" "$LEGACY_V121_MOCK_DIR"
+# 原版夹具只有全局 Prompt；给原生旧版初始化独立服务状态，避免污染其他实例。
+LEGACY_V121_ANYTHING_STATE="${TEST_ROOT}/legacy-v121-anythingllm-state.json"
+printf '{"documents":[]}\n' > "$LEGACY_V121_ANYTHING_STATE"
+LEGACY_V130_SAVED_DEPLOY="${TEST_ROOT}/before-legacy-v121-deploy"
+[[ ! -e "$LEGACY_V130_SAVED_DEPLOY" && ! -L "$LEGACY_V130_SAVED_DEPLOY" ]] \
+  || fail '旧版基线的原测试实例保全目标已存在'
+mv -- "$DEPLOY_DIR" "$LEGACY_V130_SAVED_DEPLOY"
+expect_local_ready_install env \
+  PATH="${TEST_ROOT}/bin:${LEGACY_V121_MOCK_DIR}:${ORIGINAL_PATH}" \
+  MOCK_ANYTHING_STATE="$LEGACY_V121_ANYTHING_STATE" \
+  MOCK_PROJECT_DIR="$DEPLOY_DIR" MOCK_DOCKER_STRICT_CONFIG=1 \
+  AI_API_BASE_URL=https://provider.invalid AI_API_KEY="$TEST_PROVIDER_KEY" \
+  AI_MODEL=gpt-vision-test AI_SUPPORTS_VISION=true \
+  CRISP_WEBSITE_ID=11111111-1111-1111-1111-111111111111 CRISP_TOKEN_TIER=website \
+  CRISP_TOKEN_IDENTIFIER=test-only-identifier CRISP_TOKEN_KEY="$TEST_CRISP_KEY" \
+  ANYTHINGLLM_API_KEY="$TEST_ANYTHING_KEY" N8N_HOST=support.example.invalid \
+  PUBLIC_WEBHOOK_URL=https://support.example.invalid/ TIMEZONE=UTC \
+  "${LEGACY_V121_SOURCE}/install.sh" --deploy-dir "$DEPLOY_DIR" \
+  --command-path "${TEST_ROOT}/bin/crispai" --non-interactive \
+  > "${TEST_ROOT}/legacy-v121-install.log" 2>&1
+# 仅移入原测试的业务原文与知识；不复制新代 .env、marker、有效投影或运行回执。
+for business_file in runtime.yaml handoff.yaml keyword.yaml menu.yaml tags.yaml feedback.yaml prompt.md logging.yaml; do
+  assert_file "${LEGACY_V130_SAVED_DEPLOY}/config/${business_file}"
+  cp -a -- "${LEGACY_V130_SAVED_DEPLOY}/config/${business_file}" "${DEPLOY_DIR}/config/${business_file}"
+done
+cp -a -- "${LEGACY_V130_SAVED_DEPLOY}/knowledge/." "${DEPLOY_DIR}/knowledge/"
+env PATH="${TEST_ROOT}/bin:${LEGACY_V121_MOCK_DIR}:${ORIGINAL_PATH}" \
+  MOCK_ANYTHING_STATE="$LEGACY_V121_ANYTHING_STATE" \
+  MOCK_PROJECT_DIR="$DEPLOY_DIR" "${DEPLOY_DIR}/scripts/materials.sh" --deploy-dir "$DEPLOY_DIR" apply \
+  > "${TEST_ROOT}/legacy-v121-business-apply.log" 2>&1
+for legacy_program in install.sh update.sh scripts/common.sh scripts/materials.sh n8n/runtime.js; do
+  cmp -s -- "${LEGACY_V121_SOURCE}/${legacy_program}" "${DEPLOY_DIR}/${legacy_program}" \
+    || fail "旧版基线程序不是固定源码原字节：${legacy_program}"
+done
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.2.1 ]] || fail '旧版基线 VERSION 不符'
+jq -e '.schema_version == 1 and .state == "applied"' "${DEPLOY_DIR}/config/materials-applied.json" \
+  >/dev/null || fail '旧版原生初始化或业务应用没有形成 schema1 applied 投影'
+assert_file "${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz"
+# 将旧版实际应用的 Prompt 精确绑定回当前实例；其他实例和歧义拒绝合同不变。
+python3 - "$MOCK_ANYTHING_STATE" "$LEGACY_V121_ANYTHING_STATE" "$DEPLOY_DIR" "$TEST_ROOT" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+active, legacy, project, scope = map(Path, sys.argv[1:])
+for path in (active, legacy):
+    info = path.lstat()
+    if path.parent != scope or path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit(1)
+original = json.loads(active.read_bytes())
+old = json.loads(legacy.read_bytes())
+key = str(project)
+instances = original['rag_instances']
+if not isinstance(instances, dict) or key not in instances or 'prompt' in original:
+    raise SystemExit(1)
+prompt = old['prompt']
+if not isinstance(prompt, str) or len(prompt.encode('utf-8')) > 256 * 1024:
+    raise SystemExit(1)
+unchanged = {name:value for name,value in instances.items() if name != key}
+unchanged_hash = hashlib.sha256(json.dumps(unchanged, sort_keys=True).encode()).hexdigest()
+instances[key]['prompt'] = prompt
+active.write_text(json.dumps(original, ensure_ascii=False, sort_keys=True) + '\n')
+observed = json.loads(active.read_bytes())
+if observed['rag_instances'][key]['prompt'] != prompt or 'prompt' in observed or hashlib.sha256(json.dumps({name:value for name,value in observed['rag_instances'].items() if name != key}, sort_keys=True).encode()).hexdigest() != unchanged_hash:
+    raise SystemExit(1)
+PY
+env MOCK_PROJECT_DIR="$DEPLOY_DIR" "${MOCK_DIR}/docker" compose \
+  --project-directory "$DEPLOY_DIR" --env-file "${DEPLOY_DIR}/.env" \
+  -f "${DEPLOY_DIR}/docker-compose.yml" up -d anythingllm
+printf '升级基线：固定真实 v1.2.1 程序、原生 schema1 投影和保留的业务原文。\n'
+sed -i '/^SNAPSHOT_MIN_FREE_MB=/d; /^SNAPSHOT_RETENTION_COUNT=/d; /^PROVIDER_ADAPTER_KEY=/d; /^CRISPAI_LOG_RETENTION_HOURS=/d' \
+  "${DEPLOY_DIR}/.env"
+UPDATE_SERVICE_STATE="${TEST_ROOT}/update-running-services"
+printf 'postgres\nanythingllm\nn8n\nprovider-adapter\n' > "$UPDATE_SERVICE_STATE"
+export MOCK_DOCKER_SERVICE_STATE="$UPDATE_SERVICE_STATE"
+
+# pull 仍在 marker 或配置变更之前；该阶段失败只清理同次 journal，不做无谓回滚。
+if env MOCK_DOCKER_FAIL_PULL=1 MOCK_EXPECT_PREFLIGHT_ENV_KEY=PROVIDER_ADAPTER_KEY \
+  MOCK_EXPECT_PREFLIGHT_ENV_KEY_SECONDARY=CRISPAI_LOG_RETENTION_HOURS \
+  "${PROJECT_ROOT}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update-rollback.log" 2>&1; then
   fail "镜像拉取失败时更新被错误报告为成功"
 fi
-[[ "$(<"${DEPLOY_DIR}/VERSION")" == v0.6.0 ]] || fail "更新失败后未恢复旧版本"
-grep -Fq '已自动回滚到更新前版本' "${TEST_ROOT}/update-rollback.log" || fail "更新失败未报告自动回滚"
-[[ ! -e "${DEPLOY_DIR}/scripts/doctor.sh" && ! -e "${DEPLOY_DIR}/get.sh" ]] \
-  || fail "旧版本自动回滚遗留了该版本不存在的新维护入口"
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.2.1 ]] || fail "pull失败改写了旧版本"
+grep -Fq '程序与服务未改变；维护默认值可能已补齐，未执行无谓版本回滚' "${TEST_ROOT}/update-rollback.log" \
+  || fail '业务代际修改前失败未走无回滚分支'
+[[ ! -e "${DEPLOY_DIR}/backups/update-recovery.json" \
+  && ! -L "${DEPLOY_DIR}/backups/update-recovery.json" ]] \
+  || fail '业务代际修改前失败遗留了恢复 journal'
+[[ -z "$(find "${DEPLOY_DIR}/tmp" -mindepth 1 -maxdepth 1 -type d -name 'update-preflight-*' -print -quit)" ]] \
+  || fail 'pull失败遗留了候选Compose临时环境目录'
+! grep -Eq '^(PROVIDER_ADAPTER_KEY|CRISPAI_LOG_RETENTION_HOURS)=' "${DEPLOY_DIR}/.env" \
+  || fail 'pull失败把临时迁移的内部Key或缺省值发布到活动环境'
 [[ "$(sed -n 's/^SNAPSHOT_MIN_FREE_MB=//p' "${DEPLOY_DIR}/.env")" == 1024 ]] || fail "旧部署未补齐快照预留空间"
 [[ "$(sed -n 's/^SNAPSHOT_RETENTION_COUNT=//p' "${DEPLOY_DIR}/.env")" == 10 ]] || fail "旧部署未补齐快照保留数量"
-pass "更新失败自动回滚"
+# 这里只重建后续场景的夹具基线；不把测试主动补值冒充为上一个失败更新的行为。
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; ensure_secret "$1/.env" PROVIDER_ADAPTER_KEY; env_set "$1/.env" CRISPAI_LOG_RETENTION_HOURS 168' \
+  -- "$DEPLOY_DIR"
+pass "更新在业务代际修改前失败不做无谓回滚"
+
+wait_for_update_gate() {
+  local ready=$1 child=$2 deadline=$((SECONDS + 30))
+  while [[ ! -f "$ready" ]]; do
+    kill -0 "$child" 2>/dev/null || fail '更新在到达硬中断门前提前退出'
+    (( SECONDS < deadline )) || fail '更新硬中断门未在预算内到达'
+    sleep 0.05
+  done
+  [[ ! -L "$ready" && "$(stat -c '%a:%h:%u' -- "$ready")" == "600:1:${EUID}" ]] \
+    || fail '更新硬中断门身份不安全'
+}
+
+copy_release_source_fixture() {
+  local destination=$1 release_path
+  mkdir -m 0700 -- "$destination"
+  while IFS= read -r release_path; do
+    [[ -n "$release_path" && "$release_path" != \#* ]] || continue
+    release_path=${release_path//@VERSION@/$PROJECT_VERSION}
+    mkdir -p -- "${destination}/$(dirname -- "$release_path")"
+    cp -a -- "${PROJECT_ROOT}/${release_path}" "${destination}/${release_path}"
+  done < "${PROJECT_ROOT}/scripts/release-manifest.txt"
+}
+
+assert_next_update_cleans_orphans() {
+  local label=$1 invalid_source="${TEST_ROOT}/invalid-update-source"
+  shift
+  mkdir -p -- "$invalid_source"
+  if "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$invalid_source" --no-pull \
+    > "${TEST_ROOT}/${label}-orphan-cleanup.log" 2>&1; then
+    fail "${label}孤儿收敛入口错误接受了不完整source"
+  fi
+  for orphan in "$@"; do
+    [[ ! -e "$orphan" && ! -L "$orphan" ]] || fail "${label}下一入口未清理严格归属孤儿：$orphan"
+  done
+  [[ ! -e "${DEPLOY_DIR}/backups/update-recovery.json" ]] \
+    || fail "${label}孤儿收敛错误创建了正式journal"
+}
+
+kill_update_group_at_gate() {
+  local ready=$1 log=$2 child group own_group status deadline
+  shift 2
+  setsid env "$@" "${PROJECT_ROOT}/update.sh" \
+    --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull > "$log" 2>&1 &
+  child=$!
+  wait_for_update_gate "$ready" "$child"
+  group=$(ps -o pgid= -p "$child" | tr -d ' ')
+  own_group=$(ps -o pgid= -p $$ | tr -d ' ')
+  [[ "$group" =~ ^[1-9][0-9]*$ && "$group" == "$child" && "$group" != "$own_group" ]] \
+    || fail '拒绝向未经核验的独立更新进程组发送SIGKILL'
+  kill -KILL -- "-$group"
+  if wait "$child"; then status=0; else status=$?; fi
+  (( status == 137 )) || fail "硬中断更新退出码异常：${status}"
+  deadline=$((SECONDS + 10))
+  while kill -0 -- "-$group" 2>/dev/null; do
+    (( SECONDS < deadline )) || fail '硬中断更新进程组未完全退出'
+    sleep 0.05
+  done
+}
+
+resume_pre_mutation_update() {
+  local label=$1 journal="${DEPLOY_DIR}/backups/update-recovery.json" token snapshot candidate
+  local marker_hash=$2 env_hash=$3 version_hash=$4 services_hash=$5
+  token=$(jq -r '.token' "$journal")
+  snapshot=$(jq -r '.snapshot_id' "$journal")
+  candidate=$(jq -r '.source_candidate_dir' "$journal")
+  : > "$MOCK_DOCKER_LOG"
+  CRISP_AI_FAILED_UPDATE_TOKEN="$token" "${candidate}/scripts/rollback.sh" \
+    --deploy-dir "$DEPLOY_DIR" --snapshot "$snapshot" --failed-update-recovery \
+    > "${TEST_ROOT}/update-${label}-resume.log" 2>&1
+  [[ ! -e "$journal" && ! -L "$journal" \
+    && ! -e "$candidate" && ! -L "$candidate" \
+    && "$(sha256sum "${DEPLOY_DIR}/.crisp-ai-installation" | awk '{print $1}')" == "$marker_hash" \
+    && "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$env_hash" \
+    && "$(sha256sum "${DEPLOY_DIR}/VERSION" | awk '{print $1}')" == "$version_hash" \
+    && "$(sort "$UPDATE_SERVICE_STATE" | sha256sum | awk '{print $1}')" == "$services_hash" ]] \
+    || fail "${label}硬中断未按原marker收口journal/冻结候选"
+  [[ -z "$(find "${DEPLOY_DIR}/tmp" -mindepth 1 -maxdepth 1 -name 'update-preflight-*' -print -quit)" ]] \
+    || fail "${label}硬中断后遗留token绑定preflight目录"
+  ! grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG" \
+    || fail "${label}pre-mutation收口错误停止业务服务"
+  ! grep -Eq '(^| )(pg_restore|pg_dump)( |$)' "$MOCK_DOCKER_LOG" \
+    || fail "${label}pre-mutation收口错误读取或恢复版本快照"
+}
+
+UPDATE_GATE_BIN="${TEST_ROOT}/update-phase-gate-bin"
+UPDATE_REAL_MKTEMP=$(command -v mktemp)
+UPDATE_REAL_SYNC=$(command -v sync)
+UPDATE_REAL_DF=$(command -v df)
+mkdir -m 0700 -- "$UPDATE_GATE_BIN"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'real=${MOCK_UPDATE_REAL_MKTEMP:?}' \
+  'journal=${MOCK_UPDATE_JOURNAL_PATH:?}' \
+  'marker=${MOCK_UPDATE_MARKER_PATH:?}' \
+  'ready=${MOCK_UPDATE_PHASE_READY:?}' \
+  'release=${MOCK_UPDATE_PHASE_RELEASE:?}' \
+  'template=${1:-}' \
+  'if [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == helper-write && "$template" == "${MOCK_UPDATE_HELPER_TEMPLATE:?}" ]]; then' \
+  '  created=$("$real" "$@")' \
+  '  [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '  : > "$ready"; chmod 0600 "$ready"' \
+  '  while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  '  printf '\''%s\n'\'' "$created"' \
+  '  exit 0' \
+  'fi' \
+  'if [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == before-marker && "$template" == "${marker}.tmp.XXXXXX" && -f "$journal" && ! -L "$journal" ]] &&' \
+  '  jq -e '\''.phase == "recovery_armed"'\'' "$journal" >/dev/null 2>&1; then' \
+  '  [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '  : > "$ready"; chmod 0600 "$ready"' \
+  '  while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  'fi' \
+  'exec "$real" "$@"' > "${UPDATE_GATE_BIN}/mktemp"
+chmod 0700 "${UPDATE_GATE_BIN}/mktemp"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'real=${MOCK_UPDATE_REAL_SYNC:?}' \
+  'journal=${MOCK_UPDATE_JOURNAL_PATH:?}' \
+  'marker=${MOCK_UPDATE_MARKER_PATH:?}' \
+  'ready=${MOCK_UPDATE_PHASE_READY:?}' \
+  'release=${MOCK_UPDATE_PHASE_RELEASE:?}' \
+  'if (( $# == 2 )) && [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == journal-eexist && "$1" == -f' \
+  '  && "$2" == "${journal}.tmp."* && ! -e "$journal" && ! -L "$journal" ]]; then' \
+  '  "$real" "$@"' \
+  '  printf '\''{"foreign":true}\n'\'' > "$journal"; chmod 0600 "$journal"' \
+  '  exit 0' \
+  'fi' \
+  'if (( $# == 2 )) && [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == journal-temp && "$1" == -f &&' \
+  '  "$2" == "${journal}.tmp."* && ! -e "$journal" && ! -L "$journal" ]]; then' \
+  '  "$real" "$@"' \
+  '  [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '  : > "$ready"; chmod 0600 "$ready"' \
+  '  while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  '  exit 0' \
+  'fi' \
+  'if (( $# == 2 )) && [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == after-marker && "$1" == -f && "$2" == "$marker" && -f "$journal" && ! -L "$journal" ]] &&' \
+  '  jq -e '\''.phase == "recovery_armed"'\'' "$journal" >/dev/null 2>&1; then' \
+  '  [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '  : > "$ready"; chmod 0600 "$ready"' \
+  '  while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  'fi' \
+  'exec "$real" "$@"' > "${UPDATE_GATE_BIN}/sync"
+chmod 0700 "${UPDATE_GATE_BIN}/sync"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'real=${MOCK_UPDATE_REAL_DF:?}' \
+  'ready=${MOCK_UPDATE_PHASE_READY:?}' \
+  'release=${MOCK_UPDATE_PHASE_RELEASE:?}' \
+  'backups=${MOCK_UPDATE_BACKUPS_DIR:?}' \
+  'journal=${MOCK_UPDATE_JOURNAL_PATH:?}' \
+  'if [[ "${MOCK_UPDATE_PHASE_GATE_KIND:-}" == candidate-published && ! -e "$journal" && ! -L "$journal" ]] &&' \
+  '  compgen -G "${backups}/update-candidate-*" >/dev/null; then' \
+  '  [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '  : > "$ready"; chmod 0600 "$ready"' \
+  '  while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  'fi' \
+  'exec "$real" "$@"' > "${UPDATE_GATE_BIN}/df"
+chmod 0700 "${UPDATE_GATE_BIN}/df"
+
+# journal 尚未正式发布前的三类真实 SIGKILL 必须由下一次受管 update 入口自行收敛。
+ORPHAN_COPY_SOURCE="${TEST_ROOT}/orphan-copy-source"
+copy_release_source_fixture "$ORPHAN_COPY_SOURCE"
+truncate -s 268435456 "${ORPHAN_COPY_SOURCE}/tests/fixtures/logs/systemctl"
+ORPHAN_COPY_LOG="${TEST_ROOT}/orphan-copy.log"
+setsid "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$ORPHAN_COPY_SOURCE" --no-pull \
+  > "$ORPHAN_COPY_LOG" 2>&1 &
+ORPHAN_COPY_CHILD=$!
+ORPHAN_DEADLINE=$((SECONDS + 30))
+ORPHAN_COPY_PATH=''
+while [[ -z "$ORPHAN_COPY_PATH" ]]; do
+  kill -0 "$ORPHAN_COPY_CHILD" 2>/dev/null || fail 'candidate复制中断门前update提前退出'
+  ORPHAN_COPY_PATH=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type d \
+    -name '.update-candidate-*.tmp' -print -quit)
+  (( SECONDS < ORPHAN_DEADLINE )) || fail '未观察到candidate复制临时目录'
+  [[ -n "$ORPHAN_COPY_PATH" ]] || sleep 0.01
+done
+ORPHAN_COPY_GROUP=$(ps -o pgid= -p "$ORPHAN_COPY_CHILD" | tr -d ' ')
+ORPHAN_OWN_GROUP=$(ps -o pgid= -p $$ | tr -d ' ')
+[[ "$ORPHAN_COPY_GROUP" == "$ORPHAN_COPY_CHILD" && "$ORPHAN_COPY_GROUP" != "$ORPHAN_OWN_GROUP" ]] \
+  || fail 'candidate复制中断进程组身份不安全'
+kill -KILL -- "-$ORPHAN_COPY_GROUP"
+if wait "$ORPHAN_COPY_CHILD"; then ORPHAN_COPY_STATUS=0; else ORPHAN_COPY_STATUS=$?; fi
+(( ORPHAN_COPY_STATUS == 137 )) || fail 'candidate复制中断未得到SIGKILL状态'
+ORPHAN_DEADLINE=$((SECONDS + 10))
+while kill -0 -- "-$ORPHAN_COPY_GROUP" 2>/dev/null; do
+  (( SECONDS < ORPHAN_DEADLINE )) || fail 'candidate复制中断进程组未完全退出'
+  sleep 0.05
+done
+assert_next_update_cleans_orphans candidate-copy "$ORPHAN_COPY_PATH"
+rm -rf -- "$ORPHAN_COPY_SOURCE"
+
+for orphan_stage in candidate-published journal-temp; do
+  ORPHAN_READY="${TEST_ROOT}/${orphan_stage}.ready"
+  ORPHAN_RELEASE="${TEST_ROOT}/${orphan_stage}.release"
+  ORPHAN_LOG="${TEST_ROOT}/${orphan_stage}.log"
+  rm -f -- "$ORPHAN_READY" "$ORPHAN_RELEASE"
+  case "$orphan_stage" in
+    candidate-published)
+      kill_update_group_at_gate "$ORPHAN_READY" "$ORPHAN_LOG" \
+        PATH="${UPDATE_GATE_BIN}:${PATH}" MOCK_UPDATE_REAL_DF="$UPDATE_REAL_DF" \
+        MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+        MOCK_UPDATE_PHASE_READY="$ORPHAN_READY" MOCK_UPDATE_PHASE_RELEASE="$ORPHAN_RELEASE" \
+        MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+        MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+        MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+        MOCK_UPDATE_PHASE_GATE_KIND=candidate-published
+      ORPHAN_PATH=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type d \
+        -name 'update-candidate-*' -print -quit)
+      ;;
+    journal-temp)
+      kill_update_group_at_gate "$ORPHAN_READY" "$ORPHAN_LOG" \
+        PATH="${UPDATE_GATE_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+        MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" \
+        MOCK_UPDATE_REAL_DF="$UPDATE_REAL_DF" MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+        MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+        MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+        MOCK_UPDATE_PHASE_READY="$ORPHAN_READY" MOCK_UPDATE_PHASE_RELEASE="$ORPHAN_RELEASE" \
+        MOCK_UPDATE_PHASE_GATE_KIND=journal-temp
+      ORPHAN_PATH=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type f \
+        -name 'update-recovery.json.tmp.*' -print -quit)
+      ;;
+  esac
+  [[ -n "$ORPHAN_PATH" && ! -e "${DEPLOY_DIR}/backups/update-recovery.json" ]] \
+    || fail "${orphan_stage}硬中断落点不精确"
+  ORPHAN_CANDIDATE=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type d \
+    -name 'update-candidate-*' -print -quit)
+  [[ -n "$ORPHAN_CANDIDATE" ]] || fail "${orphan_stage}未保留对应冻结candidate"
+  assert_next_update_cleans_orphans "$orphan_stage" "$ORPHAN_PATH" "$ORPHAN_CANDIDATE"
+done
+pass 'candidate复制/发布及journal-temp三类无journal SIGKILL孤儿由下一入口持久收敛'
+
+EMPTY_JOURNAL_TEMP="${DEPLOY_DIR}/backups/update-recovery.json.tmp.$(printf 'a%.0s' {1..64}).ABC123"
+TRUNCATED_JOURNAL_TEMP="${DEPLOY_DIR}/backups/update-recovery.json.tmp.$(printf 'b%.0s' {1..64}).DEF456"
+: > "$EMPTY_JOURNAL_TEMP"
+printf '{"schema_version":' > "$TRUNCATED_JOURNAL_TEMP"
+chmod 0600 "$EMPTY_JOURNAL_TEMP" "$TRUNCATED_JOURNAL_TEMP"
+assert_next_update_cleans_orphans partial-journal-temp "$EMPTY_JOURNAL_TEMP" "$TRUNCATED_JOURNAL_TEMP"
+
+# 候选清理中断后可只剩混合0500/0700目录和部分400/600文件；下一入口
+# 按partial合同继续，不再要求完整manifest。
+INTERRUPTED_CLEANUP_TOKEN=$(printf 'c%.0s' {1..64})
+INTERRUPTED_CLEANUP="${DEPLOY_DIR}/backups/.update-candidate-${INTERRUPTED_CLEANUP_TOKEN}.tmp"
+mkdir -m 0700 -- "$INTERRUPTED_CLEANUP" "$INTERRUPTED_CLEANUP/remaining"
+printf 'partial-cleanup\n' > "$INTERRUPTED_CLEANUP/remaining/member"
+chmod 0500 "$INTERRUPTED_CLEANUP/remaining"
+chmod 0400 "$INTERRUPTED_CLEANUP/remaining/member"
+assert_next_update_cleans_orphans interrupted-candidate-cleanup "$INTERRUPTED_CLEANUP"
+
+UNSAFE_CLEANUP_TOKEN=$(printf 'd%.0s' {1..64})
+UNSAFE_CLEANUP="${DEPLOY_DIR}/backups/.update-candidate-${UNSAFE_CLEANUP_TOKEN}.tmp"
+mkdir -m 0700 -- "$UNSAFE_CLEANUP"
+ln -s -- /etc/passwd "$UNSAFE_CLEANUP/foreign-link"
+if "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "${TEST_ROOT}/invalid-update-source" --no-pull \
+  > "${TEST_ROOT}/unsafe-candidate-cleanup.log" 2>&1; then
+  fail '含链接的candidate partial被错误清理并继续更新'
+fi
+[[ -L "$UNSAFE_CLEANUP/foreign-link" ]] || fail '不安全candidate partial被猜测删除'
+rm -rf -- "$UNSAFE_CLEANUP"
+sync -f "${DEPLOY_DIR}/backups"
+
+JOURNAL_EEXIST_READY="${TEST_ROOT}/journal-eexist.ready-unused"
+JOURNAL_EEXIST_RELEASE="${TEST_ROOT}/journal-eexist.release-unused"
+if env PATH="${UPDATE_GATE_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+  MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" MOCK_UPDATE_REAL_DF="$UPDATE_REAL_DF" \
+  MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+  MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+  MOCK_UPDATE_PHASE_READY="$JOURNAL_EEXIST_READY" MOCK_UPDATE_PHASE_RELEASE="$JOURNAL_EEXIST_RELEASE" \
+  MOCK_UPDATE_PHASE_GATE_KIND=journal-eexist \
+  "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/journal-eexist.log" 2>&1; then
+  fail 'renameat2 EEXIST竞态被错误报告为更新成功'
+fi
+[[ "$(<"${DEPLOY_DIR}/backups/update-recovery.json")" == '{"foreign":true}' ]] \
+  || fail 'renameat2 EEXIST覆盖了并发出现的journal目标'
+[[ -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
+  \( -name 'update-candidate-*' -o -name '.update-candidate-*.tmp' -o -name 'update-recovery.json.tmp.*' \) \
+  -print -quit)" ]] || fail 'renameat2 EEXIST失败后遗留了本轮candidate/temp'
+rm -f -- "${DEPLOY_DIR}/backups/update-recovery.json"
+sync -f "${DEPLOY_DIR}/backups"
+pass '空/截断journal temp可受限收敛且renameat2 EEXIST不覆盖并发目标'
+
+for early_phase in prepared recovery-armed-old-marker recovery-armed-installing-marker; do
+  EARLY_READY="${TEST_ROOT}/update-${early_phase}.ready"
+  EARLY_RELEASE="${TEST_ROOT}/update-${early_phase}.release"
+  EARLY_LOG="${TEST_ROOT}/update-${early_phase}.log"
+  rm -f -- "$EARLY_READY" "$EARLY_RELEASE"
+  EARLY_MARKER_HASH=$(sha256sum "${DEPLOY_DIR}/.crisp-ai-installation" | awk '{print $1}')
+  EARLY_ENV_HASH=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+  EARLY_VERSION_HASH=$(sha256sum "${DEPLOY_DIR}/VERSION" | awk '{print $1}')
+  EARLY_SERVICES_HASH=$(sort "$UPDATE_SERVICE_STATE" | sha256sum | awk '{print $1}')
+  : > "$MOCK_DOCKER_LOG"
+  case "$early_phase" in
+    prepared)
+      kill_update_group_at_gate "$EARLY_READY" "$EARLY_LOG" \
+        MOCK_UPDATE_PULL_GATE_READY="$EARLY_READY" MOCK_UPDATE_PULL_GATE_RELEASE="$EARLY_RELEASE"
+      [[ "$(jq -r '.phase' "${DEPLOY_DIR}/backups/update-recovery.json")" == prepared ]] \
+        || fail 'prepared硬中断没有保留prepared journal'
+      [[ "$(stat -c '%a:%h:%u' "${DEPLOY_DIR}/backups/update-recovery.json")" == "600:1:${EUID}" ]] \
+        || fail 'prepared硬中断journal不是0600普通单链接文件'
+      [[ -z "$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -name 'update-recovery.json.tmp.*' -print -quit)" ]] \
+        || fail '原子no-clobber发布后仍有journal临时链接'
+      ;;
+    recovery-armed-old-marker)
+      kill_update_group_at_gate "$EARLY_READY" "$EARLY_LOG" \
+        PATH="${UPDATE_GATE_BIN}:${PATH}" MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" \
+        MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+        MOCK_UPDATE_REAL_DF="$UPDATE_REAL_DF" MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+        MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+        MOCK_UPDATE_PHASE_READY="$EARLY_READY" MOCK_UPDATE_PHASE_RELEASE="$EARLY_RELEASE" \
+        MOCK_UPDATE_PHASE_GATE_KIND=before-marker
+      [[ "$(jq -r '.phase' "${DEPLOY_DIR}/backups/update-recovery.json")" == recovery_armed \
+        && "$(sha256sum "${DEPLOY_DIR}/.crisp-ai-installation" | awk '{print $1}')" == "$EARLY_MARKER_HASH" ]] \
+        || fail 'recovery_armed旧marker硬中断落点不精确'
+      ;;
+    recovery-armed-installing-marker)
+      kill_update_group_at_gate "$EARLY_READY" "$EARLY_LOG" \
+        PATH="${UPDATE_GATE_BIN}:${PATH}" MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" \
+        MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+        MOCK_UPDATE_REAL_DF="$UPDATE_REAL_DF" MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+        MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+        MOCK_UPDATE_PHASE_READY="$EARLY_READY" MOCK_UPDATE_PHASE_RELEASE="$EARLY_RELEASE" \
+        MOCK_UPDATE_PHASE_GATE_KIND=after-marker
+      EARLY_CANDIDATE=$(jq -r '.source_candidate_dir' "${DEPLOY_DIR}/backups/update-recovery.json")
+      [[ "$(jq -r '.phase' "${DEPLOY_DIR}/backups/update-recovery.json")" == recovery_armed \
+        && "$(sed -n 's/^state=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == installing \
+        && "$(sed -n 's/^installed_version=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == v1.2.1 \
+        && "$(sed -n 's/^source=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == "$EARLY_CANDIDATE" ]] \
+        || fail 'recovery_armed installing marker硬中断落点不精确'
+      ;;
+  esac
+  resume_pre_mutation_update "$early_phase" "$EARLY_MARKER_HASH" "$EARLY_ENV_HASH" \
+    "$EARLY_VERSION_HASH" "$EARLY_SERVICES_HASH"
+done
+pass 'prepared/recovery_armed三种SIGKILL落点可按token无业务回滚收口'
+
+UPDATE_TMP_SYNC_BIN="${TEST_ROOT}/update-tmp-sync-bin"
+mkdir -m 0700 -- "$UPDATE_TMP_SYNC_BIN"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'real=${MOCK_UPDATE_REAL_SYNC:?}' \
+  'tmp_parent=${MOCK_UPDATE_TMP_PARENT:?}' \
+  'journal=${MOCK_UPDATE_JOURNAL_PATH:?}' \
+  'pull_done=${MOCK_UPDATE_PULL_COMPLETED_MARKER:?}' \
+  'mode=${MOCK_UPDATE_TMP_SYNC_MODE:?}' \
+  'preflight=""' \
+  'if [[ -f "$journal" && ! -L "$journal" ]]; then' \
+  '  token=$(jq -r '\''.token // ""'\'' "$journal" 2>/dev/null || true)' \
+  '  [[ "$token" =~ ^[a-f0-9]{64}$ ]] && preflight="${tmp_parent}/update-preflight-${token}"' \
+  'fi' \
+  'if (( $# == 2 )) && [[ "$1" == -f && "$2" == "$tmp_parent" && -f "$pull_done"' \
+  '  && -n "$preflight" && -f "$journal" && ! -L "$journal" && ! -e "$preflight" && ! -L "$preflight" ]] &&' \
+  '  jq -e '\''.phase == "prepared"'\'' "$journal" >/dev/null 2>&1; then' \
+  '  case "$mode" in' \
+  '    fail) exit 1 ;;' \
+  '    recreate) "$real" "$@"; mkdir -m 0700 -- "$preflight"; exit 0 ;;' \
+  '    *) exit 2 ;;' \
+  '  esac' \
+  'fi' \
+  'exec "$real" "$@"' > "${UPDATE_TMP_SYNC_BIN}/sync"
+chmod 0700 "${UPDATE_TMP_SYNC_BIN}/sync"
+
+for tmp_sync_mode in fail recreate; do
+  TMP_SYNC_PULL_DONE="${TEST_ROOT}/tmp-sync-${tmp_sync_mode}.pull-done"
+  rm -f -- "$TMP_SYNC_PULL_DONE"
+  TMP_SYNC_MARKER_HASH=$(sha256sum "${DEPLOY_DIR}/.crisp-ai-installation" | awk '{print $1}')
+  TMP_SYNC_ENV_HASH=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+  TMP_SYNC_VERSION_HASH=$(sha256sum "${DEPLOY_DIR}/VERSION" | awk '{print $1}')
+  TMP_SYNC_SERVICES_HASH=$(sort "$UPDATE_SERVICE_STATE" | sha256sum | awk '{print $1}')
+  if env PATH="${UPDATE_TMP_SYNC_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+    MOCK_UPDATE_TMP_PARENT="${DEPLOY_DIR}/tmp" \
+    MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+    MOCK_UPDATE_PULL_COMPLETED_MARKER="$TMP_SYNC_PULL_DONE" \
+    MOCK_UPDATE_TMP_SYNC_MODE="$tmp_sync_mode" \
+    "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+    > "${TEST_ROOT}/tmp-sync-${tmp_sync_mode}.log" 2>&1; then
+    fail "tmp父目录sync-${tmp_sync_mode}故障被错误报告为更新成功"
+  fi
+  TMP_SYNC_JOURNAL="${DEPLOY_DIR}/backups/update-recovery.json"
+  [[ -f "$TMP_SYNC_JOURNAL" && "$(jq -r '.phase' "$TMP_SYNC_JOURNAL")" == prepared ]] \
+    || fail "tmp父目录sync-${tmp_sync_mode}故障丢失prepared journal"
+  TMP_SYNC_TOKEN=$(jq -r '.token' "$TMP_SYNC_JOURNAL")
+  TMP_SYNC_PREFLIGHT="${DEPLOY_DIR}/tmp/update-preflight-${TMP_SYNC_TOKEN}"
+  # wrapper 的路径参数在启动前未知；从 journal 得到 token 后，确认真实清理未被假报。
+  if [[ "$tmp_sync_mode" == recreate ]]; then
+    [[ -d "$TMP_SYNC_PREFLIGHT" && ! -L "$TMP_SYNC_PREFLIGHT" ]] \
+      || fail 'tmp父目录sync后路径复现未保留preflight责任'
+  else
+    [[ ! -e "$TMP_SYNC_PREFLIGHT" && ! -L "$TMP_SYNC_PREFLIGHT" ]] \
+      || fail 'tmp父目录持续sync失败时preflight路径形状异常'
+  fi
+  TMP_SYNC_CANDIDATE=$(jq -r '.source_candidate_dir' "$TMP_SYNC_JOURNAL")
+  [[ -d "$TMP_SYNC_CANDIDATE" ]] || fail "tmp父目录sync-${tmp_sync_mode}故障删除了恢复candidate"
+  resume_pre_mutation_update "tmp-sync-${tmp_sync_mode}" "$TMP_SYNC_MARKER_HASH" "$TMP_SYNC_ENV_HASH" \
+    "$TMP_SYNC_VERSION_HASH" "$TMP_SYNC_SERVICES_HASH"
+done
+pass 'preflight删除必须经tmp父目录fsync和absence回读，失败/复现均保留并可重入'
+
+UPDATE_BACKUPS_SYNC_BIN="${TEST_ROOT}/update-backups-sync-bin"
+mkdir -m 0700 -- "$UPDATE_BACKUPS_SYNC_BIN"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'real=${MOCK_UPDATE_REAL_SYNC:?}' \
+  'mode=${MOCK_UPDATE_BACKUPS_SYNC_MODE:?}' \
+  'backups=${MOCK_UPDATE_BACKUPS_DIR:?}' \
+  'if [[ "$mode" == rename-fail && $# == 2 && "$1" == -f && "$2" == "$backups" ]] &&' \
+  '  compgen -G "${backups}/update-recovery.finalizing-*.json" >/dev/null; then' \
+  '  exit 1' \
+  'fi' \
+  'if [[ "$mode" == unlink-fail ]]; then' \
+  '  tombstone=${MOCK_UPDATE_TOMBSTONE_PATH:?}' \
+  '  state=${MOCK_UPDATE_BACKUPS_SYNC_STATE:?}' \
+  '  if [[ "$mode" == unlink-fail && $# == 2 && "$1" == -f && "$2" == "$backups"' \
+  '    && ! -e "$tombstone" && ! -e "$state" ]] &&' \
+  '    [[ -f "${tombstone}.helper" && ! -L "${tombstone}.helper" ]]; then' \
+  '    : > "$state"; chmod 0600 "$state"; exit 1' \
+  '  fi' \
+  'fi' \
+  'if [[ "$mode" == candidate-cleanup-gate && $# == 2 && "$1" == -f && "$2" == "$backups" ]]; then' \
+  '  candidate=${MOCK_UPDATE_CANDIDATE_PATH:?}' \
+  '  partial="${backups}/.${candidate##*/}.tmp"' \
+  '  ready=${MOCK_UPDATE_PHASE_READY:?}' \
+  '  release=${MOCK_UPDATE_PHASE_RELEASE:?}' \
+  '  if [[ -d "$partial" && ! -L "$partial" && ! -e "$candidate" && ! -L "$candidate" ]]; then' \
+  '    "$real" "$@"' \
+  '    [[ ! -e "$ready" && ! -L "$ready" && ! -L "$release" ]] || exit 2' \
+  '    : > "$ready"; chmod 0600 "$ready"' \
+  '    while [[ ! -f "$release" ]]; do sleep 0.05; done' \
+  '    exit 0' \
+  '  fi' \
+  'fi' \
+  'exec "$real" "$@"' > "${UPDATE_BACKUPS_SYNC_BIN}/sync"
+chmod 0700 "${UPDATE_BACKUPS_SYNC_BIN}/sync"
+
+TOMBSTONE_CONFIG_FAIL="${TEST_ROOT}/tombstone-config-fail"
+: > "$TOMBSTONE_CONFIG_FAIL"
+chmod 0600 "$TOMBSTONE_CONFIG_FAIL"
+ROLLBACK_COMPLETE_BEFORE_TOMBSTONE=$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")
+if env PATH="${UPDATE_BACKUPS_SYNC_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+  MOCK_UPDATE_BACKUPS_SYNC_MODE=rename-fail MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_CONFIGURATION_READBACK_FAIL_ONCE_FILE="$TOMBSTONE_CONFIG_FAIL" \
+  "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/tombstone-parent-sync.log" 2>&1; then
+  fail 'journal改名后backups fsync失败被错误报告为恢复成功'
+fi
+[[ ! -e "$TOMBSTONE_CONFIG_FAIL" && ! -e "${DEPLOY_DIR}/backups/update-recovery.json" ]] \
+  || fail 'tombstone故障场景未命中配置失败或仍保留双journal'
+TOMBSTONE_PATH=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type f \
+  -name 'update-recovery.finalizing-*.json' -print -quit)
+[[ -n "$TOMBSTONE_PATH" && "$(jq -r '.phase' "$TOMBSTONE_PATH")" == restored ]] \
+  || fail 'backups父目录fsync失败未保留严格restored tombstone'
+TOMBSTONE_TOKEN=$(jq -r '.token' "$TOMBSTONE_PATH")
+TOMBSTONE_SNAPSHOT=$(jq -r '.snapshot_id' "$TOMBSTONE_PATH")
+TOMBSTONE_CANDIDATE=$(jq -r '.source_candidate_dir' "$TOMBSTONE_PATH")
+[[ -x "${TOMBSTONE_CANDIDATE}/scripts/rollback.sh" ]] \
+  || fail 'tombstone保留时丢失可执行恢复candidate'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$ROLLBACK_COMPLETE_BEFORE_TOMBSTONE" ]] \
+  || fail 'tombstone尚未持久收口时提前记录rollback complete'
+
+TOMBSTONE_READY="${TEST_ROOT}/tombstone-restore-temp.ready"
+TOMBSTONE_RELEASE="${TEST_ROOT}/tombstone-restore-temp.release"
+TOMBSTONE_STATE="${TEST_ROOT}/tombstone-restore-temp.state"
+setsid env PATH="${UPDATE_BACKUPS_SYNC_BIN}:${UPDATE_GATE_BIN}:${PATH}" \
+  MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" MOCK_UPDATE_REAL_MKTEMP="$UPDATE_REAL_MKTEMP" \
+  MOCK_UPDATE_BACKUPS_SYNC_MODE=pass MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_UPDATE_TOMBSTONE_PATH="$TOMBSTONE_PATH" MOCK_UPDATE_BACKUPS_SYNC_STATE="$TOMBSTONE_STATE" \
+  MOCK_UPDATE_JOURNAL_PATH="${DEPLOY_DIR}/backups/update-recovery.json" \
+  MOCK_UPDATE_MARKER_PATH="${DEPLOY_DIR}/.crisp-ai-installation" \
+  MOCK_UPDATE_HELPER_TEMPLATE="${TOMBSTONE_PATH}.helper.tmp.XXXXXX" \
+  MOCK_UPDATE_PHASE_READY="$TOMBSTONE_READY" MOCK_UPDATE_PHASE_RELEASE="$TOMBSTONE_RELEASE" \
+  MOCK_UPDATE_PHASE_GATE_KIND=helper-write \
+  CRISP_AI_FAILED_UPDATE_TOKEN="$TOMBSTONE_TOKEN" "${TOMBSTONE_CANDIDATE}/scripts/rollback.sh" \
+  --deploy-dir "$DEPLOY_DIR" --snapshot "$TOMBSTONE_SNAPSHOT" --failed-update-recovery \
+  > "${TEST_ROOT}/tombstone-restore-temp.log" 2>&1 &
+TOMBSTONE_CHILD=$!
+wait_for_update_gate "$TOMBSTONE_READY" "$TOMBSTONE_CHILD"
+TOMBSTONE_GROUP=$(ps -o pgid= -p "$TOMBSTONE_CHILD" | tr -d ' ')
+TOMBSTONE_OWN_GROUP=$(ps -o pgid= -p $$ | tr -d ' ')
+[[ "$TOMBSTONE_GROUP" == "$TOMBSTONE_CHILD" && "$TOMBSTONE_GROUP" != "$TOMBSTONE_OWN_GROUP" ]] \
+  || fail 'tombstone restore-temp中断进程组身份不安全'
+kill -KILL -- "-$TOMBSTONE_GROUP"
+if wait "$TOMBSTONE_CHILD"; then TOMBSTONE_STATUS=0; else TOMBSTONE_STATUS=$?; fi
+(( TOMBSTONE_STATUS == 137 )) || fail 'tombstone restore-temp中断未得到SIGKILL状态'
+TOMBSTONE_DEADLINE=$((SECONDS + 10))
+while kill -0 -- "-$TOMBSTONE_GROUP" 2>/dev/null; do
+  (( SECONDS < TOMBSTONE_DEADLINE )) || fail 'tombstone restore-temp中断进程组未完全退出'
+  sleep 0.05
+done
+TOMBSTONE_HELPER="${TOMBSTONE_PATH}.helper"
+TOMBSTONE_HELPER_TEMP=$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 -type f \
+  -name "$(basename -- "$TOMBSTONE_HELPER").tmp.*" -print -quit)
+[[ -n "$TOMBSTONE_HELPER_TEMP" && -f "$TOMBSTONE_PATH" \
+  && "$(stat -c '%s' -- "$TOMBSTONE_HELPER_TEMP")" == 0 \
+  && ! -e "$TOMBSTONE_HELPER" && -d "$TOMBSTONE_CANDIDATE" ]] \
+  || fail 'helper写入/fsync期间SIGKILL未保留权威tombstone与partial helper'
+TOMBSTONE_UNLINK_STATE="${TEST_ROOT}/tombstone-unlink-sync-failed"
+if env PATH="${UPDATE_BACKUPS_SYNC_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+  MOCK_UPDATE_BACKUPS_SYNC_MODE=unlink-fail MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_UPDATE_TOMBSTONE_PATH="$TOMBSTONE_PATH" MOCK_UPDATE_BACKUPS_SYNC_STATE="$TOMBSTONE_UNLINK_STATE" \
+  MOCK_UPDATE_PHASE_READY="${TEST_ROOT}/unused-tombstone-ready" \
+  MOCK_UPDATE_PHASE_RELEASE="${TEST_ROOT}/unused-tombstone-release" \
+  CRISP_AI_FAILED_UPDATE_TOKEN="$TOMBSTONE_TOKEN" "${TOMBSTONE_CANDIDATE}/scripts/rollback.sh" \
+  --deploy-dir "$DEPLOY_DIR" --snapshot "$TOMBSTONE_SNAPSHOT" --failed-update-recovery \
+  > "${TEST_ROOT}/tombstone-unlink-sync-failed.log" 2>&1; then
+  fail 'tombstone unlink后父目录fsync失败被错误报告成功'
+fi
+[[ -f "$TOMBSTONE_UNLINK_STATE" && ! -e "$TOMBSTONE_PATH" \
+  && ! -e "$TOMBSTONE_HELPER_TEMP" && -f "$TOMBSTONE_HELPER" \
+  && -d "$TOMBSTONE_CANDIDATE" ]] \
+  || fail 'tombstone unlink后fsync失败未保留helper-only可重入责任'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$ROLLBACK_COMPLETE_BEFORE_TOMBSTONE" ]] \
+  || fail 'tombstone/helper未收口时提前记录rollback complete'
+CANDIDATE_CLEANUP_READY="${TEST_ROOT}/candidate-cleanup.ready"
+CANDIDATE_CLEANUP_RELEASE="${TEST_ROOT}/candidate-cleanup.release"
+setsid env PATH="${UPDATE_BACKUPS_SYNC_BIN}:${PATH}" MOCK_UPDATE_REAL_SYNC="$UPDATE_REAL_SYNC" \
+  MOCK_UPDATE_BACKUPS_SYNC_MODE=candidate-cleanup-gate MOCK_UPDATE_BACKUPS_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_UPDATE_TOMBSTONE_PATH="$TOMBSTONE_PATH" MOCK_UPDATE_BACKUPS_SYNC_STATE="$TOMBSTONE_UNLINK_STATE" \
+  MOCK_UPDATE_CANDIDATE_PATH="$TOMBSTONE_CANDIDATE" \
+  MOCK_UPDATE_PHASE_READY="$CANDIDATE_CLEANUP_READY" MOCK_UPDATE_PHASE_RELEASE="$CANDIDATE_CLEANUP_RELEASE" \
+  CRISP_AI_FAILED_UPDATE_TOKEN="$TOMBSTONE_TOKEN" "${TOMBSTONE_CANDIDATE}/scripts/rollback.sh" \
+  --deploy-dir "$DEPLOY_DIR" --snapshot "$TOMBSTONE_SNAPSHOT" --failed-update-recovery \
+  > "${TEST_ROOT}/candidate-cleanup-interrupted.log" 2>&1 &
+CANDIDATE_CLEANUP_CHILD=$!
+wait_for_update_gate "$CANDIDATE_CLEANUP_READY" "$CANDIDATE_CLEANUP_CHILD"
+CANDIDATE_CLEANUP_GROUP=$(ps -o pgid= -p "$CANDIDATE_CLEANUP_CHILD" | tr -d ' ')
+[[ "$CANDIDATE_CLEANUP_GROUP" == "$CANDIDATE_CLEANUP_CHILD" \
+  && "$CANDIDATE_CLEANUP_GROUP" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]] \
+  || fail 'candidate cleanup中断进程组身份不安全'
+kill -KILL -- "-$CANDIDATE_CLEANUP_GROUP"
+if wait "$CANDIDATE_CLEANUP_CHILD"; then CANDIDATE_CLEANUP_STATUS=0; else CANDIDATE_CLEANUP_STATUS=$?; fi
+(( CANDIDATE_CLEANUP_STATUS == 137 )) || fail 'candidate cleanup中断未得到SIGKILL状态'
+CANDIDATE_CLEANUP_DEADLINE=$((SECONDS + 10))
+while kill -0 -- "-$CANDIDATE_CLEANUP_GROUP" 2>/dev/null; do
+  (( SECONDS < CANDIDATE_CLEANUP_DEADLINE )) || fail 'candidate cleanup中断进程组未收口'
+  sleep 0.05
+done
+TOMBSTONE_PARTIAL_CANDIDATE="${DEPLOY_DIR}/backups/.${TOMBSTONE_CANDIDATE##*/}.tmp"
+[[ ! -e "$TOMBSTONE_HELPER" && ! -e "$TOMBSTONE_PATH" \
+  && ! -e "$TOMBSTONE_CANDIDATE" && -d "$TOMBSTONE_PARTIAL_CANDIDATE" \
+  && -x "${TOMBSTONE_PARTIAL_CANDIDATE}/scripts/rollback.sh" ]] \
+  || fail 'candidate cleanup硬中断未在恢复责任收口后只留无秘密partial candidate'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$((ROLLBACK_COMPLETE_BEFORE_TOMBSTONE + 1))" ]] \
+  || fail 'candidate孤儿清理中断前rollback complete未在journal/helper收口后唯一记录'
+assert_next_update_cleans_orphans candidate-cleanup-resume "$TOMBSTONE_PARTIAL_CANDIDATE"
+[[ ! -e "$TOMBSTONE_HELPER_TEMP" && ! -e "$TOMBSTONE_HELPER" \
+  && ! -e "$TOMBSTONE_PATH" && ! -e "$TOMBSTONE_CANDIDATE" \
+  && ! -e "$TOMBSTONE_PARTIAL_CANDIDATE" ]] \
+  || fail '下一受管update未收口candidate cleanup中断孤儿'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$((ROLLBACK_COMPLETE_BEFORE_TOMBSTONE + 1))" ]] \
+  || fail '孤儿收敛未保持rollback complete恰好一次'
+pass 'journal/helper先收口业务责任，candidate清理中断只留可收敛无秘密孤儿'
+
+# 冻结候选形成后，原工作区即使被删除并在同一路径换成另一 inode，也不得再被执行、
+# 复制或作为恢复授权；故障恢复必须只依赖 journal 绑定的只读候选。
+SOURCE_DRIFT_DIR="${TEST_ROOT}/update-source-drift"
+SOURCE_DRIFT_ORIGINAL="${TEST_ROOT}/update-source-drift-original"
+SOURCE_DRIFT_SENTINEL="${TEST_ROOT}/mutable-source-was-executed"
+mkdir -m 0700 -- "$SOURCE_DRIFT_DIR"
+while IFS= read -r release_path; do
+  [[ -n "$release_path" && "$release_path" != \#* ]] || continue
+  release_path=${release_path//@VERSION@/$PROJECT_VERSION}
+  mkdir -p -- "${SOURCE_DRIFT_DIR}/$(dirname -- "$release_path")"
+  cp -a -- "${PROJECT_ROOT}/${release_path}" "${SOURCE_DRIFT_DIR}/${release_path}"
+done < "${PROJECT_ROOT}/scripts/release-manifest.txt"
+SOURCE_DRIFT_READY="${TEST_ROOT}/update-source-drift.ready"
+SOURCE_DRIFT_RELEASE="${TEST_ROOT}/update-source-drift.release"
+SOURCE_DRIFT_CONFIG_FAIL="${TEST_ROOT}/update-source-drift-config-fail"
+: > "$SOURCE_DRIFT_CONFIG_FAIL"
+chmod 0600 "$SOURCE_DRIFT_CONFIG_FAIL"
+setsid env MOCK_UPDATE_PULL_GATE_READY="$SOURCE_DRIFT_READY" \
+  MOCK_UPDATE_PULL_GATE_RELEASE="$SOURCE_DRIFT_RELEASE" \
+  MOCK_CONFIGURATION_READBACK_FAIL_ONCE_FILE="$SOURCE_DRIFT_CONFIG_FAIL" \
+  "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$SOURCE_DRIFT_DIR" --no-pull \
+  > "${TEST_ROOT}/update-source-drift.log" 2>&1 &
+SOURCE_DRIFT_CHILD=$!
+wait_for_update_gate "$SOURCE_DRIFT_READY" "$SOURCE_DRIFT_CHILD"
+SOURCE_DRIFT_CANDIDATE=$(jq -r '.source_candidate_dir' "${DEPLOY_DIR}/backups/update-recovery.json")
+[[ -d "$SOURCE_DRIFT_CANDIDATE" && ! -L "$SOURCE_DRIFT_CANDIDATE" \
+  && "$(stat -c '%a:%u' "$SOURCE_DRIFT_CANDIDATE")" == "500:${EUID}" ]] \
+  || fail 'source漂移前没有形成token绑定只读候选'
+mv -- "$SOURCE_DRIFT_DIR" "$SOURCE_DRIFT_ORIGINAL"
+mkdir -m 0700 -- "$SOURCE_DRIFT_DIR"
+mkdir -m 0700 -- "${SOURCE_DRIFT_DIR}/scripts"
+printf '%s\n' '#!/usr/bin/env bash' ": > '$SOURCE_DRIFT_SENTINEL'" 'exit 99' \
+  > "${SOURCE_DRIFT_DIR}/scripts/knowledge-profile.sh"
+chmod 0700 "${SOURCE_DRIFT_DIR}/scripts/knowledge-profile.sh"
+: > "$SOURCE_DRIFT_RELEASE"
+chmod 0600 "$SOURCE_DRIFT_RELEASE"
+if wait "$SOURCE_DRIFT_CHILD"; then
+  fail 'source冻结后换inode且配置故障被错误报告为更新成功'
+fi
+[[ ! -e "$SOURCE_DRIFT_SENTINEL" && ! -e "$SOURCE_DRIFT_CONFIG_FAIL" \
+  && "$(<"${DEPLOY_DIR}/VERSION")" == v1.2.1 \
+  && ! -e "${DEPLOY_DIR}/backups/update-recovery.json" \
+  && ! -e "$SOURCE_DRIFT_CANDIDATE" ]] \
+  || fail '冻结后source删除/换inode影响了候选执行或同次快照恢复'
+rm -rf -- "$SOURCE_DRIFT_DIR" "$SOURCE_DRIFT_ORIGINAL"
+pass '冻结source后原路径删除换inode不影响候选执行和失败恢复'
+
+# copy/config 后失败时自动进入同次快照恢复；先让恢复在 pg_restore 中断，
+# 验证 journal 保留、伪造调用全部在再次停服前拒绝，再用原 token 幂等续做。
+UPDATE_CONFIG_FAIL_ONCE="${TEST_ROOT}/update-configuration-fail-once"
+: > "$UPDATE_CONFIG_FAIL_ONCE"
+chmod 0600 "$UPDATE_CONFIG_FAIL_ONCE"
+if env MOCK_CONFIGURATION_READBACK_FAIL_ONCE_FILE="$UPDATE_CONFIG_FAIL_ONCE" \
+  MOCK_DOCKER_FAIL_PG_RESTORE=1 \
+  "${PROJECT_ROOT}/update.sh" --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/update-recovery-interrupted.log" 2>&1; then
+  fail '配置后失败且恢复中断时更新被错误报告为成功'
+fi
+[[ ! -e "$UPDATE_CONFIG_FAIL_ONCE" ]] \
+  || fail '恢复中断场景未在copy发布新VERSION后的配置回读点命中'
+UPDATE_RECOVERY_JOURNAL="${DEPLOY_DIR}/backups/update-recovery.json"
+[[ -f "$UPDATE_RECOVERY_JOURNAL" && ! -L "$UPDATE_RECOVERY_JOURNAL" \
+  && "$(stat -c '%a:%h:%u' "$UPDATE_RECOVERY_JOURNAL")" == "600:1:${EUID}" ]] \
+  || fail '恢复中断未保留0600普通单链接journal'
+jq -e '.schema_version == 1 and .kind == "failed-update-recovery" and
+  .old_version == "v1.2.1" and .new_version == "v1.3.0" and .phase == "recovering" and
+  (.token | test("^[a-f0-9]{64}$")) and (.snapshot_manifest_sha256 | test("^[a-f0-9]{64}$")) and
+  (.snapshot_archive_sha256 | test("^[a-f0-9]{64}$")) and
+  (.source_candidate_sha256 | test("^[a-f0-9]{64}$"))' "$UPDATE_RECOVERY_JOURNAL" >/dev/null \
+  || fail '恢复中断journal缺少严格身份'
+UPDATE_RECOVERY_TOKEN=$(jq -r '.token' "$UPDATE_RECOVERY_JOURNAL")
+UPDATE_RECOVERY_SNAPSHOT=$(jq -r '.snapshot_id' "$UPDATE_RECOVERY_JOURNAL")
+UPDATE_RECOVERY_CANDIDATE=$(jq -r '.source_candidate_dir' "$UPDATE_RECOVERY_JOURNAL")
+[[ -x "${UPDATE_RECOVERY_CANDIDATE}/scripts/rollback.sh" ]] \
+  || fail '恢复中断未保留可重入的冻结rollback入口'
+ROLLBACK_COMPLETE_BEFORE=$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")
+
+assert_failed_update_recovery_rejected() {
+  local label=$1 token=$2 snapshot=$3 log="${TEST_ROOT}/update-recovery-${1}.log"
+  : > "$MOCK_DOCKER_LOG"
+  if CRISP_AI_FAILED_UPDATE_TOKEN="$token" "${UPDATE_RECOVERY_CANDIDATE}/scripts/rollback.sh" \
+    --deploy-dir "$DEPLOY_DIR" --snapshot "$snapshot" --failed-update-recovery > "$log" 2>&1; then
+    fail "${label}错误取得升级失败恢复授权"
+  fi
+  if grep -Eq '(^| )stop( |$)' "$MOCK_DOCKER_LOG"; then
+    fail "${label}拒绝后仍停止了服务"
+  fi
+}
+
+assert_failed_update_recovery_rejected wrong-token "$(printf '0%.0s' {1..64})" "$UPDATE_RECOVERY_SNAPSHOT"
+assert_failed_update_recovery_rejected wrong-snapshot "$UPDATE_RECOVERY_TOKEN" "${UPDATE_RECOVERY_SNAPSHOT}-wrong"
+chmod 0700 "$UPDATE_RECOVERY_CANDIDATE"
+printf 'foreign-member\n' > "${UPDATE_RECOVERY_CANDIDATE}/foreign-member"
+chmod 0600 "${UPDATE_RECOVERY_CANDIDATE}/foreign-member"
+chmod 0500 "$UPDATE_RECOVERY_CANDIDATE"
+sync -f "$UPDATE_RECOVERY_CANDIDATE"
+assert_failed_update_recovery_rejected candidate-extra-member "$UPDATE_RECOVERY_TOKEN" "$UPDATE_RECOVERY_SNAPSHOT"
+chmod 0700 "$UPDATE_RECOVERY_CANDIDATE"
+rm -f -- "${UPDATE_RECOVERY_CANDIDATE}/foreign-member"
+chmod 0500 "$UPDATE_RECOVERY_CANDIDATE"
+sync -f "$UPDATE_RECOVERY_CANDIDATE"
+[[ "$(stat -c '%a' -- "${UPDATE_RECOVERY_CANDIDATE}/VERSION")" == 400 ]] \
+  || fail '执行位篡改负例的VERSION基线模式不是0400'
+chmod 0500 "${UPDATE_RECOVERY_CANDIDATE}/VERSION"
+sync -f "${UPDATE_RECOVERY_CANDIDATE}/VERSION"
+assert_failed_update_recovery_rejected candidate-execute-bit "$UPDATE_RECOVERY_TOKEN" "$UPDATE_RECOVERY_SNAPSHOT"
+chmod 0400 "${UPDATE_RECOVERY_CANDIDATE}/VERSION"
+sync -f "${UPDATE_RECOVERY_CANDIDATE}/VERSION"
+ln -- "$UPDATE_RECOVERY_JOURNAL" "${TEST_ROOT}/update-recovery.external-hardlink"
+assert_failed_update_recovery_rejected hardlinked-journal "$UPDATE_RECOVERY_TOKEN" "$UPDATE_RECOVERY_SNAPSHOT"
+rm -f -- "${TEST_ROOT}/update-recovery.external-hardlink"
+install -m 0600 -- "$UPDATE_RECOVERY_JOURNAL" "${TEST_ROOT}/update-recovery.journal.safe"
+jq -cS '.snapshot_archive_sha256=("0"*64)' "$UPDATE_RECOVERY_JOURNAL" \
+  > "${UPDATE_RECOVERY_JOURNAL}.bad"
+chmod 0600 "${UPDATE_RECOVERY_JOURNAL}.bad"
+mv -f -- "${UPDATE_RECOVERY_JOURNAL}.bad" "$UPDATE_RECOVERY_JOURNAL"
+assert_failed_update_recovery_rejected wrong-sha "$UPDATE_RECOVERY_TOKEN" "$UPDATE_RECOVERY_SNAPSHOT"
+install -m 0600 -- "${TEST_ROOT}/update-recovery.journal.safe" "$UPDATE_RECOVERY_JOURNAL"
+install -m 0600 -- "${DEPLOY_DIR}/.crisp-ai-installation" "${TEST_ROOT}/update-recovery.marker.safe"
+bash -c 'set -euo pipefail; source "$1/scripts/common.sh"; write_installation_marker "$1" "$2" v1.2.1 local-ready' \
+  -- "$DEPLOY_DIR" "$PROJECT_ROOT"
+assert_failed_update_recovery_rejected non-installing "$UPDATE_RECOVERY_TOKEN" "$UPDATE_RECOVERY_SNAPSHOT"
+install -m 0600 -- "${TEST_ROOT}/update-recovery.marker.safe" "${DEPLOY_DIR}/.crisp-ai-installation"
+
+UPDATE_RESTORED_RM_BIN="${TEST_ROOT}/update-restored-rm-bin"
+UPDATE_RESTORED_RM_TRIGGER="${TEST_ROOT}/update-restored-rm-fail-once"
+UPDATE_RECOVERY_TOMBSTONE_PATH="${DEPLOY_DIR}/backups/update-recovery.finalizing-${UPDATE_RECOVERY_TOKEN}.json"
+UPDATE_REAL_RM=$(command -v rm)
+mkdir -m 0700 -- "$UPDATE_RESTORED_RM_BIN"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'target=${MOCK_UPDATE_JOURNAL_PATH:?}' \
+  'trigger=${MOCK_UPDATE_RM_FAIL_ONCE_FILE:?}' \
+  'real_rm=${MOCK_UPDATE_REAL_RM:?}' \
+  'for argument in "$@"; do' \
+  '  if [[ "$argument" == "$target" && -f "$trigger" && ! -L "$trigger" ]]; then' \
+  "    if jq -e '.phase == \"restored\"' \"\$target\" >/dev/null 2>&1; then" \
+  '      "$real_rm" -f -- "$trigger"' \
+  '      exit 1' \
+  '    fi' \
+  '  fi' \
+  'done' \
+  'exec "$real_rm" "$@"' > "${UPDATE_RESTORED_RM_BIN}/rm"
+chmod 0700 "${UPDATE_RESTORED_RM_BIN}/rm"
+: > "$UPDATE_RESTORED_RM_TRIGGER"
+chmod 0600 "$UPDATE_RESTORED_RM_TRIGGER"
+if env PATH="${UPDATE_RESTORED_RM_BIN}:${PATH}" \
+  MOCK_UPDATE_JOURNAL_PATH="$UPDATE_RECOVERY_TOMBSTONE_PATH" \
+  MOCK_UPDATE_RM_FAIL_ONCE_FILE="$UPDATE_RESTORED_RM_TRIGGER" MOCK_UPDATE_REAL_RM="$UPDATE_REAL_RM" \
+  CRISP_AI_FAILED_UPDATE_TOKEN="$UPDATE_RECOVERY_TOKEN" "${UPDATE_RECOVERY_CANDIDATE}/scripts/rollback.sh" \
+  --deploy-dir "$DEPLOY_DIR" --snapshot "$UPDATE_RECOVERY_SNAPSHOT" --failed-update-recovery \
+  > "${TEST_ROOT}/update-recovery-resumed-first.log" 2>&1; then
+  fail 'restored阶段journal清理失败被错误报告为恢复成功'
+fi
+[[ ! -e "$UPDATE_RESTORED_RM_TRIGGER" \
+  && ! -e "$UPDATE_RECOVERY_JOURNAL" \
+  && "$(jq -r '.phase' "$UPDATE_RECOVERY_TOMBSTONE_PATH")" == restored ]] \
+  || fail 'restored阶段journal清理故障未精确命中并保留恢复责任'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$ROLLBACK_COMPLETE_BEFORE" ]] \
+  || fail 'journal尚未清理时提前记录了rollback complete'
+CRISP_AI_FAILED_UPDATE_TOKEN="$UPDATE_RECOVERY_TOKEN" "${UPDATE_RECOVERY_CANDIDATE}/scripts/rollback.sh" \
+  --deploy-dir "$DEPLOY_DIR" --snapshot "$UPDATE_RECOVERY_SNAPSHOT" --failed-update-recovery \
+  > "${TEST_ROOT}/update-recovery-resumed.log" 2>&1
+[[ ! -e "$UPDATE_RECOVERY_JOURNAL" && ! -L "$UPDATE_RECOVERY_JOURNAL" ]] \
+  || fail '幂等续做恢复完成后仍保留journal'
+[[ ! -e "$UPDATE_RECOVERY_TOMBSTONE_PATH" && ! -L "$UPDATE_RECOVERY_TOMBSTONE_PATH" ]] \
+  || fail '幂等续做恢复完成后仍保留tombstone'
+[[ ! -e "${UPDATE_RECOVERY_TOMBSTONE_PATH}.helper" \
+  && -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
+    -name "$(basename -- "$UPDATE_RECOVERY_TOMBSTONE_PATH").helper.tmp.*" -print -quit)" ]] \
+  || fail '幂等续做恢复完成后仍保留journal helper'
+[[ "$(jq -s '[.[] | select(.action == "rollback" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$((ROLLBACK_COMPLETE_BEFORE + 1))" ]] \
+  || fail 'journal清理后的rollback complete不是唯一一次'
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.2.1 \
+  && "$(sed -n 's/^state=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == local-ready \
+  && "$(sed -n 's/^installed_version=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == v1.2.1 \
+  && "$(sed -n 's/^fact_local_services=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == ready \
+  && "$(sed -n 's/^fact_app_config=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == ready ]] \
+  || fail '幂等续做未恢复旧版本和安装标记'
+pass '升级恢复journal拒绝伪造身份且中断后可按同一token幂等续做'
+
+: > "$UPDATE_CONFIG_FAIL_ONCE"
+chmod 0600 "$UPDATE_CONFIG_FAIL_ONCE"
+if env MOCK_CONFIGURATION_READBACK_FAIL_ONCE_FILE="$UPDATE_CONFIG_FAIL_ONCE" \
+  "${PROJECT_ROOT}/update.sh" \
+  --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
+  > "${TEST_ROOT}/update-recovery-complete.log" 2>&1; then
+  fail '配置后故障被错误报告为更新成功'
+fi
+[[ ! -e "$UPDATE_CONFIG_FAIL_ONCE" ]] \
+  || fail '自动恢复场景未在copy发布新VERSION后的配置回读点命中'
+grep -Fq '已自动恢复到更新前版本：v1.2.1' "${TEST_ROOT}/update-recovery-complete.log" \
+  || fail 'copy/config后故障未完成同次快照自动恢复'
+! grep -Fq '回滚前安全快照：' "${TEST_ROOT}/update-recovery-complete.log" \
+  || fail 'failed-update-recovery错误创建了混合现场安全快照'
+[[ "$(<"${DEPLOY_DIR}/VERSION")" == v1.2.1 \
+  && ! -e "$UPDATE_RECOVERY_JOURNAL" && ! -L "$UPDATE_RECOVERY_JOURNAL" ]] \
+  || fail 'copy/config后自动恢复未收口旧版本或journal'
+[[ -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
+  \( -name 'update-candidate-*' -o -name '.update-candidate-*.tmp' \) -print -quit)" ]] \
+  || fail 'copy/config后自动恢复遗留了只读冻结候选'
+pass 'v1.2.1到v1.3.0在copy/config后失败自动恢复同次完整快照'
 
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
+UPDATE_ENV_BASELINE="${TEST_ROOT}/update-env-before.env"
+cp -p -- "${DEPLOY_DIR}/.env" "$UPDATE_ENV_BASELINE"
+UPDATE_HANDOFF_BASELINE="${TEST_ROOT}/update-handoff-before.yaml"
+UPDATE_TAGS_BASELINE="${TEST_ROOT}/update-tags-before.yaml"
+cp -p -- "${DEPLOY_DIR}/config/handoff.yaml" "$UPDATE_HANDOFF_BASELINE"
+cp -p -- "${DEPLOY_DIR}/config/tags.yaml" "$UPDATE_TAGS_BASELINE"
+UPDATE_HANDOFF_HASH_BEFORE=$(sha256sum "$UPDATE_HANDOFF_BASELINE" | awk '{print $1}')
+UPDATE_TAGS_HASH_BEFORE=$(sha256sum "$UPDATE_TAGS_BASELINE" | awk '{print $1}')
+UPDATE_COMPLETE_BEFORE=$(jq -s '[.[] | select(.action == "update" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'printf "legacy-backup-should-not-run\\n" >&2' \
   'exit 97' > "${DEPLOY_DIR}/scripts/backup.sh"
 chmod 0750 "${DEPLOY_DIR}/scripts/backup.sh"
 mkdir -m 0700 -- "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock"
-UPDATE_SERVICE_STATE="${TEST_ROOT}/update-running-services"
 printf 'postgres\nanythingllm\nn8n\nprovider-adapter\n' > "$UPDATE_SERVICE_STATE"
-export MOCK_DOCKER_SERVICE_STATE="$UPDATE_SERVICE_STATE"
-"${DEPLOY_DIR}/update.sh" \
+UPDATE_RM_BIN="${TEST_ROOT}/update-rm-bin"
+UPDATE_RM_TRIGGER="${TEST_ROOT}/update-rm-fail-once"
+UPDATE_REAL_RM=$(command -v rm)
+mkdir -m 0700 -- "$UPDATE_RM_BIN"
+# 变量由生成的故障注入 mock 运行时展开，父测试 shell 不得提前展开。
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'directory=${MOCK_UPDATE_JOURNAL_DIR:?}' \
+  'trigger=${MOCK_UPDATE_RM_FAIL_ONCE_FILE:?}' \
+  'real_rm=${MOCK_UPDATE_REAL_RM:?}' \
+  'for argument in "$@"; do' \
+  '  if [[ "${argument%/*}" == "$directory" && "${argument##*/}" =~ ^update-recovery\.finalizing-[a-f0-9]{64}\.json$' \
+  '    && -f "$argument" && ! -L "$argument" && -f "$trigger" && ! -L "$trigger" ]]; then' \
+  "    if jq -e '.phase == \"update_committed\"' \"\$argument\" >/dev/null 2>&1; then" \
+  '      "$real_rm" -f -- "$trigger"' \
+  '      exit 1' \
+  '    fi' \
+  '  fi' \
+  'done' \
+  'exec "$real_rm" "$@"' > "${UPDATE_RM_BIN}/rm"
+chmod 0700 "${UPDATE_RM_BIN}/rm"
+: > "$UPDATE_RM_TRIGGER"
+chmod 0600 "$UPDATE_RM_TRIGGER"
+env PATH="${UPDATE_RM_BIN}:${PATH}" \
+  MOCK_UPDATE_JOURNAL_DIR="${DEPLOY_DIR}/backups" \
+  MOCK_UPDATE_RM_FAIL_ONCE_FILE="$UPDATE_RM_TRIGGER" MOCK_UPDATE_REAL_RM="$UPDATE_REAL_RM" \
+  "${PROJECT_ROOT}/update.sh" \
   --deploy-dir "$DEPLOY_DIR" --source-dir "$PROJECT_ROOT" --no-pull \
   > "${TEST_ROOT}/update.log" 2>&1
 unset MOCK_DOCKER_SERVICE_STATE
+[[ ! -e "$UPDATE_RM_TRIGGER" ]] || fail 'update_committed清理故障没有精确命中一次'
+grep -Fq '新版本已到提交点，正在核验当前健康并收口恢复 journal；不得倒回旧版本' \
+  "${TEST_ROOT}/update.log" || fail 'update_committed清理失败未进入只收口新版本的finalizer'
+grep -Fq '更新提交已完成：v1.3.0' "${TEST_ROOT}/update.log" \
+  || fail 'update_committed finalizer没有返回成功'
+! grep -Fq '开始按同次更新前快照自动恢复' "${TEST_ROOT}/update.log" \
+  || fail 'update_committed错误倒回旧快照'
+[[ ! -e "${DEPLOY_DIR}/backups/update-recovery.json" \
+  && ! -L "${DEPLOY_DIR}/backups/update-recovery.json" ]] \
+  || fail 'update_committed finalizer成功后仍保留journal'
+[[ -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
+  -name 'update-recovery.finalizing-*' -print -quit)" ]] \
+  || fail 'update_committed finalizer成功后仍保留tombstone'
+[[ -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
+  \( -name 'update-candidate-*' -o -name '.update-candidate-*.tmp' \) -print -quit)" ]] \
+  || fail 'update_committed finalizer成功后仍保留只读冻结候选'
+[[ "$(jq -s '[.[] | select(.action == "update" and .phase == "complete")] | length' \
+  "${DEPLOY_DIR}/logs/maintenance.jsonl")" == "$((UPDATE_COMPLETE_BEFORE + 1))" ]] \
+  || fail 'update_committed journal清理前假记complete或重入后重复记录'
 if grep -Fq 'legacy-backup-should-not-run' "${TEST_ROOT}/update.log"; then
   fail "升级错误调用了旧部署中的备份脚本"
 fi
 [[ "$(<"${DEPLOY_DIR}/VERSION")" == "$PROJECT_VERSION" ]] || fail "更新后版本错误"
+[[ "$(sed -n 's/^source=//p' "${DEPLOY_DIR}/.crisp-ai-installation" | head -n 1)" == "$PROJECT_ROOT" ]] \
+  || fail 'update_committed finalizer未把安装marker source恢复为原始受管source'
 [[ ! -e "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock" \
   && ! -L "${DEPLOY_DIR}/data/runtime/scheduler-scan.lock" ]] \
   || fail '升级未在 n8n 停写窗口迁移旧版无所有权扫描空锁'
 grep -Fq '已在 n8n 停写窗口迁移旧版会话扫描空锁' "${TEST_ROOT}/update.log" \
   || fail '升级未报告旧版扫描锁迁移结果'
-[[ "$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')" == "$ENV_HASH_BEFORE" ]] || fail "更新改写了 .env"
+assert_update_env_preserved "$UPDATE_ENV_BASELINE" "$DEPLOY_DIR" "$ENV_HASH_BEFORE" \
+  > "${TEST_ROOT}/update-env-preservation.json" || fail "更新改写了非派生配置或知识窗口未对应接口池"
 cmp -s -- "${PROJECT_ROOT}/scripts/visitor-output.js" "${DEPLOY_DIR}/scripts/visitor-output.js" \
   || fail '更新后访客输出策略模块不是当前源码代'
-jq -e '
+assert_update_configuration_preserved "$UPDATE_HANDOFF_BASELINE" "${DEPLOY_DIR}/config/handoff.yaml" \
+  "${TEST_ROOT}/update-handoff-preservation" "$UPDATE_HANDOFF_HASH_BEFORE" \
+  || fail '升级改写了合法人工接管原文或配置解码失败'
+jq -s -e '
+  .[0].handoff.message as $original_message | .[1] |
   .handoff.disable_ai == true and .handoff.notify_user.enabled == true and
   (.handoff.keywords | index("转人工") != null) and
   (.handoff.keywords | index("真人") != null) and
-  .handoff.message == "正在为您转接人工客服，请稍候。" and
+  .handoff.message == $original_message and
   (.handoff | has("topic_keywords") | not) and
   (.handoff | has("on_low_confidence") | not) and
   .handoff.no_answer_message == "" and
   .handoff.low_confidence_message == "" and
   .handoff.failure_message == ""
-' "${DEPLOY_DIR}/config/handoff.yaml" >/dev/null || fail "旧人工接管配置未安全迁移"
-jq -e '
-  .tags.ai_resolved == "customer_resolved" and
+' "${TEST_ROOT}/update-handoff-preservation/before.json" \
+  "${TEST_ROOT}/update-handoff-preservation/after.json" >/dev/null \
+  || fail '合法人工接管字段或原有通知未完整保留'
+assert_update_configuration_preserved "$UPDATE_TAGS_BASELINE" "${DEPLOY_DIR}/config/tags.yaml" \
+  "${TEST_ROOT}/update-tags-preservation" "$UPDATE_TAGS_HASH_BEFORE" jq-json \
+  || fail '升级改写了标签字段或不是受管同值排版'
+jq -s -e '
+  .[0].tags.ai_resolved as $original_resolved_tag | .[1] |
+  .tags.ai_resolved == $original_resolved_tag and
   .tags.knowledge_miss == "knowledge_miss" and
   .tags.low_confidence == "low_confidence" and
   .tags.human_required == "human_required"
-' "${DEPLOY_DIR}/config/tags.yaml" >/dev/null || fail "旧默认标签未安全迁移"
+' "${TEST_ROOT}/update-tags-preservation/before.json" \
+  "${TEST_ROOT}/update-tags-preservation/after.json" >/dev/null \
+  || fail '原有标签值未完整保留'
 [[ -n "$(find "${DEPLOY_DIR}/backups" -maxdepth 1 -type f -name 'pre-update-*.tar.gz' -print -quit)" ]] \
   || fail "更新前未创建备份"
 [[ -n "$(find "${DEPLOY_DIR}/backups/versions" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] \
@@ -1541,7 +2753,7 @@ grep -Eq '(^| )down( |$)' "$MOCK_DOCKER_LOG" || fail "默认安全卸载未执�
   || fail "安全卸载改写了 .env"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$SAFE_PROMPT_HASH" ]] \
   || fail "安全卸载改写了 Prompt 配置"
-[[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" ]] || fail "安全卸载删除了知识文件"
+[[ -f "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}" ]] || fail "安全卸载删除了知识文件"
 [[ -f "${DEPLOY_DIR}/logs/uninstall-preserve.log" ]] || fail "安全卸载删除了日志"
 [[ -f "${DEPLOY_DIR}/data/uninstall-preserve.txt" ]] || fail "安全卸载删除了运行数据"
 [[ -d "${DEPLOY_DIR}/config" && -d "${DEPLOY_DIR}/knowledge" \
@@ -1586,7 +2798,7 @@ grep -Fxq 'state=local-ready' "${DEPLOY_DIR}/.crisp-ai-installation" \
   || fail "安全卸载后同路径重装改写了 .env"
 [[ "$(sha256sum "${DEPLOY_DIR}/config/prompt.md" | awk '{print $1}')" == "$SAFE_PROMPT_HASH" ]] \
   || fail "安全卸载后同路径重装改写了 Prompt"
-[[ -f "${DEPLOY_DIR}/knowledge/test-knowledge.md" \
+[[ -f "${DEPLOY_DIR}/knowledge/${RESTORE_KNOWLEDGE_PROJECTION}" \
   && -f "${DEPLOY_DIR}/logs/uninstall-preserve.log" \
   && -f "${DEPLOY_DIR}/data/uninstall-preserve.txt" ]] \
   || fail "安全卸载后同路径重装未保留数据"

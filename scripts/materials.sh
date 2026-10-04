@@ -774,7 +774,8 @@ materials_snapshot_create() {
   install -m 600 -- "${deploy_dir}/knowledge/catalog.json" "${stage}/knowledge/catalog.json" \
     || { rm -rf -- "$stage"; return 1; }
   while IFS= read -r library; do
-    mkdir -m 700 -p -- "${stage}/knowledge/${library}/sources" \
+    install -d -m 0700 -- "${stage}/knowledge/${library}" \
+      "${stage}/knowledge/${library}/sources" \
       || { rm -rf -- "$stage"; return 1; }
   done < <(jq -M -r '.libraries[].id' "${deploy_dir}/knowledge/catalog.json")
   while IFS= read -r row; do
@@ -807,6 +808,8 @@ materials_snapshot_extract() {
 materials_snapshot_validate_generation() {
   local deploy_dir=$1 snapshot=$2 projection=$3 stage restore_deploy name normalized semantic runtime_semantic actual expected
   local manifest_hash map_hash settings_hash profile_hash lexical_hash enabled_document_count expected_workspace
+  local allow_profile_migration=${4:-false}
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   materials_projection_validate "$projection" || return 1
   jq -M -e '.state == "applied"' "$projection" >/dev/null || return 1
   stage=$(mktemp -d "${deploy_dir}/tmp/materials-snapshot-validate.XXXXXXXX") || return 1
@@ -818,7 +821,8 @@ materials_snapshot_validate_generation() {
   mkdir -p -- "${restore_deploy}/tmp" || { rm -rf -- "$stage"; return 1; }
   knowledge_catalog_validate "${restore_deploy}/knowledge/catalog.json" || { rm -rf -- "$stage"; return 1; }
   while IFS= read -r library; do
-    mkdir -m 700 -p -- "${restore_deploy}/knowledge/${library}/sources" \
+    install -d -m 0700 -- "${restore_deploy}/knowledge/${library}" \
+      "${restore_deploy}/knowledge/${library}/sources" \
       || { rm -rf -- "$stage"; return 1; }
   done < <(jq -M -r '.libraries[].id' "${restore_deploy}/knowledge/catalog.json")
   for name in runtime handoff keyword menu tags feedback; do
@@ -893,7 +897,8 @@ materials_snapshot_validate_generation() {
     rm -rf -- "$stage"
     return 1
   fi
-  if ! materials_knowledge_generation_validate "$deploy_dir" "${restore_deploy}/knowledge/catalog.json"; then
+  if ! materials_knowledge_generation_validate "$deploy_dir" \
+      "${restore_deploy}/knowledge/catalog.json" "$allow_profile_migration"; then
     rm -rf -- "$stage"
     return 1
   fi
@@ -901,7 +906,9 @@ materials_snapshot_validate_generation() {
 }
 
 materials_applied_external_readback() {
-  local deploy_dir=$1 snapshot=$2 projection=$3 stage restore_deploy locations
+  local deploy_dir=$1 snapshot=$2 projection=$3 allow_profile_migration=${4:-false}
+  local stage restore_deploy locations
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   stage=$(mktemp -d "${deploy_dir}/tmp/materials-applied-readback.XXXXXXXX") || return 1
   restore_deploy="${stage}/deploy"
   if ! materials_snapshot_extract "$snapshot" "$restore_deploy" \
@@ -922,6 +929,7 @@ materials_applied_external_readback() {
         $manifest[0].files[$document.projection] == null)
     ' >/dev/null \
     || ! materials_snapshot_validate_generation "$deploy_dir" "$snapshot" "$projection" \
+      "$allow_profile_migration" \
     || ! materials_projection_readback "$deploy_dir"; then
     rm -rf -- "$stage"
     return 1
@@ -990,15 +998,19 @@ materials_snapshot_publish() {
 }
 
 materials_knowledge_generation_validate() {
-  local deploy_dir=$1 catalog=$2
+  local deploy_dir=$1 catalog=$2 allow_profile_migration=${3:-false}
+  local -a profile_arguments=(--deploy-dir "$deploy_dir" refresh-bindings)
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   [[ -f "$catalog" && ! -L "$catalog" ]] || return 1
   if [[ "$catalog" != "${deploy_dir}/knowledge/catalog.json" ]]; then
     [[ "$catalog" == "${deploy_dir}/tmp/"* ]] || return 1
     [[ $(realpath -e -- "$catalog") == "$(realpath -e -- "${deploy_dir}/tmp")/"* ]] || return 1
   fi
   if [[ -f "${deploy_dir}/data/runtime/knowledge-profile.json" && ! -L "${deploy_dir}/data/runtime/knowledge-profile.json" ]]; then
-    python3 -B "${MATERIALS_SCRIPT_DIR}/knowledge-profile.py" --deploy-dir "$deploy_dir" \
-      refresh-bindings --validate-only --require-complete >/dev/null || return 1
+    [[ "$allow_profile_migration" == false ]] || profile_arguments+=(--allow-migration)
+    profile_arguments+=(--validate-only --require-complete)
+    python3 -B "${MATERIALS_SCRIPT_DIR}/knowledge-profile.py" \
+      "${profile_arguments[@]}" >/dev/null || return 1
   else
     jq -M -e '(.embedding_profile // "") == "" and .files == {} and .pending_files == {} and .garbage_locations == []' \
       "${deploy_dir}/data/knowledge-manifest.json" >/dev/null \
@@ -1022,7 +1034,19 @@ materials_knowledge_generation_validate() {
       (($manifest[0].files[$document.projection].locations // []) | type == "array" and length > 0)) and
     ($projected[0] == ($documents | map(.projection) | unique | sort)) and
     ($map[0].schema_version == 2) and ($map[0].revision == (.revision // 0)) and
-    ($map[0].documents == [
+    ($map[0].documents | type == "array") and
+    all($map[0].documents[];
+      type == "object" and
+      ((keys - ["location","library_id","library_name","document_id","projection","source_title"]) | length == 0) and
+      (if has("source_title") then
+        .source_title as $title |
+        if ($title | type) != "string" then false
+        else ($title | utf8bytelength <= 1024) and
+          ($title | gsub("\\s";"") | length > 0) and
+          ($title | explode | any(. < 32 or . == 127) | not)
+        end
+      else true end)) and
+    (($map[0].documents | map(del(.source_title))) == [
       $documents[] as $document |
       $manifest[0].files[$document.projection].locations[] |
       {location:.,library_id:$document.library_id,library_name:$document.library_name,
@@ -1047,9 +1071,11 @@ materials_recovery_capture() {
   else
     # 显式修复的对象就是已漂移的外部 Prompt 或受管 membership，不能要求它们
     # 预先健康；但本机 canonical、五项知识摘要和容器投影仍必须严格同代。
-    materials_snapshot_validate_generation "$deploy_dir" "$snapshot" "$projection" \
-      && materials_projection_readback "$deploy_dir" \
-      || { materials_error '上一有效本机资料代不完整，未开始外部修复'; return 1; }
+    if ! materials_snapshot_validate_generation "$deploy_dir" "$snapshot" "$projection" \
+      || ! materials_projection_readback "$deploy_dir"; then
+      materials_error '上一有效本机资料代不完整，未开始外部修复'
+      return 1
+    fi
   fi
   anythingllm_connection "$deploy_dir"
   workspace=$(mktemp "${deploy_dir}/tmp/materials-workspace.XXXXXXXX") || return 1
@@ -1427,10 +1453,10 @@ materials_finalize_runtime_source() {
 
 materials_set_runtime_disable_epoch() {
   local deploy_dir=$1 epoch=$2 target="${1}/config/runtime.yaml" normalized temporary
-  [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch <= 2147483647 )) || {
+  if [[ ! "$epoch" =~ ^[0-9]+$ ]] || (( 10#$epoch > 2147483647 )); then
     materials_error '客服停用控制代次已达到安全边界，拒绝应用未受保护的配置'
     return 1
-  }
+  fi
   normalized=$(mktemp "${deploy_dir}/tmp/runtime-disable-epoch.XXXXXX") || return 1
   materials_normalize_configuration runtime "$target" "$normalized" \
     || { rm -f -- "$normalized"; return 1; }
@@ -1583,9 +1609,11 @@ materials_initialize_transaction_restore() {
 
 materials_initialize() (
   local deploy_dir=$1 projection="${1}/config/materials-applied.json" stage revision
+  local allow_profile_migration=${2:-false}
   local snapshot="${1}/backups/config-history/materials.applied.tar.gz" candidate_snapshot runtime_normalized
-  local had_projection=false legacy=false legacy_archive='' failed=false rollback_failed=false
+  local legacy=false legacy_archive='' failed=false rollback_failed=false
   local recovery_cleanup_pending=false
+  [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   acquire_maintenance_lock "$deploy_dir"
   materials_recovery_cleanup_orphans "$deploy_dir" \
     || { materials_error '资料恢复遗留临时对象不安全，已停止初始化'; return 1; }
@@ -1603,7 +1631,6 @@ materials_initialize() (
     if materials_projection_validate "$projection"; then
       :
     elif materials_projection_validate_legacy "$projection"; then
-      had_projection=true
       legacy=true
     else
       materials_error '现有资料投影损坏，拒绝回退读取可编辑原文'
@@ -1616,7 +1643,8 @@ materials_initialize() (
   if [[ -e "$projection" || -L "$projection" ]]; then
     if materials_projection_validate "$projection"; then
       if [[ -f "$snapshot" && ! -L "$snapshot" ]] \
-        && materials_applied_external_readback "$deploy_dir" "$snapshot" "$projection"; then
+        && materials_applied_external_readback "$deploy_dir" "$snapshot" "$projection" \
+          "$allow_profile_migration"; then
         return 0
       fi
       # 只允许从仍与当前投影完全一致的原文修复丢失/不完整的规范快照。
@@ -1636,7 +1664,6 @@ materials_initialize() (
     fi
     materials_projection_validate_legacy "$projection" \
       || { materials_error '资料投影在迁移前发生变化，拒绝继续'; return 1; }
-    had_projection=true
     legacy=true
   fi
   configuration_runtime_init "$deploy_dir" || return 1
@@ -1645,7 +1672,7 @@ materials_initialize() (
     || { materials_error '当前知识原文投影尚未完整生成，不能建立首份资料投影'; return 1; }
   configuration_prompt_verify_file "$deploy_dir" "${deploy_dir}/config/prompt.md" \
     || { materials_error '当前 Prompt 尚未通过 AnythingLLM 回读，不能建立首份投影'; return 1; }
-  knowledge_catalog_readback "$deploy_dir" \
+  knowledge_catalog_readback "$deploy_dir" all "$allow_profile_migration" \
     || { materials_error '当前知识索引尚未通过回读，不能建立首份投影'; return 1; }
   runtime_normalized=$(mktemp "${deploy_dir}/tmp/runtime-initialize.XXXXXX") || return 1
   materials_normalize_configuration runtime "${deploy_dir}/config/runtime.yaml" "$runtime_normalized" \
@@ -1657,9 +1684,12 @@ materials_initialize() (
       || { rm -f -- "$runtime_normalized"; return 1; }
     legacy_archive=$(mktemp -d "${deploy_dir}/backups/config-history/materials-v1-migration.XXXXXXXX") \
       || { rm -f -- "$runtime_normalized"; return 1; }
-    chmod 700 "$legacy_archive" \
-      && install -m 600 -- "$projection" "${legacy_archive}/materials-applied-v1.json" \
-      || { rm -f -- "$runtime_normalized"; rm -rf -- "$legacy_archive"; return 1; }
+    if ! chmod 700 "$legacy_archive" \
+      || ! install -m 600 -- "$projection" "${legacy_archive}/materials-applied-v1.json"; then
+      rm -f -- "$runtime_normalized"
+      rm -rf -- "$legacy_archive"
+      return 1
+    fi
     if [[ -f "${deploy_dir}/backups/config-history/materials.applied.tar.gz" \
       && ! -L "${deploy_dir}/backups/config-history/materials.applied.tar.gz" ]]; then
       install -m 600 -- "${deploy_dir}/backups/config-history/materials.applied.tar.gz" \
@@ -1683,6 +1713,7 @@ materials_initialize() (
   fi
   if [[ "$failed" == false ]]; then
     materials_snapshot_validate_generation "$deploy_dir" "$candidate_snapshot" "${stage}/materials-applied.json" \
+      "$allow_profile_migration" \
       || { materials_error '首份资料快照与候选投影不同代'; failed=true; }
   fi
   if [[ "$failed" == false ]]; then
@@ -1693,6 +1724,7 @@ materials_initialize() (
   fi
   if [[ "$failed" == false ]]; then
     materials_applied_external_readback "$deploy_dir" "$snapshot" "${stage}/materials-applied.json" \
+      "$allow_profile_migration" \
       || failed=true
   fi
   if [[ "$failed" == true ]]; then
@@ -1717,14 +1749,21 @@ materials_initialize() (
 )
 
 materials_apply() (
-  local deploy_dir=$1 knowledge_mode=${2:-none} projection="${1}/config/materials-applied.json" old_snapshot old='' stage='' revision=0
+  local deploy_dir=$1 knowledge_mode=${2:-none} knowledge_scope=${3:-all} projection="${1}/config/materials-applied.json" old_snapshot old='' stage='' revision=0
   local prompt_changed knowledge_changed config_changed final_stage='' rollback_revision history candidate_snapshot result=0 recovering=false
   local repair_scope_file=''
   local recovery="${1}/backups/config-history/materials.recovery"
   local transition_started=false transition_committed=false signal_status=0
+  local recovery_tracking_required=false
   local recovery_cleanup_pending=false
   local old_disable_epoch=0 candidate_disable_epoch=0 desired_disable_epoch=0 old_enabled=true candidate_enabled=true
   local capture_mode=verified repair_files='[]'
+  if [[ "$knowledge_scope" != all ]]; then
+    knowledge_valid_id "$knowledge_scope" \
+      || { materials_error '单库资料事务的知识库 ID 无效'; return 64; }
+    [[ "$knowledge_mode" == sync || "$knowledge_mode" == reindex ]] \
+      || { materials_error '只有知识同步或重建事务可以限定单库'; return 64; }
+  fi
   if [[ -f "$projection" && ! -L "$projection" ]] \
     && ! materials_projection_validate "$projection" \
     && materials_projection_validate_legacy "$projection"; then
@@ -1876,6 +1915,7 @@ materials_apply() (
     && [[ "$recovering" == false ]]; then
     materials_recovery_capture "$deploy_dir" "$old" "$old_snapshot" "$capture_mode" \
       || { materials_error '未建立可验证的旧资料恢复事务，拒绝开始外部修改'; return 1; }
+    recovery_tracking_required=true
     if [[ "$capture_mode" == external_repair ]]; then
       repair_scope_file=$(mktemp "${deploy_dir}/tmp/materials-repair-scope.XXXXXXXX") || return 1
       if ! python3 -B "${MATERIALS_SCRIPT_DIR}/materials-recovery.py" --deploy-dir "$deploy_dir" \
@@ -1907,12 +1947,14 @@ materials_apply() (
         result=1
       else
         chown root:1000 "${deploy_dir}/knowledge/catalog.json" 2>/dev/null || true
-        if [[ "$knowledge_mode" == reindex || "$recovering" == true ]]; then
+        if [[ "$recovering" == true ]]; then
           knowledge_sync_catalog "$deploy_dir" 1 || result=1
+        elif [[ "$knowledge_mode" == reindex ]]; then
+          knowledge_sync_catalog "$deploy_dir" 1 "$knowledge_scope" || result=1
         elif [[ "$capture_mode" == external_repair ]]; then
           knowledge_sync_catalog_repair "$deploy_dir" "$repair_scope_file" || result=1
         else
-          knowledge_sync_catalog "$deploy_dir" 0 || result=1
+          knowledge_sync_catalog "$deploy_dir" 0 "$knowledge_scope" || result=1
         fi
       fi
     fi
@@ -1946,14 +1988,21 @@ materials_apply() (
     materials_applied_external_readback "$deploy_dir" "$old_snapshot" \
       "${final_stage}/materials-applied.json" || result=1
   fi
-  if (( result == 0 )); then
+  if (( result == 0 )) && [[ "$recovery_tracking_required" == true ]]; then
     materials_recovery_finish_tracking "$deploy_dir" || result=1
+  elif (( result == 0 )) && [[ -e "$recovery" || -L "$recovery" ]]; then
+    # 未声明外部修改的纯投影刷新不应产生恢复账本；并发或遗留对象不能
+    # 被当作“无需收口”静默跳过。
+    result=1
   fi
   if (( result == 0 )); then
     transition_committed=true
-    if ! materials_recovery_clear "$deploy_dir"; then
-      materials_error '资料已完成运行回读，但旧事务未能原子退役；请重试应用以收口维护记录'
-      return 1
+    if [[ "$recovery_tracking_required" == true ]]; then
+      if ! materials_recovery_clear "$deploy_dir"; then
+        materials_error '资料已完成运行回读，但旧事务未能原子退役；请重试应用以收口维护记录'
+        return 1
+      fi
+      recovery_tracking_required=false
     fi
     jq -M -n --argjson revision "$revision" --argjson config "$config_changed" --argjson prompt "$prompt_changed" --argjson knowledge "$knowledge_changed" \
       --argjson cleanup "$recovery_cleanup_pending" \
@@ -2013,7 +2062,7 @@ materials_pool_status() {
 }
 
 materials_apply_all() (
-  local deploy_dir=$1 knowledge_mode=$2 state business result business_file status
+  local deploy_dir=$1 knowledge_mode=$2 knowledge_scope=${3:-all} state business result business_file status
   acquire_maintenance_lock "$deploy_dir"
   state=$(materials_pool_status "$deploy_dir") || return 1
   if ! jq -e '.source_valid and .current_valid' <<< "$state" >/dev/null; then
@@ -2024,7 +2073,7 @@ materials_apply_all() (
   # substitution shell，丢失内层的 130。普通文件捕获仍隔离 JSON 与说明。
   business_file=$(mktemp "${deploy_dir}/tmp/materials-result.XXXXXXXX")
   trap 'rm -f -- "$business_file"' EXIT
-  if materials_apply "$deploy_dir" "$knowledge_mode" > "$business_file"; then
+  if materials_apply "$deploy_dir" "$knowledge_mode" "$knowledge_scope" > "$business_file"; then
     business=$(<"$business_file")
   else
     status=$?
@@ -2082,13 +2131,13 @@ materials_status() {
 }
 
 materials_main() {
-  local deploy_request='' action deploy_dir knowledge_mode=none
+  local deploy_request='' action deploy_dir knowledge_mode=none knowledge_scope=all
   while (( $# )); do
     case "$1" in
       --deploy-dir) deploy_request=${2:?}; shift 2 ;;
       --help|-h)
         printf '%s\n' \
-          '用法：materials.sh [--deploy-dir PATH] status | validate | initialize | apply [--force-external|--sync-knowledge|--force-knowledge|--refresh-projection]' \
+          '用法：materials.sh [--deploy-dir PATH] status | validate | initialize | apply [--force-external|--sync-knowledge|--force-knowledge|--sync-knowledge-library ID|--force-knowledge-library ID|--refresh-projection]' \
           'status 只显示哈希、revision 与稳定路径，不输出 Prompt、知识正文或秘密。'
         return ;;
       *) break ;;
@@ -2100,6 +2149,12 @@ materials_main() {
       --force-external) knowledge_mode=external; shift ;;
       --sync-knowledge) knowledge_mode=sync; shift ;;
       --force-knowledge) knowledge_mode=reindex; shift ;;
+      --sync-knowledge-library)
+        [[ -n ${2:-} ]] || { materials_error '单库同步缺少知识库 ID'; return 64; }
+        knowledge_mode=sync; knowledge_scope=$2; shift 2 ;;
+      --force-knowledge-library)
+        [[ -n ${2:-} ]] || { materials_error '单库重建缺少知识库 ID'; return 64; }
+        knowledge_mode=reindex; knowledge_scope=$2; shift 2 ;;
       --refresh-projection) knowledge_mode=refresh; shift ;;
     esac
   fi
@@ -2119,8 +2174,8 @@ materials_main() {
       jq -M -n --arg hash "$(jq -M -r '.source_sha256' "${stage}/materials-applied.json")" '{valid:true,source_sha256:$hash}'
       rm -rf -- "$stage" ;;
     initialize) materials_initialize "$deploy_dir" ;;
-    apply) materials_apply_all "$deploy_dir" "$knowledge_mode" ;;
-    apply-business) materials_apply "$deploy_dir" "$knowledge_mode" ;;
+    apply) materials_apply_all "$deploy_dir" "$knowledge_mode" "$knowledge_scope" ;;
+    apply-business) materials_apply "$deploy_dir" "$knowledge_mode" "$knowledge_scope" ;;
     *) materials_error "未知资料操作：$action"; return 64 ;;
   esac
 }

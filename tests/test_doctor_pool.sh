@@ -19,6 +19,10 @@ pool=json.loads(pool_path.read_text()); secret_path=root/'secrets/provider/gener
 secrets=json.loads(secret_path.read_text())
 for index in (1,2):
     entry=copy.deepcopy(pool['entries'][0]); entry.update(id='p_'+str(index)*24, role='backup', order=index, name='合成备用'+str(index), enabled=index==1)
+    if index == 1:
+        entry.update(context_window=16384, max_output_tokens=4096)
+    else:
+        entry.update(context_window=1456, max_output_tokens=1200, draft=True)
     pool['entries'].append(entry); secrets['entries'][entry['id']]={'api_key':'doctor-synthetic-backup-'+str(index),'custom_headers':{}}
 pool_path.write_text(json.dumps(pool)); secret_path.write_text(json.dumps(secrets))
 source=copy.deepcopy(pool); source.pop('secrets_generation'); (root/'config/provider-pool.yaml').write_text(json.dumps(source))
@@ -54,11 +58,56 @@ write_health() {
       entries:[.entries[]|{id,enabled,health:(if .enabled then $state else "disabled" end)}]}' \
     "${DEPLOY}/config/provider-pool-applied.json" > "${DEPLOY}/tmp/fixture-pool-status.json"
 }
+pool_result_status() {
+  local identifier=$1 value
+  value=$(jq -M -r --arg id "$identifier" \
+    '[.results[] | select(.id == $id)][-1].status // "MISSING"' "$OUT" 2>/dev/null || true)
+  case "$value" in
+    PASS|WARN|FAIL|SKIP|MISSING) printf '%s' "$value" ;;
+    *) printf 'INVALID' ;;
+  esac
+}
+pool_baseline_failure_snapshot() {
+  local report_state=empty summary_fail=INVALID summary_warn=INVALID value
+  local configured_budget=${pool_rag_context:-INVALID}
+  local fixture_budget=${DOCTOR_FIXTURE_RAG_CONTEXT:-INVALID}
+  local api_budget=${DOCTOR_FIXTURE_RAG_API_CONTEXT:-INVALID}
+  local env_probe_count api_probe_count
+  if [[ -s "$OUT" ]]; then
+    if jq -e 'type == "object" and (.results | type == "array") and (.summary | type == "object")' \
+        "$OUT" >/dev/null 2>&1; then
+      report_state=valid
+      value=$(jq -M -r '.summary.fail' "$OUT" 2>/dev/null || true)
+      [[ "$value" =~ ^[0-9]+$ ]] && summary_fail=$value
+      value=$(jq -M -r '.summary.warn' "$OUT" 2>/dev/null || true)
+      [[ "$value" =~ ^[0-9]+$ ]] && summary_warn=$value
+    else
+      report_state=invalid
+    fi
+  fi
+  [[ "$configured_budget" =~ ^[0-9]+$ ]] || configured_budget=INVALID
+  [[ "$fixture_budget" =~ ^[0-9]+$ ]] || fixture_budget=INVALID
+  [[ "$api_budget" =~ ^[0-9]+$ ]] || api_budget=INVALID
+  env_probe_count=$(grep -Fc 'CRISPAI_EXPECTED_RAG_CONTEXT' "$FIXTURE_LOG" || true)
+  api_probe_count=$(grep -Ec '^curl http://127\.0\.0\.1:[0-9]+/api/v1/system$' "$FIXTURE_LOG" || true)
+  printf 'rc=%s;report=%s;summary.fail=%s;summary.warn=%s;provider.configuration=%s;provider.rag_configuration=%s;anything.rag_context=%s;provider.pool_health=%s;configured_budget=%s;fixture_budget=%s;api_budget=%s;env_probe=%s;api_probe=%s' \
+    "$LAST_RC" "$report_state" "$summary_fail" "$summary_warn" \
+    "$(pool_result_status provider.configuration)" "$(pool_result_status provider.rag_configuration)" \
+    "$(pool_result_status anything.rag_context)" "$(pool_result_status provider.pool_health)" \
+    "$configured_budget" "$fixture_budget" "$api_budget" "$env_probe_count" "$api_probe_count"
+}
 write_readback
 write_health unknown
+pool_rag_context=$(env_get "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 2>/dev/null || true)
+[[ "$pool_rag_context" == 6992 ]] \
+  || fail '主备迁移夹具没有生成扣除候选输出额度后的共同输入预算 6992'
+export DOCTOR_FIXTURE_RAG_CONTEXT="$pool_rag_context"
+export DOCTOR_FIXTURE_RAG_API_CONTEXT="$pool_rag_context"
 before=$(business_hash)
 invoke --local
-(( LAST_RC == 2 )) || fail '单主未检测应警告，不假绿、不认定接口故障'
+if (( LAST_RC != 2 )); then
+  fail "单主未检测应警告，不假绿、不认定接口故障；安全诊断：$(pool_baseline_failure_snapshot)"
+fi
 for id in provider.configuration provider.pending provider.rag_transaction provider.readback provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback runtime.provider_receipts runtime.provider_settlements runtime.provider_retirements; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
@@ -71,13 +120,27 @@ invoke --local
 assert_result provider.pool_health PASS
 pass '当前代主接口真实成功证据与未检测状态区分'
 
-env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 16384
+env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 8192
 invoke --local
 assert_result provider.rag_configuration FAIL
 assert_result anything.rag_context SKIP
 (( LAST_RC == 1 )) || fail '池与知识预算投影不一致必须失败'
-env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 8192
-pass '接口池预算未投影到知识组件时不能假通过'
+env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 6992
+pass '裸最小窗口不能冒充扣除候选输出后的共同输入估算上限'
+
+cp -p -- "${DEPLOY}/config/provider-pool-applied.json" "${TEST_ROOT}/provider-pool-budget.saved"
+jq '.entries[1].context_window=4351 | .entries[1].max_output_tokens=4096' \
+  "${TEST_ROOT}/provider-pool-budget.saved" > "${DEPLOY}/config/provider-pool-applied.json"
+write_readback
+write_health healthy
+invoke --local
+assert_result provider.rag_configuration FAIL
+assert_result anything.rag_context SKIP
+(( LAST_RC == 1 )) || fail '共同输入估算小于256必须失败关闭'
+mv -- "${TEST_ROOT}/provider-pool-budget.saved" "${DEPLOY}/config/provider-pool-applied.json"
+write_readback
+write_health healthy
+pass '异构候选输出预留及共同输入估算下界由doctor独立校验'
 
 DOCTOR_FIXTURE_RAG_CONTEXT=4096 invoke --local
 assert_result provider.rag_configuration PASS
@@ -208,6 +271,7 @@ pass '旧评价残留只读报告，不清人工状态和普通任务'
 
 RESPONSIBILITY_NOW=$(date -u '+%s%3N')
 RESPONSIBILITY_OLD=$((RESPONSIBILITY_NOW - 600001))
+RESPONSIBILITY_RECENT=$((RESPONSIBILITY_NOW - 240000))
 RESPONSIBILITY_EXPIRED=$((RESPONSIBILITY_NOW - 1000))
 RESPONSIBILITY_ACTIVE=$((RESPONSIBILITY_NOW + 300000))
 RESPONSIBILITY_RUNTIME_REVISION=$(jq -r '.configuration.runtime.revision' \
@@ -220,16 +284,42 @@ answer_status() {
 }
 
 assert_answer_counts() {
-  local expected_status=$1 stalled=$2 pending=$3 silence=$4
-  jq -e --arg status "$expected_status" --arg stalled "$stalled" --arg pending "$pending" \
-    --arg silence "$silence" '
+  local expected_status=$1 stalled=$2 pending=$3 silence=$4 invalid_artifacts=${5:-0} unknown=${6:-0}
+  local actual_status=MISSING actual_counts actual_unresolved=INVALID actual_invalid=INVALID
+  local actual_stalled=INVALID actual_pending=INVALID actual_unknown=INVALID actual_silence=INVALID
+  if ! jq -e --arg status "$expected_status" --arg stalled "$stalled" --arg pending "$pending" \
+    --arg silence "$silence" --arg invalid_artifacts "$invalid_artifacts" --arg unknown "$unknown" '
       [.results[] | select(.id == "runtime.answer_responsibilities")][-1] as $item |
       $item.status == $status and
+      ($item.summary | contains("责任产物损坏 \($invalid_artifacts)")) and
       ($item.summary | contains("长期处理无产物 \($stalled)")) and
       ($item.summary | contains("待处理/处理中 \($pending)")) and
-      ($item.summary | contains("未知发送 0")) and
+      ($item.summary | contains("未知发送 \($unknown)")) and
       ($item.summary | contains("明确政策静默 \($silence)"))
-    ' "$OUT" >/dev/null || fail '应答责任 JSON 未按脱敏计数报告长期无产物状态'
+    ' "$OUT" >/dev/null; then
+    actual_status=$(jq -M -r \
+      '[.results[] | select(.id == "runtime.answer_responsibilities")][-1].status // "MISSING"' \
+      "$OUT" 2>/dev/null || true)
+    case "$actual_status" in PASS|WARN|FAIL|SKIP|MISSING) ;; *) actual_status=INVALID ;; esac
+    actual_counts=$(jq -M -r '
+      def count_after($label):
+        try capture($label + " (?<value>[0-9]+)").value catch "INVALID";
+      [.results[] | select(.id == "runtime.answer_responsibilities")][-1] as $item |
+      $item.summary as $summary |
+      [(if ($summary | type) == "string" and ($summary | test("未完成故障 [0-9]+"))
+        then ($summary | count_after("未完成故障"))
+        elif $item.status == "WARN" or $item.status == "PASS" then "0"
+        else "INVALID" end),
+       ($summary | count_after("责任产物损坏")),
+       ($summary | count_after("长期处理无产物")),
+       ($summary | count_after("待处理/处理中")),
+       ($summary | count_after("未知发送")),
+       ($summary | count_after("明确政策静默"))] | @tsv
+    ' "$OUT" 2>/dev/null || printf 'INVALID\tINVALID\tINVALID\tINVALID\tINVALID\tINVALID')
+    IFS=$'\t' read -r actual_unresolved actual_invalid actual_stalled actual_pending actual_unknown actual_silence \
+      <<< "$actual_counts"
+    fail "应答责任 JSON 未按脱敏计数报告长期无产物状态；安全诊断：status=${actual_status};unresolved=${actual_unresolved};invalid=${actual_invalid};stalled=${actual_stalled};pending=${actual_pending};unknown=${actual_unknown};silence=${actual_silence}"
+  fi
   jq -e --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
       [.results[] | select(.id == "runtime.answer_responsibilities")][-1] as $item |
       ($item | tostring) as $serialized |
@@ -250,6 +340,7 @@ assert_answer_text() {
   fixture_env "$DOCTOR" --deploy-dir "$DEPLOY" --local > "$text_out" 2> "$text_err" || text_rc=$?
   (( text_rc == expected_rc )) || fail "应答责任中文状态退出码错误：${suffix}"
   grep -Fq "[${label}] 应答责任：" "$text_out" || fail "应答责任中文状态标签错误：${suffix}"
+  grep -Fq '责任产物损坏 0' "$text_out" || fail "中文摘要含意外责任产物损坏计数：${suffix}"
   grep -Fq "长期处理无产物 ${stalled}" "$text_out" || fail "中文摘要缺少长期无产物脱敏计数：${suffix}"
   grep -Fq "待处理/处理中 ${pending}" "$text_out" || fail "中文摘要缺少待处理脱敏计数：${suffix}"
   grep -Fq '未知发送 0' "$text_out" || fail "中文摘要缺少未知发送脱敏计数：${suffix}"
@@ -285,6 +376,408 @@ assert_answer_counts FAIL 1 1 0
 assert_answer_text '故障' 1 1 1 0 received
 [[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了长期 received 原问题责任'
 pass '长期 received 且无计划、推理或出站时应答责任明确失败'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",plan:null,inference:null,
+      provider_result_receipt:null,provider_settlement:null,provider_retirement:null,
+      provider_migration_from:null,legacy_v121_pending_origin:null,
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90004}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '显式null产物仍应按长期无产物责任失败'
+assert_answer_counts FAIL 1 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了显式null长期责任'
+pass '显式null不能冒充有效责任产物'
+
+jq --argjson recent "$RESPONSIBILITY_RECENT" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$recent,event_time:$recent,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90005}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '四分钟received责任应保持需关注而非故障'
+assert_answer_counts WARN 0 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了短期received责任'
+pass '短期received责任保持需关注'
+
+RESPONSIBILITY_STATE_KEY=${SESSION_FILE##*/session-}
+RESPONSIBILITY_STATE_KEY=${RESPONSIBILITY_STATE_KEY%.json}
+RESPONSIBILITY_POOL_REVISION=$(jq -r '.revision' "${DEPLOY}/config/provider-pool-applied.json")
+RESPONSIBILITY_SECRETS_GENERATION=$(jq -r '.secrets_generation' \
+  "${DEPLOY}/config/provider-pool-applied.json")
+RESPONSIBILITY_POOL_SHA=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
+RESPONSIBILITY_MATERIALS_SHA=$(jq -r '.source_sha256' "${DEPLOY}/config/materials-applied.json")
+VALID_OUTGOING_CONTENT_SHA=$(printf '%s' \
+  '{"content":"合成已持久计划","type":"text"}' | sha256sum | awk '{print $1}')
+RESPONSIBILITY_JOB_C=$(printf 'c%.0s' {1..64})
+RESPONSIBILITY_JOB_D=$(printf 'd%.0s' {1..64})
+RESPONSIBILITY_JOB_G=$(printf '0%.0s' {1..64})
+RESPONSIBILITY_FP_C_HEX=$(printf '%s' \
+  "${RESPONSIBILITY_STATE_KEY}|${RESPONSIBILITY_JOB_C}|ai_text" | sha256sum | awk '{print substr($1,1,12)}')
+RESPONSIBILITY_FP_D_HEX=$(printf '%s' \
+  "${RESPONSIBILITY_STATE_KEY}|${RESPONSIBILITY_JOB_D}|ai_text" | sha256sum | awk '{print substr($1,1,12)}')
+RESPONSIBILITY_FP_G_HEX=$(printf '%s' \
+  "${RESPONSIBILITY_STATE_KEY}|${RESPONSIBILITY_JOB_G}|ai_text" | sha256sum | awk '{print substr($1,1,12)}')
+RESPONSIBILITY_FP_C=$((16#$RESPONSIBILITY_FP_C_HEX))
+RESPONSIBILITY_FP_D=$((16#$RESPONSIBILITY_FP_D_HEX))
+RESPONSIBILITY_FP_G=$((16#$RESPONSIBILITY_FP_G_HEX))
+VALID_PICKER_ID="crispai_$(printf 'a%.0s' {1..32})"
+VALID_PICKER_FP_HEX=$(printf '%s' "$VALID_PICKER_ID" | sha256sum | awk '{print substr($1,1,12)}')
+VALID_PICKER_FP=$((16#$VALID_PICKER_FP_HEX))
+VALID_PROVIDER_PLAN_CANONICAL=$(jq -Scn \
+  '{type:"text",purpose:"ai_text",content:"合成已持久计划",outcome:"",sources:[],tags:[]}')
+VALID_PROVIDER_PLAN_SHA=$(printf '%s' "$VALID_PROVIDER_PLAN_CANONICAL" \
+  | sha256sum | awk '{print $1}')
+RESPONSIBILITY_FUTURE=$(( $(date -u '+%s%3N') + 3600000 ))
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" \
+  --argjson pool_revision "$RESPONSIBILITY_POOL_REVISION" \
+  --arg secrets_generation "$RESPONSIBILITY_SECRETS_GENERATION" \
+  --arg pool_sha "$RESPONSIBILITY_POOL_SHA" --arg materials_sha "$RESPONSIBILITY_MATERIALS_SHA" \
+  --arg valid_content_sha "$VALID_OUTGOING_CONTENT_SHA" \
+  --argjson fingerprint_c "$RESPONSIBILITY_FP_C" --argjson fingerprint_d "$RESPONSIBILITY_FP_D" \
+  --argjson fingerprint_g "$RESPONSIBILITY_FP_G" --argjson future "$RESPONSIBILITY_FUTURE" '
+    def base($id; $fingerprint; $generation; $session):
+      {id:$id,event:"message:send",status:"received",control:false,
+       revision:$revision,generation:$generation,response_generation:0,sequence:4,
+       received_at:$old,event_time:$old,attempts:1,lease_until:0,
+       responsibility_status:"pending",
+       data:{session_id:$session,from:"user",type:"text",content:$content,
+         fingerprint:$fingerprint}};
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null |
+    .generation as $generation | .session_id as $session |
+    .jobs=[
+      (base(("1"*64);900061;$generation;$session) | .plan={}),
+      (base(("2"*64);900062;$generation;$session) |
+        .plan={type:"text",content:"x",purpose:"!!!"}),
+      (base(("3"*64);900063;$generation;$session) | .provider_migration_from=false),
+      (base(("4"*64);900064;$generation;$session) |
+        .inference={provider_receipt_protocol_version:1}),
+      (base(("5"*64);900065;$generation;$session) | .provider_result_receipt={}),
+      (base(("6"*64);900066;$generation;$session) | .provider_settlement={}),
+      (base(("7"*64);900067;$generation;$session) | .provider_retirement={}),
+      base(("8"*64);900068;$generation;$session),
+      base(("9"*64);900069;$generation;$session),
+      base(("a"*64);900070;$generation;$session),
+      (base(("b"*64);900071;$generation;$session) |
+        .inference={runtime_revision:$revision,pool_revision:$pool_revision,
+          secrets_generation:$secrets_generation,pool_sha256:$pool_sha,
+          materials_source_sha256:$materials_sha,configuration_binding:("0"*64),
+          deadline_at:9999999999999,attempt_generation:1,provider_receipt_protocol_version:1}),
+      (base(("c"*64);900072;$generation;$session) |
+        .plan={type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"}),
+      (base(("d"*64);900073;$generation;$session) |
+        .plan={type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"}),
+      (base(("e"*64);900074;$generation;$session) |
+        .plan={type:"picker",purpose:"menu",ordinary:true,
+          content:{id:"bad-picker",text:"请选择",choices:[false]}}),
+      (base(("f"*64);900075;$generation;$session) |
+        .inference={runtime_revision:$revision,pool_revision:$pool_revision,
+          secrets_generation:7,pool_sha256:$pool_sha,
+          materials_source_sha256:$materials_sha,configuration_binding:("0"*64),
+          deadline_at:9999999999999,attempt_generation:1,provider_receipt_protocol_version:1}),
+      (base(("0"*64);900076;$generation;$session) |
+        .plan={type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text",
+          fingerprint:$fingerprint_g}),
+      (base(42;900077;$generation;$session) |
+        .plan={type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"}),
+      (base(("ab"*32);900078;$generation;$session) |
+        .plan={type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text",
+          fingerprint:"-"})
+    ] |
+    .outgoing={
+      "900068":{job_id:("8"*64)},
+      "900069":{job_id:("9"*64),status:"queued",
+        body:{type:"bogus",content:"x",from:"operator",origin:"chat",fingerprint:900069}},
+      "900070":{job_id:("a"*64),status:"queued",
+        body:{type:"text",content:{text:"x"},from:"operator",origin:"chat",fingerprint:900070}},
+      ($fingerprint_c | tostring):{job_id:("c"*64),status:"rate_limited",
+        created_at:$old,attempts:1,generation:$generation,response_generation:0,
+        delivery_identity_version:1,purpose:"ai_text",message_type:"text",
+        semantic_intent:"answer",content_sha256:("d"*64),attempt_token:("c"*32),
+        failure:"crisp_rate_limited",recovery_deferred:true,next_action_at:($old+60000),
+        body:{type:"text",content:"合成已持久计划",from:"operator",origin:"chat",
+          fingerprint:$fingerprint_c}},
+      "999999":{job_id:("d"*64),status:"rejected",
+        created_at:$old,attempts:1,generation:$generation,response_generation:0,
+        delivery_identity_version:1,purpose:"ai_text",message_type:"text",
+        semantic_intent:"answer",content_sha256:$valid_content_sha,attempt_token:("d"*32),
+        failure:"crisp_http_400",recovery_deferred:true,next_action_at:($old+300000),
+        body:{type:"text",content:"合成已持久计划",from:"operator",origin:"chat",
+          fingerprint:$fingerprint_d}},
+      "scalar":"broken",
+      ($fingerprint_g | tostring):{job_id:("0"*64),status:"sending",
+        body:{type:"text",content:"合成已持久计划",from:"operator",origin:"chat",
+          fingerprint:$fingerprint_g},created_at:$future,attempts:1,generation:$generation,
+        response_generation:0,delivery_identity_version:1,purpose:"ai_text",message_type:"text",
+        semantic_intent:"answer",content_sha256:$valid_content_sha,attempt_token:("e"*32)}
+    }
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '十九类畸形责任产物必须阻断本地自检'
+assert_answer_counts FAIL 14 18 0 19 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了畸形责任产物集合'
+pass '畸形plan、Provider身份、摘要、fingerprint与outgoing均不能冒充有效责任产物'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" \
+  --arg picker_id "$VALID_PICKER_ID" --argjson picker_fingerprint "$VALID_PICKER_FP" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"picker",content:{id:$picker_id,text:"暂无可用选项",choices:[]},
+        fingerprint:$picker_fingerprint,ordinary:true,purpose:"menu"},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90007}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '合法已持久计划应交由现有后续诊断而非无产物故障'
+assert_answer_counts WARN 0 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了合法计划责任'
+pass '合法空选项picker可排除无产物分类但不冒充已回答'
+
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/valid-picker.session"
+jq --argjson fingerprint "$((VALID_PICKER_FP + 1))" \
+  '.jobs[0].plan.fingerprint=$fingerprint' "${TEST_ROOT}/valid-picker.session" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail 'picker的id与fingerprint错配必须阻断本地自检'
+assert_answer_counts FAIL 0 1 0 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了picker身份错配责任'
+pass 'picker身份按createOffer生产公式闭合验证'
+
+jq '.jobs=[false]' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.state FAIL
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 1 )) || fail 'scalar job成员必须形成结构化会话状态故障'
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了scalar job状态'
+pass 'jobs数组非对象成员不会中止doctor或伪造通过'
+
+for nested_case in worker offer plan; do
+  case "$nested_case" in
+    worker) jq '.worker=[]' "${TEST_ROOT}/session.saved" > "$SESSION_FILE" ;;
+    offer) jq '.offers={bad:[]}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE" ;;
+    plan) jq '.jobs=[{plan:[]}]' "${TEST_ROOT}/session.saved" > "$SESSION_FILE" ;;
+  esac
+  before=$(business_hash)
+  invoke --local
+  assert_result runtime.state FAIL
+  assert_result runtime.answer_responsibilities WARN
+  (( LAST_RC == 1 )) || fail "嵌套scalar状态必须形成结构化故障：${nested_case}"
+  [[ "$before" == "$(business_hash)" ]] || fail "只读doctor改写了嵌套scalar状态：${nested_case}"
+done
+pass 'worker、offer与plan非对象值均结构化失败而不中止doctor'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"unresolved_failure",failure_since:"1x",
+      failure_code:"synthetic_unresolved",
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:900080}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '畸形failure_since必须保留结构化未解决责任故障'
+assert_answer_counts FAIL 0 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了畸形failure_since责任'
+pass 'failure_since非整数时安全回退received_at而不中止doctor'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" '
+    def base($id; $fingerprint; $generation; $session):
+      {id:$id,event:"message:send",status:"received",control:false,
+       revision:$revision,generation:$generation,response_generation:0,sequence:4,
+       received_at:$old,event_time:$old,attempts:1,lease_until:0,
+       responsibility_status:"pending",
+       data:{session_id:$session,from:"user",type:"text",content:$content,
+         fingerprint:$fingerprint}};
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .generation as $generation | .session_id as $session |
+    .jobs=[
+      (base(("1"*64);900081;$generation;$session) |
+        .plan={type:"text",content:"",ordinary:true,purpose:"ai_text"}),
+      (base(("2"*64);900082;$generation;$session) |
+        .plan={type:"internal",content:"x",ordinary:true,purpose:"ai_text"})
+    ]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '不可投递plan不得冒充恢复产物'
+assert_answer_counts FAIL 2 2 0 2
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了不可投递plan责任'
+pass '空text与错误用途internal均不能遮蔽长期无产物责任'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"internal",content:"",ordinary:true,purpose:"technical_unresolved",
+        safe_error_context:"text",answer_responsibility:"unresolved_failure",
+        diagnostic_code:"runtime_unavailable",tags:[]},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:900083}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '精确technical_unresolved计划应保持可诊断恢复状态'
+assert_answer_counts WARN 0 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了技术恢复计划'
+pass '精确technical_unresolved生产形状仍可作为恢复产物'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      provider_settlement:{schema_version:1,state:"settled",plan_sha256:("a"*64),
+        response_generation:0,attempts:1,settled_at:$old},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:900084}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '缺少plan的完成settlement必须阻断本地自检'
+assert_answer_counts FAIL 1 1 0 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了planless settlement责任'
+pass 'planless settlement不能冒充可恢复答案正文'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" \
+  --arg plan_sha "$VALID_PROVIDER_PLAN_SHA" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null | .outgoing={} |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"},
+      provider_settlement:{schema_version:1,state:"settled",plan_sha256:$plan_sha,
+        response_generation:0,attempts:1,settled_at:$old},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:900085}}]
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '同事务plan与完成settlement应保持可恢复状态'
+assert_answer_counts WARN 0 1 0 0
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了合法plan与settlement责任'
+pass '同事务plan与settlement摘要保持精确绑定'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_C" \
+  --arg content_sha "$VALID_OUTGOING_CONTENT_SHA" \
+  --argjson fingerprint "$RESPONSIBILITY_FP_C" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:900086}}] |
+    .outgoing={($fingerprint | tostring):{job_id:$job,status:"queued",purpose:true,
+      content_sha256:$content_sha,
+      body:{type:"text",content:"合成已持久计划",from:"operator",origin:"chat",
+        fingerprint:$fingerprint}}}
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '无公开生产合同的queued记录必须显式失败关闭'
+assert_answer_counts FAIL 0 1 0 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了queued畸形身份'
+pass 'queued附加错误类型不会中止jq或冒充恢复产物'
+
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" \
+  --arg content "$RESPONSIBILITY_CONTENT" --arg job "$RESPONSIBILITY_JOB_ID" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:0,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90008}}] |
+    .outgoing={"90008":{job_id:$job}}
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) || fail '合法计划不得遮蔽同责任的畸形outgoing'
+assert_answer_counts FAIL 0 1 0 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了合法与畸形并存责任'
+pass '合法产物不能遮蔽同一责任的畸形产物'
+
+VALID_OUTGOING_NOW=$(date -u '+%s%3N')
+VALID_OUTGOING_FINGERPRINT_HEX=$(printf '%s' \
+  "${RESPONSIBILITY_STATE_KEY}|${RESPONSIBILITY_JOB_ID}|ai_text|recovery:2" | sha256sum | awk '{print substr($1,1,12)}')
+VALID_OUTGOING_FINGERPRINT=$((16#$VALID_OUTGOING_FINGERPRINT_HEX))
+jq --argjson old "$RESPONSIBILITY_OLD" --argjson now "$VALID_OUTGOING_NOW" \
+  --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" --arg content "$RESPONSIBILITY_CONTENT" \
+  --arg job "$RESPONSIBILITY_JOB_ID" --arg content_sha "$VALID_OUTGOING_CONTENT_SHA" \
+  --argjson fingerprint "$VALID_OUTGOING_FINGERPRINT" '
+    .mode="ai" | .resume_at=null | .pause_reason="" | .last_human_at=0 |
+    .human_event_id="" | .control_watermark=0 | .worker=null |
+    .jobs=[{id:$job,event:"message:send",status:"received",control:false,
+      revision:$revision,generation:.generation,response_generation:2,sequence:4,
+      received_at:$old,event_time:$old,attempts:1,lease_until:0,
+      responsibility_status:"pending",
+      plan:{type:"text",content:"合成已持久计划",ordinary:true,purpose:"ai_text"},
+      data:{session_id:.session_id,from:"user",type:"text",content:$content,fingerprint:90009}}] |
+    .outgoing={($fingerprint | tostring):{
+      status:"sending",body:{type:"text",content:"合成已持久计划",from:"operator",
+        origin:"chat",fingerprint:$fingerprint},created_at:$now,attempts:1,job_id:$job,
+      generation:.generation,response_generation:2,delivery_identity_version:1,
+      purpose:"ai_text",message_type:"text",semantic_intent:"answer",
+      content_sha256:$content_sha,attempt_token:("c"*32)}}
+  ' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+before=$(business_hash)
+invoke --local
+assert_result runtime.answer_responsibilities WARN
+(( LAST_RC == 2 )) || fail '合法当前发送身份应由未知发送诊断而非产物损坏阻断'
+assert_answer_counts WARN 0 1 0 0 1
+[[ "$before" == "$(business_hash)" ]] || fail '只读doctor改写了合法当前发送身份'
+pass '无显式fingerprint的恢复代sending按生产公式保持可诊断待处理'
 
 jq --argjson old "$RESPONSIBILITY_OLD" --argjson expired "$RESPONSIBILITY_EXPIRED" \
   --argjson revision "$RESPONSIBILITY_RUNTIME_REVISION" --arg content "$RESPONSIBILITY_CONTENT" \
@@ -398,7 +891,7 @@ assert_result runtime.provider_receipts FAIL
 (( LAST_RC == 1 )) || fail '未知回执协议版本不能被当成明确无结果'
 
 POOL_REVISION=$(jq -r '.revision' "${DEPLOY}/config/provider-pool-applied.json")
-LEGACY_RUNTIME_REVISION=$(jq -r '.jobs[0].revision' "${TEST_ROOT}/session.saved")
+LEGACY_RUNTIME_REVISION=$RESPONSIBILITY_RUNTIME_REVISION
 LEGACY_SECRETS_GENERATION=$(jq -r '.secrets_generation' "${DEPLOY}/config/provider-pool-applied.json")
 LEGACY_POOL_SHA=$(sha256sum "${DEPLOY}/config/provider-pool-applied.json" | awk '{print $1}')
 LEGACY_MATERIALS_SHA=$(jq -r '.source_sha256' "${DEPLOY}/config/materials-applied.json")
@@ -407,7 +900,8 @@ LEGACY_TARGET_JSON=$(jq -cn --argjson runtime "$LEGACY_RUNTIME_REVISION" \
   --arg pool_sha "$LEGACY_POOL_SHA" --arg materials_sha "$LEGACY_MATERIALS_SHA" \
   '[$runtime,$pool,$secrets,$pool_sha,$materials_sha]')
 LEGACY_TARGET_BINDING=$(printf '%s' "$LEGACY_TARGET_JSON" | sha256sum | awk '{print $1}')
-jq --argjson pool_revision "$POOL_REVISION" '.jobs[0].status="received" |
+jq --argjson pool_revision "$POOL_REVISION" --argjson runtime_revision "$LEGACY_RUNTIME_REVISION" '
+    .jobs[0].status="received" | .jobs[0].revision=$runtime_revision |
     .jobs[0].responsibility_status="pending" |
     .jobs[0].inference={pool_revision:$pool_revision,deadline_at:1} |
     del(.jobs[0].provider_result_receipt)' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
@@ -415,7 +909,8 @@ invoke --local
 assert_result runtime.provider_receipts WARN
 (( LAST_RC == 2 )) || fail 'v1.2.x旧推理信封应等待独占任务迁移而不是假绿或删除'
 
-jq --argjson pool_revision "$POOL_REVISION" '.jobs[0].status="received" |
+jq --argjson pool_revision "$POOL_REVISION" --argjson runtime_revision "$LEGACY_RUNTIME_REVISION" '
+    .jobs[0].status="received" | .jobs[0].revision=$runtime_revision |
     .jobs[0].responsibility_status="pending" | .jobs[0].deferred_configuration=true |
     .jobs[0].inference={pool_revision:$pool_revision,deadline_at:1} |
     .jobs[0].legacy_v121_pending_origin={schema_version:1,phase:"source_frozen",
@@ -442,7 +937,8 @@ assert_result runtime.provider_receipts FAIL
 
 jq --argjson pool_revision "$POOL_REVISION" --arg secrets "$LEGACY_SECRETS_GENERATION" \
   --arg pool_sha "$LEGACY_POOL_SHA" --arg materials_sha "$LEGACY_MATERIALS_SHA" \
-  --arg binding "$LEGACY_TARGET_BINDING" '.jobs[0].status="received" |
+  --arg binding "$LEGACY_TARGET_BINDING" --argjson runtime_revision "$LEGACY_RUNTIME_REVISION" '
+    .jobs[0].status="received" | .jobs[0].revision=$runtime_revision |
     .jobs[0].responsibility_status="pending" | .jobs[0].deferred_configuration=true |
     .jobs[0].legacy_v121_pending_origin={schema_version:1,phase:"successor_bound",
       source:{runtime_revision:.jobs[0].revision,pool_revision:$pool_revision,deadline_at:1},
@@ -686,6 +1182,48 @@ jq --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" --arg identity "$LEGACY_CLEANUP
 invoke --local
 assert_result runtime.provider_retirements WARN
 (( LAST_RC == 2 )) || fail 'successor_bound旧缓存的签名cleanup等待必须是可诊断警告'
+
+LEGACY_UNSETTLED_CANONICAL=$(jq -Scn --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" \
+  '{envelope:$envelope,purpose:"legacy_unsettled_retired"}')
+LEGACY_UNSETTLED_SHA=$(printf '%s' "$LEGACY_UNSETTLED_CANONICAL" | sha256sum | awk '{print $1}')
+jq --argjson envelope "$LEGACY_CLEANUP_ENVELOPE" --arg identity "$LEGACY_UNSETTLED_SHA" \
+  --argjson runtime_revision "$RUNTIME_REVISION" --argjson pool_revision "$POOL_REVISION" \
+  --argjson deadline "$LEGACY_CLEANUP_DEADLINE" '
+    .jobs[0]={id:("e"*64),status:"received",responsibility_status:"unresolved_failure",
+      failure_code:"legacy_unsettled_plan_migrated",legacy_unsettled_plan_migrated_at:1,
+      generation:.generation,revision:$runtime_revision,
+      inference:{pool_revision:$pool_revision,deadline_at:$deadline},
+      provider_retirement:{schema_version:1,state:"pending",purpose:"legacy_unsettled_retired",
+        envelope:$envelope,identity_sha256:$identity,attempts:0,first_recorded_at:1,
+        next_action_at:0}}' "${TEST_ROOT}/session.saved" > "$SESSION_FILE"
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/provider-retirement.legacy-unsettled"
+invoke --local
+assert_result runtime.provider_retirements WARN
+assert_result runtime.answer_responsibilities FAIL
+(( LAST_RC == 1 )) \
+  || fail '旧未结算答案的签名cleanup应警告且未解决应答责任必须保持故障'
+
+jq '.jobs[0].legacy_unsettled_plan_migrated_at=-1' \
+  "${TEST_ROOT}/provider-retirement.legacy-unsettled" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '负数旧计划迁移标记不得授权破坏性Provider清理'
+
+jq '.jobs[0].failure_code="unrelated"' \
+  "${TEST_ROOT}/provider-retirement.legacy-unsettled" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements FAIL
+(( LAST_RC == 1 )) || fail '错误故障类别不得授权旧未结算答案清理'
+
+jq '.jobs[0].provider_retirement={schema_version:1,state:"retired",
+      purpose:"legacy_unsettled_retired",attempts:1,retired_at:1,
+      identity_sha256:.jobs[0].provider_retirement.identity_sha256} |
+    del(.jobs[0].inference,.jobs[0].provider_result_receipt,.jobs[0].provider_settlement,
+      .jobs[0].provider_migration_from,.jobs[0].legacy_v121_pending_origin)' \
+  "${TEST_ROOT}/provider-retirement.legacy-unsettled" > "$SESSION_FILE"
+invoke --local
+assert_result runtime.provider_retirements PASS
+cp -p -- "$SESSION_FILE" "${TEST_ROOT}/provider-retirement.legacy-unsettled-finished"
 
 jq '.jobs[0].provider_retirement={schema_version:1,state:"retired",
       purpose:"conversation_cancelled",attempts:1,retired_at:1,identity_sha256:("a"*64)} |

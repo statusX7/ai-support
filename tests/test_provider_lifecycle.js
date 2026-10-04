@@ -88,7 +88,8 @@ async function repack(archive, name, mutate) {
   const output=path.join(work,name+'.tar.gz'); await checked('tar',['-czf',output,'-C',directory,'.']); return output;
 }
 
-async function fixture() {
+async function fixture(fixtureWork = work) {
+  const work = fixtureWork;
   const deploy=path.join(work,'deploy');
   for (const directory of ['config','knowledge','tmp','logs','data/runtime','data/anythingllm','data/postgres','data/n8n','data/analytics','backups/config-history','backups/versions','bin','systemd']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
   for (const directory of ['scripts','docs','n8n']) fs.cpSync(path.join(project,directory),path.join(deploy,directory),{recursive:true});
@@ -281,8 +282,12 @@ async function fixture() {
   return f;
 }
 
+const selectedCase=process.env.CRISPAI_LIFECYCLE_CASE || '';
+if(selectedCase && selectedCase!=='PL09D')throw new Error('生命周期定向用例无效');
+if(selectedCase)process.stdout.write('仅执行 '+selectedCase+' 定向用例；不代表完整生命周期或发布验收。\n');
 let passed=0,failed=0;
 async function test(name, action) {
+  if(selectedCase && !name.startsWith(selectedCase+' '))return;
   try {await action();passed++;process.stdout.write('通过 UNIT/CONTRACT '+name+'\n');}
   catch(error){failed++;process.stdout.write('失败 UNIT/CONTRACT '+name+'\n'+error.stack+'\n');}
 }
@@ -303,6 +308,13 @@ async function main(){
       ].join('\n'),'--',f.deploy],{env:f.snapshotEnv});
       assert.equal(started.code,0,started.stderr+started.stdout);
       await f.ok('knowledge-profile.sh',['ensure'],f.snapshotEnv);
+      // 首份资料投影与真实安装/升级同序：先通过生产入口同步并回读 Prompt。
+      const promptSynced=await command('bash',['-c',[
+        'set -euo pipefail','source "$1/scripts/common.sh"','sync_prompt_to_anythingllm "$1"',
+      ].join('\n'),'--',f.deploy],{env:f.snapshotEnv});
+      assert.equal(promptSynced.code,0,promptSynced.stderr+promptSynced.stdout);
+      assert.equal(read(f.workspaceState).openAiPrompt,
+        fs.readFileSync(path.join(f.deploy,'config/prompt.md'),'utf8'));
       await f.ok('knowledge.sh',['sync'],f.snapshotEnv);
       const recaptured=await command('bash',['-c',[
         'set -euo pipefail','source "$1/scripts/common.sh"','docker_compose "$1" up -d --no-deps anythingllm',
@@ -454,7 +466,8 @@ async function main(){
             write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
             const result=await f.invoke('snapshot.sh',args,f.snapshotEnv);
             write(path.join(work,`pending-knowledge-${kind}-${args.length}.log`),result.stdout+result.stderr);
-            assert.notEqual(result.code,0);assert.match(result.stderr,/知识索引存在未完成迁移/);
+            assert.notEqual(result.code,0);
+            assert.match(result.stderr,kind==='dangling'?/受管知识路径不能包含符号链接/:/知识索引存在未完成迁移|知识索引迁移尚未完成/);
             assert(!/\bstop\b/.test(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8')));
             assert.deepEqual(f.capture(),before);assert.equal(f.calls.length,callCount);assert(fs.lstatSync(marker));
           }
@@ -657,6 +670,84 @@ async function main(){
         }finally{fs.unlinkSync(target);}
       }
     });
+    await test('PL09C 同版本显式重应用不绕过降级、未决事务或完整启动保护',async()=>{
+      const versionFile=path.join(f.deploy,'VERSION'),markerFile=path.join(f.deploy,'.crisp-ai-installation');
+      const originalVersion=fs.readFileSync(versionFile),originalMarker=fs.readFileSync(markerFile);
+      const transaction=path.join(f.deploy,'.env.crispai-atomic.json');
+      const transactionBody='synthetic-same-version-pending-transaction\n';
+      assert(!fs.existsSync(transaction));
+      write(transaction,transactionBody);
+      try{
+        const variants=[
+          ['same-default',currentVersion,[],/目标版本必须高于当前版本/],
+          ['same-explicit',currentVersion,['--reapply'],/当前部署已有未完成配置或资料恢复责任/],
+          ['downgrade-explicit','v999.0.0',['--reapply'],/目标版本必须高于当前版本/],
+          ['same-skip-start',currentVersion,['--reapply','--skip-start'],/更新不再支持 --skip-start/],
+        ];
+        for(const [name,installedVersion,options,expected] of variants){
+          write(versionFile,installedVersion+'\n');
+          write(markerFile,originalMarker.toString('utf8').replace(/^installed_version=.*$/m,'installed_version='+installedVersion));
+          const before=f.capture(),markerBefore=fs.readFileSync(markerFile),callCount=f.calls.length;
+          const externalBefore=fs.readFileSync(f.externalCurlLog);
+          write(f.snapshotEnv.MOCK_DOCKER_LOG,'');
+          const result=await command('bash',[path.join(project,'update.sh'),'--deploy-dir',f.deploy,'--source-dir',project,'--no-pull',...options],
+            {env:{...f.snapshotEnv,PROVIDER_ADAPTER_MANAGEMENT_URL:f.adapterBase},timeout:60000});
+          assert.notEqual(result.code,0,name);assert.notEqual(result.code,124,name);assert.match(result.stderr,expected,name);
+          assert.deepEqual(f.capture(),before,name);assert.deepEqual(fs.readFileSync(markerFile),markerBefore,name);
+          assert.equal(fs.readFileSync(versionFile,'utf8'),installedVersion+'\n',name);
+          assert.equal(fs.readFileSync(transaction,'utf8'),transactionBody,name);
+          assert.equal(f.calls.length,callCount,name);assert.deepEqual(fs.readFileSync(f.externalCurlLog),externalBefore,name);
+          assert.equal(fs.readFileSync(f.snapshotEnv.MOCK_DOCKER_LOG,'utf8'),'',name);
+          assert(!fs.existsSync(path.join(f.deploy,'backups/update-recovery.json')),name);
+        }
+      }finally{
+        fs.writeFileSync(versionFile,originalVersion);fs.writeFileSync(markerFile,originalMarker);fs.unlinkSync(transaction);
+      }
+    });
+    await test('PL09D 当前版本正常待编辑资料重应用必须保持完整有效代',async()=>{
+      const ownedWork=path.join(work,'draft-update');fs.mkdirSync(ownedWork,{mode:0o700});
+      const g=await fixture(ownedWork);
+      try{
+        await g.ok('provider.sh',['migrate']);await g.start();
+        await g.ok('configuration.sh',['migrate']);
+        await g.ok('knowledge-profile.sh',['capture'],g.snapshotEnv);
+        const native=async body=>checked('bash',['-c','set -euo pipefail\nsource "$1/scripts/common.sh"\n'+body,'--',g.deploy],{env:{...g.snapshotEnv,PROVIDER_ADAPTER_MANAGEMENT_URL:g.adapterBase}});
+        await native('docker_compose "$1" up -d --no-deps anythingllm');
+        await g.ok('knowledge-profile.sh',['ensure'],g.snapshotEnv);
+        await native('sync_prompt_to_anythingllm "$1"\nknowledge_sync "$1"\ndocker_compose "$1" up -d --no-deps anythingllm');
+        await g.ok('materials.sh',['initialize'],g.snapshotEnv);
+        await g.ok('configuration.sh',['materials-apply'],g.snapshotEnv);
+        await native('migrate_runtime_env "$1"');
+        await g.ok('logs.sh',['initialize'],g.snapshotEnv);
+        g.snapshotEnv.MOCK_LOG_MAX_FILES=(await native('env_get "$1/.env" CRISPAI_LOG_MAX_FILES')).stdout.trim();
+        g.snapshotEnv.MOCK_LOG_MAX_SIZE=(await native('env_get "$1/.env" CRISPAI_LOG_MAX_SIZE')).stdout.trim();
+        await native('docker_compose "$1" up -d --remove-orphans\nimport_and_publish_workflow "$1"\npython3 "$1/scripts/provider-pool.py" --deploy-dir "$1" verify-applied');
+        const eligible=await command('bash',[path.join(g.deploy,'scripts/healthcheck.sh'),'--deploy-dir',g.deploy,'--application','--installation-in-progress'],
+          {env:{...g.snapshotEnv,PROVIDER_ADAPTER_MANAGEMENT_URL:g.adapterBase},timeout:90000});
+        assert.equal(eligible.code,0,'当前版本基线尚未就绪：\n'+eligible.stderr+eligible.stdout);
+        const effectiveBefore=read(path.join(g.deploy,'config/materials-applied.json'));
+        assert.equal(effectiveBefore.state,'applied');
+        assert.equal(read(g.workspaceState).openAiPrompt,effectiveBefore.prompt.text);
+        const draft=effectiveBefore.prompt.text+'\n合成待编辑说明：测试灯为蓝色；不要把本测试当真实客户数据。\n';
+        write(path.join(g.deploy,'config/prompt.md'),draft);
+        const result=await command('bash',[path.join(project,'update.sh'),'--deploy-dir',g.deploy,'--source-dir',project,'--no-pull','--reapply'],
+          {env:{...g.snapshotEnv,PROVIDER_ADAPTER_MANAGEMENT_URL:g.adapterBase},timeout:180000});
+        const effectiveAfter=read(path.join(g.deploy,'config/materials-applied.json'));
+        const afterWorkspace=read(g.workspaceState);
+        const facts={code:result.code,current_version:fs.readFileSync(path.join(g.deploy,'VERSION'),'utf8').trim()===currentVersion,
+          draft_preserved:fs.readFileSync(path.join(g.deploy,'config/prompt.md'),'utf8')===draft,
+          effective_applied:effectiveAfter.state==='applied',workspace_matches_effective:afterWorkspace.openAiPrompt===effectiveAfter.prompt.text,
+          recovery_journal_present:fs.existsSync(path.join(g.deploy,'backups/update-recovery.json')),
+          model_calls:g.calls.length};
+        process.stdout.write('PL09D实际事实 '+JSON.stringify(facts)+'\n');
+        assert.equal(result.code,0,result.stderr+result.stdout);
+        assert.equal(facts.current_version,true);assert.equal(facts.draft_preserved,true);
+        assert.equal(facts.effective_applied,true);assert.equal(facts.workspace_matches_effective,true);
+        assert.equal(facts.recovery_journal_present,false);
+        const readback=await native('source "$1/scripts/materials.sh"\nmaterials_applied_external_readback "$1" "$1/backups/config-history/materials.applied.tar.gz" "$1/config/materials-applied.json"');
+        assert.equal(readback.code,0);
+      }finally{await g.close();}
+    });
     await test('PL12 知识中间代、部分模块及冒充旧候选的自洽载荷全部停前拒绝',async()=>{
       const clearNewModules=payload=>{
         for(const name of knowledgeModules)fs.unlinkSync(path.join(payload,name));
@@ -733,6 +824,14 @@ async function main(){
       write(path.join(legacy,'.env'),f.initialEnv);write(path.join(legacy,'.crisp-ai-installation'),'ai-support\nstate=local-ready\nsource='+legacy+'\ninstalled_version=v1.1.0\n');
       write(path.join(legacy,'data/runtime/synthetic-legacy.json'),{synthetic:true,mode:'human',generation:7});
       write(path.join(legacy,'data/anythingllm/synthetic-legacy.json'),{synthetic:true,version:'v1.1.0'});
+      // HTTP 夹具读取的运行态也随旧版数据库目录进入快照，冷恢复后从原载荷回读。
+      write(path.join(legacy,'data/anythingllm/lifecycle-workspace.json'),{
+        slug:'crisp-support',openAiPrompt:fs.readFileSync(path.join(legacy,'config/prompt.md'),'utf8'),
+        openAiTemp:0.7,documents:[],
+      });
+      write(path.join(legacy,'data/anythingllm/lifecycle-runtime.json'),{
+        rag_instances:{[f.deploy]:{context_window:8192,documents:[]}},
+      });
       // v1.1.0 冷恢复专项保留独立 Docker 运行状态，但 HTTP 仍访问本场景
       // 自有服务。通用 curl 桩既会掩盖实际 Prompt 同步，也会污染降级前
       // 当前代安全快照的只读回读。

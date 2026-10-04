@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const {createAdapter, parseHeaders, chatToResponses, mechanicalFailureAnswer} = require('../scripts/provider-adapter.js');
 const {VISITOR_FALLBACKS, visitorFallbackFor, mechanicalFailureAnswer: sharedMechanicalFailureAnswer,
   legacyGenericNonAnswer, sanitizeVisitorText} = require('../scripts/visitor-output.js');
@@ -15,17 +16,41 @@ async function main() {
   const configurationPath = path.join(work, 'provider.json');
   fs.writeFileSync(configurationPath, JSON.stringify({schema_version:2,provider:{}}));
   let calls = [], mode='responses', delay=0, answer='协议验证回答';
+  let responseEncoding='identity', chatFields={};
   const upstream = http.createServer(async (request, response) => {
     let text=''; for await (const chunk of request) text += chunk;
     const body=JSON.parse(text || '{}');
     calls.push({path:request.url,body,headers:request.headers});
     if (delay) await new Promise(resolve=>setTimeout(resolve,delay));
     response.setHeader('content-type','application/json');
-    if (request.url === '/proxy/v1/responses' && mode === 'responses') response.end(JSON.stringify({id:'synthetic-response',output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}}));
-    else if (request.url === '/proxy/v1/chat/completions' && mode === 'chat') response.end(JSON.stringify({id:'synthetic-chat',choices:[{message:{content:answer},finish_reason:'stop'}]}));
+    const sendJson = async (value,status=200) => {
+      response.statusCode=status;
+      const raw=Buffer.from(JSON.stringify(value));
+      if(responseEncoding==='corrupt-gzip') {
+        response.setHeader('content-encoding','gzip');response.end(Buffer.from('not-a-gzip-stream'));return;
+      }
+      let encoded=raw;
+      if(responseEncoding==='gzip')encoded=zlib.gzipSync(raw);
+      else if(responseEncoding==='deflate')encoded=zlib.deflateSync(raw);
+      else if(responseEncoding==='br')encoded=zlib.brotliCompressSync(raw);
+      else if(responseEncoding==='slow-gzip')encoded=zlib.gzipSync(raw);
+      else if(responseEncoding==='multiple')encoded=zlib.gzipSync(raw);
+      if(responseEncoding!=='identity')response.setHeader('content-encoding',
+        responseEncoding==='multiple'?'gzip, br':responseEncoding==='unknown'?'zstd':
+          responseEncoding==='slow-gzip'?'gzip':responseEncoding);
+      if(responseEncoding==='slow-gzip') {
+        const split=Math.max(1,Math.floor(encoded.length/2));
+        response.write(encoded.subarray(0,split));
+        await new Promise(resolve=>setTimeout(resolve,1500));
+        response.end(encoded.subarray(split));return;
+      }
+      response.end(encoded);
+    };
+    if (request.url === '/proxy/v1/responses' && mode === 'responses') await sendJson({id:'synthetic-response',output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}});
+    else if (request.url === '/proxy/v1/chat/completions' && mode === 'chat') await sendJson({id:'synthetic-chat',choices:[{message:{content:answer,...chatFields},finish_reason:'stop'}]});
     else if (mode === 'redirect') {response.writeHead(302,{location:'http://127.0.0.1:1/leak'});response.end();}
-    else if (mode === 'empty') response.end(JSON.stringify({choices:[]}));
-    else {response.writeHead(401);response.end(JSON.stringify({error:{message:'secret-do-not-echo'}}));}
+    else if (mode === 'empty') await sendJson({choices:[]});
+    else await sendJson({error:{message:'secret-do-not-echo'}},401);
   });
   await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve));
   // 固定到本夹具自己的实例根，避免发布验收机上真实 /opt/crisp-ai 接口池
@@ -46,6 +71,41 @@ async function main() {
     const visual=await post({messages:[{role:'user',content:[{type:'text',text:'识图'},{type:'image_url',image_url:{url:image}}]}]});assert.equal(visual.status,200);assert.equal(calls.at(-1).body.input[0].content[1].type,'input_image');pass('图片内容实际转为 Responses input_image');
     assert.throws(()=>chatToResponses({messages:[{role:'user',content:[{type:'image_url',image_url:{url:'http://169.254.169.254/latest/meta-data'}}]}]}, {model:'test'}));pass('适配器拒绝未经下载校验的外链图片');
     environment.AI_API_MODE='chat_completions';mode='chat';answer='Chat 协议验证回答';const chat=await post(body);assert.equal(chat.status,200);assert.equal(calls.at(-1).path,'/proxy/v1/chat/completions');pass('Chat-only 实际接线');
+    answer='空工具数组仍是完整业务答案';chatFields={tool_calls:[]};
+    const emptyTools=await post(body);assert.equal(emptyTools.status,200);
+    assert.equal((await emptyTools.json()).choices[0].message.content,answer);
+    for(const invalid of [
+      {tool_calls:[{id:'call-fixture',type:'function',function:{name:'unsafe',arguments:'{}'}}]},
+      {tool_calls:{}},{tool_calls:'[]'},{function_call:{}},{function_call:''},
+    ]) {
+      chatFields=invalid;assert.equal((await post(body)).status,502,
+        '非空或畸形工具字段必须失败关闭');
+    }
+    chatFields={tool_calls:null,function_call:null};
+    assert.equal((await post(body)).status,200,'null 工具字段与缺失字段等价');
+    chatFields={};pass('P01 空 tool_calls 合法，真实或畸形工具请求失败关闭');
+
+    for(const item of [
+      {protocol:'chat_completions',mode:'chat',encoding:'gzip'},
+      {protocol:'responses',mode:'responses',encoding:'deflate'},
+      {protocol:'responses',mode:'responses',encoding:'br'},
+    ]) {
+      environment.AI_API_MODE=item.protocol;mode=item.mode;responseEncoding=item.encoding;
+      answer=`${item.encoding} 压缩响应中的完整中文答案`;
+      const compressed=await post(body);assert.equal(compressed.status,200,item.encoding);
+      assert.equal((await compressed.json()).choices[0].message.content,answer,item.encoding);
+    }
+    environment.AI_API_MODE='chat_completions';mode='chat';answer='压缩协议负例正文';
+    for(const encoding of ['unknown','multiple','corrupt-gzip']) {
+      responseEncoding=encoding;
+      assert.equal((await post(body)).status,502,encoding+' 必须失败关闭');
+    }
+    responseEncoding='gzip';answer='x'.repeat(8*1024*1024);
+    assert.equal((await post(body)).status,502,'解压后超过8MiB必须在JSON解析前拒绝');
+    responseEncoding='slow-gzip';answer='压缩响应头之后仍在等待的正文';
+    assert.equal((await post(body)).status,504,'压缩半流超时必须保持timeout分类');
+    responseEncoding='identity';answer='Chat 协议验证回答';
+    pass('U01 gzip/deflate/br按解压后容量读取，未知、多重、损坏及炸弹拒绝');
     const mechanical = ['暂时无法回复，请稍后再试。', '  抱歉，暂时无法回复，请稍后再试。谢谢理解！  ',
       '系\u200b统　正忙，请稍后再试，谢谢理解。', '当前暂时不能答复，建议过一会儿再试。',
       '服务开了小差，请过会儿再试。', '很抱歉，我们目前没有办法为您提供帮助，请您耐心等待。',

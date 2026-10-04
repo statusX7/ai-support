@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 const {signEnvelope,envelopeMarker,verifyEnvelope,requestContract} = require('../scripts/provider-envelope.js');
@@ -213,34 +214,42 @@ manager.apply_rag_window=apply_window
     const first=await run(imports+`
 pool,secret=manager.load()
 primary=pool['primary_id']
-assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='8192'
-pool['entries'][1]['context_window']=32768
+assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='6992'
+for item in pool['entries']: item['context_window']=32768
 result=manager.commit(pool,secret,pool['revision'])
-assert calls==[32768] and result['rag_context']=={'context_window':32768,'state':'applied'}
+assert calls==[31568] and result['rag_context']=={'context_window':31568,'state':'applied'}
 env=module.read_env(manager.env)
-assert env['AI_MODEL_TOKEN_LIMIT']=='8192' and env['AI_MAX_OUTPUT_TOKENS']=='1200'
+# 兼容投影必须跟随当前主接口，而不是保留提交前的旧窗口。
+assert env['AI_MODEL_TOKEN_LIMIT']=='32768' and env['AI_MAX_OUTPUT_TOKENS']=='1200'
 pool,secret=manager.load()
 assert not manager.transaction.exists()
 pool['entries'][0]['name']='同容量改名'
 pool['entries'][0]['model']='same-window-model'
 secret[primary]['api_key']='synthetic-same-window-new-key'
 manager.commit(pool,secret,pool['revision'])
-assert calls==[32768]
+assert calls==[31568]
 pool,secret=manager.load()
 pool['entries'][0],pool['entries'][1]=pool['entries'][1],pool['entries'][0]
 pool['primary_id']=pool['entries'][0]['id']
 for index,item in enumerate(pool['entries']): item.update(order=index,role='primary' if index==0 else 'backup')
 manager.commit(pool,secret,pool['revision'])
-assert calls==[32768] and module.read_env(manager.env)['AI_MODEL_TOKEN_LIMIT']=='32768'
+assert calls==[31568] and module.read_env(manager.env)['AI_MODEL_TOKEN_LIMIT']=='32768'
 pool,secret=manager.load()
 probe=copy.deepcopy(pool)
-probe['entries'][2].update(context_window=2097152,enabled=False,draft=True)
-assert module.rag_context_window(probe)==32768
-probe['entries'][0]['capabilities'][probe['entries'][0]['api_mode']]=False
-assert module.rag_context_window(probe)==8192
-pool['entries'][0]['context_window']=16384
+probe['entries'][2].update(context_window=1456,max_output_tokens=1200,enabled=False,draft=True)
+assert module.rag_context_window(probe)==31568
+probe['entries'][1]['context_window']=8192
+assert module.rag_context_window(probe)==6992
+probe['entries'][1]['capabilities'][probe['entries'][1]['api_mode']]=False
+assert module.rag_context_window(probe)==31568
+probe['entries'][1]['capabilities'][probe['entries'][1]['api_mode']]=True
+probe['entries'][1].update(context_window=1455,max_output_tokens=1200)
+try: module.rag_context_window(probe)
+except module.PoolError as failure: assert failure.code=='invalid_entry'
+else: raise AssertionError('共同输入估算小于256仍被接受')
+for item in pool['entries']: item['context_window']=16384
 manager.commit(pool,secret,pool['revision'])
-assert calls==[32768,16384]
+assert calls==[31568,15184]
 pool,secret=manager.load()
 original=copy.deepcopy(pool)
 def reject_candidate(window):
@@ -249,40 +258,40 @@ def reject_candidate(window):
     try: manager.commit(concurrent,current_secret,concurrent['revision'])
     except module.PoolError as failure: assert failure.code=='configuration_applying'
     else: raise AssertionError('concurrent commit was accepted')
-    if window==65536: raise module.PoolError('rag_context_apply_failed','synthetic candidate refusal')
+    if window==64336: raise module.PoolError('rag_context_apply_failed','synthetic candidate refusal')
     return {'ok':True,'state':'applied','context_window':window}
 manager.apply_rag_window=reject_candidate
-pool['entries'][0]['context_window']=65536
+for item in pool['entries']: item['context_window']=65536
 try: manager.commit(pool,secret,pool['revision'])
 except module.PoolError as failure: assert failure.code=='rag_context_apply_failed'
 else: raise AssertionError('failed application was accepted')
 restored,restored_secret=manager.load()
 assert restored['entries']==original['entries'] and restored_secret==secret
-assert restored['revision']==original['revision']+2 and calls[-2:]==[65536,16384]
+assert restored['revision']==original['revision']+2 and calls[-2:]==[64336,15184]
 assert not manager.transaction.exists()
-assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='16384'
+assert module.read_env(manager.env)['PROVIDER_RAG_CONTEXT_WINDOW']=='15184'
 # 旧版已迁池缺少新投影，即使聚合数值未变化也必须同步一次。
 manager.apply_rag_window=apply_window
 module.atomic(manager.env,'\\n'.join(line for line in manager.env.read_text().splitlines() if not line.startswith('PROVIDER_RAG_CONTEXT_WINDOW='))+'\\n',0o600)
 manager.migrate()
-assert calls[-1]==16384 and len(calls)==5
+assert calls[-1]==15184 and len(calls)==5
 pool,secret=manager.load()
 def reject_all(window):
     apply_window(window)
     raise module.PoolError('rag_context_apply_failed','synthetic component unavailable')
 manager.apply_rag_window=reject_all
-pool['entries'][0]['context_window']=65536
+for item in pool['entries']: item['context_window']=65536
 try: manager.commit(pool,secret,pool['revision'])
 except module.PoolError as failure: assert failure.code=='rag_context_restore_failed'
 else: raise AssertionError('failed restoration was accepted')
 pending=module.read(manager.transaction)
 assert pending['phase']=='restore_failed'
 assert stat.S_IMODE(manager.transaction.stat().st_mode)==0o600
-assert module.rag_context_window(manager.load()[0])==16384
+assert module.rag_context_window(manager.load()[0])==15184
 print(json.dumps({'ok':True,'helper_calls':calls,'phase':pending['phase']}))
 `);
     assert.equal(first.code,0,first.stderr+first.stdout);
-    assert.deepEqual(JSON.parse(first.stdout).helper_calls,[32768,16384,65536,16384,16384,65536,16384]);
+    assert.deepEqual(JSON.parse(first.stdout).helper_calls,[31568,15184,64336,15184,15184,64336,15184]);
     assert.equal((await f.get('status')).configuration_state,'applying');
     assert.equal((await fetch(f.base+'/healthz')).status,503);
     const blocked=await f.post();assert.equal(blocked.status,400);assert.equal(blocked.value.error.code,'configuration_applying');assert.equal(f.calls.length,0);
@@ -308,9 +317,9 @@ for changed in ({'owner_boot_id':'00000000-0000-0000-0000-000000000000'},{'owner
     stale['started_at']-=150000
     module.atomic(manager.transaction,stale,0o600)
     result=manager.recover_rag_context()
-    assert result['rag_context']=={'context_window':16384,'state':'applied'}
+    assert result['rag_context']=={'context_window':15184,'state':'applied'}
     assert not manager.transaction.exists()
-assert calls==[16384,16384]
+assert calls==[15184,15184]
 # 身份字段缺失或不可核对时仍闭锁，不能用坏记录绕过真实存活helper。
 malformed=dict(pending)
 del malformed['owner_boot_id']
@@ -318,7 +327,7 @@ module.atomic(manager.transaction,malformed,0o600)
 try: manager.recover_rag_context()
 except module.PoolError as failure: assert failure.code=='invalid_configuration'
 else: raise AssertionError('missing owner identity was accepted')
-assert module.read(manager.transaction)==malformed and calls==[16384,16384]
+assert module.read(manager.transaction)==malformed and calls==[15184,15184]
 manager.transaction.unlink()
 print(json.dumps({'ok':True,'recovered':True,'stale_owner_identity_cases':2}))
 `);
@@ -333,12 +342,12 @@ print(json.dumps({'ok':True,'recovered':True,'stale_owner_identity_cases':2}))
     const acknowledgements=await run(imports+`
 from types import SimpleNamespace
 actual_run=module.subprocess.run
-for payload,status in [({'ok':True,'state':'deferred','context_window':16384},0),({'ok':True,'state':'applied','context_window':8192},0),({'ok':True,'state':'applied','context_window':'16384'},0),({'ok':True,'state':'applied','context_window':16384},1)]:
+for payload,status in [({'ok':True,'state':'deferred','context_window':15184},0),({'ok':True,'state':'applied','context_window':6992},0),({'ok':True,'state':'applied','context_window':'15184'},0),({'ok':True,'state':'applied','context_window':15184},1)]:
     def returned(command,**options):
-        assert command[-2:]==['internal-rag-context-apply','16384'] and options['timeout']==135
+        assert command[-2:]==['internal-rag-context-apply','15184'] and options['timeout']==135
         return SimpleNamespace(returncode=status,stdout=json.dumps(payload))
     module.subprocess.run=returned
-    try: module.Manager.apply_rag_window(manager,16384)
+    try: module.Manager.apply_rag_window(manager,15184)
     except module.PoolError as failure: assert failure.code=='rag_context_apply_failed'
     else: raise AssertionError('invalid helper acknowledgement was accepted')
 module.subprocess.run=actual_run
@@ -354,7 +363,7 @@ print(json.dumps({'ok':True,'invalid_acknowledgements_rejected':4}))
       fs.writeFileSync(marker,'ai-support\nstate='+state+'\n',{mode:0o600});
       fs.writeFileSync(envFile,fs.readFileSync(envFile,'utf8').split('\n').filter(line=>!line.startsWith('PROVIDER_RAG_CONTEXT_WINDOW=')).join('\n'),{mode:0o600});
       const deferred=await f.cli(['migrate','--defer-runtime']);assert.equal(deferred.code,0,deferred.stdout);
-      assert.deepEqual(deferred.value.rag_context,{context_window:16384,state:'deferred'});assert.equal(f.calls.length,1);
+      assert.deepEqual(deferred.value.rag_context,{context_window:15184,state:'deferred'});assert.equal(f.calls.length,1);
     }
     assert.equal((await f.cli(['list','--defer-runtime'])).value.error.code,'invalid_action');
     const pendingFile=path.join(f.directory,'config/provider-pool-transaction.json');
@@ -362,7 +371,7 @@ print(json.dumps({'ok':True,'invalid_acknowledgements_rejected':4}))
     assert.equal((await f.cli(['migrate','--defer-runtime'])).value.error.code,'configuration_applying');assert.ok(fs.existsSync(pendingFile));fs.unlinkSync(pendingFile);
     fs.symlinkSync(path.join(f.directory,'missing-transaction'),pendingFile);
     assert.notEqual((await f.cli(['recover-rag-context'])).code,0);assert.ok(fs.lstatSync(pendingFile).isSymbolicLink());fs.unlinkSync(pendingFile);
-    process.stdout.write('通过 UNIT/CONFIG：有限聚合窗口、仅变化时同步、锁外回读、并发拒绝、新代次回滚、失败闭锁恢复与仅安装可延后（helper为受控替身，不计入HTTP协议组数）\n');
+    process.stdout.write('通过 UNIT/CONFIG：共同输入估算上限扣除候选输出、仅变化时同步、锁外回读、并发拒绝、新代次回滚、失败闭锁恢复与仅安装可延后（helper为受控替身，不计入HTTP协议组数）\n');
   } finally {await f.close();}
 }
 
@@ -386,7 +395,7 @@ def apply_window(window):
 manager.apply_rag_window=apply_window
 pool,secret=manager.load()
 candidate=copy.deepcopy(pool)
-candidate['entries'][1]['context_window']=16384
+for item in candidate['entries']: item['context_window']=16384
 temporary=manager.root/'tmp'
 temporary.mkdir(exist_ok=True)
 lock_path=temporary/'maintenance.lock'
@@ -415,7 +424,7 @@ with lock_path.open('a') as held:
     try:
         os.environ.update(values)
         manager.commit(candidate,secret,pool['revision'])
-        assert calls==[16384]
+        assert calls==[15184]
         with lock_path.open('a') as observer:
             try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError: pass
@@ -446,12 +455,13 @@ spec=importlib.util.spec_from_file_location('child_pool',sys.argv[1]); module=im
 manager=module.Manager(sys.argv[2])
 actual_run=module.subprocess.run
 def helper_run(command,**options):
-    assert command[-2:]==['internal-rag-context-apply','32768']
+    assert command[-2:]==['internal-rag-context-apply','31568']
     descriptor=module.inherited_maintenance_descriptor(manager.root/'tmp/maintenance.lock')
     assert descriptor is not None and options['pass_fds']==(descriptor,)
     return actual_run([sys.executable,'-c',sys.argv[3],sys.argv[2]],**options)
 module.subprocess.run=helper_run
-pool,secret=manager.load(); pool['entries'][1]['context_window']=32768
+pool,secret=manager.load()
+for item in pool['entries']: item['context_window']=32768
 manager.commit(pool,secret,pool['revision'])
 '''
 helper_code='''import fcntl,json,os,sys
@@ -462,7 +472,7 @@ with (Path(sys.argv[1])/'tmp/maintenance.lock').open('a') as observer:
     try: fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: pass
     else: raise AssertionError('helper did not retain parent maintenance lock')
-print(json.dumps({'ok':True,'state':'applied','context_window':32768}))
+print(json.dumps({'ok':True,'state':'applied','context_window':31568}))
 '''
 parent_check='''import fcntl,sys
 from pathlib import Path
@@ -475,7 +485,7 @@ print('parent-lock-retained')
 completed=module.subprocess.run(['bash','-c','set -euo pipefail; source "$1"; acquire_maintenance_lock "$2"; python3 -B -c "$3" "$4" "$2" "$5"; python3 -B -c "$6" "$2"','--',str(Path(sys.argv[1]).with_name('common.sh')),str(manager.root),child_code,sys.argv[1],helper_code,parent_check],stdout=module.subprocess.PIPE,stderr=module.subprocess.PIPE,text=True,timeout=8)
 assert completed.returncode==0,completed.stderr+completed.stdout
 assert completed.stdout.strip()=='parent-lock-retained'
-assert module.rag_context_window(manager.load()[0])==32768
+assert module.rag_context_window(manager.load()[0])==31568
 with lock_path.open('a') as observer:
     fcntl.flock(observer,fcntl.LOCK_EX|fcntl.LOCK_NB)
 # 异常锁类型必须快速拒绝，不能在FIFO打开阶段阻塞维护入口。
@@ -491,7 +501,7 @@ for kind in ('fifo','symlink'):
         except (module.PoolError,OSError): pass
         else: raise AssertionError('unsafe maintenance lock type was accepted')
         assert time.monotonic()-started<1
-        assert manager.load()[0]==before and calls==[16384]
+        assert manager.load()[0]==before and calls==[15184]
     finally: lock_path.unlink()
 print(json.dumps({'ok':True,'maintenance_conflict_rejected':True,'inherited_parent_and_helper_verified':True}))
 `;
@@ -685,6 +695,20 @@ async function main() {
       const questionFile=path.join(f.directory,'data/provider-router/questions',questionId+'.json');
       assert.equal(fs.existsSync(questionFile),true);
 
+      state.jobs[0].provider_migration_from=null;
+      json(sessionFile,state);
+      const nullMigrationRoute=await f.post(sample,envelope);
+      assert.equal(nullMigrationRoute.status,400,
+        '无迁移信封不得把本地显式null迁移字段当作缺失');
+      assert.equal(nullMigrationRoute.value.error.code,'question_cancelled');
+      const nullMigrationReplay=await f.replay(envelope);
+      assert.equal(nullMigrationReplay.status,400,
+        '重放入口同样必须按迁移字段存在性失败关闭');
+      assert.equal(nullMigrationReplay.value.error.code,'question_cancelled');
+      assert.equal(f.calls.length,1,'损坏迁移绑定不得重新调用上游');
+      delete state.jobs[0].provider_migration_from;
+      json(sessionFile,state);
+
       const unauthorized=await f.retire(envelope);assert.equal(unauthorized.status,400);
       assert.equal(unauthorized.value.error.code,'question_conflict');
       assert.equal(fs.existsSync(questionFile),true,'仅有旧签名不得删除仍在处理的问题');
@@ -754,6 +778,53 @@ async function main() {
       const repeated=await f.retire(envelope);
       assert.equal(repeated.status,200,repeated.text);assert.deepEqual(repeated.value,{ok:true,state:'absent'});
       assert.equal(f.calls.length,0,'旧缓存清理和幂等确认均不得调用任何上游');
+    }finally{await f.close();}
+  });
+  await test('v1.2.1无出站旧答案只允许由迁移责任授权cleanup后重规划',async()=>{
+    const f=await fixture();try {
+      const current=read(f.poolFile),questionId='5'.repeat(64),
+        website='fixture-legacy-unsettled-website',sessionId='fixture-legacy-unsettled-session',
+        sessionKey=digest(website+'\0'+sessionId),deadline=Date.now()-1;
+      const envelope={version:1,scope:'conversation',question_id:questionId,
+        session_key:sessionKey,generation:0,runtime_revision:1,pool_revision:current.revision,
+        deadline_at:deadline,stage:'answer',attempt_generation:1,legacy_v121_cleanup:true};
+      const questionFile=path.join(f.directory,'data/provider-router/questions',questionId+'.json');
+      fs.mkdirSync(path.dirname(questionFile),{recursive:true,mode:0o700});
+      json(questionFile,{id:questionId,
+        binding:digest(JSON.stringify(['conversation',sessionKey,0,1,current.revision,deadline])),
+        revision:current.revision,deadline,attempts:1,
+        stages:{answer:{tried:[current.primary_id],result:chat('尚未取得投递权的旧答案')}},
+        created_at:Date.now()-1000});
+      const sessionFile=path.join(f.directory,'data/runtime','session-'+sessionKey+'.json');
+      const job={id:questionId,generation:0,revision:1,status:'received',
+        responsibility_status:'unresolved_failure',failure_code:'legacy_unsettled_plan_migrated',
+        legacy_unsettled_plan_migrated_at:Date.now(),
+        inference:{pool_revision:current.revision,deadline_at:deadline}};
+      job.provider_retirement={schema_version:1,state:'pending',purpose:'legacy_unsettled_retired',
+        envelope,identity_sha256:digest(canonical({envelope,purpose:'legacy_unsettled_retired'})),
+        attempts:0,first_recorded_at:Date.now(),next_action_at:0};
+      json(sessionFile,{schema_version:2,website_id:website,session_id:sessionId,mode:'ai',
+        generation:0,uncertain_events:[],jobs:[job]});
+
+      const wrong=await f.retire(envelope,'non_answer_retired');
+      assert.equal(wrong.status,400);assert.equal(wrong.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true);
+      const negative={...job,legacy_unsettled_plan_migrated_at:-1};
+      json(sessionFile,{schema_version:2,website_id:website,session_id:sessionId,mode:'ai',
+        generation:0,uncertain_events:[],jobs:[negative]});
+      const rejectedMarker=await f.retire(envelope,'legacy_unsettled_retired');
+      assert.equal(rejectedMarker.status,400);
+      assert.equal(rejectedMarker.value.error.code,'question_conflict');
+      assert.equal(fs.existsSync(questionFile),true,
+        '负数迁移标记不得授权删除旧Provider问题');
+      json(sessionFile,{schema_version:2,website_id:website,session_id:sessionId,mode:'ai',
+        generation:0,uncertain_events:[],jobs:[job]});
+      const retired=await f.retire(envelope,'legacy_unsettled_retired');
+      assert.equal(retired.status,200,retired.text);assert.deepEqual(retired.value,{ok:true,state:'retired'});
+      assert.equal(fs.existsSync(questionFile),false);
+      const repeated=await f.retire(envelope,'legacy_unsettled_retired');
+      assert.equal(repeated.status,200,repeated.text);assert.deepEqual(repeated.value,{ok:true,state:'absent'});
+      assert.equal(f.calls.length,0,'迁移清理不得重新调用上游或把旧答案直接发送');
     }finally{await f.close();}
   });
   await test('RAG system须完整保留有效Prompt，截断/用户段替代零推理且显式短probe不受影响',async()=>{
@@ -828,6 +899,132 @@ async function main() {
       assert.ok(recent.records.every(record=>record.pool_revision===f.pool.revision && Number.isSafeInteger(record.remaining_budget_ms) && record.remaining_budget_ms>=0 && record.remaining_budget_ms<=f.pool.policy.question_timeout_ms));
     }finally{await f.close();}
   });
+  await test('P01 空tool_calls经adapter与旧缓存重放均保留正文，真实或畸形工具请求不切备用',async()=>{
+    const f=await fixture(2);try {
+      let toolCalls=[];
+      f.behavior=async(_call,response)=>{
+        response.writeHead(200,{'content-type':'application/json'});
+        response.end(JSON.stringify({choices:[{message:{role:'assistant',content:'P01受控业务答案',tool_calls:toolCalls},finish_reason:'stop'}]}));
+        return true;
+      };
+      const envelope=f.envelope();
+      const first=await f.post(sample,envelope);assert.equal(first.status,200,first.text);
+      assert.equal(first.value.choices[0].message.content,'P01受控业务答案');
+      assert.equal(f.calls.length,1);
+      const questionFile=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+      const cached=read(questionFile);
+      cached.stages.answer.result.choices[0].message.tool_calls=[];
+      json(questionFile,cached);
+      const replayed=await f.post(sample,envelope);assert.equal(replayed.status,200,replayed.text);
+      assert.equal(replayed.value.choices[0].message.content,'P01受控业务答案');
+      assert.equal(f.calls.length,1,'带空数组的同请求缓存不得再次付费调用候选');
+      const toolFinishedCache=copy(cached);
+      toolFinishedCache.stages.answer.result.choices[0].finish_reason='tool_calls';
+      toolFinishedCache.stages.answer.result.choices[0].message.tool_calls=[];
+      toolFinishedCache.stages.answer.result.choices[0].message.refusal='异常finish不能借拒绝字段通过';
+      json(questionFile,toolFinishedCache);
+      const blockedCache=await f.post(sample,envelope);assert.equal(blockedCache.status,400,blockedCache.text);
+      assert.equal(blockedCache.value.error.code,'invalid_response');assert.equal(f.calls.length,1,
+        'finish_reason=tool_calls 即使数组为空也不得从缓存重放');
+
+      for(const invalid of [
+        [{id:'call-fixture',type:'function',function:{name:'unsafe',arguments:'{}'}}],
+        {},'[]',
+      ]) {
+        toolCalls=invalid;
+        const rejected=await f.post(sample,f.envelope());
+        assert.equal(rejected.status,400,rejected.text);
+        assert.equal(f.calls.at(-1).index,0);
+      }
+      assert.equal(f.calls.length,4,'每个真实/畸形工具请求只允许主候选一次，不得换源绕过');
+    }finally{await f.close();}
+  });
+  await test('DeepSeek异常finish不泄露部分正文，资源中断切备用、工具终态不换源、缓存不重放',async()=>{
+    for(const finishReason of ['insufficient_system_resource','aborted']) {
+      const f=await fixture(2);try {
+        const leaked='不得交付的部分正文-'+finishReason;
+        f.behavior=async(call,response)=>{
+          if(call.index===0){response.end(JSON.stringify({choices:[{message:{role:'assistant',content:leaked},finish_reason:finishReason}]}));return true;}
+          return false;
+        };
+        const envelope=f.envelope(),result=await f.post(sample,envelope);
+        assert.equal(result.status,200,result.text);assert.deepEqual(f.calls.map(call=>call.index),[0,1]);
+        assert.equal(result.value.choices[0].message.content,'验证回答');assert.ok(!result.text.includes(leaked));
+        const records=(await f.get('recent')).records.filter(record=>record.question_id===envelope.question_id);
+        assert.equal(records.filter(record=>record.outcome==='failed'&&record.error_class==='upstream_unavailable').length,1);
+        const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+        const cached=read(file);cached.stages.answer.result.choices[0]={message:{role:'assistant',content:leaked},finish_reason:finishReason};json(file,cached);
+        const before=f.calls.length,replay=await f.post(sample,envelope);assert.equal(replay.status,400,replay.text);
+        assert.equal(replay.value.error.code,'invalid_response');assert.equal(f.calls.length,before,'异常finish缓存不得重放或再次调用');
+      }finally{await f.close();}
+    }
+    for(const toolFields of [{}, {tool_calls:[]}, {tool_calls:null}]) {
+      const f=await fixture(2);try {
+        f.behavior=async(call,response)=>{
+          response.end(JSON.stringify({choices:[{message:{role:'assistant',content:'工具终态正文不得可见',...toolFields},finish_reason:'tool_calls'}]}));return true;
+        };
+        const result=await f.post();assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,'invalid_input');
+        assert.deepEqual(f.calls.map(call=>call.index),[0],'明确工具终态不得换源绕过');assert.ok(!result.text.includes('工具终态正文'));
+      }finally{await f.close();}
+    }
+    const unknown=await fixture(2);try {
+      unknown.behavior=async(call,response)=>{
+        if(call.index===0){response.end(JSON.stringify({choices:[{message:{role:'assistant',content:'未知终态部分正文'},finish_reason:'synthetic_unknown'}]}));return true;}
+        return false;
+      };
+      const result=await unknown.post();assert.equal(result.status,200,result.text);
+      assert.deepEqual(unknown.calls.map(call=>call.index),[0,1]);assert.ok(!result.text.includes('未知终态部分正文'));
+      assert.equal((await unknown.get('recent')).records.find(record=>record.outcome==='failed').error_class,'invalid_response');
+    }finally{await unknown.close();}
+    const length=await fixture();try {
+      length.behavior=async(_call,response)=>{response.end(JSON.stringify({choices:[{
+        message:{role:'assistant',content:'达到输出上限前的完整可见正文'},finish_reason:'length'}]}));return true;};
+      const result=await length.post();assert.equal(result.status,200,result.text);
+      assert.equal(result.value.choices[0].finish_reason,'length');assert.equal(length.calls.length,1);
+    }finally{await length.close();}
+  });
+  await test('U01 主接口损坏压缩响应切备用，备用br完整答案不混入主字节',async()=>{
+    const f=await fixture(2);try {
+      f.behavior=async(call,response)=>{
+        response.setHeader('content-type','application/json');
+        if(call.index===0){response.setHeader('content-encoding','gzip');response.end(Buffer.from('broken-gzip'));return true;}
+        const raw=Buffer.from(JSON.stringify(chat('备用压缩接口的完整业务答案')));
+        response.setHeader('content-encoding','br');response.end(zlib.brotliCompressSync(raw));return true;
+      };
+      const envelope=f.envelope();
+      const result=await f.post(sample,envelope);assert.equal(result.status,200,result.text);
+      assert.equal(result.value.choices[0].message.content,'备用压缩接口的完整业务答案');
+      assert.deepEqual(f.calls.map(call=>call.index),[0,1]);
+      assert.ok(!result.text.includes('broken-gzip'));
+      const cached=await f.post(sample,envelope);
+      assert.equal(cached.status,200,cached.text);
+      assert.equal(f.calls.length,2,'压缩备用结果缓存重放不得再次调用任何候选');
+    }finally{await f.close();}
+  });
+  await test('U01 未知或多重编码持续半流时关闭主连接，备用唯一完成且无悬挂',async()=>{
+    for(const encoding of ['zstd','gzip, br']) {
+      const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
+      try {
+        let primaryClosed=false,primaryStarted=false;
+        f.behavior=async(call,response)=>{
+          response.setHeader('content-type','application/json');
+          if(call.index===0){
+            response.once('close',()=>{primaryClosed=true;});
+            response.writeHead(200,{'content-encoding':encoding});response.write('{');
+            primaryStarted=true;await gate;response.end('}');return true;
+          }
+          response.end(JSON.stringify(chat('编码异常后仅由备用返回完整答案')));return true;
+        };
+        const pending=f.post();
+        await until(()=>primaryStarted,encoding+'主接口未进入持续半流');
+        const result=await pending;assert.equal(result.status,200,result.text);
+        assert.equal(result.value.choices[0].message.content,'编码异常后仅由备用返回完整答案');
+        await until(()=>primaryClosed,encoding+'异常响应连接未被主动关闭');
+        assert.deepEqual(f.calls.map(call=>call.index),[0,1]);
+        assert.equal((await f.get('recent')).records.filter(record=>record.outcome==='success').length,1);
+      }finally{release();await f.close();}
+    }
+  });
   await test('401共享认证范围、429额度/Retry-After不截短、模型不存在仅影响同模型',async()=>{
     const f=await fixture(3);try {
       f.publish((pool,secret)=>{secret[pool.entries[1].id]=copy(secret[pool.entries[0].id]);});
@@ -842,6 +1039,20 @@ async function main() {
     }finally{await g.close();}
     assert.equal(retryAfterMilliseconds('900'),900000);assert.ok(retryAfterMilliseconds(new Date(Date.now()+900000).toUTCString())>899000);
     for(const code of ['credit_balance_exhausted','project_spend_limit_exceeded','organization_spend_limit_exceeded','organization_usage_limit_exceeded'])assert.equal(classifyFailure(429,{error:{code}}).kind,'quota_exhausted');
+  });
+  await test('裸HTTP402及冲突body固定按认证范围额度耗尽切备用',async()=>{
+    for(const body of [{},{error:{code:'unknown_billing_shape'}},{error:{code:'invalid_api_key'}},{error:{code:'model_not_found'}}]) {
+      assert.deepEqual(classifyFailure(402,body),{kind:'quota_exhausted',fallback:true,scope:'authScope',retryAfter:0,status:402});
+      const f=await fixture(2);try {
+        f.behavior=async(call,response)=>{
+          if(call.index===0){response.writeHead(402,{'content-type':'application/json'});response.end(JSON.stringify(body));return true;}
+          return false;
+        };
+        const result=await f.post();assert.equal(result.status,200,result.text);assert.deepEqual(f.calls.map(call=>call.index),[0,1]);
+        const failed=(await f.get('recent')).records.find(record=>record.outcome==='failed');
+        assert.equal(failed.error_class,'quota_exhausted');assert.equal(failed.http_status,402);
+      }finally{await f.close();}
+    }
   });
   await test('普通404按接口协议故障切换备用，单接口保留结构化诊断',async()=>{
     assert.deepEqual(classifyFailure(404,{error:{message:'route not found'}}),{
@@ -897,6 +1108,71 @@ async function main() {
       f.behavior=async(call,response)=>{response.end(JSON.stringify({output_text:'不知道，资料未提到。'}));return true;};assert.equal((await f.post()).status,200);assert.equal(f.calls.length,3);
       f.behavior=async(call,response)=>{response.writeHead(400);response.end(JSON.stringify({error:{code:'invalid_request_error'}}));return true;};assert.equal((await f.post()).status,400);assert.equal(f.calls.length,4);
     }finally{await f.close();}
+  });
+  await test('Responses工具输出与正文并存失败关闭且不换源，reasoning不进入客户正文',async()=>{
+    for(const tool of [
+      {type:'function_call',name:'unsafe',arguments:'{}'},
+      {type:'custom_tool_call',name:'unsafe',input:'{}'},
+    ]) {
+      const f=await fixture(2);try {
+        f.publish(pool=>{pool.entries[0].api_mode='responses';pool.entries[0].capabilities.responses=true;});
+        f.behavior=async(call,response)=>{
+          response.end(JSON.stringify({status:'completed',output_text:'工具混合正文不得可见',output:[tool,
+            {type:'message',content:[{type:'output_text',text:'工具混合正文不得可见'}]}]}));return true;
+        };
+        const result=await f.post();assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,'invalid_input');
+        assert.deepEqual(f.calls.map(call=>call.index),[0]);assert.ok(!result.text.includes('工具混合正文'));
+      }finally{await f.close();}
+    }
+    const contentTool=await fixture(2);try {
+      contentTool.publish(pool=>{pool.entries[0].api_mode='responses';pool.entries[0].capabilities.responses=true;});
+      contentTool.behavior=async(call,response)=>{
+        response.end(JSON.stringify({status:'completed',output:[{type:'message',content:[
+          {type:'output_text',text:'content工具混合正文不得可见'},{type:'custom_tool_call',name:'unsafe',input:'{}'}]}]}));return true;
+      };
+      const result=await contentTool.post();assert.equal(result.status,400,result.text);assert.deepEqual(contentTool.calls.map(call=>call.index),[0]);
+      assert.ok(!result.text.includes('content工具混合正文'));
+    }finally{await contentTool.close();}
+    for(const [label,makeBody,cacheCase] of [
+      ['未知顶层item',(leaked)=>({status:'completed',output_text:leaked,output:[
+        {type:'synthetic_unknown_item',value:'untrusted'},
+        {type:'message',content:[{type:'output_text',text:leaked}]}]}),true],
+      ['未知content part',(leaked)=>({status:'completed',output:[{type:'message',content:[
+        {type:'output_text',text:leaked},{type:'synthetic_unknown_part',text:'untrusted'}]}]}),false],
+    ]) {
+      const f=await fixture(2);try {
+        f.publish(pool=>{pool.entries[0].api_mode='responses';pool.entries[0].capabilities.responses=true;});
+        const leaked=label+'不得进入客户正文',abnormal=makeBody(leaked);
+        f.behavior=async(call,response)=>{
+          if(call.index===0){response.end(JSON.stringify(abnormal));return true;}
+          return false;
+        };
+        const envelope=f.envelope(),result=await f.post(sample,envelope);
+        assert.equal(result.status,200,result.text);assert.equal(result.value.choices[0].message.content,'验证回答');
+        assert.deepEqual(f.calls.map(call=>call.index),[0,1]);assert.ok(!result.text.includes(leaked));
+        const records=(await f.get('recent')).records.filter(record=>record.question_id===envelope.question_id);
+        assert.equal(records.filter(record=>record.outcome==='failed'&&record.entry_id===f.pool.primary_id
+          &&record.error_class==='invalid_response').length,1,label+'必须作为主候选invalid_response');
+        assert.equal(records.filter(record=>record.outcome==='success'&&record.entry_id===f.pool.entries[1].id).length,1);
+        if(cacheCase) {
+          const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+          const cached=read(file);cached.stages.answer.result=copy(abnormal);json(file,cached);
+          const before=f.calls.length,replayed=await f.post(sample,envelope);
+          assert.equal(replayed.status,400,replayed.text);assert.equal(replayed.value.error.code,'invalid_response');
+          assert.equal(f.calls.length,before,'异常Responses缓存不得触发新上游调用');assert.ok(!replayed.text.includes(leaked));
+        }
+      }finally{await f.close();}
+    }
+    const reasoning=await fixture();try {
+      reasoning.publish(pool=>{pool.entries[0].api_mode='responses';pool.entries[0].capabilities.responses=true;});
+      reasoning.behavior=async(call,response)=>{
+        response.end(JSON.stringify({status:'completed',output:[
+          {type:'reasoning',content:[{type:'reasoning_text',text:'不得显示的推理正文'}]},
+          {type:'message',content:[{type:'output_text',text:'仅显示最终业务答案'}]}]}));return true;
+      };
+      const result=await reasoning.post();assert.equal(result.status,200,result.text);
+      assert.equal(result.value.choices[0].message.content,'仅显示最终业务答案');assert.ok(!result.text.includes('不得显示的推理正文'));
+    }finally{await reasoning.close();}
   });
   await test('视觉与回答共享预算，图片不静默删除、重复并发不放大调用',async()=>{
     const f=await fixture(3,{max_attempts:3});try {
@@ -1267,6 +1543,65 @@ async function main() {
       assert.equal(result.status,200);assert.equal(f.calls.at(-1).body.input[0].content[1].image_url,image);assert.equal(f.calls.length,2);
     }finally{await f.close();}
   });
+  await test('共同输入估算上限内主503真实切备用，超限备用显式skip且零HTTP',async()=>{
+    const privateMarker='context-body-must-not-appear';
+    const estimate=body=>256+body.messages.reduce((sum,message)=>sum+16+estimateTextTokens(message.content),0);
+    const configure=f=>f.publish(pool=>{
+      pool.entries[0].context_window=32768;pool.entries[0].max_output_tokens=1200;
+      pool.entries[1].context_window=8192;pool.entries[1].max_output_tokens=1200;
+    });
+    const excessive={messages:[sample.messages[0],{role:'user',content:privateMarker+'x'.repeat(24000)}]};
+    const skippedFixture=await fixture(2);try {
+      configure(skippedFixture);
+      const budget=Math.min(...skippedFixture.pool.entries.filter(entry=>entry.enabled&&!entry.draft
+        &&entry.capabilities[entry.api_mode]).map(entry=>entry.context_window-entry.max_output_tokens));
+      assert.equal(budget,6992);assert.ok(estimate(excessive)>budget);
+      skippedFixture.behavior=async(call,response)=>{
+        if(call.index===0){response.writeHead(503);response.end('{}');return true;}
+        return false;
+      };
+      const envelope=skippedFixture.envelope(),result=await skippedFixture.post(excessive,envelope);
+      assert.equal(result.status,400,result.text);assert.equal(result.value.error.code,'upstream_unavailable');
+      assert.deepEqual(skippedFixture.calls.map(call=>call.index),[0]);
+      const records=(await skippedFixture.get('recent')).records.filter(record=>record.question_id===envelope.question_id);
+      const skipped=records.find(record=>record.outcome==='skipped');
+      const failed=records.find(record=>record.outcome==='failed');
+      assert.ok(skipped);assert.ok(failed);
+      assert.deepEqual(Object.keys(skipped).sort(),['at','attempt','context_window','duration_ms','entry_id','error_class',
+        'input_tokens_estimate','outcome','pool_revision','question_id','remaining_budget_ms',
+        'requested_output_tokens','required_tokens','stage'].sort());
+      assert.equal(skipped.entry_id,skippedFixture.pool.entries[1].id);assert.equal(skipped.stage,'answer');
+      assert.equal(skipped.error_class,'context_window_insufficient');assert.equal(skipped.context_window,8192);
+      assert.equal(skipped.input_tokens_estimate,estimate(excessive));assert.equal(skipped.requested_output_tokens,1200);
+      assert.equal(skipped.required_tokens,skipped.input_tokens_estimate+1200);assert.ok(skipped.required_tokens>skipped.context_window);
+      assert.equal(skipped.duration_ms,0);assert.equal(skipped.attempt,failed.attempt);assert.equal(skipped.attempt,1);
+      assert.ok(Number.isSafeInteger(skipped.remaining_budget_ms)&&skipped.remaining_budget_ms>=0);
+      assert.ok(!JSON.stringify(records).includes(privateMarker));assert.ok(!JSON.stringify(records).includes('fixture-key'));
+      const stored=read(path.join(skippedFixture.directory,'data/provider-router/questions',envelope.question_id+'.json'));
+      assert.equal(stored.attempts,1);assert.equal(stored.round_attempts,1);
+      assert.deepEqual(stored.stages.answer.tried,[skippedFixture.pool.primary_id]);
+    }finally{await skippedFixture.close();}
+
+    const fallbackFixture=await fixture(2);try {
+      configure(fallbackFixture);
+      const fitting={messages:[sample.messages[0],{role:'user',content:'完整共同输入'+ 'x'.repeat(12000)}]};
+      const budget=Math.min(...fallbackFixture.pool.entries.filter(entry=>entry.enabled&&!entry.draft
+        &&entry.capabilities[entry.api_mode]).map(entry=>entry.context_window-entry.max_output_tokens));
+      assert.equal(budget,6992);assert.ok(estimate(fitting)<=budget);
+      fallbackFixture.behavior=async(call,response)=>{
+        if(call.index===0){response.writeHead(503);response.end('{}');return true;}
+        return false;
+      };
+      const envelope=fallbackFixture.envelope(),result=await fallbackFixture.post(fitting,envelope);
+      assert.equal(result.status,200,result.text);assert.equal(result.value.model,'fixture-model-1');
+      assert.deepEqual(fallbackFixture.calls.map(call=>call.index),[0,1]);
+      assert.deepEqual(fallbackFixture.calls[1].body.messages,fitting.messages,'备用必须接收同一完整消息正文');
+      const records=(await fallbackFixture.get('recent')).records.filter(record=>record.question_id===envelope.question_id);
+      assert.equal(records.filter(record=>record.outcome==='skipped').length,0);
+      assert.equal(records.filter(record=>record.outcome==='failed'&&record.entry_id===fallbackFixture.pool.primary_id).length,1);
+      assert.equal(records.filter(record=>record.outcome==='success'&&record.entry_id===fallbackFixture.pool.entries[1].id).length,1);
+    }finally{await fallbackFixture.close();}
+  });
   await test('完整池源校验与应用、跨实例导入缺Key草稿、有效主保持',async()=>{
     const f=await fixture(2);try {
       const source=Object.fromEntries(Object.entries(f.pool).filter(([key])=>key!=='secrets_generation'));
@@ -1475,18 +1810,27 @@ async function main() {
         assert.equal((await f.post(body,envelope)).text,result.text);assert.equal(f.calls.length,2);
       }finally{release();await f.close();}
     }
-    const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
-    try {
-      let partialSent=false,clientHeaders=false,upstreamClosed=false;
-      f.behavior=async(_call,response)=>{response.once('close',()=>{upstreamClosed=true;});response.writeHead(200,{'content-type':'application/json'});response.write('{"choices":[{"message":{"content":"迟到内容');partialSent=true;await gate;response.end('不能出站"}}]}');return true;};
-      const envelope=f.envelope(),body={...sample,stream:true},controller=new AbortController();
-      const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope({...envelope,...requestContract(body)},f.key)},body:JSON.stringify(body),signal:controller.signal}).then(async response=>{clientHeaders=true;return{status:response.status,text:await response.text()};}).catch(error=>({aborted:error.name==='AbortError'}));
-      await until(()=>partialSent,'取消例未收到半份上游');assert.equal(clientHeaders,false);controller.abort();assert.equal((await pending).aborted,true);
-      const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
-      await until(()=>upstreamClosed&&read(file).terminal?.code==='question_cancelled','客户端取消未持久结束上游');release();await sleep(30);
-      assert.equal(clientHeaders,false);assert.equal(f.calls.length,1);const stored=read(file);assert.equal(stored.attempts,1);assert.equal(stored.stages.answer.result,undefined);assert.equal((await f.get('recent')).records.length,0);
-      const again=await f.post(body,envelope);assert.equal(again.status,400);assert.equal(again.value.error.code,'question_cancelled');assert.ok(!again.text.includes('data: '));assert.ok(!again.text.includes('迟到内容'));assert.equal(f.calls.length,1);
-    }finally{release();await f.close();}
+    for(const encoding of ['identity','gzip']) {
+      const f=await fixture(2);let release;const gate=new Promise(resolve=>{release=resolve;});
+      try {
+        let partialSent=false,clientHeaders=false,upstreamClosed=false;
+        const raw=Buffer.from(JSON.stringify(chat('迟到内容不能出站')));
+        const wire=encoding==='gzip'?zlib.gzipSync(raw):raw;
+        const split=Math.max(1,Math.floor(wire.length/2));
+        f.behavior=async(_call,response)=>{response.once('close',()=>{upstreamClosed=true;});
+          response.writeHead(200,{'content-type':'application/json',
+            ...(encoding==='gzip'?{'content-encoding':'gzip'}:{})});
+          response.write(wire.subarray(0,split));partialSent=true;await gate;
+          response.end(wire.subarray(split));return true;};
+        const envelope=f.envelope(),body={...sample,stream:true},controller=new AbortController();
+        const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+f.key,'content-type':'application/json','x-crispai-question':signEnvelope({...envelope,...requestContract(body)},f.key)},body:JSON.stringify(body),signal:controller.signal}).then(async response=>{clientHeaders=true;return{status:response.status,text:await response.text()};}).catch(error=>({aborted:error.name==='AbortError'}));
+        await until(()=>partialSent,encoding+'取消例未收到半份上游');assert.equal(clientHeaders,false);controller.abort();assert.equal((await pending).aborted,true);
+        const file=path.join(f.directory,'data/provider-router/questions',envelope.question_id+'.json');
+        await until(()=>upstreamClosed&&read(file).terminal?.code==='question_cancelled',encoding+'客户端取消未持久结束上游');release();await sleep(30);
+        assert.equal(clientHeaders,false);assert.equal(f.calls.length,1);const stored=read(file);assert.equal(stored.attempts,1);assert.equal(stored.stages.answer.result,undefined);assert.equal((await f.get('recent')).records.length,0);
+        const again=await f.post(body,envelope);assert.equal(again.status,400);assert.equal(again.value.error.code,'question_cancelled');assert.ok(!again.text.includes('data: '));assert.ok(!again.text.includes('迟到内容'));assert.equal(f.calls.length,1);
+      }finally{release();await f.close();}
+    }
   });
   process.stdout.write(`UNIT/PROTOCOL 主备协议合计 ${count} 组通过，0 失败\n`);
 }

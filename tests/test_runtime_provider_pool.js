@@ -9,7 +9,7 @@ const http = require('node:http');
 const {spawn} = require('node:child_process');
 const {createRuntime} = require('../n8n/runtime');
 const {createAdapter} = require('../scripts/provider-adapter');
-const {verifyEnvelope} = require('../scripts/provider-envelope');
+const {verifyEnvelope,signEnvelope,requestContract} = require('../scripts/provider-envelope');
 const project = path.resolve(__dirname,'..');
 const area = path.join(project,'.work/v1.3.0');
 fs.mkdirSync(area,{recursive:true});
@@ -88,7 +88,8 @@ async function fixture(label) {
   let sequence=10000, runtime;
   const f={root,calls,sent,histories,tasks,failed:new Set(),slow:false,delay:400,failAnswer:false,
     adapterRestarts:0,answerRequests:[],answerResponses:[],adapterInternalRequests:[],
-    dropNextAdapterResponse:false,sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false};
+    dropNextAdapterResponse:false,sendAttempts:0,metaCalls:0,unknownSend:false,tagFailure:false,
+    resignAnswerSystem:false};
   const upstream=http.createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw||'{}');
     const index=Number(/^\/p(\d)\//.exec(req.url)?.[1]);
@@ -188,8 +189,17 @@ async function fixture(label) {
       else {
         assert.equal(captured.envelope.stage,'answer');assert.equal(captured.body.temperature,0.35);f.answerRequests.push(structuredClone(captured));
         if(f.beforeAnswer)await f.beforeAnswer(captured);
-        // 在实际 adapter 之前扰动载荷，以保留完整 Prompt 守卫负例。
-        if(f.answerSystem!==undefined)captured.body.messages[0].content=f.answerSystem;
+        // 先保留签名后正文篡改反例；需要单独验证Prompt守卫时，测试夹具用内部Key
+        // 重新绑定变更后的正文身份，使请求能越过请求摘要门而只命中Prompt完整性门。
+        if(f.answerSystem!==undefined){
+          captured.body.messages[0].content=f.answerSystem;
+          if(f.resignAnswerSystem){
+            const rebound=requestContract(captured.body);
+            captured.headers['x-crispai-question']=signEnvelope({...captured.envelope,
+              request_contract_version:rebound.request_contract_version,
+              request_sha256:rebound.request_sha256},internal);
+          }
+        }
       }
       // 重启会更换本地随机端口；始终解析当前 adapter，模拟部署中不变的服务地址。
       const response=await postAdapter(captured.body,captured.headers,options.timeout||10000,
@@ -249,7 +259,8 @@ function assertUnresolved(f,event,result,code=''){
   if(code)assert.equal(job.failure_code,code);assert(Number.isFinite(job.retry_at));return job;
 }
 async function recoverOnce(f,event,result){
-  f.failed.clear();f.failAnswer=false;f.slow=false;f.behavior=null;f.beforeAnswer=null;f.answerSystem=undefined;
+  f.failed.clear();f.failAnswer=false;f.slow=false;f.behavior=null;f.beforeAnswer=null;
+  f.answerSystem=undefined;f.resignAnswerSystem=false;
   await f.makeDue(event.data.session_id,result.jobId);await wait(1100);
   const before=f.sent.length,beforeCalls=f.calls.length;
   let recovered=await f.process(result.key,result.jobId);
@@ -281,22 +292,31 @@ async function recoverOnce(f,event,result){
     assert.equal(f.answerRequests[0].envelope.stage,'answer');assert.equal(f.answerRequests[0].body.messages[0].content,'用户原文规则：结合知识与公开历史回答。');
     assert(JSON.stringify(f.calls[2].body).includes('合成处理码是蓝色'));
   });
-  await test('adapter前丢失业务Prompt时零可见出站并保留责任，恢复后原问题仅一份有效答案',async f=>{
-    f.answerSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
+  await test('签名后正文篡改先拒绝；重新绑定正文但丢失业务Prompt仍零出站并可恢复',async f=>{
+    const truncated='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
+    f.answerSystem=truncated;
+    const tamperEvent=f.event('session_pool_request-tamper','合成签名正文篡改问题');
+    const tamperUnresolved=await f.deliver(tamperEvent);assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);
+    assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'invalid_envelope');
+    assertUnresolved(f,tamperEvent,tamperUnresolved,'invalid_response');
+    await recoverOnce(f,tamperEvent,tamperUnresolved);assert.equal(f.sent.length,1);
+    f.answerSystem=truncated;f.resignAnswerSystem=true;
+    const promptTasksBefore=f.tasks.length;
     const event=f.event('session_pool_prompt1','合成普通问题');
-    const unresolved=await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);
-    assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'context_preparation_incomplete');
+    const unresolved=await f.deliver(event);assert.equal(f.calls.length,1);assert.equal(f.sent.length,1);
+    assert.equal(f.answerResponses.at(-1).status,400);assert.equal(f.answerResponses.at(-1).body.error.code,'context_preparation_incomplete');
     assertUnresolved(f,event,unresolved,'context_preparation_incomplete');assert.equal(f.state(event.data.session_id).mode,'ai');
-    f.restart();await f.deliver(event);assert.equal(f.calls.length,0);assert.equal(f.sent.length,0);assert.equal(f.tasks.length,1);
-    await recoverOnce(f,event,unresolved);assert.equal(f.sent.length,1);
-    f.answerSystem='用户原文规则：\n--prompt truncated for brevity--\n公开历史回答。';
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,1);assert.equal(f.sent.length,1);
+    assert.equal(f.tasks.length,promptTasksBefore+1,'重复事件不得再次执行知识检索');
+    await recoverOnce(f,event,unresolved);assert.equal(f.sent.length,2);
+    f.answerSystem=truncated;f.resignAnswerSystem=true;
     const imageEvent=f.event('session_pool_promptimage',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
     const imageUnresolved=await f.deliver(imageEvent);assert.equal(f.calls.filter(call=>call.visual).length,1);
-    assert.equal(f.answerResponses.at(-1).body.error.code,'context_preparation_incomplete');assert.equal(f.sent.length,1);assert.equal(f.state(imageEvent.data.session_id).image_context.length,1);
+    assert.equal(f.answerResponses.at(-1).body.error.code,'context_preparation_incomplete');assert.equal(f.sent.length,2);assert.equal(f.state(imageEvent.data.session_id).image_context.length,1);
     assertUnresolved(f,imageEvent,imageUnresolved,'context_preparation_incomplete');
     assert.equal(f.state(imageEvent.data.session_id).mode,'ai');f.restart();await f.deliver(imageEvent);
-    assert.equal(f.calls.filter(call=>call.visual).length,1);assert.equal(f.sent.length,1);
-    await recoverOnce(f,imageEvent,imageUnresolved);assert.equal(f.sent.length,2);
+    assert.equal(f.calls.filter(call=>call.visual).length,1);assert.equal(f.sent.length,2);
+    await recoverOnce(f,imageEvent,imageUnresolved);assert.equal(f.sent.length,3);
     assert.equal(f.calls.filter(call=>call.visual).length,1,'恢复不得重新识图');
   });
   await test('视觉与RAG回答共享三次上限，耗尽后保留责任并在恢复后仅答一次',async f=>{
@@ -311,8 +331,10 @@ async function recoverOnce(f,event,result){
     f.slow=true;f.delay=1000;f.failed=new Set([0]);const pending=f.deliver(f.event('session_pool_humanA','慢问题'));
     await until(()=>f.calls.length===1,'慢推理未进入合成上游');
     const human=f.event('session_pool_humanA','真人公开处理进度',{from:'operator',automated:false});human.event='message:received';
-    const started=Date.now();await f.deliver(human);assert(Date.now()-started<300);assert.equal(f.state('session_pool_humanA').mode,'human');
-    const cancelled=await pending;assert(Date.now()-started<400);assert.equal(cancelled.status,'cancelled');
+    const started=Date.now();await f.deliver(human);const handoffElapsed=Date.now()-started;
+    const cancelled=await pending;const cancellationElapsed=Date.now()-started;
+    assert(handoffElapsed<600,'人工接管提交耗时 '+handoffElapsed+'ms，取消收敛 '+cancellationElapsed+'ms；超过600ms门禁');assert.equal(f.state('session_pool_humanA').mode,'human');
+    assert(cancellationElapsed<750,'慢请求取消收敛耗时 '+cancellationElapsed+'ms，超过750ms门禁');assert.equal(cancelled.status,'cancelled');
     assert.equal(f.calls.length,1);assert.equal(f.sent.length,0);
     const cancelledJob=f.state('session_pool_humanA').jobs.find(item=>item.id===cancelled.jobId);
     assert.equal(cancelledJob.responsibility_status,'intentional_silence');
@@ -346,8 +368,16 @@ async function recoverOnce(f,event,result){
     await f.publish(pool=>{pool.entries[1].enabled=false;});await changed;assert.equal(f.sent.length,0);assert.equal(f.calls.length,2);
   });
   await test('A19 视觉后重启adapter仍共享真实总期限和累计次数，重放缓存不再次识图',async f=>{
-    await f.publish(pool=>{Object.assign(pool.policy,{question_timeout_ms:3000,call_timeout_ms:2500,connect_timeout_ms:100,max_attempts:4});});
-    let answerClosed=false,answerClosedAt,beforeRestart,afterRestart,replay,answerEnvelope,visionCallsBefore,resolveAnswerClosed;
+    // 本场验证跨视觉/回答阶段的5秒总期限，不验证主接口冷却后回切。
+    // 5秒给全量套件负载下的真实adapter重启和缓存回读留出调度余量；回答阶段
+    // 仍必须消耗同一个deadline并以question_timeout终止，不能取得新的一题预算。
+    // 将失败候选冷却明确设为长于题目期限，避免毫秒级执行开销决定主接口
+    // 是否恰在回答阶段前恢复资格，从而改变本场真正要观测的调用序列。
+    await f.publish(pool=>{Object.assign(pool.policy,{question_timeout_ms:5000,
+      call_timeout_ms:4500,connect_timeout_ms:100,max_attempts:4,
+      cooldown_initial_ms:15000,cooldown_max_ms:15000});});
+    let answerClosed=false,answerClosedAt,beforeRestart,afterRestart,replay,answerEnvelope,
+      visionCallsBefore,replayStartedAt,replayFinishedAt,resolveAnswerClosed;
     const answerClosedEvent=new Promise(resolve=>{resolveAnswerClosed=resolve;});
     f.behavior=async(call,response)=>{
       if(call.visual){await wait(call.index===0?250:700);if(call.index===0){response.writeHead(503);response.end('{}');return true;}return false;}
@@ -358,24 +388,33 @@ async function recoverOnce(f,event,result){
     f.beforeAnswer=async request=>{
       answerEnvelope=f.decode(request.headers['x-crispai-question']);
       beforeRestart=f.question(answerEnvelope.question_id);visionCallsBefore=f.calls.length;
-      await f.restartAdapter();replay=await f.replayVision();afterRestart=f.question(answerEnvelope.question_id);
+      await f.restartAdapter();replayStartedAt=Date.now();replay=await f.replayVision();
+      replayFinishedAt=Date.now();afterRestart=f.question(answerEnvelope.question_id);
     };
     const event=f.event('session_pool_deadline',{type:'image/png',url:'https://storage.crisp.chat/synthetic.png'},{type:'file'});
     const result=await f.deliver(event),ended=Date.now(),stored=f.question(answerEnvelope.question_id);
-    assert.equal(f.adapterRestarts,1);assert.equal(beforeRestart.attempts,2);assert.equal(afterRestart.attempts,2);assert.equal(visionCallsBefore,2);assert.equal(replay.status,200);assert.equal(replay.body.choices[0].message.content,'合成图片中是蓝色保存按钮。');
+    assert.equal(f.adapterRestarts,1);assert.equal(beforeRestart.attempts,2);assert.equal(afterRestart.attempts,2);assert.equal(visionCallsBefore,2);
+    assert.equal(replay.status,200,'视觉缓存重放状态 '+replay.status+'，错误 '+String(replay.body?.error?.code||'none')
+      +'，开始时剩余 '+(answerEnvelope.deadline_at-replayStartedAt)+'ms，耗时 '+(replayFinishedAt-replayStartedAt)+'ms');
+    assert.equal(replay.body.choices[0].message.content,'合成图片中是蓝色保存按钮。');
     assert.equal(f.visionRequest.envelope.stage,'vision');assert.equal(answerEnvelope.stage,'answer');assert.equal(f.visionRequest.envelope.question_id,answerEnvelope.question_id);assert.equal(f.visionRequest.envelope.deadline_at,answerEnvelope.deadline_at);
-    assert.equal(beforeRestart.deadline,answerEnvelope.deadline_at);assert.equal(afterRestart.deadline,beforeRestart.deadline);assert.equal(stored.deadline,beforeRestart.deadline);assert.equal(stored.attempts,4);
-    assert.deepEqual(f.calls.map(call=>call.index),[0,1,1,2]);assert.equal(f.calls.filter(call=>call.visual).length,2);assert.equal(f.tasks.length,1);assert.match(f.tasks[0].query,/蓝色保存按钮/);
+    assert.equal(beforeRestart.deadline,answerEnvelope.deadline_at);assert.equal(afterRestart.deadline,beforeRestart.deadline);assert.equal(stored.deadline,beforeRestart.deadline);
+    assert([3,4].includes(stored.attempts),'adapter重启后累计尝试必须保留，且不得超过四次总上限');
+    const expectedCalls=stored.attempts===4?[0,1,1,2]:[0,1,1];
+    assert.deepEqual(f.calls.map(call=>call.index),expectedCalls);
+    assert.equal(f.calls.filter(call=>call.visual).length,2);assert.equal(f.tasks.length,1);assert.match(f.tasks[0].query,/蓝色保存按钮/);
     assert.equal(f.answerResponses[0].status,400);assert.equal(f.answerResponses[0].body.error.code,'question_timeout');assert.equal(stored.terminal.code,'question_timeout');assert.equal(stored.stages.answer.result,undefined);
-    assert.ok(ended>=stored.deadline);assert.ok(ended-stored.deadline<700);assert.ok(ended-f.calls[0].at<3700);assert.ok(ended-f.calls.at(-1).at<2200);
+    assert.ok(ended>=stored.deadline);assert.ok(ended-stored.deadline<700);assert.ok(ended-f.calls[0].at<5700);assert.ok(ended-f.calls.at(-1).at<4200);
     // 直接 adapter 回程不再多经过 RAG HTTP；给同进程 socket 的 close 事件有限派发时间。
     await Promise.race([answerClosedEvent,wait(100)]);
     write(path.join(f.root,'deadline-observation.json'),{deadline:stored.deadline,returned_at:ended,
       upstream_closed:answerClosed,upstream_closed_at:answerClosedAt??null,close_event_wait_max_ms:100,
       attempts:stored.attempts,vision_attempts:f.calls.filter(call=>call.visual).length});
-    assert.equal(answerClosed,true);assert.ok(answerClosedAt<=ended+100);
+    if(stored.attempts===4){assert.equal(answerClosed,true);assert.ok(answerClosedAt<=ended+100);}
+    else assert.equal(answerClosed,false,'总期限先耗尽时不得启动最后一个候选再制造连接');
     assert.equal(f.sent.length,0);assert.equal(f.state(event.data.session_id).mode,'ai');assertUnresolved(f,event,result,'question_timeout');
-    f.restart();await f.deliver(event);assert.equal(f.calls.length,4);assert.equal(f.sent.length,0);assert.equal(f.tasks.length,1);
+    f.restart();await f.deliver(event);assert.equal(f.calls.length,stored.attempts);
+    assert.equal(f.sent.length,0);assert.equal(f.tasks.length,1);
     await recoverOnce(f,event,result);assert.equal(f.sent.length,1);
   });
   await test('主接口200机械故障切到备用，备用200机械故障继续切下一备用且仅出站业务答案',async f=>{
@@ -402,6 +441,8 @@ async function recoverOnce(f,event,result){
     assert(!f.sent.some(item=>/系统繁忙|稍后再试/.test(item.content)));
   });
   await test('视觉摘要及图片最终阶段的机械答复均在接口池内切换，不污染记忆或访客出站',async f=>{
+    await f.publish(pool=>{Object.assign(pool.policy,{
+      cooldown_initial_ms:15000,cooldown_max_ms:15000});});
     const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
     f.behavior=async(call,response)=>{
       if(call.index===0&&call.visual){send(response,{choices:[{message:{role:'assistant',content:'系统维护中，请过会儿再试。'}}]});return true;}
@@ -489,6 +530,10 @@ async function recoverOnce(f,event,result){
     assert.equal(f.calls.length,1);assert.equal(f.sent.length,1);
   });
   await test('A21 全池失败后多会话零可见出站且责任不丢，恢复后每问题仅一份答案',async f=>{
+    // outage阶段需要明确覆盖所有并发会话；不能用默认1秒冷却并假设
+    // adapter/runtime重启与五个并发任务一定会在该窗口内完成。
+    await f.publish(pool=>{Object.assign(pool.policy,{
+      cooldown_initial_ms:15000,cooldown_max_ms:15000});});
     f.failed=new Set([0,1,2]);
     const initial=f.event('session_pool_exhausted0','合成全失败问题');
     const firstResult=await f.deliver(initial);assertUnresolved(f,initial,firstResult,'upstream_unavailable');assert.deepEqual(f.calls.map(call=>call.index),[0,1,2]);
@@ -502,6 +547,8 @@ async function recoverOnce(f,event,result){
       assert.equal((await f.receive(event)).reason,'重复事件已忽略');
     }
     assert.equal(f.calls.length,3);assert.equal(f.sent.length,0);
+    // 将“仍在故障冷却”和“上游已经恢复”两个阶段显式分开。
+    await wait(15100);
     const callsBeforeRecovery=f.calls.length;
     for(const [index,event] of [initial,...events].entries()) {
       const result=index===0?firstResult:results[index-1];

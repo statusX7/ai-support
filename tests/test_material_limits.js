@@ -43,6 +43,9 @@ try {
   const realParent=path.join(work,'real-parent');fs.mkdirSync(realParent);fs.writeFileSync(path.join(realParent,'item.md'),'虚构\n');
   const linkedParent=path.join(work,'linked-parent');fs.symlinkSync(realParent,linkedParent);
   result=inspect(path.join(linkedParent,'item.md'));assert.notEqual(result.status,0);assert.match(result.stderr,/父目录/);
+  fs.unlinkSync(path.join(linkedTree,'link.md'));
+  fs.rmdirSync(linkedTree);
+  fs.unlinkSync(linkedParent);
   pass('来源自身、目录成员及父路径的符号链接均被拒绝');
 
   let permissionFixture;
@@ -62,9 +65,11 @@ try {
     assert.equal(fs.statSync(denied).mode & 0o777,0o700);
     assert.equal(fs.statSync(path.join(denied,'secret.md')).mode & 0o777,0o600);
     if(process.getuid?.()===0) {
+      const droppedEnv={...process.env};
+      delete droppedEnv.TMPDIR;
       result=run('python3',['-c',
         'import os,sys\nos.setgroups([])\nos.setgid(65534)\nos.setuid(65534)\nos.execv("/bin/bash",["bash",sys.argv[1],"inspect-source",sys.argv[2]])',
-        path.join(copiedScripts,'knowledge.sh'),permissionSource],{cwd:'/tmp'});
+        path.join(copiedScripts,'knowledge.sh'),permissionSource],{cwd:'/tmp',env:droppedEnv});
     } else {
       fs.chmodSync(denied,0o000);
       result=run('bash',[path.join(copiedScripts,'knowledge.sh'),'inspect-source',permissionSource],{cwd:'/tmp'});

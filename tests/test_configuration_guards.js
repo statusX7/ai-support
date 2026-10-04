@@ -48,20 +48,38 @@ const outsideEnv = path.join(envGuardRoot, 'outside.env');
 fs.writeFileSync(outsideEnv, 'SAFE=outside\n', { mode: 0o600 });
 const symlinkEnv = path.join(envGuardRoot, 'symlink.env');
 fs.symlinkSync(outsideEnv, symlinkEnv);
-let guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE changed', 'guard', symlinkEnv], { cwd: project, encoding: 'utf8' });
-assert.notEqual(guarded.status, 0, guarded.stderr);
-assert.equal(fs.readFileSync(outsideEnv, 'utf8'), 'SAFE=outside\n');
-assert.equal(fs.readlinkSync(symlinkEnv), outsideEnv);
-record('环境配置拒绝符号链接且不改写链接目标');
+let guarded;
+try {
+  guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE changed', 'guard', symlinkEnv], { cwd: project, encoding: 'utf8' });
+  assert.notEqual(guarded.status, 0, guarded.stderr);
+  assert.equal(fs.readFileSync(outsideEnv, 'utf8'), 'SAFE=outside\n');
+  assert.equal(fs.readlinkSync(symlinkEnv), outsideEnv);
+  record('环境配置拒绝符号链接且不改写链接目标');
+} finally {
+  fs.rmSync(symlinkEnv, { force: true });
+  assert.equal(fs.existsSync(symlinkEnv), false);
+  assert.equal(fs.lstatSync(outsideEnv).isFile(), true);
+  assert.equal(fs.readFileSync(outsideEnv, 'utf8'), 'SAFE=outside\n');
+}
 const hardlinkSource = path.join(envGuardRoot, 'hardlink-source.env');
 const hardlinkEnv = path.join(envGuardRoot, 'hardlink.env');
 fs.writeFileSync(hardlinkSource, 'SAFE=hardlink\n', { mode: 0o600 });
 fs.linkSync(hardlinkSource, hardlinkEnv);
-guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE changed', 'guard', hardlinkEnv], { cwd: project, encoding: 'utf8' });
-assert.notEqual(guarded.status, 0, guarded.stderr);
-assert.equal(fs.readFileSync(hardlinkSource, 'utf8'), 'SAFE=hardlink\n');
-assert.equal(fs.readFileSync(hardlinkEnv, 'utf8'), 'SAFE=hardlink\n');
-record('环境配置拒绝多链接文件且不改写共享 inode');
+try {
+  guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE changed', 'guard', hardlinkEnv], { cwd: project, encoding: 'utf8' });
+  assert.notEqual(guarded.status, 0, guarded.stderr);
+  assert.equal(fs.readFileSync(hardlinkSource, 'utf8'), 'SAFE=hardlink\n');
+  assert.equal(fs.readFileSync(hardlinkEnv, 'utf8'), 'SAFE=hardlink\n');
+  record('环境配置拒绝多链接文件且不改写共享 inode');
+} finally {
+  fs.rmSync(hardlinkEnv, { force: true });
+  assert.equal(fs.existsSync(hardlinkEnv), false);
+  const sourceState = fs.lstatSync(hardlinkSource);
+  assert.equal(sourceState.isFile(), true);
+  assert.equal(sourceState.isSymbolicLink(), false);
+  assert.equal(sourceState.nlink, 1);
+  assert.equal(fs.readFileSync(hardlinkSource, 'utf8'), 'SAFE=hardlink\n');
+}
 const directoryEnv = path.join(envGuardRoot, 'directory.env');
 fs.mkdirSync(directoryEnv);
 guarded = spawnSync('bash', ['-c', 'source scripts/common.sh; env_set "$1" SAFE changed', 'guard', directoryEnv], { cwd: project, encoding: 'utf8' });

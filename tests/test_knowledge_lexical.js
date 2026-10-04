@@ -114,13 +114,19 @@ test('L08 缺失/畸形parsed JSON或pageContent校验失败，旧索引原样�
 });
 test('L09 路径穿越/链接目录/链接文件/硬链接不能读取映射以外文件',()=>{
   for(const kind of ['traversal','file-link','directory-link','hard-link']) {
-    const f=fixture('unsafe-'+kind); built(f);
-    const file=path.join(f.root,'data/anythingllm/documents',f.documents[0].location);
-    if(kind==='traversal') save(f.mapPath,{schema_version:2,documents:[{...f.documents[0],location:'../../../../.env'}]});
-    if(kind==='file-link') {fs.unlinkSync(file); fs.symlinkSync(path.join(f.root,'.env'),file);}
-    if(kind==='hard-link') {fs.unlinkSync(file); fs.linkSync(path.join(f.root,'.env'),file);}
-    if(kind==='directory-link') {const dir=path.dirname(file); fs.renameSync(dir,dir+'-old'); fs.symlinkSync(dir+'-old',dir);}
-    rejectedBuild(f,kind==='traversal'?'map_invalid':'source_invalid');
+    const f=fixture('unsafe-'+kind);
+    try {
+      built(f);
+      const file=path.join(f.root,'data/anythingllm/documents',f.documents[0].location);
+      if(kind==='traversal') save(f.mapPath,{schema_version:2,documents:[{...f.documents[0],location:'../../../../.env'}]});
+      if(kind==='file-link') {fs.unlinkSync(file); fs.symlinkSync(path.join(f.root,'.env'),file);}
+      if(kind==='hard-link') {fs.unlinkSync(file); fs.linkSync(path.join(f.root,'.env'),file);}
+      if(kind==='directory-link') {const dir=path.dirname(file); fs.renameSync(dir,dir+'-old'); fs.symlinkSync(dir+'-old',dir);}
+      rejectedBuild(f,kind==='traversal'?'map_invalid':'source_invalid');
+    } finally {
+      fs.rmSync(f.root,{recursive:true,force:true});
+      assert.equal(fs.existsSync(f.root),false);
+    }
   }
 });
 test('L10 只索引当前启用映射，不读取未映射文件、会话或非pageContent元数据',()=>{
@@ -134,12 +140,18 @@ test('L10 只索引当前启用映射，不读取未映射文件、会话或非p
   assert.equal(f.search(question).results.length,1);
 });
 test('L11 重复构建逐字幂等；替换原子且不跟随输出链接',()=>{
-  const f=fixture('atomic'); built(f); const first=fs.readFileSync(f.indexPath),inode=fs.statSync(f.indexPath).ino;
-  built(f); assert.deepEqual(fs.readFileSync(f.indexPath),first); assert.equal(fs.statSync(f.indexPath).ino,inode);
-  const protectedFile=path.join(f.root,'.env'),original=fs.readFileSync(protectedFile);
-  fs.unlinkSync(f.indexPath); fs.symlinkSync(protectedFile,f.indexPath);
-  const result=f.build(); assert.equal(result.status,1); assert.equal(JSON.parse(result.stdout).error.code,'output_invalid');
-  assert.deepEqual(fs.readFileSync(protectedFile),original);
+  const f=fixture('atomic');
+  try {
+    built(f); const first=fs.readFileSync(f.indexPath),inode=fs.statSync(f.indexPath).ino;
+    built(f); assert.deepEqual(fs.readFileSync(f.indexPath),first); assert.equal(fs.statSync(f.indexPath).ino,inode);
+    const protectedFile=path.join(f.root,'.env'),original=fs.readFileSync(protectedFile);
+    fs.unlinkSync(f.indexPath); fs.symlinkSync(protectedFile,f.indexPath);
+    const result=f.build(); assert.equal(result.status,1); assert.equal(JSON.parse(result.stdout).error.code,'output_invalid');
+    assert.deepEqual(fs.readFileSync(protectedFile),original);
+  } finally {
+    fs.rmSync(f.root,{recursive:true,force:true});
+    assert.equal(fs.existsSync(f.root),false);
+  }
 });
 test('L12 完整50MiB合法正文生成明确部分索引，保留显式尾问答与首中尾窗口',()=>{
   const paragraph='这一段只记载虚构园艺展品、颜色、木架、花盆和日常维护事项。'.repeat(100)+'\n\n';
@@ -253,10 +265,19 @@ test('L20 完整且锚定的礼貌范围说明可剥离为完整FAQ强命中，�
 });
 test('L21 范围说明、否定引用、复述改问、复合问题、短泛问及数字冲突不能绕过门槛',()=>{
   const f=fixture('prefix-negative',[qa,'问：可以吗？\n答：请先说明具体事项。\n',
+    '问：能否？\n答：请说明需要确认的业务对象。\n',
+    '问：支持吗？\n答：请说明需要确认的具体功能。\n',
+    '问：允许吗？\n答：请说明需要确认的具体规则。\n',
+    '问：请根据现有知识库回答：可以吗？\n答：固定前缀不能成为业务实体。\n',
+    '问：请根据现有知识库回答：\n答：空业务正文不能成为严格问句。\n',
     '问：ZK-4831号补给箱怎样开启？\n答：按蓝色按钮开启。\n']); built(f);
   for(const query of ['请根据现有知识库回答：另一座银杉花园的停车时间是什么？',
     '本次只检查资料目录，不询问其中任何补给箱事实。',
-    '请根据现有知识库回答：可以吗？',
+    '请根据现有知识库回答：可以吗？','可以吗？',
+    '请根据现有知识库回答：能否？','能否？',
+    '请根据现有知识库回答：支持吗？','支持吗？',
+    '请根据现有知识库回答：允许吗？','允许吗？',
+    '请根据现有知识库回答：',
     '请根据现有知识库回答：补给箱',
     '请根据现有知识库回答：ZK-4832号补给箱怎样开启？',
     '请确认编号4832是否适用，再回答：'+question,
@@ -264,7 +285,9 @@ test('L21 范围说明、否定引用、复述改问、复合问题、短泛问�
     '上一个问题是“'+question+'”。现在请回答银杉花园几点关门？',
     question+'另外，银杉花园几点关门？',
     '请根据现有知识库回答：不要回答“'+question+'”，请改答停车时间。']) {
-    assert.deepEqual(f.search(query).results,[],query);
+    const result=f.search(query);
+    assert.deepEqual(result.results,[],query);
+    assert.equal(result.faq_exact.status,'none',query);
   }
 });
 test('L22 相同内容的重复构建会修复受管索引属主，不因提前返回留下可写投影',()=>{
@@ -397,18 +420,19 @@ test('L26 书名号引用、不要按引用回答及分号复合问句不能进�
   assert.equal(polite.results.length,1);
   assert.equal(polite.results[0].lexical.kind,'synonym_overlap');
 });
-test('L27 严格第一人称互补问法可匹配双问式同义 FAQ，第二主题和残余实体仍保持空',()=>{
+test('L27 不以业务域硬编码猜测互补问法，严格同问和纯意图前缀仍可安全命中',()=>{
   const sameIntent='问：是否可以开具发票？能否开票？\n答：这是虚构票务说明。\n';
   const f=fixture('synonym-complementary-intent',[sameIntent]); built(f);
-  const complementary=f.search('我要开发票，能办理吗？');
-  assert.equal(complementary.results.length,1);
-  assert.equal(complementary.results[0].lexical.kind,'synonym_overlap');
-  assert.equal(complementary.results[0].text,sameIntent);
-  for(const query of ['我想要开发票，能办理吗？','我目前需要开发票，能办理吗？','我想现在开票，能办理吗？',
-    '我要开发票，这里支持吗？','我要开发票，本站支持吗？','我要开发票，平台支持吗？']) {
-    const positive=f.search(query);
-    assert.equal(positive.results.length,1,query);
-    assert.equal(positive.results[0].lexical.kind,'synonym_overlap',query);
+  const exact=f.search('是否可以开具发票？能否开票？');
+  assert.equal(exact.faq_exact.status,'unique');
+  assert.equal(exact.results.length,1);
+  assert.equal(exact.results[0].lexical.kind,'exact_question');
+  assert.equal(exact.results[0].text,sameIntent);
+  for(const query of ['我要开发票，能办理吗？','我想要开发票，能办理吗？','我目前需要开发票，能办理吗？',
+    '我想现在开票，能办理吗？','我要开发票，这里支持吗？','我要开发票，本站支持吗？','我要开发票，平台支持吗？']) {
+    const unbound=f.search(query);
+    assert.deepEqual(unbound.results,[],query);
+    assert.equal(unbound.faq_exact.status,'none',query);
   }
 
   const anchored='问：星舟票据允许？可以？\n答：这是虚构星舟票据说明。\n';
@@ -490,7 +514,22 @@ test('L29 v2 FAQ绑定完整多行答案字节范围，严格短问在近似toke
   assert.equal(result.faq_exact.status,'unique');
   assert.equal(result.faq_exact.answer_text,faqAnswer);
   assert.equal(result.faq_exact.answer_sha256,hash(faqAnswer));
+  assert.equal(result.results.length,1);
   assert.equal(result.results[0].lexical.kind,'exact_question');
+  assert.equal(result.results[0].text,source);
+  assert.equal(result.results[0].metadata.docpath,f.documents[0].location);
+  const bounded=f.search('星钥',{maxBytes:Buffer.byteLength(source)-1});
+  assert.equal(bounded.faq_exact.status,'unique');
+  assert.deepEqual(bounded.results,[],'容量不足时必须跳过整片，不得截断严格来源');
+
+  const conflictFixture=fixture('structured-short-conflict',[
+    '问题：星钥？\n回答：虚构规则甲。\n','问题：星钥？\n回答：虚构规则乙。\n']);
+  built(conflictFixture);
+  const conflict=conflictFixture.search('星钥');
+  assert.equal(conflict.faq_exact.status,'conflict');
+  assert.deepEqual(conflict.results,[],'短问冲突不能借严格回填选取任一来源');
+  assert.equal('answer_text' in conflict.faq_exact,false);
+  assert.equal('answer_sha256' in conflict.faq_exact,false);
 });
 test('L30 严格同问同答案可汇总来源，不同答案即使落在结果上限外也判冲突并禁止直答',()=>{
   const sharedQuestion='虚构月桥在周三开放吗？';
@@ -513,5 +552,12 @@ test('L30 严格同问同答案可汇总来源，不同答案即使落在结果�
   assert.equal('answer_text' in result.faq_exact,false);
   assert.equal('answer_sha256' in result.faq_exact,false);
 });
-process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:path.relative(project,evidence),synthetic_only:true})+'\n');
+const evidenceRelative=path.relative(project,evidence);
+let cleanupError=null;
+try {fs.rmSync(evidence,{recursive:true,force:true});}
+catch(error) {cleanupError=error && error.name ? error.name : 'Error';}
+const evidenceCleaned=!cleanupError && !fs.existsSync(evidence);
+if(!evidenceCleaned) {failed++; console.error('失败 UNIT/CONTRACT：合成证据目录清理失败\n'+cleanupError);}
+process.stdout.write(JSON.stringify({layer:'UNIT/CONTRACT',passed,failed,evidence:evidenceRelative,synthetic_only:true,synthetic_evidence_cleaned:evidenceCleaned})+'\n');
+process.stdout.write((evidenceCleaned?'合成证据目录已清理：':'合成证据目录清理失败：')+evidenceRelative+'\n');
 process.exitCode=failed?1:0;

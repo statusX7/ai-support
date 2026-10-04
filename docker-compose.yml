@@ -192,6 +192,10 @@ services:
         target: /opt/crisp-ai/n8n
         read_only: true
       - type: bind
+        source: ${DEPLOY_DIR:-/opt/crisp-ai}/scripts/visitor-output.js
+        target: /opt/crisp-ai/scripts/visitor-output.js
+        read_only: true
+      - type: bind
         source: ${DEPLOY_DIR:-/opt/crisp-ai}/data/analytics
         target: /opt/crisp-ai/data/analytics
       - type: bind

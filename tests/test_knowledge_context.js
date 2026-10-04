@@ -40,6 +40,50 @@ check('独立问题、Prompt/护栏、整块引用、历史顺序与输入不可
   assert.equal(result.sources.length, context.knowledge.length);
   assert.equal(result.sources[0].docpath, input.enabledMap.documents[0].location);
 });
+check('检索有片段不等于覆盖具名事项，依据不足与真实必要澄清明确区分', () => {
+  const input=fixture();
+  input.question='请说明已经指明的合成事项 TEST-MATTER-417 的现行规则。';
+  input.history=[{role:'user',content:'已说明合成平台与已尝试步骤。'},
+    {role:'assistant',content:'这条历史只是已确认背景，不是 TEST-MATTER-417 的规则。'}];
+  const before=JSON.stringify(input);
+  const result=prepare(input);
+  assert.equal(JSON.stringify(input),before);
+  assert.equal(result.messages.at(-1).content,input.question);
+  assert.deepEqual(clone(result.messages.slice(3,-1)),input.history);
+  assert(result.messages[2].content.includes('相近关键词不代表已经找到该事项的规则'));
+  assert(result.messages[2].content.includes('应具体说明该事项暂无当前依据'));
+  assert(result.messages[2].content.includes('只有确实缺少会改变判断的字段时才问一个具体问题'));
+  assert(result.messages[2].content.includes('不得作为缺失信息重复索要'));
+  const context=JSON.parse(result.messages[2].content.split('\n').slice(1).join('\n'));
+  assert.equal(context.knowledge[0].text,excerpt);
+  assert.equal(result.sources.length,1);
+});
+check('专门问答与联合问答按用户范围选择，完整资料/顺序/来源和冲突边界保留', () => {
+  for (const reverse of [false,true]) {
+    const input=fixture();
+    input.question='即使连接方式改变，也请回答：'+question;
+    const direct={...clone(input.response.body.results[0]),text:excerpt};
+    const combined={...clone(direct),id:'synthetic-combined-faq',
+      text:'问：曜石灯塔补给箱启封口令和注销记录是什么？\n答：联合操作从另一处入口执行。',distance:0.01};
+    input.response.body.results=reverse?[combined,direct]:[direct,combined];
+    const before=JSON.stringify(input),result=prepare(input);
+    assert.equal(JSON.stringify(input),before);
+    const instruction=result.messages[2].content.split('\n')[0];
+    assert(instruction.includes('优先使用与当前问题范围一致的专门问答'));
+    assert(instruction.includes('若用户实际问联合事项'));
+    assert(instruction.includes('同一适用范围仍有互相矛盾的答案'));
+    assert(instruction.includes('不得按召回顺序、分数或来源数量自行裁决'));
+    const context=JSON.parse(result.messages[2].content.split('\n').slice(1).join('\n'));
+    assert.deepEqual(context.knowledge.map(item=>item.text),input.response.body.results.map(item=>item.text));
+    assert.equal(result.sources.length,2);
+    assert.equal(result.messages.at(-1).content,input.question);
+    assert.deepEqual(clone(result.messages.slice(3,-1)),input.history);
+    input.question='曜石灯塔补给箱启封口令和注销记录是什么？';
+    const joined=prepare(input);
+    assert.equal(joined.messages.at(-1).content,input.question);
+    assert.equal(JSON.parse(joined.messages[2].content.split('\n').slice(1).join('\n')).knowledge.length,2);
+  }
+});
 check('来源只接受 exact projection 或显式 source_title，不接受任意前缀', () => {
   const input=fixture(); input.enabledMap.documents[0].source_title='纯合成旧标题 "灯塔".txt';
   input.response.body.results[0].metadata.title=input.enabledMap.documents[0].source_title;

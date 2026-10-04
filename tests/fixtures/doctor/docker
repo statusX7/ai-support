@@ -156,10 +156,20 @@ const request = async (url, options) => {
     const [payload, signature] = options.headers["x-crispai-question"].split(".");
     assert.equal(signature, crypto.createHmac("sha256", env.PROVIDER_ADAPTER_KEY).update("crispai-provider-v1\0" + payload).digest("hex"));
     const envelope = JSON.parse(Buffer.from(payload, "base64url"));
+    const poolRaw = fs.readFileSync(root + "/config/provider-pool-applied.json", "utf8");
+    const pool = JSON.parse(poolRaw);
+    const poolSha256 = crypto.createHash("sha256").update(poolRaw).digest("hex");
+    const configurationBinding = crypto.createHash("sha256").update(JSON.stringify([
+      applied.revision, pool.revision, pool.secrets_generation, poolSha256, applied.source_sha256,
+    ])).digest("hex");
     assert.equal(envelope.scope, "admin"); assert.equal(envelope.stage, "answer");
     assert.match(envelope.question_id, /^[a-f0-9]{64}$/);
-    assert.equal(envelope.pool_revision, read("config/provider-pool-applied.json").revision);
+    assert.equal(envelope.pool_revision, pool.revision);
     assert.equal(envelope.runtime_revision, applied.revision);
+    assert.equal(envelope.secrets_generation, pool.secrets_generation);
+    assert.equal(envelope.pool_sha256, poolSha256);
+    assert.equal(envelope.materials_source_sha256, applied.source_sha256);
+    assert.equal(envelope.configuration_binding, configurationBinding);
     assert(!Object.hasOwn(envelope, "session_key") && !Object.hasOwn(envelope, "generation"));
     assert(envelope.deadline_at > Date.now() && envelope.deadline_at <= deadline);
   }

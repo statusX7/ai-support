@@ -8,12 +8,17 @@ const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 const root = path.resolve(__dirname, '..');
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const urlNamespace = Buffer.from('6ba7b8119dad11d180b400c04fd430c8','hex');
 
 async function main() {
   fs.mkdirSync(path.join(root,'.work/v1.3.0'),{recursive:true});
   const work = fs.mkdtempSync(path.join(root,'.work/v1.3.0/configuration-contract-'));
   const deploy = path.join(work,'deploy');
-  for (const directory of ['config','knowledge','tmp','data/runtime','backups/config-history','n8n','scripts','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
+  for (const directory of ['config','knowledge','tmp','data/runtime','data/anythingllm/vector-cache','backups/config-history','n8n','scripts','bin']) fs.mkdirSync(path.join(deploy,directory),{recursive:true});
   fs.writeFileSync(path.join(deploy,'.crisp-ai-installation'),'ai-support\nstate=staged\n');
   fs.writeFileSync(path.join(deploy,'VERSION'),'v1.1.0\n');
   for (const name of ['keyword','handoff','menu','tags','feedback','provider']) {
@@ -31,6 +36,12 @@ async function main() {
   const documents = new Map(); let locations=[], prompt=fs.readFileSync(path.join(deploy,'config/prompt.md'),'utf8'), sequence=0, modelStatus=200, sourceRemoval=[], lastProviderHeaders={};
   let providerChatFailure=false;
   let modelEmpty=false, modelHang=false, modelCalls=0, systemWindowReads=0;
+  const cachePath=location=>{
+    const bytes=crypto.createHash('sha1').update(urlNamespace).update(location).digest().subarray(0,16);
+    bytes[6]=(bytes[6]&0x0f)|0x50;bytes[8]=(bytes[8]&0x3f)|0x80;
+    const hex=bytes.toString('hex');
+    return path.join(deploy,'data/anythingllm/vector-cache',`${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}.json`);
+  };
   const service=http.createServer(async(request,response)=>{
     let data=Buffer.alloc(0);for await(const chunk of request)data=Buffer.concat([data,chunk]);
     const send=(status,body)=>{response.writeHead(status,{'content-type':'application/json'});response.end(JSON.stringify(body));};
@@ -56,10 +67,12 @@ async function main() {
       documents.set(location,{filename});send(200,{success:true,documents:[{location}]});return;
     }
     if(request.url === '/api/v1/workspace/crisp-support/update-embeddings'){
+      for(const location of body.adds || []) fs.writeFileSync(cachePath(location),JSON.stringify({location,embedding:[0.1,0.2,0.3]})+'\n',{mode:0o600});
+      for(const location of body.deletes || []) fs.rmSync(cachePath(location),{force:true});
       locations=[...new Set([...locations,...(body.adds || [])])].filter(item=>!(body.deletes || []).includes(item));send(200,{success:true});return;
     }
     if(request.url === '/api/v1/system/remove-documents'){
-      for(const name of body.names || []){sourceRemoval.push(name);documents.delete(name);}send(200,{success:true});return;
+      for(const name of body.names || []){sourceRemoval.push(name);documents.delete(name);fs.rmSync(path.join(deploy,'data/anythingllm/documents',name),{force:true});fs.rmSync(cachePath(name),{force:true});}send(200,{success:true});return;
     }
     if(request.url === '/api/v1/workspace/crisp-support/vector-search'){
       send(200,{results:locations.map(location=>({text:'协议服务检索样本，不是真实模型',metadata:{docpath:location,title:documents.get(location)?.filename},score:0.8}))});return;
@@ -99,23 +112,38 @@ async function main() {
   });
   const ok=async(script,args)=>{const output=await invoke(script,args);assert.equal(output.code,0,`${script} ${args.join(' ')}\n${output.stderr}\n${output.stdout}`);return output;};
   const readCatalog=()=>JSON.parse(fs.readFileSync(path.join(deploy,'knowledge/catalog.json')));
+  const writeProfile=()=>{
+    const profile={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
+      passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
+    const fingerprint=digest(canonical(profile));
+    const manifestPath=path.join(deploy,'data/knowledge-manifest.json');
+    if(!fs.existsSync(manifestPath)) fs.writeFileSync(manifestPath,JSON.stringify({version:1,files:{},pending_files:{},garbage_locations:[]})+'\n',{mode:0o600});
+    const manifest=JSON.parse(fs.readFileSync(manifestPath,'utf8'));
+    assert.equal(manifest.version,1);assert.deepEqual(manifest.pending_files||{},{});assert.deepEqual(manifest.garbage_locations||[],[]);
+    assert.deepEqual(manifest.files||{},{});manifest.embedding_profile=fingerprint;
+    fs.writeFileSync(manifestPath,JSON.stringify(manifest)+'\n',{mode:0o600});
+    fs.writeFileSync(path.join(deploy,'data/runtime/knowledge-profile.json'),JSON.stringify({schema_version:1,state:'applied',profile,fingerprint,applied_at:Date.now()})+'\n',{mode:0o640});
+    return fingerprint;
+  };
   try {
     await ok('provider.sh',['migrate']);
     await startAdapter();
     const installationFile=path.join(deploy,'.crisp-ai-installation'), installationBefore=fs.readFileSync(installationFile);
     fs.writeFileSync(installationFile,'ai-support\nstate=local-ready\n');
     const initialPool=JSON.parse(fs.readFileSync(path.join(deploy,'config/provider-pool-applied.json')));
+    const ragInputWindow=pool=>Math.min(...pool.entries.filter(entry=>entry.enabled&&!entry.draft
+      &&entry.capabilities[entry.api_mode]===true).map(entry=>entry.context_window-entry.max_output_tokens));
     const initialWindow=initialPool.entries.find(entry=>entry.id===initialPool.primary_id).context_window;
     const windowCandidate=path.join(work,'rag-window-candidate.json');
     fs.writeFileSync(windowCandidate,JSON.stringify({provider:{context_window:initialWindow*2}}));
     const windowApplied=JSON.parse((await ok('provider.sh',['edit',initialPool.primary_id,windowCandidate])).stdout);
-    assert.deepEqual(windowApplied.rag_context,{context_window:initialWindow*2,state:'applied'});
+    assert.deepEqual(windowApplied.rag_context,{context_window:ragInputWindow(windowApplied),state:'applied'});
     const runningWindow=()=>JSON.parse(fs.readFileSync(path.join(deploy,'tmp/configuration-rag-running.json')));
-    assert.equal(runningWindow().context_window,initialWindow*2);
+    assert.equal(runningWindow().context_window,ragInputWindow(windowApplied));
     fs.writeFileSync(windowCandidate,JSON.stringify({provider:{context_window:initialWindow}}));
     const windowRestored=JSON.parse((await ok('provider.sh',['edit',initialPool.primary_id,windowCandidate])).stdout);
-    assert.deepEqual(windowRestored.rag_context,{context_window:initialWindow,state:'applied'});
-    assert.equal(runningWindow().context_window,initialWindow);
+    assert.deepEqual(windowRestored.rag_context,{context_window:ragInputWindow(windowRestored),state:'applied'});
+    assert.equal(runningWindow().context_window,ragInputWindow(windowRestored));
     assert.equal(runningWindow().recreates,2);
     assert.equal(systemWindowReads,2,'两次受控重建都必须经过官方API运行回读');
     assert.equal(runningWindow().service,'anythingllm');
@@ -221,7 +249,12 @@ async function main() {
     assert.deepEqual(fs.readFileSync(handoffFile),invalidModernBytes,'严格迁移失败不得改写现代损坏配置');
     fs.writeFileSync(handoffFile,currentHandoffBytes);
     pass('旧人工配置先迁移再严格校验且幂等，现代缺失通知文案仍拒绝并保留旧值');
+    const profileFingerprint=writeProfile();
     await ok('knowledge.sh',['sync']);
+    const synchronizedManifest=JSON.parse(fs.readFileSync(path.join(deploy,'data/knowledge-manifest.json'),'utf8'));
+    assert.equal(synchronizedManifest.embedding_profile,profileFingerprint);
+    assert.ok(Object.values(synchronizedManifest.files).every(record=>record.embedding_profile===profileFingerprint
+      &&record.cache_bindings.length===record.locations.length));
     assert.equal(readCatalog().libraries[0].id,'kb_default');assert.equal(readCatalog().libraries[0].documents.length,1);const originalSequence=sequence;
     await ok('knowledge.sh',['sync']);assert.equal(sequence,originalSequence);pass('单库幂等迁移保留既有 filename 与索引');
     const libraryIds=[];
@@ -289,7 +322,9 @@ async function main() {
     pass('旧启用反馈候选重新应用仍停用邀请，不篡改历史正文');
     const candidate=path.join(work,'runtime.json');fs.writeFileSync(candidate,JSON.stringify({enabled:false}));await ok('configuration.sh',['apply','runtime','--input',candidate]);
     let runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.disable_epoch,1);assert.equal(runtime.applied_revision,runtime.revision);pass('全局配置原子提交与运行时文件读回');
-    const revision=runtime.revision;fs.writeFileSync(candidate,JSON.stringify({enabled:true}));const failure=await invoke('configuration.sh',['apply','runtime','--input',candidate],{CONFIGURATION_FIXTURE_READBACK_FAIL:'1'});assert.notEqual(failure.code,0);
+    const revision=runtime.revision;fs.writeFileSync(candidate,JSON.stringify({enabled:true}));
+    const readbackFailure=path.join(deploy,'tmp/configuration-readback-fail-once');fs.writeFileSync(readbackFailure,'',{mode:0o600});
+    const failure=await invoke('configuration.sh',['apply','runtime','--input',candidate],{CONFIGURATION_FIXTURE_READBACK_FAIL_ONCE_FILE:readbackFailure});assert.notEqual(failure.code,0);assert.equal(fs.existsSync(readbackFailure),false);
     runtime=JSON.parse((await ok('configuration.sh',['status'])).stdout);assert.equal(runtime.enabled,false);assert.equal(runtime.disable_epoch,1);assert.ok(runtime.revision>revision);pass('应用失败恢复旧值且revision/停用代次防旧请求复活');
     const models=JSON.parse((await ok('provider.sh',['models'])).stdout);assert.deepEqual(models.models,['synthetic-a','synthetic-b']);pass('模型列表去重与排序');
     modelStatus=401;assert.equal((await invoke('provider.sh',['models'])).code,3);modelStatus=404;assert.equal((await invoke('provider.sh',['models'])).code,2);modelStatus=200;pass('模型鉴权失败和手填后备状态可区分');
@@ -336,10 +371,14 @@ async function main() {
     const unsafeSource=path.join(work,'unsafe');fs.mkdirSync(unsafeSource);fs.symlinkSync(path.join(deploy,'.env'),path.join(unsafeSource,'secret-link'));
     const unsafeArchive=path.join(work,'unsafe.tar.gz');await new Promise((resolve,reject)=>{const child=spawn('tar',['-czf',unsafeArchive,'-C',unsafeSource,'.']);child.on('close',code=>code?reject(new Error('tar')):resolve());});
     assert.notEqual((await invoke('migration.sh',['import-preview',unsafeArchive])).code,0);pass('迁移包拒绝未授权路径和符号链接');
-    console.log(`UNIT/CONTRACT 合计 ${count} 通过，0 失败；证据 ${path.relative(root,work)}`);
+    console.log(`UNIT/CONTRACT 合计 ${count} 通过，0 失败；合成目录退出前清理`);
   } finally {
     if(adapter){adapter.closeAllConnections();await new Promise(resolve=>adapter.close(resolve));}
     service.closeAllConnections();await new Promise(resolve=>service.close(resolve));
+    const evidenceRoot=path.join(root,'.work','v1.3.0');
+    assert.equal(path.dirname(work),evidenceRoot,'只能清理本测试直属合成目录');
+    assert.match(path.basename(work),/^configuration-contract-[A-Za-z0-9]+$/,'合成目录名称不受信任');
+    fs.rmSync(work,{recursive:true,force:true});
   }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

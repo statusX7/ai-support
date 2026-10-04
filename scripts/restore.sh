@@ -354,9 +354,26 @@ preflight_current_knowledge_generation() {
   printf '%s\n' legacy
 }
 
+preflight_current_materials_generation() {
+  local projection="${DEPLOY_DIR}/config/materials-applied.json"
+  local snapshot="${DEPLOY_DIR}/backups/config-history/materials.applied.tar.gz"
+  if [[ ! -e "$projection" && ! -L "$projection" ]]; then
+    printf '%s\n' legacy
+    return 0
+  fi
+  # 离线文件恢复不发布新的有效代。保留并验证旧投影和知识元数据，
+  # 让后续受管应用仍可冻结、回读和恢复旧代；不能先清空 manifest。
+  if ! bash -c 'set -euo pipefail; source "$2"; materials_snapshot_validate_generation "$1" "$1/backups/config-history/materials.applied.tar.gz" "$1/config/materials-applied.json"' \
+    -- "$DEPLOY_DIR" "${SCRIPT_DIR}/materials.sh"; then
+    die '当前受管资料代不完整；恢复尚未修改现有资料'
+  fi
+  sha256sum -- "$projection" "$snapshot" | sha256sum | cut -d ' ' -f 1
+}
+
 # 在安全备份、停止服务或覆盖任何现有配置/原文之前验证当前索引代次。
 # 缓存已被篡改、迁移未完成或 profile 摘要错误时必须零恢复修改。
 INITIAL_KNOWLEDGE_GENERATION=$(preflight_current_knowledge_generation)
+INITIAL_MATERIALS_GENERATION=$(preflight_current_materials_generation)
 
 if (( SAFETY_BACKUP )); then
   SAFETY_FILE="${DEPLOY_DIR}/backups/pre-restore-$(date -u '+%Y%m%dT%H%M%SZ').tar.gz"
@@ -399,6 +416,8 @@ esac
 CURRENT_KNOWLEDGE_GENERATION=$(preflight_current_knowledge_generation)
 [[ "$CURRENT_KNOWLEDGE_GENERATION" == "$INITIAL_KNOWLEDGE_GENERATION" ]] \
   || die '知识索引代次在恢复预检期间发生变化；现有资料未覆盖'
+[[ $(preflight_current_materials_generation) == "$INITIAL_MATERIALS_GENERATION" ]] \
+  || die '受管资料代次在恢复预检期间发生变化；现有资料未覆盖'
 
 for config_name in "${ACTIVE_CONFIG_FILES[@]}"; do
   install -m 0640 -- "${CONFIG_CANDIDATE}/config/${config_name}" "${DEPLOY_DIR}/config/${config_name}"
@@ -420,16 +439,17 @@ while IFS= read -r -d '' file; do
   is_supported_knowledge_file "$config_name" || continue
   install -m 0640 -- "$file" "${DEPLOY_DIR}/knowledge/${config_name}"
 done < <(find "${STAGING}/knowledge" -maxdepth 1 -type f -print0 | sort -z)
-CURRENT_KNOWLEDGE_PROFILE=''
-[[ "$CURRENT_KNOWLEDGE_GENERATION" == legacy ]] \
-  || CURRENT_KNOWLEDGE_PROFILE=$CURRENT_KNOWLEDGE_GENERATION
-# 离线业务恢复必须失效旧文档映射，但不能把当前已验证的 Embedding
-# 代次降回“未知”。下一次同步会为恢复后的原文重新上传并逐文件绑定缓存。
-jq -M -n --arg profile "$CURRENT_KNOWLEDGE_PROFILE" '
-  {version:1,files:{},pending_files:{},garbage_locations:[]} +
-  (if $profile == "" then {} else {embedding_profile:$profile} end)
-' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
-chmod 600 "${DEPLOY_DIR}/data/knowledge-manifest.json"
+if [[ "$INITIAL_MATERIALS_GENERATION" == legacy ]]; then
+  CURRENT_KNOWLEDGE_PROFILE=''
+  [[ "$CURRENT_KNOWLEDGE_GENERATION" == legacy ]] \
+    || CURRENT_KNOWLEDGE_PROFILE=$CURRENT_KNOWLEDGE_GENERATION
+  # 未使用受管投影的旧实例仍失效旧文档映射，并保留已验证的 Embedding 代次。
+  jq -M -n --arg profile "$CURRENT_KNOWLEDGE_PROFILE" '
+    {version:1,files:{},pending_files:{},garbage_locations:[]} +
+    (if $profile == "" then {} else {embedding_profile:$profile} end)
+  ' > "${DEPLOY_DIR}/data/knowledge-manifest.json"
+  chmod 600 "${DEPLOY_DIR}/data/knowledge-manifest.json"
+fi
 
 set_runtime_ownership "$DEPLOY_DIR"
 secure_permissions "$DEPLOY_DIR"
@@ -444,8 +464,14 @@ if (( SKIP_RESTART == 0 )); then
   wait_for_local_health "$DEPLOY_DIR"
   bootstrap_anythingllm_api_key "$DEPLOY_DIR"
   ensure_anythingllm_workspace "$DEPLOY_DIR"
-  knowledge_sync "$DEPLOY_DIR" || die "知识文件恢复后同步失败"
-  sync_prompt_to_anythingllm "$DEPLOY_DIR"
+  if [[ "$INITIAL_MATERIALS_GENERATION" == legacy ]]; then
+    knowledge_sync "$DEPLOY_DIR" || die "知识文件恢复后同步失败"
+    sync_prompt_to_anythingllm "$DEPLOY_DIR"
+  else
+    # 先冻结完整旧代，再同步恢复原文、发布新投影并实际回读。
+    bash "${SCRIPT_DIR}/materials.sh" --deploy-dir "$DEPLOY_DIR" apply-business --sync-knowledge >/dev/null \
+      || die '恢复原文未通过受管应用与回读；未宣称恢复后的资料已生效'
+  fi
   import_and_publish_workflow "$DEPLOY_DIR"
   wait_for_local_health "$DEPLOY_DIR"
   if [[ -f "${DEPLOY_DIR}/scripts/materials.sh" && ! -L "${DEPLOY_DIR}/scripts/materials.sh" ]]; then
@@ -463,4 +489,7 @@ fi
 trap - EXIT
 record_maintenance_event "$DEPLOY_DIR" restore complete
 rm -rf -- "$STAGING"
+if (( SKIP_RESTART )) && [[ "$INITIAL_MATERIALS_GENERATION" != legacy ]]; then
+  info '仅完成旧格式原文离线恢复；上一有效资料代已保留，恢复原文须经受管同步/应用及回读后才生效'
+fi
 info '备份恢复完成；.env 和现有密钥未被覆盖'

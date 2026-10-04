@@ -17,7 +17,7 @@ usage() {
 --local        检查本地组件与实际接线，不访问外部服务，不执行模型推理。
 --application  与 --local 相同，供安装、更新和回滚健康门禁使用；不产生模型费用。
 --full         额外检查已配置外部连接并执行一次受控模型调用，可能产生少量费用。
---installation-in-progress  仅供安装或更新期间检查尚未提交的完整暂存代。
+--installation-in-progress  仅供维护期间检查完整暂存代；仅已有应答故障时允许组件就绪，故障结果仍保留，不代表客服验收。
 
 兼容门禁将“仅有警告/外部待接入”（doctor 退出 2）视为本地检查成功；
 明确组件故障仍退出 1。新管理入口请直接使用 crispai doctor。
@@ -80,7 +80,38 @@ esac
 (( JSON == 0 )) || arguments+=(--json)
 
 status=0
-bash "$DOCTOR" "${arguments[@]}" || status=$?
+if (( INSTALLATION_IN_PROGRESS )) && [[ "$SCOPE" == local ]]; then
+  # 维护期间区分运行组件就绪与已有客服责任故障。完整 doctor 结果原样保留，
+  # 不把应答故障改成 PASS；普通自检、发布验收仍按原 FAIL 退出。
+  (( JSON == 1 )) || arguments+=(--json)
+  report=$(bash "$DOCTOR" "${arguments[@]}") || status=$?
+  if (( JSON )); then
+    printf '%s\n' "$report"
+  elif jq -e '.schema_version == 1 and (.results | type) == "array"' <<< "$report" >/dev/null 2>&1; then
+    jq -M -r '
+      def status_label: {PASS:"通过",WARN:"需关注",FAIL:"故障",SKIP:"未检查"}[.] // .;
+      "CrispAI 组件自检 \(.version)\n范围：本地组件；检测时间：\(.checked_at)\n",
+      (.results[] | "[\(.status|status_label)] \(.name)：\(.summary)" +
+        (if (.suggestion // "") == "" then "" else "\n  建议：\(.suggestion)" end)),
+      "结果：通过 \(.summary.pass)，警告 \(.summary.warn)，失败 \(.summary.fail)，跳过 \(.summary.skip)。"
+    ' <<< "$report"
+  else
+    printf '%s\n' "$report"
+  fi
+  if (( status == 1 )) && jq -e '
+    .schema_version == 1 and .scope == "local" and .summary.fail == 1 and
+    (.results | type) == "array" and
+    ([.results[].id] | length) == ([.results[].id] | unique | length) and
+    ([.results[] | select(.status == "FAIL")] | length) == 1 and
+    any(.results[]; .id == "runtime.answer_responsibilities" and .status == "FAIL" and
+      (.summary | contains("责任产物损坏 0；") and contains("未知发送 0；")))
+  ' <<< "$report" >/dev/null 2>&1; then
+    printf '%s\n' '维护运行组件已就绪；已有应答责任仍为故障，未通过客服业务验收。保留任务与原始自检结果，不因已有责任故障回退运行数据。' >&2
+    exit 0
+  fi
+else
+  bash "$DOCTOR" "${arguments[@]}" || status=$?
+fi
 case "$status" in
   0) exit 0 ;;
   2)

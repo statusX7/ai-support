@@ -125,6 +125,10 @@ class SnapshotLiveTests(unittest.TestCase):
                     "LC_ALL": "C", "SNAPSHOT_FIXTURE_REAL_FIND": REAL_FIND,
                     "SNAPSHOT_FIXTURE_REAL_DU": REAL_DU, "SNAPSHOT_FIXTURE_REAL_PYTHON": REAL_PYTHON}
 
+    def tearDown(self):
+        shutil.rmtree(self.base)
+        self.assertFalse(self.base.exists())
+
     def run_function(self, mode="validate", extra=None, unprivileged=False):
         definitions = "\n".join(production_function(name) for name in
                                 ("snapshot_scan_sources", "snapshot_validate_tree", "snapshot_capacity_check", "copy_snapshot_tree", "snapshot_assert_provider_settled", "snapshot_assert_atomic_config_settled"))
@@ -606,7 +610,7 @@ class SnapshotLiveTests(unittest.TestCase):
         source = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
         safety = source.index('SAFETY_ID=$("${SCRIPT_DIR}/snapshot.sh"')
         stop = source.index('docker_compose "$DEPLOY_DIR" stop "${PAUSED_APP_SERVICES[@]}"')
-        mutation = source.index('MUTATION_STARTED=1')
+        mutation = source.index('MUTATION_STARTED=1', safety)
         self.assertLess(safety, stop)
         self.assertLess(stop, mutation)
 
@@ -625,6 +629,230 @@ class SnapshotLiveTests(unittest.TestCase):
                     self.assertTrue(target.is_file())
                 finally:
                     target.unlink()
+
+
+    def test_20_restored_runtime_is_readable_by_real_run_user(self):
+        """实际恢复权限后，UID1000可读取状态，知识控制投影仍由root签发。"""
+        if os.geteuid() != 0:
+            self.skipTest("真实运行用户权限验证需要root")
+        with tempfile.TemporaryDirectory(prefix="crispai-runtime-owner-") as temporary:
+            base = Path(temporary)
+            base.chmod(0o755)
+            deploy, payload = base / "deploy", base / "payload"
+            for directory in (deploy / "data/runtime", payload / "data/runtime", payload / "tmp"):
+                directory.mkdir(parents=True)
+            for ancestor in (deploy, deploy / "data"):
+                ancestor.chmod(0o755)
+            content = b'{"started_at":1,"completed_at":2}\n'
+            scheduler = payload / "data/runtime/scheduler-health.json"
+            scheduler.write_bytes(content)
+            scheduler.chmod(0o600)
+            projection = payload / "data/runtime/knowledge-map.json"
+            projection.write_bytes(b'{"schema_version":2,"documents":[]}\n')
+            projection.chmod(0o600)
+            old_state = deploy / "data/runtime/fixture-old.json"
+            old_state.write_bytes(b'{"old":true}\n')
+            function = production_function("restore_snapshot_tree", ROOT / "scripts/rollback.sh")
+            script = 'set -euo pipefail\nsource "$1/scripts/common.sh"\nDEPLOY_DIR=$2\nPAYLOAD=$3\n' + function
+            script += '\nrestore_snapshot_tree data/runtime\n'
+            result = subprocess.run(["bash", "-c", script, "--", str(ROOT), str(deploy), str(payload)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            restored = deploy / "data/runtime/scheduler-health.json"
+            self.assertEqual(restored.read_bytes(), content)
+            self.assertEqual((restored.stat().st_uid, restored.stat().st_gid, restored.stat().st_mode & 0o777),
+                             (1000, 1000, 0o600))
+            control = deploy / "data/runtime/knowledge-map.json"
+            self.assertEqual(control.read_bytes(), projection.read_bytes())
+            self.assertEqual((control.stat().st_uid, control.stat().st_gid, control.stat().st_mode & 0o777),
+                             (0, 1000, 0o640))
+            self.assertFalse(old_state.exists())
+            def run_user():
+                os.setgroups([])
+                os.setgid(1000)
+                os.setuid(1000)
+            reading = subprocess.run([sys.executable, "-c",
+                                      "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+                                      str(restored)], preexec_fn=run_user, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=5)
+            self.assertEqual(reading.returncode, 0, reading.stderr)
+            self.assertEqual(reading.stdout, content)
+
+    def test_21_legacy_canonical_is_counted_and_copied(self):
+        """旧版本已有的资料原文包也必须进入容量和快照，缺省旧实例不凭空创建。"""
+        source = SOURCE.read_text(encoding="utf-8")
+        selection = source.split("SNAPSHOT_HAS_MATERIALS_CANONICAL=0\n", 1)[1].split("\nsnapshot_validate_file() {", 1)[0]
+        selection = "SNAPSHOT_HAS_MATERIALS_CANONICAL=0\n" + selection
+        blocks = re.findall(r"^if \(\( SNAPSHOT_HAS_MATERIALS_CANONICAL \)\); then\n.*?^fi$", source, re.M | re.S)
+        self.assertEqual(len(blocks), 2)
+        canonical = self.base / "backups/config-history/materials.applied.tar.gz"
+        canonical.parent.mkdir(parents=True)
+        with tarfile.open(canonical, "w:gz") as archive:
+            member = tarfile.TarInfo("config/prompt.md")
+            data = b"synthetic legacy prompt\n"
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+        expected = canonical.read_bytes()
+        script = "set -euo pipefail\ndie(){ printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+        script += production_function("snapshot_version_at_least")
+        script += '\nDEPLOY_DIR=$1\nSTAGING="$1/staging"\nVERSION_VALUE=$2\nSNAPSHOT_SOURCE_PATHS=()\n'
+        script += selection + "\n" + "\n".join(blocks) + '\nprintf "%s\\n" "${#SNAPSHOT_SOURCE_PATHS[@]}"\n'
+        result = subprocess.run(["bash", "-c", script, "--", str(self.base), "v1.2.1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        archived = self.base / "staging/payload/backups/config-history/materials.applied.tar.gz"
+        self.assertEqual(archived.read_bytes(), expected)
+        self.assertEqual(archived.stat().st_mode & 0o777, 0o600)
+        archived.unlink()
+        canonical.unlink()
+        absent = subprocess.run(["bash", "-c", script, "--", str(self.base), "v1.1.0"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        self.assertEqual(absent.returncode, 0, absent.stderr)
+        self.assertEqual(absent.stdout.strip(), "0")
+        self.assertFalse(archived.exists())
+        required = subprocess.run(["bash", "-c", script, "--", str(self.base), "v1.3.0"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        self.assertNotEqual(required.returncode, 0)
+
+
+    def test_22_failed_update_rewind_preserves_new_accepted_delivered_and_human_facts(self):
+        import hashlib
+        import copy
+
+        website = "synthetic-rewind-website"
+        session = "session_synthetic_rewind_01"
+        key = hashlib.sha256((website + "\0" + session).encode()).hexdigest()
+        name = "session-" + key + ".json"
+        original = {
+            "schema_version": 2, "website_id": website, "session_id": session,
+            "jobs": [{"id": "a" * 64, "status": "received"}],
+            "outgoing": {}, "last_human_at": 0,
+        }
+        variants = [
+            ("same", True),
+            ("derived_only", True),
+            ("new_job", False),
+            ("new_owned", False),
+            ("new_outgoing", False),
+            ("new_human", False),
+            ("legacy_changed", False),
+            ("invalid_json", False),
+            ("wrong_owned_bucket", False),
+            ("old_outgoing_known_owned", True),
+        ]
+        for label, allowed in variants:
+            with self.subTest(label=label):
+                case = self.base / ("rewind-" + label)
+                live = case / "deploy"
+                payload = case / "payload"
+                current = live / "data/runtime"
+                archived = payload / "data/runtime"
+                current.mkdir(parents=True)
+                archived.mkdir(parents=True)
+                old = copy.deepcopy(original)
+                fresh = copy.deepcopy(original)
+                if label == "derived_only":
+                    fresh["jobs"][0].update(status="processing", lease_until=99, plan={"content": "合成计划"})
+                elif label == "new_job":
+                    fresh["jobs"].append({"id": "b" * 64, "status": "done"})
+                elif label == "new_outgoing":
+                    fresh["outgoing"]["8"] = {"status": "sent"}
+                elif label == "new_human":
+                    fresh["last_human_at"] = 10
+                elif label == "legacy_changed":
+                    old = {"aiEnabled": True}
+                    fresh = {"aiEnabled": False}
+                elif label == "old_outgoing_known_owned":
+                    old["outgoing"]["9"] = {"status": "unknown"}
+                    fresh["outgoing"]["9"] = {"status": "sent"}
+                (archived / name).write_text(json.dumps(old))
+                (current / name).write_text("{" if label == "invalid_json" else json.dumps(fresh))
+                if label in ("new_owned", "wrong_owned_bucket", "old_outgoing_known_owned"):
+                    fingerprint = "9" if label != "new_owned" else "8"
+                    bucket = "08" if label == "wrong_owned_bucket" else format(int(fingerprint) % 256, "02x")
+                    (current / ("owned-" + key + "-" + bucket + ".json")).write_text(
+                        json.dumps({"schema_version": 1, "fingerprints": [fingerprint]})
+                    )
+                files = [file for file in case.rglob("*") if file.is_file()]
+                before = {str(file): file.read_bytes() for file in files}
+                script = "set -euo pipefail\nDEPLOY_DIR=$1\nPAYLOAD=$2\n"
+                script += production_function(
+                    "failed_update_assert_runtime_rewind_safe", ROOT / "scripts/rollback.sh"
+                )
+                script += "\nfailed_update_assert_runtime_rewind_safe\n"
+                result = subprocess.run(
+                    ["bash", "-c", script, "--", str(live), str(payload)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, allowed, (label, result.stderr))
+                self.assertEqual({str(file): file.read_bytes() for file in files}, before)
+                if not allowed:
+                    self.assertIn("拒绝", result.stderr.decode())
+
+
+    def test_23_maintenance_component_readiness_retains_business_failures(self):
+        # 只验证真实兼容入口对结构化报告的分层合同；doctor 此处是明确的报告夹具，
+        # 不替代真实 doctor 集成、TARGET 服务或客服业务验收。
+        fixture = self.base / "health-contract"
+        scripts = fixture / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/healthcheck.sh", scripts / "healthcheck.sh")
+        doctor = scripts / "doctor.sh"
+        doctor.write_text(
+            '#!/usr/bin/env bash\nset -euo pipefail\n'
+            'printf "%s\\n" "$HEALTH_CONTRACT_REPORT"\nexit "$HEALTH_CONTRACT_EXIT"\n'
+        )
+        doctor.chmod(0o750)
+        problem = {
+            "id": "runtime.answer_responsibilities", "status": "FAIL",
+            "name": "应答责任", "summary": "责任产物损坏 0；未知发送 0；未完成故障 2",
+        }
+        report = {
+            "schema_version": 1, "scope": "local", "version": "v1.3.0",
+            "checked_at": "synthetic", "results": [problem],
+            "summary": {"pass": 0, "warn": 0, "fail": 1, "skip": 0},
+        }
+        variants = [
+            ("ordinary", report, False, 1, 1),
+            ("maintenance", report, True, 1, 0),
+            ("artifact", {**report, "results": [{**problem, "summary": "责任产物损坏 1；未知发送 0；"}]}, True, 1, 1),
+            ("unknown-send", {**report, "results": [{**problem, "summary": "责任产物损坏 0；未知发送 1；"}]}, True, 1, 1),
+            ("other-component", {**report, "results": [{**problem, "id": "runtime.state"}]}, True, 1, 1),
+            ("duplicate-id", {**report, "results": [problem, {**problem, "status": "PASS"}]}, True, 1, 1),
+            ("two-failures", {**report, "results": [problem, {**problem, "id": "runtime.state"}], "summary": {**report["summary"], "fail": 2}}, True, 1, 1),
+            ("invalid-json", "{", True, 1, 1),
+            ("healthy", {**report, "results": [{**problem, "status": "PASS"}], "summary": {**report["summary"], "pass": 1, "fail": 0}}, True, 0, 0),
+        ]
+        for label, value, maintenance, doctor_exit, expected in variants:
+            with self.subTest(label=label):
+                environment = os.environ.copy()
+                environment.update(
+                    HEALTH_CONTRACT_REPORT=value if isinstance(value, str) else json.dumps(value),
+                    HEALTH_CONTRACT_EXIT=str(doctor_exit),
+                )
+                arguments = ["bash", str(scripts / "healthcheck.sh"), "--application", "--json"]
+                if maintenance:
+                    arguments.append("--installation-in-progress")
+                result = subprocess.run(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                self.assertEqual(result.returncode, expected, (label, result.stderr))
+                if label != "invalid-json":
+                    self.assertEqual(json.loads(result.stdout), value)
+                if label == "maintenance":
+                    self.assertIn("未通过客服业务验收", result.stderr.decode())
+                    self.assertEqual(json.loads(result.stdout)["summary"]["fail"], 1)
+
+
+        environment = os.environ.copy()
+        environment.update(HEALTH_CONTRACT_REPORT=json.dumps(report), HEALTH_CONTRACT_EXIT="1")
+        human = subprocess.run(
+            ["bash", str(scripts / "healthcheck.sh"), "--application", "--installation-in-progress"],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+        )
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("[故障] 应答责任", human.stdout.decode())
+        self.assertIn("失败 1", human.stdout.decode())
+        self.assertIn("未通过客服业务验收", human.stderr.decode())
 
 
 if __name__ == "__main__":

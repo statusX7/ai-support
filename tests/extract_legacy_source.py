@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""校验并安全提取由测试编排器提供的 v1.1.0 源码归档。"""
+"""校验并安全提取由测试编排器提供的固定旧版本源码归档。"""
 
 import argparse
 import hashlib
@@ -71,7 +71,9 @@ def verified_copy(archive_path, expected_sha256, destination_parent):
         source.close()
 
 
-def extract(archive_path, expected_sha256, destination):
+def extract(archive_path, expected_sha256, destination, expected_version="v1.1.0"):
+    if expected_version not in ("v1.1.0", "v1.2.1"):
+        raise ValueError("旧版源码版本不在测试白名单")
     if not archive_path.is_absolute():
         raise ValueError("受控旧版归档必须使用绝对路径")
     if not destination.is_absolute():
@@ -123,12 +125,18 @@ def extract(archive_path, expected_sha256, destination):
         target = destination / relative
         if not target.is_file() or target.is_symlink():
             raise ValueError("旧版源码缺少必要普通文件")
-    if (destination / "VERSION").read_text(encoding="utf-8").strip() != "v1.1.0":
-        raise ValueError("旧版源码 VERSION 不是 v1.1.0")
-    for relative in ("get.sh", "scripts/doctor.sh", "scripts/visitor-output.js"):
-        target = destination / relative
-        if target.exists() or target.is_symlink():
-            raise ValueError("旧版源码混入后续版本模块")
+    if (destination / "VERSION").read_text(encoding="utf-8").strip() != expected_version:
+        raise ValueError("旧版源码 VERSION 与声明版本不符")
+    if expected_version == "v1.1.0":
+        for relative in ("get.sh", "scripts/doctor.sh", "scripts/visitor-output.js"):
+            target = destination / relative
+            if target.exists() or target.is_symlink():
+                raise ValueError("旧版源码混入后续版本模块")
+    else:
+        for relative in ("get.sh", "scripts/doctor.sh", "scripts/materials.sh"):
+            target = destination / relative
+            if not target.is_file() or target.is_symlink():
+                raise ValueError("v1.2.1 源码缺少必要旧版模块")
 
 
 def main():
@@ -136,12 +144,13 @@ def main():
     parser.add_argument("--archive", required=True)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--destination", required=True)
+    parser.add_argument("--expected-version", choices=("v1.1.0", "v1.2.1"), default="v1.1.0")
     arguments = parser.parse_args()
     if len(arguments.sha256) != 64 or any(character not in "0123456789abcdef" for character in arguments.sha256):
         print("错误：受控旧版归档 SHA256 格式无效", file=sys.stderr)
         return 1
     try:
-        extract(Path(arguments.archive), arguments.sha256, Path(arguments.destination))
+        extract(Path(arguments.archive), arguments.sha256, Path(arguments.destination), arguments.expected_version)
     except (OSError, UnicodeError, ValueError, tarfile.TarError) as error:
         print("错误：旧版测试源码归档校验失败：" + str(error), file=sys.stderr)
         return 1

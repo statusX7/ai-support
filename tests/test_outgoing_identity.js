@@ -2,30 +2,75 @@
 
 // 合成 Crisp REST/Hook，验证可见昵称与内部归属独立；不连接真实客户。
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 const {createRuntime} = require('../n8n/runtime.js');
 const project = path.resolve(__dirname, '..');
 const root = fs.mkdtempSync(path.join(project, '.test-runtime.outgoing-identity.'));
+const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+  : value && typeof value === 'object' ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    : JSON.stringify(value);
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 fs.mkdirSync(path.join(root, 'config'));
 for (const name of ['keyword', 'handoff', 'menu', 'tags', 'feedback', 'runtime', 'provider']) {
   fs.copyFileSync(path.join(project, 'config', name + '.yaml.example'), path.join(root, 'config', name + '.yaml'));
 }
-fs.writeFileSync(path.join(root, 'config/prompt.md'), '这是虚构协议测试提示词。');
+const prompt = '这是虚构协议测试提示词。';
+fs.writeFileSync(path.join(root, 'config/prompt.md'), prompt);
 const json = (name, value) => fs.writeFileSync(path.join(root, 'config', name + '.yaml'), JSON.stringify(value));
 json('runtime', {schema_version:2, enabled:true, revision:1, applied_revision:1});
 json('provider', {provider:{base_url:'https://identity-provider.invalid/v1',model:'synthetic-identity-model',api_mode:'chat_completions'}});
 fs.mkdirSync(path.join(root,'data/runtime'),{recursive:true});
-fs.writeFileSync(path.join(root,'data/runtime/knowledge-map.json'),JSON.stringify({schema_version:2,revision:1,documents:[{
-  library_id:'kb_default',document_id:'doc_2222222222222222',projection:'synthetic-identity.md',location:'synthetic/identity.json'
+const mapPath=path.join(root,'data/runtime/knowledge-map.json');
+fs.writeFileSync(mapPath,JSON.stringify({schema_version:2,revision:1,documents:[{
+  library_id:'kb_default',library_name:'合成身份资料',document_id:'doc_2222222222222222',
+  projection:'synthetic-identity.md',location:'synthetic/identity.json'
 }]}));
 const menu = JSON.parse(fs.readFileSync(path.join(root, 'config/menu.yaml')));
 menu.welcome.enabled = false; json('menu', menu);
+const settingsPath=path.join(root,'data/runtime/knowledge-settings.json');
+fs.writeFileSync(settingsPath,JSON.stringify({schema_version:1,workspace_slug:'support',temperature:0.7,observed_at:Date.now()}));
+const profileValue={engine:'native',model:'synthetic-embedding',chunk_size:1000,chunk_overlap:20,
+  passage_prefix:'',query_prefix:'',component_version:'synthetic',splitter:'synthetic'};
+const profilePath=path.join(root,'data/runtime/knowledge-profile.json');
+fs.writeFileSync(profilePath,JSON.stringify({schema_version:1,state:'applied',profile:profileValue,
+  fingerprint:digest(canonical(profileValue)),applied_at:Date.now()}));
+const mapRaw=fs.readFileSync(mapPath);
+const lexicalPayload={schema_version:2,algorithm:'crispai-lexical-v2',map_sha256:digest(mapRaw),complete:false,
+  coverage:{source_documents:1,indexed_documents:0,omitted_documents:1,source_bytes:1,indexed_bytes:0,
+    omitted_bytes:1,reasons:['index_capacity']},passages:[]};
+const lexicalPath=path.join(root,'data/runtime/knowledge-lexical.json');
+fs.writeFileSync(lexicalPath,JSON.stringify({...lexicalPayload,payload_sha256:digest(canonical(lexicalPayload))}));
+const configuration=Object.fromEntries(['runtime','handoff','keyword','menu','tags','feedback']
+  .map(name=>[name,JSON.parse(fs.readFileSync(path.join(root,'config',name+'.yaml')))]));
+const knowledge={catalog_revision:1,catalog_sha256:digest(canonical({fixture:'outgoing-identity'})),
+  manifest_sha256:digest(canonical({fixture:'outgoing-identity',documents:1})),map_sha256:digest(mapRaw),
+  settings_sha256:digest(fs.readFileSync(settingsPath)),profile_sha256:digest(fs.readFileSync(profilePath)),
+  lexical_sha256:digest(fs.readFileSync(lexicalPath)),enabled_library_ids:['kb_default'],
+  library_count:1,document_count:1,enabled_document_count:1};
+const runtimeSource=structuredClone(configuration.runtime);delete runtimeSource.revision;delete runtimeSource.applied_revision;
+const sourceComponents={runtime:digest(canonical(runtimeSource)),handoff:digest(canonical(configuration.handoff)),
+  keyword:digest(canonical(configuration.keyword)),menu:digest(canonical(configuration.menu)),
+  tags:digest(canonical(configuration.tags)),feedback:digest(canonical(configuration.feedback)),
+  prompt:digest(prompt),knowledge:digest(canonical(knowledge))};
+const materialsPath=path.join(root,'config/materials-applied.json');
+fs.writeFileSync(materialsPath,JSON.stringify({schema_version:2,state:'applied',revision:1,
+  applied_at:Date.now(),source_sha256:digest(canonical(sourceComponents)),source_components:sourceComponents,
+  configuration,prompt:{text:prompt,bytes:Buffer.byteLength(prompt),sha256:digest(prompt)},knowledge}));
+const setRuntimeEnabled=enabled=>{
+  const value={schema_version:2,enabled,revision:1,applied_revision:1};json('runtime',value);
+  const applied=JSON.parse(fs.readFileSync(materialsPath));applied.configuration.runtime=value;
+  const source=structuredClone(value);delete source.revision;delete source.applied_revision;
+  applied.source_components.runtime=digest(canonical(source));
+  applied.source_sha256=digest(canonical(applied.source_components));
+  fs.writeFileSync(materialsPath,JSON.stringify(applied));
+};
 const env = {CRISP_WEBSITE_ID:'fixture-website-identity', CRISP_HOOK_MODE:'website', CRISP_WEBSITE_HOOK_SECRET:'fixture-hook-identity-0123456789', CRISP_AUTH_B64:'Zml4dHVyZTpleGFtcGxl', ANYTHINGLLM_API_KEY:'fixture-internal', ANYTHINGLLM_WORKSPACE:'support'};
 let now = Date.now(), sequence = 200, runtime, sent = [], requests = 0, messageLookups = 0;
 const histories = new Map();
-let onSend = null, onModel = null, sendFailure = false;
+let onSend = null, onModel = null, onMessageDetail = null, sendFailure = false;
 const key = session => runtime.stateKey(env.CRISP_WEBSITE_ID, session);
 const state = session => runtime.readState(key(session));
 const bucket = (session, fingerprint) => path.join(root, 'data/runtime', 'owned-' + key(session) + '-' + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
@@ -37,7 +82,7 @@ const request = async (url, options={}) => {
   if (match) {
     const session = decodeURIComponent(match[1]), suffix = match[2], history = histories.get(session) || [];
     if (suffix === '/messages') return {status:200,body:{error:false,data:history}};
-    if (suffix.startsWith('/message/')) {messageLookups++;return {status:200,body:{error:false,data:history.find(item=>String(item.fingerprint)===suffix.slice(9)) || {}}};}
+    if (suffix.startsWith('/message/')) {messageLookups++;const original=history.find(item=>String(item.fingerprint)===suffix.slice(9)) || {};return {status:200,body:{error:false,data:onMessageDetail?onMessageDetail(structuredClone(original)):original}};}
     if (suffix === '/meta') return {status:200,body:{error:false,data:{segments:[]}}};
     if (suffix === '/message' && options.method === 'POST') {
       if (sendFailure) return {status:400,body:{error:true,reason:'synthetic-rejection'}};
@@ -133,8 +178,14 @@ const registeredConfirmation = async (session,expired=false) => {
 (async()=>{
   await test('中性官方昵称、不请求徽标；POST前自有指纹落盘，false回流不暂停',async()=>{
     const session='session_identity-a';
-    await deliver(event(session,'合成问题'));
-    assert.equal(sent.length,1);assert.equal(state(session).mode,'ai');assert.equal(requests,1);
+    const result=await deliver(event(session,'合成问题')),current=state(session);
+    const diagnostic=JSON.stringify({result:{status:result?.status||null,reason:result?.reason||null,route:result?.route||null},
+      requests,sent:sent.length,mode:current.mode,jobs:current.jobs.map(job=>({status:job.status,
+        responsibility_status:job.responsibility_status||null,responsibility_reason:job.responsibility_reason||null,
+        failure_code:job.failure_code||null,deferred_configuration:job.deferred_configuration===true,
+        retry_at:job.retry_at||null,plan:job.plan?{type:job.plan.type,purpose:job.plan.purpose,
+          ordinary:job.plan.ordinary,ai:job.plan.ai,diagnostic_code:job.plan.diagnostic_code||null}:null}))});
+    assert.equal(sent.length,1,diagnostic);assert.equal(current.mode,'ai');assert.equal(requests,1);
     assert.equal(state(session).outgoing[String(sent[0].fingerprint)].status,'sent');
     const recorded=JSON.parse(fs.readFileSync(bucket(session,sent[0].fingerprint)));
     assert.deepEqual(Object.keys(recorded).sort(),['fingerprints','schema_version']);
@@ -195,6 +246,95 @@ const registeredConfirmation = async (session,expired=false) => {
     await runtime.process(accepted.key,accepted.jobId);
     assert.equal(messageLookups,before+1);assert.equal(state(session).mode,'human');
     assert.equal(state(session).pause_reason,'operator_reply');assert.deepEqual(state(session).uncertain_events,[]);
+  });
+  await test('精确REST确认Crisp触发器和Haruka自动菜单后，解除屏障并回答原问题一次',async()=>{
+    const cases=[
+      {origin:'urn:crisp.im:triggers:0',type:'text',content:'合成原生自动触发器文字'},
+      {origin:'urn:crisp.im:triggers:0',type:'picker',content:{id:'synthetic-trigger',text:'合成原生菜单',choices:[{value:'one',label:'合成选项',selected:false}]}},
+      {origin:'urn:haruka.dy:haruka-ai-platform:0',type:'picker',content:{id:'synthetic-external-option',text:'合成外部自动菜单',choices:[{value:'one',label:'合成选项',selected:false}]}}
+    ];
+    for(const [index,item] of cases.entries()){
+      const session='session_identity-machine-rest-'+index;now+=1000;
+      const native=operatorEvent(session,{...item,user:{type:'website',nickname:'不作为身份依据'}});
+      histories.set(session,[native.data]);
+      const priorRequests=requests,priorSent=sent.filter(message=>message.session_id===session).length;
+      const control=await receive(native);
+      assert(state(session).uncertain_events.includes(control.jobId),'Hook来源字符串不能单独解除身份屏障');
+      const queued=await receive(event(session,'合成自动菜单之后的独立咨询'));
+      assert.equal(state(session).jobs.find(job=>job.id===queued.jobId).status,'received');
+      assert.equal(requests,priorRequests);
+      const generation=state(session).generation,lookups=messageLookups;
+      await runtime.process(control.key,control.jobId);
+      assert(messageLookups>lookups,'必须取得真实模块发出的精确REST回查');
+      assert.deepEqual(state(session).uncertain_events,[]);
+      assert.equal(state(session).mode,'ai');assert.equal(state(session).generation,generation);
+      assert.equal(state(session).jobs.find(job=>job.id===control.jobId).status,'done');
+      assert.equal(state(session).jobs.find(job=>job.id===control.jobId).responsibility_status,'control_handled');
+      await runtime.process(queued.key,queued.jobId);
+      assert.equal(state(session).jobs.find(job=>job.id===queued.jobId).status,'done');
+      assert.equal(sent.filter(message=>message.session_id===session).length,priorSent+1);
+      assert.equal(requests,priorRequests+1);
+      await receive(structuredClone(native));
+      assert.equal(state(session).jobs.filter(job=>job.id===control.jobId).length,1);
+      assert.equal(sent.filter(message=>message.session_id===session).length,priorSent+1);
+    }
+  });
+  await test('机器来源存在时显式真人和官方账号仍接管，不能放行旧AI答案',async()=>{
+    for(const [index,identity] of [{automated:false,user:{type:'website',nickname:'合成真人'}},
+      {user:{user_id:operatorId,nickname:'合成官方真人'}}].entries()){
+      const session='session_identity-machine-human-'+index;now+=1000;
+      const queued=await receive(event(session,'合成接管前待答问题'));
+      const original=operatorEvent(session,{origin:'urn:crisp.im:triggers:0',...identity});
+      histories.set(session,[original.data]);
+      const partial=structuredClone(original);
+      if(index===1)partial.data.user={type:'website',nickname:'合成待确认身份'};
+      const before=sent.filter(message=>message.session_id===session).length;
+      await deliver(partial);
+      assert.equal(state(session).mode,'human');
+      assert.equal(state(session).jobs.find(job=>job.id===queued.jobId).status,'cancelled');
+      await runtime.process(queued.key,queued.jobId);
+      assert.equal(sent.filter(message=>message.session_id===session).length,before);
+    }
+  });
+  await test('其他URN、Haruka文本及不完整或不一致的机器REST回执继续待查',async()=>{
+    const cases=[
+      {origin:'chat'},{origin:'urn:crisp.im:slack:0'},{origin:'urn:crisp.im:triggers:1'},
+      {origin:'urn:haruka.dy:haruka-ai-platform:0'},{origin:'urn:unknown.invalid:auto:0'},
+      {change:original=>{delete original.website_id;}},
+      {change:original=>{original.session_id='session_wrong_binding';}},
+      {detailChange:original=>({...original,fingerprint:original.fingerprint+1})},
+      {detailChange:()=>({})},
+      {change:original=>{original.content='另一条合成正文';}},
+      {change:original=>{original.automated=null;}},
+      {change:original=>{original.user.user_id=operatorId;}}
+    ];
+    for(const [index,item] of cases.entries()){
+      const session='session_identity-machine-invalid-'+index;now+=1000;
+      const hook=operatorEvent(session,{origin:item.origin||'urn:crisp.im:triggers:0',user:{type:'website',nickname:'不能按昵称放行'}});
+      const original=structuredClone(hook.data);if(item.change)item.change(original);
+      histories.set(session,[original]);
+      const accepted=await receive(hook),before=sent.length;
+      onMessageDetail=item.detailChange||null;
+      try{await runtime.process(accepted.key,accepted.jobId);}finally{onMessageDetail=null;}
+      assert.equal(state(session).mode,'ai');
+      assert(state(session).uncertain_events.includes(accepted.jobId),'未被证明的机器消息不能解除屏障：'+index);
+      assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).responsibility_status,'unresolved_failure');
+      assert.equal(sent.length,before);
+    }
+  });
+  await test('机器归属解除不能绕过管理员总关或产生自动人工转接',async()=>{
+    const session='session_identity-machine-disabled';now+=1000;
+    const hook=operatorEvent(session,{origin:'urn:crisp.im:triggers:0',user:{type:'website',nickname:'合成自动文字'}});
+    histories.set(session,[hook.data]);
+    const control=await receive(hook),queued=await receive(event(session,'合成总关之前的问题'));
+    const before=sent.length,priorRequests=requests;
+    setRuntimeEnabled(false);
+    try{
+      await runtime.process(control.key,control.jobId);
+      await runtime.process(queued.key,queued.jobId);
+      assert.equal(sent.length,before);assert.equal(requests,priorRequests);
+      assert.equal(state(session).mode,'ai');
+    }finally{setRuntimeEnabled(true);}
   });
   await test('note/typing/未知actor/坏UUID/网站UUID别名及未认证Hook均不能误判人工',async()=>{
     const cases=[{type:'note'},{type:'typed'},{stealth:true},{properties:{stealth:true}},
@@ -258,7 +398,7 @@ const registeredConfirmation = async (session,expired=false) => {
     for(const [index,[ordinary,controls,maintenance,disabled]] of [[127,0,false,false],[128,0,false,false],[96,32,false,false],[128,0,true,true]].entries()){
       const session='session_identity-queue-'+index;now+=1000;
       await seedQueue(session,ordinary,controls);
-      json('runtime',{schema_version:2,enabled:!disabled,revision:1,applied_revision:1});
+      setRuntimeEnabled(!disabled);
       if(maintenance)fs.writeFileSync(marker,JSON.stringify({phase:'applying'}),{mode:0o600});
       try {
         const started=Date.now(), before=messageLookups, accepted=await receive(operatorEvent(session));
@@ -266,7 +406,7 @@ const registeredConfirmation = async (session,expired=false) => {
         assert.equal(state(session).generation,1);assert.equal(state(session).resume_at,now+3600000);
         assert.equal(state(session).jobs.filter(job=>!job.control&&job.status==='cancelled').length,ordinary);
         assert.equal(state(session).jobs.filter(pendingJob).length,controls+1);assert.equal(messageLookups,before);
-      } finally {if(maintenance)fs.unlinkSync(marker);json('runtime',{schema_version:2,enabled:true,revision:1,applied_revision:1});}
+      } finally {if(maintenance)fs.unlinkSync(marker);setRuntimeEnabled(true);}
     }
   });
   await test('普通第129条与未知身份满队列仍拒绝，自有回流及伪造按钮不误人工或占优先槽',async()=>{
@@ -339,9 +479,9 @@ const registeredConfirmation = async (session,expired=false) => {
     assert.equal(sent.length,before+1);assert.equal(sent.at(-1).session_id,session);assert.equal(sent.at(-1).content,'合成已登记人工确认');
     assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,'done');assert.equal(state(session).jobs.filter(pendingJob).length,128);
     const disabled='session_identity-disabled-confirm';await seedQueue(disabled,128);const offClick=await registeredConfirmation(disabled);
-    json('runtime',{schema_version:2,enabled:false,revision:1,applied_revision:1});
+    setRuntimeEnabled(false);
     try {assert.equal((await receive(offClick)).accepted,true);assert.equal(state(disabled).mode,'human');assert.equal(state(disabled).jobs.filter(pendingJob).length,0);}
-    finally {json('runtime',{schema_version:2,enabled:true,revision:1,applied_revision:1});}
+    finally {setRuntimeEnabled(true);}
     const fullSlot='session_identity-priority-human';now+=1000;await seedQueue(fullSlot,0,128);
     const reservedClick=await receive(await registeredConfirmation(fullSlot));assert.equal(reservedClick.accepted,true);
     const unknown={status:'unknown',body:{type:'text',content:'合成旧通知仍待对账'},created_at:now,attempts:1,job_id:reservedClick.jobId,generation:1};
@@ -351,7 +491,7 @@ const registeredConfirmation = async (session,expired=false) => {
     assert.equal(state(fullSlot).jobs.filter(job=>pendingJob(job)&&job.priority_confirmation).length,1);
     assert.deepEqual(state(fullSlot).outgoing['987654323'],unknown);
   });
-  await test('优先确认未终态时手动恢复也不新增handoff offer；sent/failed/cancelled后可再次提供确认',async()=>{
+  await test('优先确认未终态时手动恢复也不新增handoff offer；明确拒绝保留同一通知恢复责任',async()=>{
     const blocked='session_identity-priority-backpressure';now+=1000;await seedQueue(blocked,0,128);
     const received=await receive(await registeredConfirmation(blocked));assert.equal(received.accepted,true);
     const unknown={status:'unknown',body:{type:'text',content:'合成正在对账的人工通知'},created_at:now,attempts:1,job_id:received.jobId,generation:1};
@@ -365,17 +505,29 @@ const registeredConfirmation = async (session,expired=false) => {
     assert.equal(sent.length,before);assert.equal(Object.values(state(blocked).offers).filter(offer=>offer.kind==='handoff').length,0);
     assert.equal(state(blocked).jobs.filter(job=>pendingJob(job)&&job.priority_confirmation).length,1);
     assert.deepEqual(state(blocked).outgoing['987654322'],unknown);
-    for(const outcome of ['sent','failed','cancelled']){
+    for(const outcome of ['sent','rejected','cancelled']){
       const session='session_identity-slot-'+outcome;now+=1000;await seedQueue(session,0,128);
       const accepted=await receive(await registeredConfirmation(session));assert.equal(accepted.accepted,true);
       if(outcome==='cancelled'){now+=1000;await runtime.resume(key(session));}
-      sendFailure=outcome==='failed';
-      try {await runtime.process(key(session));} finally {sendFailure=false;}
-      assert.equal(state(session).jobs.find(job=>job.id===accepted.jobId).status,outcome==='sent'?'done':outcome);
+      sendFailure=outcome==='rejected';let processed;
+      try {processed=await runtime.process(key(session));} finally {sendFailure=false;}
+      const stored=state(session).jobs.find(job=>job.id===accepted.jobId);
+      if(outcome==='sent')assert.equal(stored.status,'done');
+      else if(outcome==='cancelled')assert.equal(stored.status,'cancelled');
+      else {
+        const rejected=Object.values(state(session).outgoing).find(record=>record?.job_id===accepted.jobId);
+        assert.equal(processed.status,'rejected');assert.equal(stored.status,'received');
+        assert.equal(stored.responsibility_status,'unresolved_failure');assert.equal(stored.failure_code,'crisp_http_400');
+        assert.equal(stored.priority_confirmation,true);assert.equal(stored.execution_token,undefined);assert.equal(stored.lease_until,0);
+        assert.equal(rejected.status,'rejected');assert.equal(rejected.failure,'crisp_http_400');assert(rejected.body);
+      }
       await runtime.transaction(key(session),current=>{for(const job of current.jobs)if(job.id!==accepted.jobId)job.status='done';});
       now+=1000;await runtime.resume(key(session));now+=1000;
       const prior=sent.length;await deliver(event(session,'人工'));
-      assert.equal(sent.length,prior+1);assert.equal(sent.at(-1).type,'picker');
+      if(outcome==='rejected'){
+        assert.equal(sent.length,prior);assert.equal(Object.values(state(session).offers).filter(offer=>offer.kind==='handoff').length,0);
+        assert.equal(state(session).jobs.filter(job=>pendingJob(job)&&job.priority_confirmation).length,1);
+      }else{assert.equal(sent.length,prior+1);assert.equal(sent.at(-1).type,'picker');}
     }
   });
   await test('满128任务时文字/文件真人控制不等待在途模型、A旧答零出站且B独立',async()=>{

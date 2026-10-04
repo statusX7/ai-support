@@ -389,6 +389,97 @@ const test = async (name, action) => {
 };
 
 (async () => {
+  await test('L01 已AI重复恢复保留待答责任和计划，真正人工恢复及确认竞态保持边界', async () => {
+    const fx = fixture('resume-idempotent-current');
+    const session = 'session_resume-idempotent01';
+    const received = await webhook(fx, session, '重复恢复不能丢失当前普通咨询', 99801);
+    assert.equal(received.statusCode, 200);
+    assert.equal(received.accepted, true);
+    const before = readJson(stateFile(fx, session));
+    assert.equal(before.mode, 'ai');
+    assert.equal(before.jobs.find((job) => job.id === received.jobId).status, 'received');
+    const result = await fx.runtime.resume(received.key);
+    const after = readJson(stateFile(fx, session));
+    const stored = after.jobs.find((job) => job.id === received.jobId);
+    process.stdout.write('观察 L01 当前持久事实：' + JSON.stringify({
+      variant: 'queued_ai', accepted: received.accepted, before_mode: before.mode,
+      before_generation: before.generation, after_mode: after.mode,
+      after_generation: after.generation, original_job_status: stored?.status,
+      original_input_retained: stored?.data?.content === '重复恢复不能丢失当前普通咨询',
+      business_posts: fx.postAttempts.length,
+    }) + '\n');
+    assert.equal(result.generation, before.generation, '已是AI的恢复必须保持代次');
+    assert.equal(after.generation, before.generation);
+    assert.equal(after.control_watermark, before.control_watermark);
+    assert.deepEqual(after.offers, before.offers);
+    assert.equal(stored.status, 'received');
+    assert.deepEqual(stored.data, before.jobs.find((job) => job.id === received.jobId).data);
+
+    const cached = fixture('resume-idempotent-cached');
+    const cachedSession = 'session_resume-cached01';
+    const cachedInput = await webhook(cached, cachedSession, '已生成的合成计划等待发送', 99802);
+    const savedPlan = { type: 'text', content: '合成业务计划保持原样',
+      ordinary: true, purpose: 'keyword_text', ai: false, sources: [], tags: [] };
+    await cached.runtime.transaction(cachedInput.key, (state) => {
+      state.jobs.find((job) => job.id === cachedInput.jobId).plan = structuredClone(savedPlan);
+    });
+    const cachedBefore = readJson(stateFile(cached, cachedSession));
+    await cached.runtime.resume(cachedInput.key);
+    const cachedAfter = readJson(stateFile(cached, cachedSession));
+    const cachedJob = cachedAfter.jobs.find((job) => job.id === cachedInput.jobId);
+    assert.equal(cachedAfter.generation, cachedBefore.generation);
+    assert.equal(cachedJob.status, 'received');
+    assert.deepEqual(cachedJob.plan, savedPlan);
+    assert.deepEqual(cachedJob.data, cachedBefore.jobs.find((job) => job.id === cachedInput.jobId).data);
+
+    const human = fixture('resume-genuine-human');
+    const humanSession = 'session_resume-human01';
+    const oldInput = await webhook(human, humanSession, '人工接管前的旧问题不得复活', 99803);
+    human.tick(1);
+    const operator = await webhook(human, humanSession, '合成真人公开接管', 99804,
+      { event: 'message:received', from: 'operator', automated: false });
+    const paused = readJson(stateFile(human, humanSession));
+    assert.equal(paused.mode, 'human');
+    assert.equal(paused.jobs.find((job) => job.id === oldInput.jobId).status, 'cancelled');
+    const genuine = await human.runtime.resume(operator.key);
+    const resumed = readJson(stateFile(human, humanSession));
+    assert.equal(genuine.mode, 'ai');
+    assert.equal(resumed.generation, paused.generation + 1);
+    assert.equal(resumed.jobs.find((job) => job.id === oldInput.jobId).status, 'cancelled');
+    human.tick(1);
+    const newInput = await webhook(human, humanSession, '人工恢复后真正的新咨询', 99805);
+    const newBefore = readJson(stateFile(human, humanSession));
+    await human.runtime.resume(newInput.key);
+    const newAfter = readJson(stateFile(human, humanSession));
+    assert.equal(newAfter.generation, newBefore.generation);
+    assert.equal(newAfter.jobs.find((job) => job.id === newInput.jobId).status, 'received');
+    assert.equal(newAfter.jobs.find((job) => job.id === oldInput.jobId).status, 'cancelled');
+
+    const race = fixture('resume-expiry-confirm-race');
+    const raceSession = 'session_resume-race01';
+    const raceOperator = await webhook(race, raceSession, '合成真人接管后管理员打开列表', 99806,
+      { event: 'message:received', from: 'operator', automated: false });
+    const listed = await race.runtime.list();
+    assert.equal(listed.find((row) => row.key === raceOperator.key).mode, 'human');
+    const deadline = readJson(stateFile(race, raceSession)).resume_at;
+    assert(Number.isFinite(deadline) && deadline > race.now());
+    race.tick(deadline - race.now() + 1);
+    const raceInput = await webhook(race, raceSession, '到期自动恢复后刚到达的新咨询', 99807);
+    const raceBefore = readJson(stateFile(race, raceSession));
+    assert.equal(raceBefore.mode, 'ai');
+    assert.equal(raceBefore.jobs.find((job) => job.id === raceInput.jobId).status, 'received');
+    await race.runtime.resume(raceOperator.key);
+    const raceAfter = readJson(stateFile(race, raceSession));
+    assert.equal(raceAfter.generation, raceBefore.generation);
+    assert.equal(raceAfter.jobs.find((job) => job.id === raceInput.jobId).status, 'received');
+    assert.deepEqual(raceAfter.jobs.find((job) => job.id === raceInput.jobId).data,
+      raceBefore.jobs.find((job) => job.id === raceInput.jobId).data);
+    for (const current of [fx, cached, human, race]) {
+      assert.equal(current.postAttempts.length, 0);
+      assert.equal(current.sent.length, 0);
+    }
+  });
+
   await test('人工期产生但恢复后才到达的消息不补答，恢复后的新消息仍入队', async () => {
     const fx = fixture('delayed-human-period-message');
     const session = 'session_delayed-human01';
@@ -793,11 +884,17 @@ const test = async (name, action) => {
       }
       return originalRequest(url, options);
     } });
-    const pendingCatchup = blocked.catchup();
+    let catchupSettled = false;
+    const pendingCatchup = blocked.catchup().finally(() => { catchupSettled = true; });
     await Promise.race([listStarted, wait(500).then(() => { throw new Error('REST 挂起夹具未启动'); })]);
     const scanStarted = Date.now();
     const whileBlocked = await blocked.scan();
-    assert(Date.now() - scanStarted < 500, '本地 scan 不得等待 REST 超时预算');
+    const scanElapsed = Date.now() - scanStarted;
+    process.stdout.write('观察 REST 扫描隔离：' + JSON.stringify({ scan_elapsed_ms: scanElapsed,
+      catchup_still_pending: !catchupSettled,
+      local_job_selected: whileBlocked.some((entry) => entry.key === fx.runtime.stateKey(website, localSession)) }) + '\n');
+    assert.equal(catchupSettled, false, '本地 scan 返回时挂起 REST 必须仍未完成');
+    assert(scanElapsed < 500, '本地 scan 不得等待 REST 超时预算');
     assert(whileBlocked.some((entry) => entry.key === fx.runtime.stateKey(website, localSession)));
     releaseList({ status: 503, body: { error: true } });
     assert.equal((await pendingCatchup).status, 'warning');
@@ -966,6 +1063,51 @@ const test = async (name, action) => {
     assert.equal(fx.catchupRequests.length, beforeRequests, '状态来源不可信时不得请求并提交新的覆盖水位');
   });
 
+  await test('现存 JSON null 不是 ENOENT，健康与补偿均报 state_invalid 且原字节不变', async () => {
+    const fx = fixture('rest-catchup-null-existing-state');
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+    const invalidBytes = Buffer.from('null');
+    fs.writeFileSync(catchupFile, invalidBytes, { mode: 0o600 });
+    fx.tick(2000);
+    const beforeRequests = fx.catchupRequests.length;
+
+    await fx.runtime.scan();
+    const health = JSON.parse(fs.readFileSync(path.join(fx.runtimeDirectory,
+      'scheduler-health.json'), 'utf8')).crisp_rest_catchup;
+    assert.equal(health.status, 'warning');
+    assert.equal(health.error_code, 'state_invalid');
+    assert(fs.readFileSync(catchupFile).equals(invalidBytes),
+      '只读健康不得把现存 JSON null 改写为 bootstrap');
+
+    const result = await fx.runtime.catchup();
+    assert.equal(result.status, 'warning');
+    assert.equal(result.error_code, 'state_invalid');
+    assert(fs.readFileSync(catchupFile).equals(invalidBytes),
+      '补偿入口不得把现存 JSON null 覆盖为当前新水位');
+    assert.equal(fx.catchupRequests.length, beforeRequests,
+      '状态来源不可信时不得发起任何 Crisp REST 请求');
+
+    const absent = fixture('rest-catchup-true-enoent-state');
+    assert.equal(fs.existsSync(path.join(absent.runtimeDirectory,
+      'crisp-rest-catchup.json')), false);
+    assert.equal((await absent.runtime.catchup()).status, 'bootstrap',
+      '真实 ENOENT 仍须建立首次接入水位');
+
+    const switched = fixture('rest-catchup-managed-website-change');
+    assert.equal((await switched.runtime.catchup()).status, 'bootstrap');
+    const switchedFile = path.join(switched.runtimeDirectory, 'crisp-rest-catchup.json');
+    const oldBinding = readJson(switchedFile).site_binding;
+    switched.restartWithEnv({ CRISP_WEBSITE_ID: '22222222-2222-4222-8222-222222222222' });
+    switched.tick(2000);
+    const requestsBeforeSwitch = switched.catchupRequests.length;
+    assert.equal((await switched.runtime.catchup()).status, 'bootstrap',
+      '结构有效的旧站水位必须由受管Website切换建立新站水位');
+    assert.notEqual(readJson(switchedFile).site_binding, oldBinding);
+    assert.equal(switched.catchupRequests.length, requestsBeforeSwitch,
+      '换站首轮只立新水位，不读取或补答旧站历史');
+  });
+
   await test('畸形 catchup 消息持久隔离且不阻塞其它会话，严格 exact 恢复后才清除责任', async () => {
     const fx = fixture('rest-catchup-message-quarantine');
     assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
@@ -1065,6 +1207,39 @@ const test = async (name, action) => {
     const visitor = await webhook(fx, session, '人工归属待核查期间的新问题', 62102);
     assert.equal(visitor.route, 'ignore');
     assert.equal(fx.runtime.readState(visitor.key).jobs.find((job) => job.id === visitor.jobId).deferred_control, true);
+
+    const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+    const validCatchupBytes = fs.readFileSync(catchupFile);
+    fs.writeFileSync(catchupFile, 'null', { mode: 0o600 });
+    fx.restart();
+    const postAttemptsBeforeInvalidState = fx.postAttempts.length;
+    await fx.runtime.scan();
+    current = fx.runtime.readState(visitor.key);
+    assert.equal(current.uncertain_events.length, 1,
+      'catchup 状态无效时不得释放尚未精确核验的 operator barrier');
+    assert.equal(current.jobs.find((job) => job.id === visitor.jobId).deferred_control, true);
+    assert.equal((await fx.runtime.process(visitor.key, visitor.jobId)).status, 'idle',
+      '身份来源未知时普通访客责任只能留在队列，不得进入回答链');
+    assert.equal(fx.postAttempts.length, postAttemptsBeforeInvalidState);
+
+    const cleanSession = 'session_catchup-invalid-state-clean';
+    const cleanVisitor = await webhook(fx, cleanSession,
+      '无会话内 barrier 但全局补偿状态不可验证的问题', 62103);
+    assert.equal(cleanVisitor.statusCode, 200);
+    assert.equal(cleanVisitor.route, 'ignore');
+    const cleanState = fx.runtime.readState(cleanVisitor.key);
+    assert.equal(cleanState.uncertain_events.length, 0);
+    assert.equal(cleanState.jobs.find((job) => job.id === cleanVisitor.jobId).deferred_control, true,
+      '无效 catchup 状态必须作为技术性 operator 身份屏障失败关闭');
+    const humanSession = 'session_catchup-invalid-state-human';
+    const human = await webhook(fx, humanSession, '真人已经接管', 62104,
+      { event: 'message:received', from: 'operator', automated: false });
+    assert.equal(human.statusCode, 200);
+    assert.equal(fx.runtime.readState(human.key).mode, 'human',
+      '技术性未知屏障不得阻止明确真人控制事实提交');
+
+    fs.writeFileSync(catchupFile, validCatchupBytes, { mode: 0o600 });
+    fx.restart();
 
     const exact = { ...malformed, content: '本项目自动消息', automated: true };
     fx.exactMessages.set(String(fingerprint), exact);
@@ -1167,7 +1342,7 @@ const test = async (name, action) => {
         updated_at: coveredWatermark + 1000 }]);
       const candidate = { website_id: website, session_id: session,
         from: 'user', type: 'text', content, fingerprint: variant === 'too_large' ? 95514 : 95513,
-        timestamp: coveredWatermark + 1000 };
+        timestamp: variant === 'too_large' ? coveredCursor : coveredWatermark + 1000 };
       if (variant === 'invalid_after_validation') {
         // catchupMessage 已完成 event_time 与字符串正文校验后才读取可选 origin。
         // 此处只回拨一次受控时钟，使随后内部 receive 的未来时间保护返回400。
@@ -1197,6 +1372,10 @@ const test = async (name, action) => {
       assert.equal(progress.window.index, 0);
       assert.equal(progress.window.message.session_id, session);
       assert.equal(progress.window.message.cursor, coveredCursor, '失败候选不得推进窗口内会话游标');
+      assert.equal(progress.window.message.boundary_replayed, false,
+        '整批责任尚未持久成功时不得提交 equal-cursor 边界已重放');
+      assert.deepEqual(progress.window.message.boundary_fingerprints, [],
+        '失败候选不得进入已覆盖边界 fingerprint');
       assert.equal(progress.last_result.status, 'warning');
       assert.equal(progress.last_result.error_code, 'local_persistence_failed');
       const conversation = fx.runtime.readState(fx.runtime.stateKey(website, session));
@@ -1209,14 +1388,83 @@ const test = async (name, action) => {
       // 修复本地校验条件后，同一 fingerprint 必须仍可从原固定窗口摄入；
       // 这证明先前 400/413 没有被当作 ACK 或已覆盖事实。
       if (variant === 'too_large') fx.catchupMessages.get(session)[0].content = '恢复后的受控可持久正文';
+      const beforeRecoveryRequests = fx.catchupRequests.length;
       fx.tick(1001);
       await fx.runtime.catchup();
+      const recoveryMessageRequest = fx.catchupRequests.slice(beforeRecoveryRequests)
+        .find((entry) => entry.type === 'messages' && entry.session === session);
+      assert(recoveryMessageRequest, '恢复轮必须再次读取同一会话边界');
+      assert.equal(recoveryMessageRequest.after, coveredCursor - 1,
+        '失败后的下一轮仍须以 cursor-1 重放 equal-cursor 消息');
       const recovered = fx.runtime.readState(fx.runtime.stateKey(website, session));
       const fingerprint = variant === 'too_large' ? 95514 : 95513;
       assert.equal(recovered.jobs.filter((job) => job.data?.fingerprint === fingerprint).length, 1,
         '本地条件恢复后只能建立一份原候选责任');
       assert.equal(recovered.jobs.find((job) => job.data?.fingerprint === fingerprint).status, 'received');
     }
+  });
+
+  await test('equal-cursor quarantine容量失败不提交边界，释放一槽后原第129条仍可持久', async () => {
+    const fx = fixture('rest-catchup-equal-cursor-quarantine-capacity', {
+      catchupMessageRequestBudget: 1,
+    });
+    const baseline = fx.now();
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    const catchupFile = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+    const session = 'session_catchup-quarantine-capacity';
+    fx.tick(2000);
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+      updated_at: baseline + 1000 }]);
+    fx.catchupMessages.set(session, []);
+    await fx.runtime.catchup();
+    const covered = readJson(catchupFile);
+    const coveredCursor = fx.runtime.readState(
+      fx.runtime.stateKey(website, session)).crisp_rest_catchup.cursor;
+    assert.equal(coveredCursor, covered.watermark);
+
+    fx.tick(16000);
+    const firstFingerprint = 95600;
+    const messages = Array.from({ length: 129 }, (_, index) => ({
+      website_id: website, session_id: session, from: 'user', type: 'text',
+      content: null, fingerprint: firstFingerprint + index, timestamp: coveredCursor,
+    }));
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+      updated_at: fx.now() }]);
+    fx.catchupMessages.set(session, messages);
+    const full = await fx.runtime.catchup();
+    assert.equal(full.status, 'warning');
+    assert.equal(full.error_code, 'unresolved_capacity');
+    let progress = readJson(catchupFile);
+    assert.equal(progress.unresolved_messages.length, 128);
+    assert.equal(progress.window.message.cursor, coveredCursor);
+    assert.equal(progress.window.message.boundary_replayed, false,
+      '第129条尚无quarantine责任时不得提交equal-cursor边界');
+    assert.equal(progress.watermark, covered.watermark);
+    assert.equal(fx.runtime.readState(fx.runtime.stateKey(website, session)).jobs.length, 0);
+
+    const removed = progress.unresolved_messages.shift();
+    progress.unresolved_messages.forEach((item) => { item.next_retry_at = fx.now() + 1000000; });
+    atomicWriteJson(catchupFile, progress);
+    fx.catchupMessages.set(session, messages.filter((message) =>
+      String(message.fingerprint) !== String(removed.fingerprint)));
+    const beforeRetryRequests = fx.catchupRequests.length;
+    fx.tick(Math.max(1, progress.next_scan_at - fx.now() + 1));
+    const recovered = await fx.runtime.catchup();
+    assert.equal(recovered.error_code, undefined);
+    const retryRequest = fx.catchupRequests.slice(beforeRetryRequests)
+      .find((entry) => entry.type === 'messages' && entry.session === session);
+    assert(retryRequest);
+    assert.equal(retryRequest.after, coveredCursor - 1,
+      '容量恢复后仍须重放失败的equal-cursor边界');
+    progress = readJson(catchupFile);
+    assert.equal(progress.unresolved_messages.length, 128);
+    assert(progress.unresolved_messages.some((item) =>
+      item.fingerprint === String(firstFingerprint + 128)),
+    '原第129条消息必须取得持久quarantine责任');
+    assert.equal(progress.window.message.boundary_replayed, true);
+    assert.equal(fx.runtime.readState(fx.runtime.stateKey(website, session)).jobs.length, 0);
+    assert.deepEqual(fx.postAttempts, []);
+    assert.deepEqual(fx.sent, []);
   });
 
   await test('Crisp 420/429 均限流退避且保留固定补偿窗口和水位', async () => {
@@ -1547,6 +1795,433 @@ const test = async (name, action) => {
     }
   });
 
+  const confirmedOwnCatchupSeed = async (name, resolved) => {
+    const fx = fixture('confirmed-own-catchup-' + name);
+    const session = 'session_confirmed-own-' + name;
+    const baseline = fx.now();
+    writeJson(path.join(fx.root, 'config/keyword.yaml'), { schema_version: 2, rules: [{
+      id: 'confirmed-own-reply', name: '自有回执受控答复', enabled: true,
+      match_mode: 'exact', keywords: ['受控自有回执咨询'], exclude_keywords: [],
+      priority: 10, action: 'reply', text: '受控的新业务答复', cooldown_seconds: 0,
+    }] });
+    installReplyReadyMaterials(fx.root, fx.now());
+    writeState(fx, session, stateValue(fx, session, [], { welcome_sent: true }));
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    fx.tick(1000);
+    const question = await webhook(fx, session, '受控自有回执咨询', 94301);
+    assert.equal(question.statusCode, 200);
+    const fingerprint = parseInt(digest(question.key + '|' + question.jobId + '|keyword_reply').slice(0, 12), 16);
+    const oldContent = '早期控制消息的旧正文';
+    const control = await webhook(fx, session, oldContent, fingerprint, {
+      event: 'message:received', from: 'operator', ...(resolved ? {} : { automated: true }),
+    });
+    assert.equal(control.statusCode, 200);
+    if (resolved) {
+      fx.exactMessages.set(String(fingerprint), {
+        website_id: website, session_id: session, from: 'operator', type: 'text',
+        content: oldContent, fingerprint, timestamp: fx.now(), automated: true,
+      });
+      await fx.runtime.process(control.key, control.jobId);
+    }
+    let current = fx.runtime.readState(question.key);
+    let handled = current.jobs.find((job) => job.id === control.jobId);
+    assert.equal(handled.status, 'done');
+    assert.equal(handled.responsibility_status, 'control_handled');
+    if (resolved) {
+      assert.equal(handled.responsibility_reason, 'operator_identity_resolved');
+      assert.equal(handled.operator_resolution.result, 'not-human');
+      assert.equal(handled.operator_resolution.human_changed, false);
+    }
+    fx.tick(1000);
+    await fx.runtime.process(question.key, question.jobId);
+    current = fx.runtime.readState(question.key);
+    const record = current.outgoing[String(fingerprint)];
+    assert.equal(record.status, 'sent', '夹具必须由真实发送路径确认出站，不手写sent');
+    assert.equal(record.delivery_identity_version, 1);
+    assert.equal(record.job_id, question.jobId);
+    assert.equal(fx.sent.length, 1);
+    const message = { ...structuredClone(fx.sent[0]), website_id: website,
+      session_id: session, timestamp: fx.now() };
+    assert.equal(message.fingerprint, fingerprint);
+    assert.notEqual(message.content, oldContent);
+    handled = current.jobs.find((job) => job.id === control.jobId);
+    assert.equal(handled.data, undefined);
+    const ownedPath = path.join(fx.runtimeDirectory, 'owned-' + question.key + '-'
+      + (fingerprint % 256).toString(16).padStart(2, '0') + '.json');
+    assert(readJson(ownedPath).fingerprints.includes(String(fingerprint)));
+    fx.tick(16000);
+    fx.catchupConversationPages.set(1, [{ website_id: website,
+      session_id: session, updated_at: fx.now() }]);
+    fx.catchupMessages.set(session, [message]);
+    return { fx, session, baseline, question, control, fingerprint, message,
+      ownedPath, catchupFile: path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json') };
+  };
+
+  const menuCatchupSeed = async (name, selected, numericAction = null) => {
+    const fx = fixture('rest-menu-terminal-' + name);
+    const baseline = fx.now();
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    const previous = readJson(path.join(fx.root, 'config/materials-applied.json'));
+    const configuration = structuredClone(previous.configuration);
+    configuration.keyword = { schema_version: 2, rules: [{ id: 'terminal-menu',
+      enabled: true, match_mode: 'exact', keywords: ['合成终态菜单'], exclude_keywords: [],
+      priority: 100, action: 'menu', target: 'terminal', cooldown_seconds: 0 }] };
+    configuration.menu = { welcome: { enabled: false, trigger: 'first_message', auto_open: false },
+      root: 'terminal', menus: { terminal: { title: '合成终态菜单', options: {
+        '1': { label: '合成业务选项', action: { type: 'reply', text: '合成菜单业务已完成。' } } } } } };
+    if (numericAction) {
+      configuration.menu.menus.terminal.options['1'].action = numericAction;
+      if (numericAction.type === 'menu') configuration.menu.menus.numericChild = {
+        title: '合成数字子菜单', options: { '1': { label: '下一项', action: { type: 'reply', text: '后续合成答复。' } } } };
+    }
+    for (const component of ['keyword', 'menu']) {
+      fx.runtime.validateConfig(component, configuration[component]);
+      writeJson(path.join(fx.root, 'config', component + '.yaml'), configuration[component]);
+    }
+    atomicWriteJson(path.join(fx.root, 'config/materials-applied.json'),
+      makeMaterials(fx.root, fx.now(), configuration, previous.revision));
+    fx.restart(); fx.tick(2000);
+    const session = 'session_menu-terminal-' + name;
+    const inputAt = fx.now();
+    const accepted = await webhook(fx, session, '合成终态菜单', 976001);
+    assert.equal(accepted.statusCode, 200);
+    await fx.runtime.process(accepted.key, accepted.jobId);
+    assert.equal(fx.sent.length, 1); assert.equal(fx.sent[0].type, 'picker');
+    const card = structuredClone(fx.sent[0]);
+    const echo = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      body: { website_id: website, event: 'message:received', data: { ...card, session_id: session } } });
+    assert.equal(echo.statusCode, 200);
+    const echoJob = readJson(stateFile(fx, session)).jobs.find(item => item.id === echo.jobId);
+    assert.equal(echoJob.status, 'done'); assert.equal(echoJob.action, 'non_operator_message');
+    let message = { website_id: website, session_id: session, from: 'user', type: 'text',
+      fingerprint: 976001, content: '合成终态菜单', timestamp: inputAt };
+    let jobId = accepted.jobId;
+    if (numericAction) {
+      fx.tick(5000);
+      const numericAt = fx.now();
+      const numeric = await webhook(fx, session, '1', 976002);
+      assert.equal(numeric.statusCode, 200);
+      const pending = readJson(stateFile(fx, session)).jobs.find(item => item.id === numeric.jobId);
+      assert.equal(pending.control, false);
+      assert.equal(pending.action, 'menu_action');
+      assert.equal(pending.choice_action.option_id, '1');
+      assert.equal((await fx.runtime.process(numeric.key, numeric.jobId)).status, 'sent');
+      assert.equal(fx.sent.length, 2);
+      if (numericAction.type === 'menu') assert.equal(fx.sent[1].type, 'picker');
+      else if (numericAction.type === 'show_handoff_offer') assert.equal(fx.sent[1].type, 'picker');
+      else assert.equal(fx.sent[1].content, numericAction.text);
+      jobId = numeric.jobId;
+      message = { website_id: website, session_id: session, from: 'user', type: 'text',
+        fingerprint: 976002, content: '1', timestamp: numericAt };
+    } else if (selected) {
+      fx.tick(5000);
+      const content = { ...structuredClone(card.content),
+        choices: card.content.choices.map((choice, index) => ({ ...choice, selected: index === 0 })) };
+      const update = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+        body: { website_id: website, event: 'message:updated', data: {
+          session_id: session, fingerprint: card.fingerprint, content, timestamp: fx.now() } } });
+      assert.equal(update.statusCode, 200);
+      await fx.runtime.process(update.key, update.jobId);
+      assert.equal(fx.sent.length, 2); assert.equal(fx.sent[1].content, '合成菜单业务已完成。');
+      jobId = update.jobId;
+      // Crisp 的更新 Hook 可省略 from/type；REST 列表保留原 operator/picker 和建卡时间。
+      message = { ...card, website_id: website, session_id: session, content, timestamp: inputAt };
+    }
+    const original = readJson(stateFile(fx, session));
+    const job = original.jobs.find((item) => item.id === jobId);
+    assert.equal(job.status, 'done'); assert.equal(job.responsibility_status, 'control_handled');
+    assert.equal(job.data, undefined);
+    fx.tick(4000);
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session, updated_at: fx.now() }]);
+    fx.catchupMessages.set(session, [message]);
+    return { fx, baseline, session, message, jobId, original,
+      catchupFile: path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json') };
+  };
+  await test('已送达菜单及已处理选择可被REST重见，不因控制终态或表示差异阻断补偿', async () => {
+    const observations = [];
+    for (const [name, selected] of [['navigation', false], ['selected-picker', true]]) {
+      const seed = await menuCatchupSeed(name, selected);
+      const beforePosts = seed.fx.postAttempts.length;
+      let result = await seed.fx.runtime.catchup();
+      let progress = readJson(seed.catchupFile);
+      for (let round = 0; !result.error_code && progress.window && round < 4; round++) {
+        seed.fx.tick(1001);
+        result = await seed.fx.runtime.catchup();
+        progress = readJson(seed.catchupFile);
+      }
+      const after = readJson(stateFile(seed.fx, seed.session));
+      for (const field of ['jobs', 'outgoing', 'offers', 'mode', 'generation', 'resume_at', 'control_watermark']) {
+        assert.deepEqual(after[field], seed.original[field], name + ' 不得重做原业务或人工副作用');
+      }
+      assert.equal(seed.fx.postAttempts.length, beforePosts, '补偿不能再次发送菜单或答复');
+      observations.push({ entry: name, error_code: result.error_code || null,
+        terminal_status: after.jobs.find(item => item.id === seed.jobId).status,
+        responsibility: after.jobs.find(item => item.id === seed.jobId).responsibility_status,
+        watermark_advanced: progress.watermark > seed.baseline,
+        original_jobs_unchanged: true, additional_posts: seed.fx.postAttempts.length - beforePosts });
+    }
+    for (const row of observations) console.log('观察菜单补偿：' + JSON.stringify(row));
+    assert(observations.every(row => row.error_code === null && row.watermark_advanced === true),
+      '真实控制终态与已确认Hook选择必须保留补偿覆盖，不得local_persistence_failed');
+  });
+  await test('菜单补偿仍拒绝冻结身份、已送达账本和实际选择的相邻冲突', async () => {
+    const variants = [
+      ['navigation-hash', false, seed => { seed.original.jobs.find(j => j.id === seed.jobId).input_identity_sha256 = '0'.repeat(64); }],
+      ['navigation-status', false, seed => { seed.original.jobs.find(j => j.id === seed.jobId).status = 'received'; }],
+      ['navigation-reason', false, seed => { seed.original.jobs.find(j => j.id === seed.jobId).responsibility_reason = 'unconfirmed'; }],
+      ['navigation-receipt', false, seed => { Object.values(seed.original.outgoing)[0].status = 'unknown'; }],
+      ['navigation-content', false, seed => { seed.message.content = '另一条合成菜单'; }],
+      ['picker-hash', true, seed => { seed.original.jobs.find(j => j.id === seed.jobId).input_identity_sha256 = '0'.repeat(64); }],
+      ['picker-covered', true, seed => { seed.original.jobs.find(j => j.id === seed.jobId).covered_message_ids = []; }],
+      ['picker-time-source', true, seed => { seed.original.jobs.find(j => j.id === seed.jobId).event_time_source = 'untrusted'; }],
+      ['picker-unconsumed', true, seed => { seed.original.offers[seed.message.content.id].consumed_at = null; }],
+      ['picker-action', true, seed => { seed.original.jobs.find(j => j.id === seed.jobId).choice_action = { type: 'unknown' }; }],
+      ['picker-event', true, seed => { seed.original.jobs.find(j => j.id === seed.jobId).event = 'message:send'; }],
+      ['picker-fingerprint', true, seed => { seed.original.offers[seed.message.content.id].fingerprint += 1; }],
+    ];
+    for (const [name, selected, mutate] of variants) {
+      const seed = await menuCatchupSeed(name, selected);
+      mutate(seed);
+      writeState(seed.fx, seed.session, seed.original);
+      const before = readJson(seed.catchupFile);
+      const beforePosts = seed.fx.postAttempts.length;
+      const result = await seed.fx.runtime.catchup();
+      assert.equal(result.error_code, 'local_persistence_failed', name + ' 必须继续拒绝冲突');
+      assert.equal(readJson(seed.catchupFile).watermark, before.watermark, name + ' 不得推进水位');
+      assert.equal(seed.fx.postAttempts.length, beforePosts, name + ' 不得再次发业务消息');
+    }
+  });
+
+
+  await test('MNU07 数字菜单导航与人工入口的已确认责任可被REST重见而不重做动作', async () => {
+    const observations = [];
+    for (const [name, action] of [
+      ['navigation', { type: 'menu', target: 'numericChild' }],
+      ['handoff', { type: 'show_handoff_offer' }],
+    ]) {
+      const seed = await menuCatchupSeed('numeric-' + name, false, action);
+      const beforePosts = seed.fx.postAttempts.length;
+      let result = await seed.fx.runtime.catchup();
+      let progress = readJson(seed.catchupFile);
+      for (let round = 0; !result.error_code && progress.window && round < 4; round++) {
+        seed.fx.tick(1001); result = await seed.fx.runtime.catchup(); progress = readJson(seed.catchupFile);
+      }
+      const after = readJson(stateFile(seed.fx, seed.session));
+      for (const field of ['jobs', 'outgoing', 'offers', 'mode', 'generation', 'resume_at', 'control_watermark']) {
+        assert.deepEqual(after[field], seed.original[field], name + ' 不得重新消费、转人工或送出');
+      }
+      assert.equal(seed.fx.postAttempts.length, beforePosts);
+      observations.push({ entry: name, error_code: result.error_code || null, watermark_advanced: progress.watermark > seed.baseline,
+        original_jobs_and_outgoing_unchanged: true, additional_posts: seed.fx.postAttempts.length - beforePosts });
+    }
+    console.log('观察数字菜单补偿：' + JSON.stringify(observations));
+    assert(observations.every(row => row.error_code === null && row.watermark_advanced === true),
+      '数字菜单已完成且严格送达的责任必须通过原补偿检查');
+  });
+  await test('MNU08 数字菜单补偿仍拒绝错误动作、输入身份与不完整发送回执', async () => {
+    const mutations = [
+      ['input-hash', seed => { seed.original.jobs.find(row => row.id === seed.jobId).input_identity_sha256 = '0'.repeat(64); }],
+      ['action-type', seed => { seed.original.jobs.find(row => row.id === seed.jobId).choice_action.action.type = 'reply'; }],
+      ['missing-choice', seed => { delete seed.original.jobs.find(row => row.id === seed.jobId).choice_action; }],
+      ['wrong-option', seed => { seed.original.jobs.find(row => row.id === seed.jobId).choice_action.option_id = '2'; }],
+      ['wrong-input', seed => { seed.message.content = '2'; }],
+      ['not-done', seed => { seed.original.jobs.find(row => row.id === seed.jobId).status = 'received'; }],
+      ['wrong-reason', seed => { seed.original.jobs.find(row => row.id === seed.jobId).responsibility_reason = 'menu'; }],
+      ['receipt-unknown', seed => { Object.values(seed.original.outgoing).find(row => row.job_id === seed.jobId).status = 'unknown'; }],
+      ['receipt-type', seed => { Object.values(seed.original.outgoing).find(row => row.job_id === seed.jobId).message_type = 'text'; }],
+      ['receipt-purpose', seed => { Object.values(seed.original.outgoing).find(row => row.job_id === seed.jobId).purpose = 'handoff_offer'; }],
+      ['receipt-semantic', seed => { Object.values(seed.original.outgoing).find(row => row.job_id === seed.jobId).semantic_intent = 'answer'; }],
+      ['receipt-unbound', seed => { Object.values(seed.original.outgoing).find(row => row.job_id === seed.jobId).receipt_identity_unbound = true; }],
+    ];
+    for (const [name, mutate] of mutations) {
+      const seed = await menuCatchupSeed('numeric-negative-' + name, false, { type: 'menu', target: 'numericChild' });
+      mutate(seed); writeState(seed.fx, seed.session, seed.original);
+      const before = readJson(seed.catchupFile); const beforePosts = seed.fx.postAttempts.length;
+      const result = await seed.fx.runtime.catchup();
+      assert.equal(result.error_code, 'local_persistence_failed', name);
+      assert.equal(readJson(seed.catchupFile).watermark, before.watermark, name);
+      assert.equal(seed.fx.postAttempts.length, beforePosts, name);
+    }
+    console.log('观察数字菜单补偿反例：' + JSON.stringify({ variants: mutations.length, all_conflicts_rejected: true, additional_posts: 0 }));
+  });
+
+  const handoffCatchupSeed = async (name, confirm) => {
+    const fx = fixture('rest-handoff-terminal-' + name);
+    const baseline = fx.now();
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    const previous = readJson(path.join(fx.root, 'config/materials-applied.json'));
+    const configuration = structuredClone(previous.configuration);
+    configuration.keyword = { schema_version: 2, rules: [{ id: 'terminal-handoff',
+      enabled: true, match_mode: 'exact', keywords: ['合成人工入口'], exclude_keywords: [],
+      priority: 100, action: 'show_handoff_offer', cooldown_seconds: 0 }] };
+    fx.runtime.validateConfig('keyword', configuration.keyword);
+    writeJson(path.join(fx.root, 'config/keyword.yaml'), configuration.keyword);
+    atomicWriteJson(path.join(fx.root, 'config/materials-applied.json'),
+      makeMaterials(fx.root, fx.now(), configuration, previous.revision));
+    fx.restart(); fx.tick(2000);
+    const session = 'session_handoff-terminal-' + name;
+    writeState(fx, session, stateValue(fx, session, [], { welcome_sent: true }));
+    const accepted = await webhook(fx, session, '合成人工入口', 982001);
+    assert.equal(accepted.statusCode, 200);
+    await fx.runtime.process(accepted.key, accepted.jobId);
+    assert.equal(fx.sent.length, 1); assert.equal(fx.sent[0].type, 'picker');
+    const card = structuredClone(fx.sent[0]);
+    const echo = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      body: { website_id: website, event: 'message:received', data: { ...card, session_id: session } } });
+    assert.equal(echo.statusCode, 200);
+    const beforeChoice = readJson(stateFile(fx, session));
+    const offer = beforeChoice.offers[card.content.id];
+    const actionType = confirm ? 'confirm_handoff' : 'cancel_handoff';
+    const value = Object.keys(offer.choices).find(key => offer.choices[key].type === actionType);
+    assert.equal(typeof value, 'string');
+    fx.tick(5000);
+    const content = { ...structuredClone(card.content),
+      choices: card.content.choices.map(choice => ({ ...choice, selected: choice.value === value })) };
+    const choice = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      body: { website_id: website, event: 'message:updated', data: {
+        session_id: session, fingerprint: card.fingerprint, content, timestamp: fx.now() } } });
+    assert.equal(choice.statusCode, 200);
+    await fx.runtime.process(choice.key, choice.jobId);
+    if (!confirm) {
+      // 到期后的审计保留期也走真实清理，只推进测试时钟，不手删 offer。
+      const expiresAt = readJson(stateFile(fx, session)).offers[card.content.id].expires_at;
+      fx.tick(expiresAt - fx.now() + 86400001);
+      await fx.runtime.transaction(choice.key, () => null);
+    }
+    const original = readJson(stateFile(fx, session));
+    const job = original.jobs.find(item => item.id === choice.jobId);
+    assert.equal(job.action, actionType);
+    assert.equal(job.responsibility_reason, actionType);
+    assert.equal(job.status, 'done');
+    assert.equal(job.responsibility_status, 'control_handled');
+    assert.equal(job.data, undefined);
+    assert.equal(original.offers[card.content.id], undefined);
+    assert.equal(original.mode, confirm ? 'human' : 'ai');
+    assert.equal(fx.sent.length, confirm ? 2 : 1);
+    fx.tick(4000);
+    const message = { ...card, website_id: website, session_id: session,
+      content, timestamp: card.timestamp };
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+      updated_at: fx.now() }]);
+    fx.catchupMessages.set(session, [message]);
+    return { fx, baseline, session, message, jobId: choice.jobId, original,
+      catchupFile: path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json') };
+  };
+  await test('已完成人工确认或取消在offer退役及Hook省略角色后仍覆盖REST且不重做控制', async () => {
+    const facts = [];
+    for (const [entry, confirm] of [['confirm', true], ['cancel', false]]) {
+      const seed = await handoffCatchupSeed(entry, confirm);
+      const posts = seed.fx.postAttempts.length;
+      let result = await seed.fx.runtime.catchup();
+      let progress = readJson(seed.catchupFile);
+      for (let round = 0; !result.error_code && progress.window && round < 4; round++) {
+        seed.fx.tick(1001); result = await seed.fx.runtime.catchup();
+        progress = readJson(seed.catchupFile);
+      }
+      const after = readJson(stateFile(seed.fx, seed.session));
+      for (const field of ['jobs', 'outgoing', 'offers', 'mode', 'generation', 'resume_at',
+        'human_event_id', 'last_human_at', 'control_watermark']) {
+        assert.deepEqual(after[field], seed.original[field], entry + ' 不得重新执行接管或改变原控制事实');
+      }
+      const row = { entry, error_code: result.error_code || null,
+        watermark_advanced: progress.watermark > seed.baseline,
+        original_offer_absent: Object.keys(seed.original.offers).length === 0,
+        original_jobs_and_controls_unchanged: true,
+        additional_posts: seed.fx.postAttempts.length - posts };
+      facts.push(row);
+      console.log('观察人工确认补偿：' + JSON.stringify(row));
+    }
+    assert(facts.every(row => row.error_code === null && row.watermark_advanced
+      && row.original_offer_absent && row.additional_posts === 0),
+    '已完成的人工选择必须覆盖REST水位，不能因offer正常退役重复接管或报local_persistence_failed');
+  });
+  await test('人工选择补偿的冻结身份和控制语义十二种相邻冲突仍失败关闭', async () => {
+    const variants = [
+      ['hash', seed => { seed.original.jobs.find(j => j.id === seed.jobId).input_identity_sha256 = '0'.repeat(64); }],
+      ['event', seed => { seed.original.jobs.find(j => j.id === seed.jobId).event = 'message:received'; }],
+      ['action', seed => { seed.original.jobs.find(j => j.id === seed.jobId).action = 'invalid_choice'; }],
+      ['status', seed => { seed.original.jobs.find(j => j.id === seed.jobId).status = 'received'; }],
+      ['responsibility', seed => { seed.original.jobs.find(j => j.id === seed.jobId).responsibility_status = 'pending'; }],
+      ['reason', seed => { seed.original.jobs.find(j => j.id === seed.jobId).responsibility_reason = 'unconfirmed'; }],
+      ['covered', seed => { seed.original.jobs.find(j => j.id === seed.jobId).covered_message_ids = []; }],
+      ['time-source', seed => { seed.original.jobs.find(j => j.id === seed.jobId).event_time_source = 'untrusted'; }],
+      ['control', seed => { seed.original.jobs.find(j => j.id === seed.jobId).control = false; }],
+      ['changed-content', seed => { seed.message.content.text += '另一控制问题'; }],
+      ['multiple-selected', seed => { seed.message.content.choices.forEach(choice => { choice.selected = true; }); }],
+      ['choice-action', seed => { seed.original.jobs.find(j => j.id === seed.jobId).choice_action = { type: 'cancel_handoff' }; }],
+    ];
+    for (const [name, mutate] of variants) {
+      const seed = await handoffCatchupSeed('conflict-' + name, true);
+      mutate(seed); writeState(seed.fx, seed.session, seed.original);
+      const before = readJson(seed.catchupFile);
+      const posts = seed.fx.postAttempts.length;
+      const result = await seed.fx.runtime.catchup();
+      assert.equal(result.error_code, 'local_persistence_failed', name + ' 不能放行控制身份冲突');
+      assert.equal(readJson(seed.catchupFile).watermark, before.watermark, name + ' 不能推进水位');
+      assert.equal(seed.fx.postAttempts.length, posts, name + ' 不能重发确认通知');
+    }
+    console.log('观察人工确认反例：' + JSON.stringify({variants:variants.length,
+      all_conflicts_rejected:true, additional_posts:0}));
+  });
+
+  await test('REST补偿以已确认自有回执越过旧控制正文与时间，不重做业务或人工副作用', async () => {
+    for (const resolved of [false, true]) {
+      const seed = await confirmedOwnCatchupSeed(resolved ? 'resolved' : 'direct', resolved);
+      const { fx, question, control, catchupFile } = seed;
+      const before = readJson(stateFile(fx, seed.session));
+      const beforePostCount = fx.postAttempts.length;
+      const result = await fx.runtime.catchup();
+      assert.notEqual(result.error_code, 'local_persistence_failed',
+        '精确sent+owned现代回执已确认本项目消息，旧控制身份不能卡住补偿');
+      assert(readJson(catchupFile).watermark > seed.baseline,
+        '必须由实际补偿流程推进水位，不手写通过');
+      const after = readJson(stateFile(fx, seed.session));
+      assert.deepEqual(after.jobs, before.jobs, '不能重写旧控制哈希、恢复正文或再次回答');
+      assert.deepEqual(after.outgoing, before.outgoing);
+      for (const field of ['mode', 'generation', 'resume_at', 'last_human_at', 'control_watermark']) {
+        assert.deepEqual(after[field], before[field]);
+      }
+      assert.equal(after.jobs.find((job) => job.id === control.jobId).input_identity_sha256,
+        before.jobs.find((job) => job.id === control.jobId).input_identity_sha256);
+      assert.equal(after.jobs.find((job) => job.id === question.jobId).responsibility_status,
+        'answered_confirmed');
+      assert.equal(fx.postAttempts.length, beforePostCount);
+      assert.equal(fx.sent.length, 1);
+    }
+  });
+
+  await test('自有补偿捷径必须具备完整回执和合法已处理控制，所有相邻冲突保持水位', async () => {
+    const variants = [
+      ['missing-owned', (seed) => {
+        writeJson(seed.ownedPath, { schema_version: 1, fingerprints: [] });
+      }],
+      ['unknown-delivery', (seed, state) => { state.outgoing[String(seed.fingerprint)].status = 'unknown'; }],
+      ['missing-modern-identity', (seed, state) => { delete state.outgoing[String(seed.fingerprint)].delivery_identity_version; }],
+      ['wrong-outgoing-digest', (seed, state) => { state.outgoing[String(seed.fingerprint)].content_sha256 = 'a'.repeat(64); }],
+      ['wrong-owner-job', (seed, state) => { state.outgoing[String(seed.fingerprint)].job_id = 'b'.repeat(64); }],
+      ['pending-control', (seed, state, control) => { control.status = 'received'; control.responsibility_status = 'pending'; }],
+      ['human-resolution', (seed, state, control) => { control.operator_resolution = { schema_version: 1, result: 'human', human_changed: true }; control.responsibility_reason = 'operator_reply'; }],
+      ['malformed-resolution', (seed, state, control) => { control.operator_resolution.result = 'unknown'; }],
+      ['wrong-covered-fingerprint', (seed, state, control) => { control.covered_message_ids = ['999999']; }],
+      ['explicit-human', (seed) => { seed.message.automated = false; }],
+      ['explicit-account', (seed) => { seed.message.user = { type: 'operator', user_id: '22222222-2222-4222-8222-222222222222' }; }],
+      ['changed-body', (seed) => { seed.message.content = '与已确认出站不同的正文'; }],
+    ];
+    for (const [name, mutate] of variants) {
+      const seed = await confirmedOwnCatchupSeed(name, true);
+      const state = readJson(stateFile(seed.fx, seed.session));
+      const control = state.jobs.find((job) => job.id === seed.control.jobId);
+      mutate(seed, state, control);
+      writeState(seed.fx, seed.session, state);
+      const before = readJson(seed.catchupFile);
+      const posts = seed.fx.postAttempts.length;
+      const result = await seed.fx.runtime.catchup();
+      assert.equal(result.error_code, 'local_persistence_failed', name + ' 不能无根据略过既有责任冲突');
+      assert.equal(readJson(seed.catchupFile).watermark, before.watermark, name + ' 不能推进全局水位');
+      assert.equal(seed.fx.postAttempts.length, posts);
+    }
+  });
+
   await test('终态补偿只按冻结身份收敛，正文、事件、哈希或责任形状冲突均失败关闭', async () => {
     const seedRetired = async (name, fingerprint) => {
       const fx = fixture('rest-catchup-terminal-identity-' + name);
@@ -1859,6 +2534,129 @@ const test = async (name, action) => {
       assert.equal(fx.exactRequests.length, 0, '已确认自动化身份不应浪费精确消息配额');
       assert.equal(fx.postAttempts.length, 0);
     }
+  });
+
+  const seedHandledNonconsultation = async (name, from, type, globalOff = false, humanMode = true) => {
+    const fx = fixture('nonconsultation-' + name);
+    const session = 'session_nonconsultation-' + name;
+    if (globalOff) fx.publishRuntimeConfiguration({ enabled: false });
+    assert.equal((await fx.runtime.catchup()).status, 'bootstrap');
+    fx.tick(1000);
+    const history = [];
+    if (from === 'operator' && humanMode) {
+      const humanTime = fx.now();
+      const human = await webhook(fx, session, '人工已处理', 96300,
+        { event: 'message:received', from: 'operator', automated: false });
+      assert.equal(human.statusCode, 200);
+      await fx.runtime.process(human.key, human.jobId);
+      assert.equal(fx.runtime.readState(human.key).mode, 'human');
+      history.push({ website_id: website, session_id: session, from: 'operator', type: 'text',
+        content: '人工已处理', fingerprint: 96300, timestamp: humanTime, automated: false });
+    }
+    fx.tick(1000);
+    const data = { website_id: website, session_id: session, from, type, fingerprint: 96301,
+      timestamp: fx.now(), content: type === 'note' ? '受控内部记录'
+        : { namespace: 'test-only', text: '受控会话事件' } };
+    const event = from === 'operator' ? 'message:received' : 'message:send';
+    const accepted = await fx.runtime.receive({ query: { key: env.CRISP_WEBSITE_HOOK_SECRET },
+      body: { website_id: website, event, timestamp: fx.now(), data } });
+    assert.equal(accepted.statusCode, 200);
+    const state = fx.runtime.readState(accepted.key);
+    const job = state.jobs.find((entry) => entry.id === accepted.jobId);
+    const reason = from === 'operator' ? 'non_operator_message' : 'non_visitor_message';
+    assert(job);
+    assert.equal(job.status, 'done');
+    assert.equal(job.action, reason);
+    assert.equal(job.responsibility_status, 'control_handled');
+    assert.equal(job.responsibility_reason, reason);
+    assert.equal(job.control === true, from === 'operator');
+    assert.equal(job.event_time_source, 'crisp_hook');
+    assert.match(job.input_identity_sha256, /^[a-f0-9]{64}$/);
+    history.push(structuredClone(data));
+    fx.catchupConversationPages.set(1, [{ website_id: website, session_id: session,
+      updated_at: fx.now() }]);
+    fx.catchupMessages.set(session, history);
+    fx.tick(16000);
+    return { fx, session, accepted, data };
+  };
+
+  await test('已处理note和event精确重见不阻断补偿且保持合法静默和人工事实', async () => {
+    const observations = [];
+    for (const item of [
+      ['operator-event', 'operator', 'event', false],
+      ['operator-note', 'operator', 'note', false],
+      ['operator-event-ai', 'operator', 'event', false, false],
+      ['operator-note-ai', 'operator', 'note', false, false],
+      ['operator-event-off', 'operator', 'event', true],
+      ['operator-note-off', 'operator', 'note', true],
+    ]) {
+      const { fx, accepted } = await seedHandledNonconsultation(...item);
+      const before = fx.runtime.readState(accepted.key);
+      const control = (state) => Object.fromEntries(['mode', 'generation', 'resume_at',
+        'last_human_at', 'human_event_id', 'control_watermark', 'uncertain_events']
+        .map((name) => [name, state[name]]));
+      const file = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+      let progress;
+      let firstError = null;
+      for (let round = 0; round < 8; round += 1) {
+        progress = readJson(file);
+        if (progress.next_scan_at > fx.now()) fx.tick(progress.next_scan_at - fx.now() + 1);
+        const result = await fx.runtime.catchup();
+        firstError ||= result.error_code || null;
+        progress = readJson(file);
+        if (!progress.window) break;
+      }
+      const after = fx.runtime.readState(accepted.key);
+      observations.push({ entry: item[0], error_code: firstError,
+        watermark_advanced: !progress.window && after.crisp_rest_catchup?.cursor === progress.watermark,
+        original_jobs_unchanged: canonical(before.jobs) === canonical(after.jobs),
+        original_control_unchanged: canonical(control(before)) === canonical(control(after)),
+        original_outgoing_unchanged: canonical(before.outgoing) === canonical(after.outgoing),
+        additional_posts: fx.postAttempts.length });
+    }
+    process.stdout.write('观察非咨询补偿：' + JSON.stringify(observations) + '\n');
+    assert(observations.every((row) => row.error_code === null && row.watermark_advanced
+      && row.original_jobs_unchanged && row.original_control_unchanged
+      && row.original_outgoing_unchanged && row.additional_posts === 0),
+    '已合法处理且完整冻结身份吻合的非咨询事件必须保持静默并允许补偿推进');
+  });
+
+  await test('非咨询补偿仍拒绝十四种冻结身份及已处理责任冲突', async () => {
+    const cases = [
+      ['hash', (job) => { job.input_identity_sha256 = 'f'.repeat(64); }],
+      ['time', (job) => { job.event_time += 1; }],
+      ['untrusted-time', (job) => { job.event_time_source = 'receive_clock'; }],
+      ['event', (job) => { job.event = 'message:send'; }],
+      ['control', (job) => { job.control = false; }],
+      ['status', (job) => { job.status = 'received'; }],
+      ['responsibility', (job) => { job.responsibility_status = 'pending'; }],
+      ['reason', (job) => { job.responsibility_reason = 'operator'; }],
+      ['action', (job) => { job.action = 'resolve_operator'; }],
+      ['covered', (job) => { job.covered_message_ids = []; }],
+      ['body', null, (data) => { data.content = { namespace: 'test-only', text: '已被替换的事件' }; }],
+      ['binding', null, (data) => { data.session_id = 'session_other-nonconsultation'; }],
+      ['role', null, (data) => { data.from = 'user'; }],
+      ['website', null, (data) => { data.website_id = '22222222-2222-4222-8222-222222222222'; }],
+    ];
+    for (const [name, mutateJob, mutateData] of cases) {
+      const { fx, accepted, session } = await seedHandledNonconsultation(name, 'operator', 'event');
+      if (mutateJob) await fx.runtime.transaction(accepted.key, (state) => {
+        mutateJob(state.jobs.find((entry) => entry.id === accepted.jobId));
+      });
+      if (mutateData) mutateData(fx.catchupMessages.get(session).at(-1));
+      const before = fx.runtime.readState(accepted.key);
+      const file = path.join(fx.runtimeDirectory, 'crisp-rest-catchup.json');
+      const watermark = readJson(file).watermark;
+      const result = await fx.runtime.catchup();
+      const after = fx.runtime.readState(accepted.key);
+      assert.equal(result.error_code, 'local_persistence_failed', name);
+      assert.equal(readJson(file).watermark, watermark, name);
+      assert.deepEqual(after.jobs, before.jobs, name);
+      assert.deepEqual(after.outgoing, before.outgoing, name);
+      assert.equal(fx.postAttempts.length, 0, name);
+    }
+    process.stdout.write('观察非咨询反例：'
+      + JSON.stringify({ variants: 14, all_conflicts_rejected: true, additional_posts: 0 }) + '\n');
   });
 
   await test('外部 Hook 已确认的自动化消息缺时间时可被 REST 重见且不重建业务责任', async () => {

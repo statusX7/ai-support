@@ -5,12 +5,20 @@ const https = require('node:https');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const path = require('node:path');
-const {createRouter,loadPool,validateEntry,parseHeaders,RouterError,terminal,classifyFailure} = require('./provider-router.js');
+const zlib = require('node:zlib');
+const {promisify} = require('node:util');
+const {createRouter,loadPool,validateEntry,parseHeaders,RouterError,terminal,classifyFailure,
+  hasUnsupportedToolInvocation,chatFinishDisposition} = require('./provider-router.js');
 const {extractEnvelope,promptRetained} = require('./provider-envelope.js');
 const {mechanicalFailureAnswer,legacyGenericNonAnswer} = require('./visitor-output.js');
 
 const MAX_INPUT_BYTES = 12 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const decompressors = Object.freeze({
+  gzip: promisify(zlib.gunzip),
+  deflate: promisify(zlib.inflate),
+  br: promisify(zlib.brotliDecompress),
+});
 
 function appliedPrompt(root, revision) {
   const read = (file, maximum) => {
@@ -89,14 +97,29 @@ function upstreamFailure(status, body, headers) {
 
 function responseToChat(body, model) {
   if (body.error || body.status === 'failed' || ['queued','in_progress','cancelled'].includes(body.status)) throw upstreamFailure(200,body);
-  const parts = (Array.isArray(body.output) ? body.output : []).flatMap(item => Array.isArray(item.content) ? item.content : []);
+  const outputItems = Array.isArray(body.output) ? body.output : [];
+  const toolItem = item => typeof item?.type === 'string'
+    && (item.type.startsWith('function_') || item.type.startsWith('custom_tool_'));
+  if (outputItems.some(toolItem)) {
+    throw terminal('invalid_input','客服协议不执行模型工具');
+  }
+  if (outputItems.some(item => !item || typeof item !== 'object' || Array.isArray(item)
+    || !['message','reasoning'].includes(item.type))) throw upstreamFailure(200,{});
+  const messageItems = outputItems.filter(item => item.type === 'message');
+  if (messageItems.some(item => !Array.isArray(item.content))) throw upstreamFailure(200,{});
+  const parts = messageItems.flatMap(item => item.content);
+  if (parts.some(toolItem)) throw terminal('invalid_input','客服协议不执行模型工具');
+  if (parts.some(part => !part || typeof part !== 'object' || Array.isArray(part)
+    || part.type === 'output_text' && typeof part.text !== 'string'
+    || part.type === 'refusal' && typeof part.refusal !== 'string'
+    || !['output_text','refusal'].includes(part.type))) throw upstreamFailure(200,{});
   const content = typeof body.output_text === 'string' ? body.output_text : parts.filter(part => part.type === 'output_text' && typeof part.text === 'string').map(part => part.text).join('');
   const refusal = parts.filter(part => part.type === 'refusal' && typeof part.refusal === 'string').map(part => part.refusal).join('');
   const filtered = body.incomplete_details?.reason === 'content_filter';
   if (!content.trim() && !refusal.trim() && !filtered) throw upstreamFailure(200,{});
   if (!refusal.trim() && !filtered && (mechanicalFailureAnswer(content) || legacyGenericNonAnswer(content))) throw upstreamFailure(200,{});
-  const input = Number(body.usage?.input_tokens) || 0, output = Number(body.usage?.output_tokens) || 0;
-  const usage = {prompt_tokens:input,completion_tokens:output,total_tokens:Number(body.usage?.total_tokens) || input+output};
+  const input = Number(body.usage?.input_tokens) || 0, outputTokens = Number(body.usage?.output_tokens) || 0;
+  const usage = {prompt_tokens:input,completion_tokens:outputTokens,total_tokens:Number(body.usage?.total_tokens) || input+outputTokens};
   if (body.usage?.input_tokens_details) usage.prompt_tokens_details = body.usage.input_tokens_details;
   if (body.usage?.output_tokens_details) usage.completion_tokens_details = body.usage.output_tokens_details;
   return {id:body.id || `chatcmpl-${crypto.randomUUID()}`,object:'chat.completion',created:Number(body.created_at) || Math.floor(Date.now()/1000),model,
@@ -106,18 +129,49 @@ function responseToChat(body, model) {
 function validChat(body,model) {
   if (body.error) throw upstreamFailure(200,body);
   const choice = body.choices?.[0], message = choice?.message;
-  if (!message || !(typeof message.content === 'string' && message.content.trim()) && !(typeof message.refusal === 'string' && message.refusal.trim()) && choice.finish_reason !== 'content_filter') throw upstreamFailure(200,{});
-  if (message.tool_calls || message.function_call) throw terminal('invalid_input','客服协议不执行模型工具');
-  if (!(typeof message.refusal === 'string' && message.refusal.trim()) && choice.finish_reason !== 'content_filter'
+  const finish = chatFinishDisposition(choice?.finish_reason);
+  if (finish === 'retryable_failure') throw upstreamFailure(503,{});
+  if (finish === 'tool_invocation') throw terminal('invalid_input','Provider 结束状态不受支持');
+  if (finish === 'invalid') throw upstreamFailure(200,{});
+  if (!message || !(typeof message.content === 'string' && message.content.trim()) && !(typeof message.refusal === 'string' && message.refusal.trim()) && finish !== 'safety_refusal') throw upstreamFailure(200,{});
+  if (hasUnsupportedToolInvocation(message)) throw terminal('invalid_input','客服协议不执行模型工具');
+  if (!(typeof message.refusal === 'string' && message.refusal.trim()) && finish !== 'safety_refusal'
     && (mechanicalFailureAnswer(message.content) || legacyGenericNonAnswer(message.content))) throw upstreamFailure(200,{});
   return {id:body.id || `chatcmpl-${crypto.randomUUID()}`,object:'chat.completion',created:body.created || Math.floor(Date.now()/1000),model:model || body.model,
-    choices:[{index:0,message:{role:'assistant',content:message.content ?? null,...(message.refusal ? {refusal:message.refusal}:{})},finish_reason:choice.finish_reason || 'stop'}],...(body.usage ? {usage:body.usage}: {})};
+    choices:[{index:0,message:{role:'assistant',content:message.content ?? null,...(message.refusal ? {refusal:message.refusal}:{})},finish_reason:finish === 'safety_refusal' ? 'content_filter':choice.finish_reason || 'stop'}],...(body.usage ? {usage:body.usage}: {})};
+}
+
+async function readLimitedBuffer(stream, maximum) {
+  const buffers = []; let total = 0;
+  for await (const chunk of stream) { total += chunk.length; if (total > maximum) throw new Error('请求或响应体超过限制'); buffers.push(Buffer.from(chunk)); }
+  return Buffer.concat(buffers);
 }
 
 async function readLimited(stream, maximum) {
-  const buffers = []; let total = 0;
-  for await (const chunk of stream) { total += chunk.length; if (total > maximum) throw new Error('请求或响应体超过限制'); buffers.push(Buffer.from(chunk)); }
-  return Buffer.concat(buffers).toString('utf8');
+  return (await readLimitedBuffer(stream,maximum)).toString('utf8');
+}
+
+function responseContentEncoding(headers = {}) {
+  let value = headers['content-encoding'];
+  if (value === undefined) return 'identity';
+  if (Array.isArray(value)) {
+    if (value.length !== 1) throw new Error('Provider 响应压缩编码无效');
+    [value] = value;
+  }
+  const encodings = String(value).split(',').map(item => item.trim().toLowerCase()).filter(Boolean);
+  if (encodings.length !== 1 || !['identity','gzip','deflate','br'].includes(encodings[0])) {
+    throw new Error('Provider 响应压缩编码不受支持');
+  }
+  return encodings[0];
+}
+
+async function readUpstreamResponse(response, maximum) {
+  const encoding = responseContentEncoding(response.headers);
+  const compressed = await readLimitedBuffer(response,maximum);
+  if (encoding === 'identity') return compressed.toString('utf8');
+  const decoded = await decompressors[encoding](compressed,{maxOutputLength:maximum});
+  if (decoded.length > maximum) throw new Error('Provider 解压响应超过限制');
+  return decoded.toString('utf8');
 }
 
 function requestUpstream(url,settings,payload,signal,fetchFunction) {
@@ -141,7 +195,19 @@ function requestUpstream(url,settings,payload,signal,fetchFunction) {
     const cleanup = () => { clearTimeout(timeout); clearTimeout(connectionTimer); signal?.removeEventListener('abort',abort); };
     const request = (url.startsWith('https:') ? https:http).request(url,{method:payload ? 'POST':'GET',headers,signal:controller.signal,agent:false},async response => {
       try {
-        const raw = await readLimited(response,MAX_RESPONSE_BYTES);
+        let raw;
+        try { raw = await readUpstreamResponse(response,MAX_RESPONSE_BYTES); }
+        catch (error) {
+          if (controller.signal.aborted || signal?.aborted
+            || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+            throw controller.signal.reason instanceof Error ? controller.signal.reason : error;
+          }
+          // content-encoding 在读取前即可判坏，解压后容量也可能在上游仍持续
+          // 发送时提前失败。先显式销毁响应及其底层 socket，不能清掉 timeout
+          // 后把主接口半流悬挂在后台；销毁本身不得覆盖原 HTTP 故障分类。
+          try { response.destroy(); } catch (_) {}
+          throw upstreamFailure(response.statusCode,{},response.headers);
+        }
         let body; try { body = JSON.parse(raw); } catch (_) { throw upstreamFailure(response.statusCode,{},response.headers); }
         if (response.statusCode < 200 || response.statusCode >= 300) throw upstreamFailure(response.statusCode,body,response.headers);
         resolve(body);

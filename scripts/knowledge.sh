@@ -471,7 +471,7 @@ knowledge_catalog_project() (
 knowledge_catalog_readback() {
   local deploy_dir=$1 scope=${2:-all} allow_profile_migration=${3:-false}
   local catalog=${4:-${1}/knowledge/catalog.json} publish_catalog=${5:-true}
-  local manifest="${1}/data/knowledge-manifest.json" locations temporary now effective_catalog=''
+  local manifest="${1}/data/knowledge-manifest.json" locations workspace_documents temporary now effective_catalog=''
   [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
   [[ "$publish_catalog" == true || "$publish_catalog" == false ]] || return 1
   [[ -f "$catalog" && ! -L "$catalog" ]] && knowledge_catalog_validate "$catalog" || return 1
@@ -480,7 +480,8 @@ knowledge_catalog_readback() {
     [[ $(realpath -e -- "$catalog") == "$(realpath -e -- "${deploy_dir}/tmp")/"* ]] || return 1
   fi
   anythingllm_connection "$deploy_dir"
-  locations=$(anythingllm_workspace_locations) || return 1
+  workspace_documents=$(anythingllm_workspace_locations documents) || return 1
+  locations=$(jq -c '[.[].docpath] | unique' <<< "$workspace_documents") || return 1
   # 推理热路径只读取这份经管理 API 回读的最小投影，避免每条咨询下载整个工作区文档清单。
   anythingllm_workspace_runtime_settings "$deploy_dir" || return 1
   jq -M -en --slurpfile catalog "$catalog" --slurpfile manifest "$manifest" --argjson locations "$locations" --arg scope "$scope" '
@@ -515,10 +516,33 @@ knowledge_catalog_readback() {
   fi
   temporary=$(mktemp "${deploy_dir}/data/runtime/knowledge-map.json.tmp.XXXXXX") \
     || { [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"; return 1; }
-  if ! jq -M -n --slurpfile catalog "$effective_catalog" --slurpfile manifest "$manifest" '{schema_version:2,revision:$catalog[0].revision,documents:[
-    $catalog[0].libraries[] | select(.enabled) | . as $library | .documents[] | . as $document |
-    $manifest[0].files[$document.projection].locations[]? | {location:.,library_id:$library.id,library_name:$library.name,document_id:$document.id,projection:$document.projection}
-  ]}' > "$temporary"; then
+  # 实际检索只提供后端标题；按已核验的 location 绑定名称，不改写原文或放开未知来源。
+  if ! jq -M -n --slurpfile catalog "$effective_catalog" --slurpfile manifest "$manifest" \
+    --argjson workspace_documents "$workspace_documents" '
+    def metadata_title($location):
+      [$workspace_documents[] | select(.docpath == $location) |
+        (if (.metadata | type) == "string" then
+           (try (.metadata | fromjson) catch error("知识来源元数据解析失败"))
+         elif .metadata == null then null
+         elif (.metadata | type) == "object" then .metadata
+         else error("知识来源元数据格式无效") end) |
+        (if . == null then null
+         elif type == "object" then (if has("title") then .title else null end)
+         else error("知识来源元数据格式无效") end) |
+        select(. != null)] | unique as $titles |
+      if ($titles | length) > 1 then error("同一知识来源的标题不一致")
+      elif ($titles | length) == 0 then null
+      elif ($titles[0] | type) != "string" then error("知识来源标题无效")
+      elif ($titles[0] | utf8bytelength) == 0 or ($titles[0] | utf8bytelength) > 1024
+        or ($titles[0] | test("\\S") | not) or ($titles[0] | explode | any(. < 32 or . == 127)) then error("知识来源标题无效")
+      else $titles[0] end;
+    {schema_version:2,revision:$catalog[0].revision,documents:[
+      $catalog[0].libraries[] | select(.enabled) | . as $library | .documents[] | . as $document |
+      $manifest[0].files[$document.projection].locations[]? | . as $location |
+      metadata_title($location) as $title |
+      {location:$location,library_id:$library.id,library_name:$library.name,document_id:$document.id,projection:$document.projection}
+      + (if $title != null and $title != $document.projection then {source_title:$title} else {} end)
+    ]}' > "$temporary"; then
     rm -f -- "$temporary"
     [[ "$publish_catalog" == true ]] || rm -f -- "$effective_catalog"
     return 1
@@ -535,8 +559,10 @@ knowledge_catalog_readback() {
 }
 
 knowledge_sync_catalog() {
-  local deploy_dir=$1 force=${2:-0} scope=${3:-all} allow_profile_migration=${4:-false} filenames=null status=0 temporary
+  local deploy_dir=$1 force=${2:-0} scope=${3:-all} allow_profile_migration=${4:-false}
+  local publish_catalog=${5:-true} filenames=null status=0 temporary
   [[ "$allow_profile_migration" == true || "$allow_profile_migration" == false ]] || return 1
+  [[ "$publish_catalog" == true || "$publish_catalog" == false ]] || return 1
   knowledge_catalog_migrate "$deploy_dir" || return 1
   # 在复制投影、上传或变更 workspace 前只验证已有缓存摘要，绝不重签当前
   # 缓存；pending/garbage 仍交给同步器的既有恢复路径处理。遗留迁移、
@@ -553,9 +579,13 @@ knowledge_sync_catalog() {
   else
     knowledge_sync "$deploy_dir" "$force" >&2 || status=$?
   fi
-  if (( status == 0 )) && knowledge_catalog_readback "$deploy_dir" "$scope" "$allow_profile_migration"; then
+  if (( status == 0 )) && knowledge_catalog_readback "$deploy_dir" "$scope" \
+      "$allow_profile_migration" "${deploy_dir}/knowledge/catalog.json" "$publish_catalog"; then
     return 0
   fi
+  # Embedding 代次迁移不拥有可编辑 catalog；同步期间出现新编辑时，
+  # 外层会恢复旧运行代并将新代保留为待应用，不得把它改写为同步失败。
+  [[ "$publish_catalog" == true ]] || return 1
   temporary=$(mktemp "${deploy_dir}/knowledge/catalog.json.tmp.XXXXXX")
   jq -M --arg scope "$scope" --slurpfile manifest "${deploy_dir}/data/knowledge-manifest.json" '.libraries |= map(if $scope != "all" and .id != $scope then . elif .enabled then
     .documents |= map(. as $document | .index_status=(if $manifest[0].files[$document.projection].sha256 == $document.sha256 then "indexed" elif $manifest[0].pending_files[$document.projection] != null then "pending" else "failed" end)) |
@@ -784,9 +814,15 @@ knowledge_main() (
         if [[ "$action" == reindex ]]; then knowledge_sync_catalog "$deploy_dir" 1 "${1:-all}"; else knowledge_sync_catalog "$deploy_dir" 0 "${1:-all}"; fi
         bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" initialize >/dev/null
       elif [[ ${1:-all} != all ]]; then
-        # 单库范围仍由现有索引器执行；随后统一投影回读新的 map/manifest。
-        if [[ "$action" == reindex ]]; then knowledge_sync_catalog "$deploy_dir" 1 "$1"; else knowledge_sync_catalog "$deploy_dir" 0 "$1"; fi
-        bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --refresh-projection >/dev/null
+        # 单库同步也必须先冻结旧资料代并建立恢复事务；不能先改远端位置，
+        # 再让后置投影刷新面对已经失效的旧快照。
+        if [[ "$action" == reindex ]]; then
+          bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" \
+            apply-business --force-knowledge-library "$1" >/dev/null
+        else
+          bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" \
+            apply-business --sync-knowledge-library "$1" >/dev/null
+        fi
       elif [[ "$action" == reindex ]]; then
         bash "${KNOWLEDGE_SCRIPT_DIR}/materials.sh" --deploy-dir "$deploy_dir" apply-business --force-knowledge >/dev/null
       else

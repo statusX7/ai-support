@@ -20,9 +20,11 @@ def main():
         return
     # 明确验证受限维护环境；仅模拟 /usr/local/bin 的目录允许普通用户穿越。
     os.umask(0o077)
-    with tempfile.TemporaryDirectory(prefix="crispai-launcher-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="crispai-launcher-test-", dir="/tmp") as temporary:
         base = Path(temporary)
         base.chmod(0o755)
+        assert base.resolve().parent == Path("/tmp")
+        assert base.stat().st_mode & 0o777 == 0o755
         deploy = base / "managed ' instance"
         deploy.mkdir(mode=0o700)
         (deploy / "config").mkdir()

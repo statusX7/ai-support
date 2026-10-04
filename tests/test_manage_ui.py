@@ -955,8 +955,9 @@ def material_menu_cases():
         passing("生产菜单16→6→2修复外部Prompt偏离；空原文拒绝且不修改生效版、不调用模型")
     finally:
         source.write_bytes(original)
-        result = invoke(command + ["--force-external"])
-        assert result.returncode == 0 and PROMPT["text"] == original.decode(), result.stdout
+        result = invoke(command)
+        assert result.returncode == 0 and PROMPT["text"] == original.decode() \
+            and json.loads(projection.read_text())["prompt"]["text"] == original.decode(), result.stdout
 
 
 def welcome_presentation_cases():
@@ -1287,7 +1288,8 @@ def main():
     (DEPLOY / ".crisp-ai-installation").write_text("ai-support\nstate=local-ready\nfact_conversation=pending\n", encoding="utf-8")
     (DEPLOY / "config/prompt.md").write_text(PROMPT["text"], encoding="utf-8")
     (DEPLOY / "knowledge/catalog.json").write_text('{"schema_version":2,"revision":1,"libraries":[]}', encoding="utf-8")
-    (DEPLOY / "data/knowledge-manifest.json").write_text('{"version":1,"files":{},"garbage_locations":[]}', encoding="utf-8")
+    (DEPLOY / "data/knowledge-manifest.json").write_text(
+        '{"version":1,"files":{},"pending_files":{},"garbage_locations":[]}', encoding="utf-8")
     for directory in (DEPLOY / "config", DEPLOY / "knowledge", DEPLOY / "data"):
         directory.chmod(0o750)
         for file in directory.rglob("*"):
