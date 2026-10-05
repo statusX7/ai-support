@@ -973,8 +973,11 @@ const deliverThroughHeldVectorFailure = async (fixture, event, control) => {
   return settled.outcome.value;
 };
 
+const selectedGroup = process.env.CRISPAI_PROVIDER_REPLY_TEST_GROUP || 'all';
+if (!['all', 'completeness'].includes(selectedGroup)) throw new Error('未支持的 Provider 回复专项');
 let passed = 0;
 async function test(name, action) {
+  if (selectedGroup === 'completeness' && !name.startsWith('F04 ')) return;
   const instance = await fixture(`case-${passed}`, 'normal');
   try {
     await action(instance);
@@ -986,6 +989,49 @@ async function test(name, action) {
 }
 
 (async () => {
+  for (const variant of ['backup-complete', 'all-truncated', 'valid-refusal']) {
+    await test('F04 ' + variant, async (f) => {
+      const partial = '第一步：打开客户端。第二步：';
+      const complete = '请打开客户端并更新订阅。';
+      const refusal = '不能提供该请求的内容。';
+      f.calls.length = 0;
+      f.setBehavior(async (call, response) => {
+        const denied = variant === 'valid-refusal';
+        const completed = variant === 'backup-complete' && call.index === 1;
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({choices: [{index: 0, message: {role: 'assistant',
+          content: denied ? null : completed ? complete : partial, ...(denied ? {refusal} : {})},
+          finish_reason: completed ? 'stop' : 'length'}]}));
+        return true;
+      });
+      const event = f.event('completeness-' + variant);
+      const accepted = await f.receive(event);
+      assert.equal(accepted.accepted, true);
+      const result = await f.process(accepted.key, accepted.jobId);
+      const stored = pendingJob(f, event, accepted.jobId);
+      assert.deepEqual(f.calls.map((call) => call.index), variant === 'valid-refusal' ? [0] : [0, 1]);
+      const question = f.question(accepted.jobId);
+      assert.equal(question.attempts, variant === 'valid-refusal' ? 1 : 2);
+      const signed = f.signedProviderPayloads.filter((entry) => entry.path === '/v1/chat/completions');
+      assert.equal(signed.length, 1);
+      assert.equal(signed[0].payload.question_id, accepted.jobId);
+      assert.ok(f.calls.every((call) => call.body.messages.at(-1).content === event.data.content));
+      if (variant === 'all-truncated') {
+        assert.equal(result.status, 'unresolved');
+        assert.equal(stored.responsibility_status, 'unresolved_failure');
+        assert.equal(stored.data.content, event.data.content);
+        assert.equal(f.crispPostAttempts.length, 0);
+        assertNoVisibleFailureReply(f);
+        assert.equal(JSON.stringify(question).includes(partial), false);
+      } else {
+        assert.equal(stored.responsibility_status, 'answered_confirmed');
+        assert.equal(f.sent.length, 1);
+        assert.equal(f.crispPostAttempts.length, 1);
+        assert.equal(f.sent[0].content, variant === 'valid-refusal' ? refusal : complete);
+        assert.notEqual(f.sent[0].content, partial);
+      }
+    });
+  }
   await test('未取得adapter完整回读时保留新问题且零推理，回读同一池后原责任恢复', async (f) => {
     fs.unlinkSync(f.readbackPath);
     const event = f.event('readback-gate');
@@ -4535,7 +4581,7 @@ async function test(name, action) {
     assert.equal(f.ragVectorClientFailuresPending(), 0);
   });
 
-  writeJson(path.join(base, 'result.json'), { layer: 'UNIT/PROTOCOL', passed, failed: 0, real_external: false });
+  writeJson(path.join(base, 'result.json'), { layer: 'UNIT/PROTOCOL', passed, failed: 0, real_external: false, selected_group: selectedGroup });
   console.log(`Provider访客失败收敛：${passed} 通过，0 失败（受控协议服务，不是真实第三方）。`);
 })().catch((error) => {
   console.error(error.stack);

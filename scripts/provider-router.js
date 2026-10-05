@@ -70,6 +70,8 @@ function cachedResultDisposition(result) {
   const finish = chatFinishDisposition(choice?.finish_reason);
   if (finish !== 'complete' && finish !== 'safety_refusal') return 'invalid';
   if (refusal || finish === 'safety_refusal') return 'safety_refusal';
+  // 传输层保留 length；客服缓存不能把尚未完成的正文重放为有效答案。
+  if (choice?.finish_reason === 'length') return 'invalid';
   if (!message || hasUnsupportedToolInvocation(message)
     || typeof message.content !== 'string' || !message.content.trim()) return 'invalid';
   return mechanicalFailureAnswer(message.content) || legacyGenericNonAnswer(message.content)
@@ -1114,6 +1116,14 @@ function createRouter(environment, invoke) {
           const result = await invoke(body,{...entry,maxOutput,timeout:Math.min(pool.policy.call_timeout_ms,question.deadline-Date.now()),connectTimeout:pool.policy.connect_timeout_ms},controller.signal);
           check();
           if (cancelError) throw cancelError;
+          const choice = result.choices?.[0];
+          if (choice?.finish_reason === 'length'
+            && !(typeof choice.message?.refusal === 'string' && choice.message.refusal.trim())) {
+            throw new RouterError('invalid_response', '模型答复达到输出上限，尚未完整', {
+              failure: {kind:'invalid_response',fallback:true,scope:'entryScope',status:200,
+                completion_reason:'length'},
+            });
+          }
           phase.result = result; delete phase.owner;
           if (result.choices?.[0]?.message?.refusal || result.choices?.[0]?.finish_reason === 'content_filter') question.terminal = {code:'safety_refusal',message:'模型已拒绝该内容，本次问题已终止'};
           try { persistQuestion(question,lock); }
@@ -1141,6 +1151,7 @@ function createRouter(environment, invoke) {
           bestEffortState(() => record({at:Date.now(),question_id:id,stage,entry_id:entry.id,
             pool_revision:pool.revision,remaining_budget_ms:Math.max(0,question.deadline-Date.now()),
             outcome:'failed',error_class:failure.kind,http_status:failure.status || 0,
+            ...(failure.completion_reason ? {completion_reason:failure.completion_reason} : {}),
             attempt:question.attempts,duration_ms:Date.now()-start}));
         } finally { clearInterval(monitor); signal?.removeEventListener('abort',cancel); }
       }

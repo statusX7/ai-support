@@ -7358,6 +7358,17 @@ function createRuntime(env = {}, options = {}) {
     appendEvent('provider_settlement_recovered', { outcome });
     return { status: 'provider_settlement_' + outcome };
   };
+  const providerAnswerIncomplete = (payload) => {
+    const choice = payload?.choices?.[0];
+    const parts = Array.isArray(payload?.output)
+      ? payload.output.flatMap((entry) => Array.isArray(entry.content) ? entry.content : []) : [];
+    if ((typeof choice?.message?.refusal === 'string' && choice.message.refusal.trim())
+      || choice?.finish_reason === 'content_filter'
+      || parts.some((part) => part.type === 'refusal' && typeof part.refusal === 'string' && part.refusal.trim())
+      || payload?.incomplete_details?.reason === 'content_filter') return false;
+    return choice?.finish_reason === 'length'
+      || payload?.status === 'incomplete';
+  };
   const knowledgePlan = async (key, job, directive = '', execution) => {
     assertProcessingPermit(execution);
     if (providerReceiptMarkerInvalid(job)) {
@@ -7428,6 +7439,11 @@ function createRuntime(env = {}, options = {}) {
           : await guardedNetwork(base + (apiMode === 'responses' ? '/responses' : '/chat/completions'), {
             method: 'POST', headers: requestHeaders, body, timeout: inferenceRemaining(job) + 1000,
           }, execution);
+        if (providerAnswerIncomplete(response.body)) {
+          if (pool) await writeProviderReceipt(key, job, execution,
+            providerReceiptRecord(job, 'vision', 'absent', null, 'invalid_response'));
+          throw providerCallError('invalid_response');
+        }
         const answer = response.body?.choices?.[0]?.message?.content || response.body?.output_text || response.body?.output?.flatMap((entry) => entry.content || []).map((entry) => entry.text || '').join('\n');
         if (response.status >= 300 || response.body?.error || typeof answer !== 'string' || !answer.trim()
           || mechanicalFailureAnswer(answer) || legacyGenericNonAnswer(answer)) {
@@ -7477,6 +7493,7 @@ function createRuntime(env = {}, options = {}) {
         || ['failed', 'queued', 'in_progress', 'cancelled'].includes(payload.status)) {
         throw providerCallError(providerDiagnosticCode(response));
       }
+      if (providerAnswerIncomplete(payload)) throw providerCallError('invalid_response');
       const choice = payload.choices?.[0];
       const parts = Array.isArray(payload.output)
         ? payload.output.flatMap((entry) => Array.isArray(entry.content) ? entry.content : []) : [];

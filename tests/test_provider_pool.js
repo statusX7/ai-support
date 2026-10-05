@@ -979,8 +979,10 @@ async function main() {
     const length=await fixture();try {
       length.behavior=async(_call,response)=>{response.end(JSON.stringify({choices:[{
         message:{role:'assistant',content:'达到输出上限前的完整可见正文'},finish_reason:'length'}]}));return true;};
-      const result=await length.post();assert.equal(result.status,200,result.text);
-      assert.equal(result.value.choices[0].finish_reason,'length');assert.equal(length.calls.length,1);
+      const result=await length.post();assert.equal(result.status,400,result.text);
+      assert.equal(result.value.error.code,'invalid_response');assert.equal(length.calls.length,1);
+      assert.ok(!result.text.includes('达到输出上限前的完整可见正文'));
+      assert.equal((await length.get('recent')).records.find(record=>record.outcome==='failed').completion_reason,'length');
     }finally{await length.close();}
   });
   await test('U01 主接口损坏压缩响应切备用，备用br完整答案不混入主字节',async()=>{
@@ -1098,15 +1100,18 @@ async function main() {
       const result=await mixed.post();assert.equal(result.value.error.code,'pool_exhausted',result.text);assert.equal(mixed.calls.length,2);
     }finally{await mixed.close();}
   });
-  await test('Responses拒绝/不完整usage保持、业务不知道与输入错误不切备用',async()=>{
-    const f=await fixture(2);try {
+  await test('Responses拒绝保留usage、截断不伪报成功，正常业务与输入错误边界保留',async()=>{
+    const f=await fixture(2,{cooldown_initial_ms:1000,cooldown_max_ms:1000,pool_cooldown_ms:100});try {
       f.publish(pool=>{pool.entries[0].api_mode='responses';pool.entries[0].capabilities.responses=true;});
       f.behavior=async(call,response)=>{response.end(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'refusal',refusal:'无法协助该请求'}]}],usage:{input_tokens:4,output_tokens:2,output_tokens_details:{reasoning_tokens:1}}}));return true;};
       const result=await f.post();assert.equal(result.status,200);assert.equal(result.value.choices[0].message.refusal,'无法协助该请求');assert.equal(result.value.usage.total_tokens,6);assert.equal(result.value.usage.completion_tokens_details.reasoning_tokens,1);assert.equal(f.calls.length,1);
       f.behavior=async(call,response)=>{response.end(JSON.stringify({status:'incomplete',incomplete_details:{reason:'max_output_tokens'},output_text:'部分但完整接收的回答',usage:{input_tokens:2,output_tokens:3}}));return true;};
-      const incomplete=await f.post();assert.equal(incomplete.value.choices[0].finish_reason,'length');assert.equal(f.calls.length,2);
-      f.behavior=async(call,response)=>{response.end(JSON.stringify({output_text:'不知道，资料未提到。'}));return true;};assert.equal((await f.post()).status,200);assert.equal(f.calls.length,3);
-      f.behavior=async(call,response)=>{response.writeHead(400);response.end(JSON.stringify({error:{code:'invalid_request_error'}}));return true;};assert.equal((await f.post()).status,400);assert.equal(f.calls.length,4);
+      const incomplete=await f.post();assert.equal(incomplete.status,400,incomplete.text);
+      assert.equal(incomplete.value.error.code,'invalid_response');assert.equal(f.calls.length,3);
+      assert.ok(!incomplete.text.includes('部分但完整接收的回答'));
+      await new Promise(resolve=>setTimeout(resolve,1100));
+      f.behavior=async(call,response)=>{response.end(JSON.stringify({output_text:'不知道，资料未提到。'}));return true;};assert.equal((await f.post()).status,200);assert.equal(f.calls.length,4);
+      f.behavior=async(call,response)=>{response.writeHead(400);response.end(JSON.stringify({error:{code:'invalid_request_error'}}));return true;};assert.equal((await f.post()).status,400);assert.equal(f.calls.length,5);
     }finally{await f.close();}
   });
   await test('Responses工具输出与正文并存失败关闭且不换源，reasoning不进入客户正文',async()=>{
