@@ -732,6 +732,9 @@ if (( SKIP_START == 0 )); then
     || die '旧知识模型配置无法安全识别；未启动可能混用索引的新组件'
   docker_compose "$DEPLOY_DIR" config --quiet
   validate_managed_caddy_configuration "$DEPLOY_DIR" || die '安装候选反代配置未通过预检；未启动新服务代'
+  # 先去重并串行拉取缺失镜像，避免共用镜像的服务同时解包。
+  docker_compose "$DEPLOY_DIR" --parallel 1 pull --policy missing \
+    || die '安装所需镜像拉取失败；未启动新服务，安装进度已保留，请从同一入口继续'
   docker_compose "$DEPLOY_DIR" up -d --remove-orphans
   refresh_program_file_mounts "$DEPLOY_DIR" || die '安装后的单文件程序挂载未完成刷新；进度已保留'
   wait_for_local_health "$DEPLOY_DIR"

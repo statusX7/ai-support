@@ -127,8 +127,8 @@ env \
 
 grep -Fxq 'state=staged' "${DEPLOY}/.crisp-ai-installation" \
   || fail '首次 --skip-start 未形成 staged 状态'
-if grep -Eq '(^| )(up|stop|restart)( |$)' "$MOCK_DOCKER_LOG"; then
-  fail '首次 --skip-start 触发了 Docker/Caddy 运行态变更'
+if grep -Eq '(^| )(pull|up|stop|restart)( |$)' "$MOCK_DOCKER_LOG"; then
+  fail '首次 --skip-start 触发了镜像拉取或 Docker/Caddy 运行态变更'
 fi
 [[ -f "${DEPLOY}/config/provider-pool-applied.json" ]] \
   || fail 'staged 部署缺少有效接口池投影'
@@ -205,11 +205,68 @@ if [[ "${AI_SUPPORT_INSTALL_PENDING_CONTRACT_ONLY:-0}" == 1 ]]; then
   exit 0
 fi
 
+# 先真实捕获缺省模型投影；该正常初始化只能添加两个元数据字段。
+install -m 0600 -- "${DEPLOY}/.env" "${WORK}/pull-before-capture.env"
+if grep -Eq '^KNOWLEDGE_(ACTIVE_)?EMBEDDING_MODEL=' "${WORK}/pull-before-capture.env"; then
+  fail '模型初始化反例的前提应为尚未捕获的 staged 配置'
+fi
+bash "${DEPLOY}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY" capture \
+  > "${WORK}/pull-model-capture.log" 2>&1
+[[ "$(sed '/^KNOWLEDGE_\(ACTIVE_\)\{0,1\}EMBEDDING_MODEL=/d' "${DEPLOY}/.env")" \
+  == "$(<"${WORK}/pull-before-capture.env")" ]] \
+  || fail '模型元数据初始化改变了原有环境字段'
+[[ "$(grep -Ec '^KNOWLEDGE_(ACTIVE_)?EMBEDDING_MODEL=' "${DEPLOY}/.env")" == 2 ]] \
+  || fail '模型元数据初始化没有仅添加完整的两个字段'
+pull_env_before=$(digest "${DEPLOY}/.env")
+bash "${DEPLOY}/scripts/knowledge-profile.sh" --deploy-dir "$DEPLOY" capture \
+  > "${WORK}/pull-model-capture-repeat.log" 2>&1
+[[ "$(digest "${DEPLOY}/.env")" == "$pull_env_before" ]] \
+  || fail '模型元数据捕获不幂等'
+
+# 拉取失败必须止于启动前，并通过同一入口保留完整配置继续暂存。
+: > "$MOCK_DOCKER_LOG"
+pull_failure_status=0
+MOCK_DOCKER_FAIL_PULL=1 "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
+  --non-interactive > "${WORK}/pull-failure.log" 2>&1 || pull_failure_status=$?
+(( pull_failure_status != 0 )) || fail '镜像拉取失败被错误标为安装成功'
+grep -Fq '安装所需镜像拉取失败；未启动新服务，安装进度已保留' "${WORK}/pull-failure.log" \
+  || fail '镜像拉取失败没有明确说明启动阶段'
+grep -Eq ' --parallel 1 pull --policy missing$' "$MOCK_DOCKER_LOG" \
+  || fail '安装器没有按缺失镜像策略串行预拉取'
+if grep -E '(^| )(up|stop|restart)( |$)' "$MOCK_DOCKER_LOG" \
+  | grep -Ev '(^| )(--help|-h)( |$)'; then
+  fail '镜像拉取失败后仍然改变了服务运行态'
+fi
+grep -Fxq 'state=installing' "${DEPLOY}/.crisp-ai-installation" \
+  || fail '镜像拉取失败没有保留可恢复 installing'
+[[ "$(digest "${DEPLOY}/.env")" == "$pull_env_before" \
+  && "$(digest "$POOL_APPLIED")" == "$pool_before" \
+  && "$(digest "${DEPLOY}/secrets/provider/generations/${generation}.json")" == "$secret_before" ]] \
+  || fail '镜像拉取失败改变了原配置或接口池秘密'
+: > "$MOCK_DOCKER_LOG"
+"$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
+  --non-interactive --skip-start > "${WORK}/pull-failure-stage.log" 2>&1
+grep -Fxq 'state=staged' "${DEPLOY}/.crisp-ai-installation" \
+  || fail '镜像拉取失败后同版无凭据继续未恢复 staged'
+! grep -Eq '(^| )(pull|up|stop|restart)( |$)' "$MOCK_DOCKER_LOG" \
+  || fail '镜像拉取失败后的仅暂存仍触碰镜像或服务'
+[[ "$(digest "${DEPLOY}/.env")" == "$pull_env_before" \
+  && "$(digest "$POOL_APPLIED")" == "$pool_before" \
+  && "$(digest "${DEPLOY}/secrets/provider/generations/${generation}.json")" == "$secret_before" ]] \
+  || fail '镜像拉取失败后继续暂存未保留原配置和秘密'
+printf '通过：[UNIT/CONTRACT] 串行预拉取失败不启动服务，未完成安装可保留配置继续。\n'
+
+: > "$MOCK_DOCKER_LOG"
 resume_status=0
 "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
   --non-interactive > "${WORK}/resume.log" 2>&1 || resume_status=$?
 (( resume_status == 2 )) \
   || fail "staged 无凭据续装应完成 local-ready，实际退出 ${resume_status}"
+pull_line=$(grep -nE ' --parallel 1 pull --policy missing$' "$MOCK_DOCKER_LOG" | head -n 1 | cut -d: -f1)
+up_line=$(grep -nE ' up -d --remove-orphans$' "$MOCK_DOCKER_LOG" | head -n 1 | cut -d: -f1)
+if [[ -z "$pull_line" || -z "$up_line" ]] || (( pull_line >= up_line )); then
+  fail '成功续装没有先串行预拉取再启动服务'
+fi
 grep -Fq '已验证暂存部署的 .env 与实际配置；本次将直接启动并验收，不重新输入凭据' \
   "${WORK}/resume.log" || fail 'staged 续装未明确复用配置'
 grep -Fxq 'state=local-ready' "${DEPLOY}/.crisp-ai-installation" \
