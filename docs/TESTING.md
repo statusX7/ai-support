@@ -13,11 +13,11 @@
 | TARGET-A | 本轮授权故障机上的命令、组件、候选/正式包与恢复验证（公开仅用代号） | 另一台机器或没有发生的客户往返 |
 | REAL-EXTERNAL | 真实 Crisp 测试访客、真实第三方模型、公网 HTTPS 与实际页面 | 合成 Hook、仅 REST 写权限、构造的真人事件；旧套件名 EXTERNAL-E2E 保留兼容 |
 
-真实空机引导作为 REAL-LOCAL 的独立硬门槛报告：初始无 Docker/Compose，生产安装器自行补齐。不得挂宿主 Docker socket、隐藏 PATH、手工先装 Docker或复用旧版本报告冒充本次实测。协议服务可以配合真实本地应用，但须写为“真实应用 + 模拟 Crisp/Provider”，不能写为“真实模型回答通过”。
+真实空机引导作为 REAL-LOCAL 的独立硬门槛报告：初始无 Docker/Compose，生产安装器自行补齐。不得挂宿主 Docker socket、隐藏 PATH、手工先装 Docker或复用旧版本报告冒充本次实测。协议服务可以配合真实本地应用，但须写为“真实应用 + 模拟 Crisp/Provider”，不能写为“真实模型回答通过”。本轮仅空机 VM 可在 Codex 本机运行；记录镜像校验、实际加速方式、初始包清单、最终包 SHA、十输入暂存及无输入续装结果，并核对 local-ready、五服务运行、四项健康、原配置/密钥及新登录入口。不得复制 TARGET-A 真实秘密和资料。成功或失败结束都先保留必要脱敏证据，再销毁本次自有 VM 和测试磁盘，记录实际回收；失败日志保留但不要求长期占用整块失败盘。
 
 运行主驱动的计数与单项复跑分开；嵌套脚本中的多条断言不重复累加到主驱动总数。跳过或证据不足不计通过，失败修复后记录最后复跑及原始原因。
 
-v1.3.0 发布顺序是硬门槛：全部产品静态、契约、固定组件、归档和业务测试均在 TARGET-A 执行，完整冻结候选通过同包验收后才允许 push、tag、创建草稿或上传 Release 资产；开发机结果不得代替。既有 tag 与资产保持不可变。发布后的匿名下载和 TARGET-A 正式同包核对仍要做，但不能替代发布前门槛。
+v1.3.0 发布顺序是硬门槛：产品静态、契约、固定组件、归档和业务测试仍在 TARGET-A；仅按用户第十二份授权，将真实空机安装及发布后匿名公开命令实装放到 Codex 本机隔离 Debian12 amd64 VM。这项例外不允许其它本机结果代替 TARGET-A 的客服、知识、主备或运行身份。完整冻结候选的 TARGET-A 同包验收及空机安装都通过后，才允许 push、tag、草稿或 Release。既有 tag 与资产不可变；发布后的匿名下载和正式同包核对仍须完成。
 
 ## 按实际影响选择检查
 
@@ -29,7 +29,7 @@ v1.3.0 发布顺序是硬门槛：全部产品静态、契约、固定组件、�
 | 任务责任、人工、总关、菜单或恢复 | `node tests/workflow-runtime.test.js`、`node tests/test_runtime_missing_reply_p0.js` | TARGET-A 隔离状态及协议夹具；选择改变了的责任和相邻正常反例，再核实际 n8n 加载及受影响业务。 |
 | Provider 参数、响应、故障切换或保存顺序 | `node tests/test_provider_adapter.js`、`node tests/test_provider_pool.js`、`node tests/test_provider_recovery_contract.js`、`node tests/test_runtime_provider_failure_reply.js`、`bash tests/test_provider_menu.sh` | 按具体改动选择，并以本项目真实路由核对需要的实机调用；不为每次修改重跑全部模型或全池 Probe。 |
 | Prompt、知识、来源或多轮上下文 | `node tests/test_knowledge_context.js`、`node tests/test_knowledge_lexical.js`、`node tests/test_knowledge_hybrid.js`、`node tests/test_knowledge_runtime.js` | 只验证受影响输入、检索及答案；资料代次递增本身不触发整套回归，实际模型调用需有明确新目的。 |
-| 安装、资料事务、维护或升级恢复 | 对应 install/materials/knowledge-profile/snapshot/lifecycle 专项 | 在 TARGET-A 的隔离目录或已授权实例执行；先核停服、写入及恢复责任，不在正式实例制造破坏性夹具。 |
+| 安装、资料事务、维护或升级恢复 | 对应 install/materials/knowledge-profile/snapshot/lifecycle 专项 | 除获授权的本机空机 VM 外，在 TARGET-A 隔离目录或已授权实例执行；先核停服、写入及恢复责任，不在实际客服实例制造破坏性夹具。 |
 | 共享契约改变或已批准里程碑 | `bash tests/run.sh` | 有明确广泛影响依据及预算才用；已有单项结果不重复计数，不能由部分输出认定完整结束。 |
 | 同一正式候选放行 | 下文发布模式及真实故事、版本/归档/运行绑定 | 保留既定强制门槛；不以开发测试替代指定包验收，不在每轮修复后重复发布流程。 |
 
@@ -131,7 +131,7 @@ bash tests/run.sh
 
 ## 最小真实验收故事
 
-在支持 Docker 的隔离 Debian 12 amd64 VM 创建无配置环境，保存发行版、架构、PID 1、初始包清单和命令可用情况。测试数据全部虚构，禁止录制密钥或真实客户正文。
+空机安装故事在获授权的 Codex 本机隔离 Debian 12 amd64 VM 创建无配置环境，保存发行版、架构、PID 1、初始包清单和命令可用情况。其余已有实机故事继续在 TARGET-A，按影响复用，不因空机地点改变重跑客服矩阵。测试数据全部虚构，禁止录制真实密钥或客户正文。发布前私密冻结包的本地分发入口不冒充正式 GitHub 命令；发布后才验证原样公开命令。
 
 1. 在无登录的干净 VM 原样执行 README/INSTALL 中同一条推荐命令，由入口取得并校验最终正式包，PTY 自动进入安装器。文件来源快速路径记录十个主要输入，确认后额外必答为零；多行粘贴逐行计数，不把输入行数误称十次按键。
 2. 确认安装器实际安装缺失包、Docker/Compose，启用 daemon 并运行容器；自动创建内部 Key/workspace，读回 Prompt、文档索引和已发布工作流。
