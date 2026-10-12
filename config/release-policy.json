@@ -1,8 +1,8 @@
 {
   "project": "ai-support",
-  "authorized_release": "v1.3.0",
+  "authorized_release": "v1.3.1",
   "allowed_new_release_tags": [
-    "v1.3.0"
+    "v1.3.1"
   ],
   "allow_auto_version_bump": false,
   "max_new_releases": 1,

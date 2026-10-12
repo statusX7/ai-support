@@ -40,7 +40,7 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 ## 2. 完成十项中文初始化
 
-第 2、5、6 项是隐藏输入，不显示文字或星号；粘贴后按回车即可。下文 `3 → 2` 表示安装后先运行 `crispai`，选主菜单 3，再选子菜单 2。尚未确认安装时，可在第 10 项选 `2` 返回对应步骤修改。
+第 2、5、6 项输入时直接显示原文，便于核对和纠正；粘贴后按回车即可。请在私密终端操作，不开启终端录屏或会话转录；程序的安装摘要与维护日志仍不显示 Key。下文 `3 → 2` 表示安装后先运行 `crispai`，选主菜单 3，再选子菜单 2。尚未确认安装时，可在第 10 项选 `2` 返回对应步骤修改。
 
 ### 1/10：第三方 AI Base URL
 
@@ -50,7 +50,7 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 ### 2/10：AI API Key
 
-这是供应商给程序的调用凭据，从同一供应商控制台的 API Keys 页面创建。虚构格式例子：`sk-demo-not-a-real-key`，实际格式以供应商为准。它是秘密，输入隐藏；不要填写 Crisp Token、账号密码或把 Key 发给 GitHub。
+这是供应商给程序的调用凭据，从同一供应商控制台的 API Keys 页面创建。虚构格式例子：`sk-demo-not-a-real-key`，实际格式以供应商为准。它是秘密，仅本次交互输入可见；不要填写 Crisp Token、账号密码或把 Key 发给 GitHub。
 
 验证：安装的少量能力请求须得到有效正文；401/403 要先核对权限，模型列表不能单独证明推理可用。填错用 `3 → 2 → 3`，编辑页 `9` 验证保存；`3 → 9` 可再明确测试指定接口。
 
@@ -68,7 +68,7 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 ### 5/10：Crisp Token Identifier
 
-这是 Website Token 密钥对的第一部分，由工作区拥有者在 `Settings → Workspace Settings → Advanced configuration → API Token → Generate Token` 取得，与第 6 项同次生成。虚构格式例子：`22222222-2222-4222-8222-222222222222`，不要据示例猜值。它按秘密处理、隐藏输入。
+这是 Website Token 密钥对的第一部分，由工作区拥有者在 `Settings → Workspace Settings → Advanced configuration → API Token → Generate Token` 取得，与第 6 项同次生成。虚构格式例子：`22222222-2222-4222-8222-222222222222`，不要据示例猜值。输入时可见，保存和日志中仍按秘密处理。
 
 验证：`10 → 6` 使用整对凭据检查；填错用 `10 → 3`，新整对 Token 用 `10 → 11`。不需要注册 Plugin，也不需要自己构造请求 Header。
 
@@ -184,7 +184,7 @@ Hook 是机器发起的 JSON POST，Crisp 无法像访客浏览器一样完成 J
 
 Hook 后台的最后调用状态可能延迟刷新。没收到真实 AI 回复时保留隔离验收条件，按[排障](TROUBLESHOOTING.md)查订阅、地址、Secret 和反代；不以手工向 Hook 注入请求代替 Crisp 官方投递，也不因 `local-ready` 就删除验收所需账号。
 
-真实 Crisp、真实第三方模型、DNS/TLS 和站点页面权限属于部署者的外部资源。普通用户缺少这些条件时，安装结果必须如实标记 `External Validation Pending`，不能称为已经接待。v1.3.0 维护者发布另有硬门槛：完整冻结候选先通过已授权 TARGET-A 的漏答、知识正确性与同包验收，才可创建 tag、推送或上传发布资产；协议测试不能冒充真实客户往返。
+真实 Crisp、真实第三方模型、DNS/TLS 和站点页面权限属于部署者的外部资源。普通用户缺少这些条件时，安装结果必须如实标记 `External Validation Pending`，不能称为已经接待。v1.3.1 维护者发布另有硬门槛：完整冻结候选先通过已授权 TARGET-A 的漏答、知识正确性与同包验收，才可创建 tag、推送或上传发布资产；协议测试不能冒充真实客户往返。
 
 ## 6. 安装后只用 crispai
 

@@ -14,7 +14,8 @@ node_image=${CRISPAI_TEST_NODE_IMAGE:-docker.n8n.io/n8nio/n8n:2.33.0}
 cleanup() {
   docker rm -f "$namespace-proxy" "$namespace-upstream" "$namespace-mounted" \
     "$namespace-domain" "$namespace-first" >/dev/null 2>&1 || true
-  docker network rm "$namespace" >/dev/null 2>&1 || true
+  docker network rm "$namespace" "${namespace}-first_default" \
+    "${namespace}-domain_default" >/dev/null 2>&1 || true
   [[ "$work" == "$PROJECT_ROOT"/.test-caddy.* && -d "$work" && ! -L "$work" ]] && find "$work" -depth -delete
 }
 trap cleanup EXIT
@@ -111,9 +112,14 @@ services:
         target: /etc/caddy/Caddyfile
         read_only: true
 EOF
-configure_webhook_access "$first_deploy" managed_https \
-  'https://first.example.invalid/' \
-  'https://first.example.invalid/webhook/crisp-webhook' first.example.invalid
+# 本夹具没有发布宿主80/443，也不会启动长期服务。仅隔离它的端口占用输入，
+# 避免TARGET-A已运行的真实Caddy阻止这项候选生成；真实端口保护另有向导反例。
+(
+  webhook_ports_available() { return 0; }
+  configure_webhook_access "$first_deploy" managed_https \
+    'https://first.example.invalid/' \
+    'https://first.example.invalid/webhook/crisp-webhook' first.example.invalid
+)
 [[ "$(env_get "$first_deploy/.env" WEBHOOK_ACCESS_MODE)" == managed_https ]]
 [[ -f "$first_deploy/config/Caddyfile" \
   && -f "$first_deploy/config/crispai-nginx.conf" \
@@ -123,6 +129,47 @@ if docker inspect "$namespace-first" >/dev/null 2>&1; then
   exit 1
 fi
 printf '通过 REAL-LOCAL：首次配置完整提交候选文件但不提前启动受管 Caddy。\n'
+
+# 模拟真实安装终端：stdin 为 PTY，预检自己的输出仍由生产函数收集。
+# 旧实现的 Caddy 容器虽 exit 0，Compose 会因读入终端触发 SIGTTIN 并等满60秒。
+python3 - "$PROJECT_ROOT/scripts/common.sh" "$first_deploy" <<'PY'
+import errno
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+common, deploy = sys.argv[1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv('/bin/bash', ['bash', '-c', 'source "$1"; caddy_validate_configuration_file "$2" "$2/config/Caddyfile"; IFS= read -r next_input; [[ "$next_input" == "next-menu-input" ]]', 'preflight', common, deploy])
+os.write(fd, b'next-menu-input\n')
+started = time.monotonic()
+status = None
+try:
+    while status is None and time.monotonic() - started < 75:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if ready:
+            try:
+                os.read(fd, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+        found, value = os.waitpid(pid, os.WNOHANG)
+        if found:
+            status = value
+    if status is None:
+        raise AssertionError('真实终端中的 Caddy 预检未有界结束')
+    assert os.waitstatus_to_exitcode(status) == 0, '真实终端中的有效 Caddy 配置被误判失败'
+finally:
+    if status is None:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+PY
+printf '通过 REAL-LOCAL：真实安装终端中的 Caddy 预检正常返回，不消费交互输入。\n'
 
 # Caddyfile 未变化也不能只凭文件摘要判运行代一致：容器创建时取得的
 # WEBHOOK_DOMAIN 必须与当前 .env 精确一致，否则域名修改会被假判已应用。

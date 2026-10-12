@@ -299,7 +299,7 @@ def wait_for(text, timeout=20):
 try:
     for expected, answer, hidden in steps:
         wait_for(expected)
-        # 等待 read -s 已关闭终端回显，防止测试转录包含测试密钥。
+        # 安装输入按用户要求回显；此处只有虚构凭据，仍等待输入读取器就绪。
         time.sleep(0.12 if hidden else 0.03)
         os.write(fd, answer.encode("utf-8") + b"\n")
 
@@ -385,9 +385,13 @@ jq -e '
 [[ "$(jq -r '.crisp.token_key' "$NORMAL_RESULT")" == "$TEST_CRISP_SECRET" ]] \
   || fail '特殊字符 Token Key 未原样保存'
 for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET"; do
-  ! grep -Fq -- "$secret" "$NORMAL_TRANSCRIPT" || fail 'PTY 转录泄露隐藏凭据'
+  grep -Fq -- "$secret" "$NORMAL_TRANSCRIPT" || fail '安装终端未回显输入，无法核对凭据'
+  [[ "$(grep -Fc -- "$secret" "$NORMAL_TRANSCRIPT")" == 1 ]] || fail '凭据在输入之外被重复输出'
+  if sed -n '/\[10\/10\]/,$p' "$NORMAL_TRANSCRIPT" | grep -Fq -- "$secret"; then
+    fail '安装摘要泄露凭据'
+  fi
 done
-pass '十项 PTY 向导、脱敏摘要、特殊字符与结构化结果'
+pass '十项 PTY 向导输入可见、摘要仍脱敏、特殊字符与结构化结果'
 
 PASTE_RESULT="${TEST_ROOT}/paste-result.json"
 PASTE_TRANSCRIPT="${TEST_ROOT}/paste-transcript.log"
@@ -402,7 +406,7 @@ PASTED_SOURCE=$(jq -r '.knowledge.libraries[2].source' "$PASTE_RESULT")
 [[ "$(<"$PASTE_COUNT")" == 28 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
 grep -Fq '知识库名称须为 1～100 个 UTF-8 字节' "$PASTE_TRANSCRIPT" || fail '超限中文库名未在向导中拒绝并重新输入'
 for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET"; do
-  ! grep -Fq -- "$secret" "$PASTE_TRANSCRIPT" || fail '粘贴分支回显秘密'
+  grep -Fq -- "$secret" "$PASTE_TRANSCRIPT" || fail '粘贴分支未回显输入的虚构凭据'
 done
 pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（含超限库名重试，真实输入 28 行）'
 
@@ -426,6 +430,18 @@ jq -e '.status == "confirmed" and .provider.api_mode == "responses" and
   "$REASONING_RESULT" >/dev/null \
   || fail '推理型 Responses 的有界正文探针仍被误判为不可用'
 pass '推理型 Responses 在 16 token 只有 reasoning 时，64 token 有界探针取得最终正文'
+
+# TARGET-A真实DeepSeek中转已复现：16 token为空正文/length，64 token为OK/stop。
+CHAT_REASONING_RESULT="${TEST_ROOT}/chat-reasoning-result.json"
+export MOCK_PROVIDER_CHAT_ONLY=1 MOCK_PROVIDER_CHAT_REASONING_MINIMUM=1
+run_pty_case normal "$CHAT_REASONING_RESULT" "${TEST_ROOT}/chat-reasoning.log" \
+  "${TEST_ROOT}/chat-reasoning.count"
+unset MOCK_PROVIDER_CHAT_ONLY MOCK_PROVIDER_CHAT_REASONING_MINIMUM
+jq -e '.status == "confirmed" and .provider.api_mode == "chat_completions" and
+  .provider.capabilities.chat_completions == true and .provider.capabilities.responses == false and
+  .provider.capabilities.vision == true' "$CHAT_REASONING_RESULT" >/dev/null \
+  || fail '仅支持Chat的推理模型仍因探测额度不足被误判为不可用'
+pass '仅支持 Chat 的推理型中转模型在有界探测后可完成配置'
 
 # 已确认配置只需要一次“复用”选择，不重新询问十项。
 REUSE_TRANSCRIPT="${TEST_ROOT}/reuse-transcript.log"
@@ -570,7 +586,7 @@ jq -e '
 grep -Fq '不会编造默认模型' "$MANUAL_TRANSCRIPT" || fail '模型列表失败没有明确降级说明'
 pass '模型列表失败后的手动选择与 Chat 实际探测'
 
-# 401 必须进入隐藏凭据纠错，不能把鉴权失败伪装成“手动模型即可继续”。
+# 401 必须进入凭据纠错，不能把鉴权失败伪装成“手动模型即可继续”。
 AUTH_MOCK_DIR="${TEST_ROOT}/auth-mock"
 AUTH_COUNT_FILE="${TEST_ROOT}/auth-model-count"
 mkdir -p -- "$AUTH_MOCK_DIR"
@@ -612,8 +628,9 @@ run_pty_case auth "$AUTH_RESULT" "$AUTH_TRANSCRIPT" "$AUTH_INPUT_COUNT"
 [[ "$(jq -r '.provider.api_key' "$AUTH_RESULT")" == "$TEST_PROVIDER_REPLACEMENT" ]] \
   || fail '401 后的新 API Key 未保存'
 grep -Fq 'Provider 鉴权失败（HTTP 401）' "$AUTH_TRANSCRIPT" || fail '401 没有明确纠错提示'
-! grep -Fq -- "$TEST_PROVIDER_REPLACEMENT" "$AUTH_TRANSCRIPT" || fail '401 纠错输入被回显'
-pass 'Provider 401 隐藏凭据纠错'
+grep -Fq -- "$TEST_PROVIDER_REPLACEMENT" "$AUTH_TRANSCRIPT" || fail '401 纠错输入未回显，无法核对新 Key'
+[[ "$(grep -Fc -- "$TEST_PROVIDER_REPLACEMENT" "$AUTH_TRANSCRIPT")" == 1 ]] || fail '401 纠错后的 Key 在输入之外重复输出'
+pass 'Provider 401 可见输入凭据纠错'
 
 # 12 个模型验证分页、返回和搜索；序号始终对应稳定排序后的全局编号。
 PAGED_MOCK_DIR="${TEST_ROOT}/paged-mock"

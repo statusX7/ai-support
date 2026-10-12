@@ -24,13 +24,13 @@
 - 同一发布周期的开发批次使用本地 commit 与进度记录；最终由主 Agent 统一同步版本、CHANGELOG、报告和归档，不为每个编辑递增产品版本。
 - Git commit message 使用英文，并以版本号开头，例如 `v0.1.1 add ai provider detection`。
 - 日常修改只创建本地 commit，不执行 GitHub push。
-- 源码正式版本与部署实例验收分离；本轮 v1.3.0 不允许用 `External Validation Pending` 豁免 TARGET-A 的漏答、知识正确性或同包验收。真实账户权限被撤销时必须准确阻止发布，不得把未执行项目写成通过。
+- 源码正式版本与部署实例验收分离；本轮 v1.3.1 不允许用 `External Validation Pending` 豁免 TARGET-A 的漏答、知识正确性或同包验收。真实账户权限被撤销时必须准确阻止发布，不得把未执行项目写成通过。
 - 有 GitHub 权限时才 push 并创建 GitHub Release；没有权限时完成本地 commit、annotated tag、release notes 和推送说明，不得伪造远端状态。
 - 每次正式交付创建 `docs/reports/v版本-report.md`，记录提交、变更、分层验证和真实外部限制。
-- 本轮唯一获授权版本是 `v1.3.0`。`config/release-policy.json`、VERSION、工作流、归档、tag 和 Release 必须一致；禁止自动递增或改用其他版本。构建和尝试只使用 `build-NNN`/步骤编号。
-- v1.3.0 必须先由 TARGET-A 验收将发布的同一冻结包；通过之前不得 push 本轮提交、tag、draft 或 Release。v1.2.1 及任何既有历史对象保持不可变，不得覆盖、移动或用新的补丁版本绕过门禁。
+- 本轮唯一获授权版本是 `v1.3.1`。`config/release-policy.json`、VERSION、工作流、归档、tag 和 Release 必须一致；禁止自动递增或改用其他版本。构建和尝试只使用 `build-NNN`/步骤编号。
+- v1.3.1 必须先由 TARGET-A 验收将发布的同一冻结包；通过之前不得 push 本轮提交、tag、draft 或 Release。v1.2.1 及任何既有历史对象保持不可变，不得覆盖、移动或用新的补丁版本绕过门禁。
 - 本轮产品开发、语法/静态、单元/契约、固定组件、归档及业务测试仍在 TARGET-A 执行；源码、测试与文档先在 TARGET-A 修改、验证，再同步仓库。按用户第十二份指令，仅干净空机安装（含发布后匿名公开命令实装）允许在 Codex 本机隔离虚拟机执行；不得挂宿主 Docker socket、预装 Docker 或复制镜像缓存代替首次引导。结束先保留必要脱敏证据，再销毁本次自有虚拟机及测试磁盘。除此例外，开发机只承担阅读、同步、Git 身份核对和最终授权发布。
-- 每个有意义步骤先登记并在完成后更新 `.work/v1.3.0/control/`；恢复会话先读取 CURRENT、TASKS、当前步骤和测试账本，不因上下文压缩无依据重跑已绑定证据。
+- 每个有意义步骤先登记并在完成后更新 `.work/v1.3.1/control/`；恢复会话先读取 CURRENT、TASKS、当前步骤和测试账本，不因上下文压缩无依据重跑已绑定证据。
 
 ## 客服行为与配置
 

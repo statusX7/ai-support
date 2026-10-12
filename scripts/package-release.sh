@@ -48,8 +48,8 @@ VERSION_VALUE=$(git -C "$PROJECT_ROOT" show "${SOURCE_COMMIT}:VERSION") \
   || { printf '错误：提交缺少 VERSION\n' >&2; exit 1; }
 [[ "$VERSION_VALUE" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
   || { printf '错误：VERSION 格式无效\n' >&2; exit 1; }
-[[ "$VERSION_VALUE" == v1.3.0 ]] \
-  || { printf '错误：本轮发布政策只授权 v1.3.0，拒绝生成其他版本资产\n' >&2; exit 1; }
+[[ "$VERSION_VALUE" == v1.3.1 ]] \
+  || { printf '错误：本轮发布政策只授权 v1.3.1，拒绝生成其他版本资产\n' >&2; exit 1; }
 
 OUTPUT_LEXICAL=$(realpath -ms -- "$OUTPUT_REQUEST")
 OUTPUT_DIR=$(realpath -m -- "$OUTPUT_REQUEST")

@@ -16,7 +16,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "v1.3.0"
+VERSION = "v1.3.1"
 
 
 def run(arguments, cwd, *, environment=None, timeout=90):
@@ -88,10 +88,10 @@ def create_repository(destination):
     )
     (destination / "VERSION").write_text(VERSION + "\n", encoding="utf-8")
     (destination / "get.sh").write_text(
-        '#!/usr/bin/env bash\nGET_VERSION="v1.3.0"\n', encoding="utf-8",
+        '#!/usr/bin/env bash\nGET_VERSION="v1.3.1"\n', encoding="utf-8",
     )
     (destination / "config/app.yaml").write_text(
-        "app:\n  version: v1.3.0\n", encoding="utf-8",
+        "app:\n  version: v1.3.1\n", encoding="utf-8",
     )
     (destination / "config/release-policy.json").write_text(
         json.dumps({
@@ -536,8 +536,8 @@ def main():
         def release_policy_drift(repository):
             policy = repository / "config/release-policy.json"
             record = json.loads(policy.read_text(encoding="utf-8"))
-            record["authorized_release"] = "v1.3.1"
-            record["allowed_new_release_tags"] = ["v1.3.1"]
+            record["authorized_release"] = "v1.3.2"
+            record["allowed_new_release_tags"] = ["v1.3.2"]
             policy.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
         def generated_workflow_drift(repository):
@@ -622,14 +622,14 @@ def main():
         environment["GH_MARKER"] = str(gh_marker)
         publish = base / "scripts/publish-release.sh"
         wrong_version = run([
-            publish, "--publish", "v1.3.1", "--artifacts", artifacts_one,
+            publish, "--publish", "v1.3.2", "--artifacts", artifacts_one,
             "--target-receipt", receipt, "--dry-run",
         ], base, environment=environment)
         assert wrong_version.returncode == 64
-        assert "只授权 v1.3.0" in wrong_version.stderr
+        assert "只授权 v1.3.1" in wrong_version.stderr
         assert not gh_marker.exists()
         assert run(["git", "tag", "--list"], base).stdout == ""
-        print("通过：[UNIT/CONTRACT] 非 v1.3.0 参数在 tag/push/draft 前被拒绝", flush=True)
+        print("通过：[UNIT/CONTRACT] 非 v1.3.1 参数在 tag/push/draft 前被拒绝", flush=True)
 
         dry_run = run([
             publish, "--publish", VERSION, "--artifacts", artifacts_one,

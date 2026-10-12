@@ -673,8 +673,10 @@ wizard_probe_selected_model() {
   local work_dir=$1
   local chat_payload responses_payload vision_payload tiny_image
 
+  # 中转推理模型的输出额度包含 reasoning。实测16 token只有推理、没有正文，
+  # 不能据此误判Chat不受支持；与Responses采用相同的有界64-token探针。
   chat_payload=$(jq -cn --arg model "$WIZARD_MODEL" \
-    '{model:$model,messages:[{role:"user",content:"Reply only OK."}],max_tokens:16}')
+    '{model:$model,messages:[{role:"user",content:"Reply only OK."}],max_tokens:64}')
   if wizard_probe_json_endpoint "$work_dir" chat/completions "$chat_payload" \
     '((has("error") | not) or .error == null or .error == false) and (.choices[0].message.content | type == "string" and length > 0)'; then
     WIZARD_CHAT_CAPABILITY=true
@@ -706,7 +708,7 @@ wizard_probe_selected_model() {
     else WIZARD_VISION_CAPABILITY=false; fi
   else
     vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
-      '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}],max_tokens:16}')
+      '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}],max_tokens:64}')
     if wizard_probe_json_endpoint "$work_dir" chat/completions "$vision_payload" \
       '((has("error") | not) or .error == null or .error == false) and (.choices[0].message.content | type == "string" and length > 0)'; then
       WIZARD_VISION_CAPABILITY=true
@@ -793,10 +795,10 @@ wizard_collect_step() {
     2)
       while true; do
         if [[ -n "$WIZARD_API_KEY" ]]; then
-          wizard_read_value value '[2/10] AI API Key（回车保留现有值，输入不显示）：' 1 || return $?
+          wizard_read_value value '[2/10] AI API Key（回车保留现有值，输入时可见）：' || return $?
           value=${value:-$WIZARD_API_KEY}
         else
-          wizard_read_value value '[2/10] AI API Key（输入不显示）：' 1 || return $?
+          wizard_read_value value '[2/10] AI API Key（输入时可见）：' || return $?
         fi
         if wizard_validate_plain_value "$value" 4096; then
           WIZARD_API_KEY=$value
@@ -819,7 +821,7 @@ wizard_collect_step() {
             return 1
           fi
           wizard_warn "Provider 鉴权失败（HTTP ${WIZARD_MODELS_HTTP_STATUS}）"
-          wizard_read_value value '请重新输入 AI API Key（输入不显示）：' 1 || return $?
+          wizard_read_value value '请重新输入 AI API Key（输入时可见）：' || return $?
           wizard_validate_plain_value "$value" 4096 || {
             wizard_warn 'API Key 无效'
             continue
@@ -864,10 +866,10 @@ wizard_collect_step() {
     5)
       while true; do
         if [[ -n "$WIZARD_CRISP_IDENTIFIER" ]]; then
-          wizard_read_value value '[5/10] Crisp Token Identifier（回车保留现有值，输入不显示）：' 1 || return $?
+          wizard_read_value value '[5/10] Crisp Token Identifier（回车保留现有值，输入时可见）：' || return $?
           value=${value:-$WIZARD_CRISP_IDENTIFIER}
         else
-          wizard_read_value value '[5/10] Crisp Token Identifier（输入不显示）：' 1 || return $?
+          wizard_read_value value '[5/10] Crisp Token Identifier（输入时可见）：' || return $?
         fi
         if wizard_validate_plain_value "$value" 512 && [[ "$value" != *:* ]]; then
           WIZARD_CRISP_IDENTIFIER=$value
@@ -880,10 +882,10 @@ wizard_collect_step() {
     6)
       while true; do
         if [[ -n "$WIZARD_CRISP_TOKEN_KEY" ]]; then
-          wizard_read_value value '[6/10] Crisp Token Key（回车保留现有值，输入不显示）：' 1 || return $?
+          wizard_read_value value '[6/10] Crisp Token Key（回车保留现有值，输入时可见）：' || return $?
           value=${value:-$WIZARD_CRISP_TOKEN_KEY}
         else
-          wizard_read_value value '[6/10] Crisp Token Key（输入不显示）：' 1 || return $?
+          wizard_read_value value '[6/10] Crisp Token Key（输入时可见）：' || return $?
         fi
         if wizard_validate_plain_value "$value" 4096; then
           WIZARD_CRISP_TOKEN_KEY=$value

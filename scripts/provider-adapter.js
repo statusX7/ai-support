@@ -92,7 +92,12 @@ function chatToResponses(body, settings) {
 
 function upstreamFailure(status, body, headers) {
   const failure = classifyFailure(status,body,headers);
-  return new RouterError(failure.kind,'Provider 请求未返回可用结果',{failure,status:failure.status || 502});
+  // Keep only the explicitly named optional parameter, never the upstream message.
+  const unsupportedTemperature = status === 400 && failure.kind === 'invalid_request'
+    && body?.error?.param === 'temperature'
+    && /unsupported|not support/i.test(String(body.error.message || ''));
+  return new RouterError(failure.kind,'Provider 请求未返回可用结果',{failure,status:failure.status || 502,
+    ...(unsupportedTemperature ? {unsupportedParameter:'temperature'} : {})});
 }
 
 function responseToChat(body, model) {
@@ -236,6 +241,7 @@ function writeChatStream(response,result) {
 
 function createAdapter(environment = process.env, fetchFunction) {
   let router;
+  const unsupportedTemperatures = new Map();
   const root = environment.PROVIDER_ROOT || '/opt/crisp-ai';
   const pooled = () => environment.PROVIDER_POOL_REQUIRED === 'true' || !!environment.PROVIDER_POOL_PATH || fs.existsSync(path.join(environment.PROVIDER_ROOT || '/opt/crisp-ai','config/provider-pool-applied.json'));
   const configurationPending = () => {
@@ -244,6 +250,8 @@ function createAdapter(environment = process.env, fetchFunction) {
   };
   const requireApplied = () => { if (configurationPending()) throw terminal('configuration_applying','接口窗口配置正在应用或等待恢复，暂不能开始推理'); };
   const invoke = async (body,settings,signal) => {
+    const deadline = Date.now() + settings.timeout;
+    const parameterScope = settings.entryScope || crypto.createHash('sha256').update(JSON.stringify([settings.base,settings.mode,settings.model,settings.key,settings.headers])).digest('hex');
     if (pooled()) requireApplied();
     const converted = chatToResponses(body,settings);
     // 只构造受支持字段，不复用不同供应商的 previous_response_id、file、thread 或工具状态。
@@ -251,7 +259,26 @@ function createAdapter(environment = process.env, fetchFunction) {
       ...(settings.maxOutput ? {[Object.hasOwn(body,'max_completion_tokens') ? 'max_completion_tokens':'max_tokens']:settings.maxOutput}:{}),...(converted.temperature !== undefined ? {temperature:converted.temperature}:{}),...(converted.top_p !== undefined ? {top_p:converted.top_p}:{})};
     const base = new URL(settings.base);
     if (environment.PROVIDER_HOST_GATEWAY && ['127.0.0.1','localhost'].includes(base.hostname)) base.hostname = environment.PROVIDER_HOST_GATEWAY;
-    const result = await requestUpstream(base.href.replace(/\/$/,'') + '/' + (settings.mode === 'responses' ? 'responses':'chat/completions'),settings,outbound,signal,fetchFunction);
+    const endpoint = base.href.replace(/\/$/,'') + '/' + (settings.mode === 'responses' ? 'responses':'chat/completions');
+    if ((unsupportedTemperatures.get(parameterScope) || 0) > Date.now()) delete outbound.temperature;
+    else unsupportedTemperatures.delete(parameterScope);
+    let result;
+    try { result = await requestUpstream(endpoint,settings,outbound,signal,fetchFunction); }
+    catch (error) {
+      // An explicit parameter rejection is not an invalid customer question.
+      // Only retry this one optional field, on the same candidate and remaining budget.
+      if (error.unsupportedParameter !== 'temperature' || !Object.hasOwn(outbound,'temperature') || signal?.aborted) throw error;
+      if (pooled()) requireApplied();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { const timeoutError = new Error('请求超时'); timeoutError.name = 'AbortError'; throw timeoutError; }
+      delete outbound.temperature;
+      if (unsupportedTemperatures.size >= 128) unsupportedTemperatures.delete(unsupportedTemperatures.keys().next().value);
+      unsupportedTemperatures.set(parameterScope,Date.now()+3600000);
+      console.warn(JSON.stringify({event:'provider_parameter_compatibility',entry_id:settings.id || null,
+        protocol:settings.mode,parameter:'temperature',action:'use_provider_default',
+        message:'当前接口明确拒绝温度参数，使用接口默认值有界重试一次'}));
+      result = await requestUpstream(endpoint,{...settings,timeout:remaining},outbound,signal,fetchFunction);
+    }
     if (pooled()) requireApplied();
     return settings.mode === 'responses' ? responseToChat(result,settings.model):validChat(result,settings.model);
   };
@@ -311,7 +338,9 @@ function createAdapter(environment = process.env, fetchFunction) {
           if (candidate.remove_header) delete secret.custom_headers[candidate.remove_header.toLowerCase()];
         }
         const entry = validateEntry({id:'p_'+'0'.repeat(24),enabled:true,context_window:8192,max_output_tokens:1200,capabilities:{chat_completions:true,responses:true,vision:false},...candidate},secret);
-        const settings = {...entry,timeout:20000,connectTimeout:5000,maxOutput:64};
+        // Reasoning shares the output budget. Keep probes bounded by both the
+        // configured allowance and 1200, so 64 reasoning tokens do not mask a usable model.
+        const settings = {...entry,timeout:20000,connectTimeout:5000,maxOutput:Math.min(entry.max_output_tokens,1200)};
         if (request.url.endsWith('/models')) {
           settings.timeout = 10000;
           const base = new URL(settings.base);
@@ -323,7 +352,7 @@ function createAdapter(environment = process.env, fetchFunction) {
           sendJson(response,200,{ok:true,models}); return;
         }
         const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
-        const testBody = {messages:[{role:'user',content:body.vision ? [{type:'text',text:'请描述图片。'},{type:'image_url',image_url:{url:image}}]:'只回复：测试正常'}]};
+        const testBody = {temperature:0.7,messages:[{role:'user',content:body.vision ? [{type:'text',text:'请描述图片。'},{type:'image_url',image_url:{url:image}}]:'只回复：测试正常'}]};
         const result = await invoke(testBody,settings,controller.signal);
         if (result.choices[0].message.refusal || result.choices[0].finish_reason === 'content_filter') throw terminal('safety_refusal','模型拒绝了测试内容，未更新能力');
         sendJson(response,200,{ok:true,id:body.entry_id || null,verified:true,api_mode:entry.mode,capabilities:{chat_completions:entry.mode === 'chat_completions',responses:entry.mode === 'responses',vision:body.vision === true}}); return;

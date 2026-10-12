@@ -110,6 +110,7 @@ if (( LAST_RC != 2 )); then
 fi
 for id in provider.configuration provider.pending provider.rag_transaction provider.readback provider.rag_configuration provider.secret_permissions provider.adapter provider.visitor_output_code_binding provider.router_code_binding provider.envelope_code_binding anything.provider_binding anything.rag_context n8n.runtime_binding runtime.feedback runtime.provider_receipts runtime.provider_settlements runtime.provider_retirements; do assert_result "$id" PASS; done
 assert_result provider.pool_health WARN
+assert_result provider.prompt_capacity PASS
 [[ "$before" == "$(business_hash)" ]] || fail '主备默认doctor改动业务资料或会话'
 ! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '主备默认doctor执行付费推理'
 pass '新主备接线、秘密代次、版本模块、评价停用和默认只读完整检查'
@@ -119,6 +120,56 @@ invoke --local
 (( LAST_RC == 0 )) || fail '当前健康证据及全部本地组件正常应退出0'
 assert_result provider.pool_health PASS
 pass '当前代主接口真实成功证据与未检测状态区分'
+
+# Minimal capacity regression reuses the existing complete doctor fixture.
+cp -p -- "${DEPLOY}/config/materials-applied.json" "${TEST_ROOT}/capacity-materials.saved"
+cp -p -- "${DEPLOY}/config/prompt.md" "${TEST_ROOT}/capacity-prompt.saved"
+cp -p -- "$WORKSPACE_PROMPT_FILE" "${TEST_ROOT}/capacity-workspace.saved"
+capacity_prompt_fixture() {
+  python3 - "$DEPLOY" "$WORKSPACE_PROMPT_FILE" "$1" <<'PY'
+import hashlib, json, pathlib, sys
+root=pathlib.Path(sys.argv[1]); path=root/'config/materials-applied.json'
+value=json.loads(path.read_text()); text='合成资料' * int(sys.argv[3])
+value['prompt'].update(text=text,bytes=len(text.encode()),sha256=hashlib.sha256(text.encode()).hexdigest())
+path.write_text(json.dumps(value)); (root/'config/prompt.md').write_text(text)
+pathlib.Path(sys.argv[2]).write_text(text)
+PY
+  reseal_materials_fixture
+}
+capacity_prompt_fixture 1500
+before=$(business_hash)
+invoke --local
+assert_result provider.pool_health PASS
+assert_result provider.prompt_capacity FAIL
+(( LAST_RC == 1 )) || fail '短请求健康不能掩盖完整提示词已超过所有候选窗口'
+# The existing 1.1 multiplier rounds 12000 * 1.1 upward to 13201 in JS.
+# Include the Router 272 overhead and primary 1200 output reservation.
+jq -e '.results[] | select(.id=="provider.prompt_capacity") | .summary | contains("14673")' "$OUT" >/dev/null \
+  || fail '容量诊断未使用 Router 中文估算及各自输出预留'
+[[ "$before" == "$(business_hash)" ]] || fail '容量诊断修改了业务配置或会话'
+! grep -Eq 'provider\.example\.test|/workspace/.*/chat' "$FIXTURE_LOG" || fail '容量诊断执行了模型请求'
+pass '全池短请求健康但完整提示词超限时明确故障，诊断只读且不推理'
+capacity_prompt_fixture 1100
+invoke --local
+assert_result provider.prompt_capacity WARN
+(( LAST_RC == 2 )) || fail '主窗口不足但备用可容纳必须警告，不得误报全池不可用'
+pass '候选容量分别核对，保留大窗口备用的可用性'
+cp -p -- "${TEST_ROOT}/capacity-materials.saved" "${DEPLOY}/config/materials-applied.json"
+cp -p -- "${TEST_ROOT}/capacity-prompt.saved" "${DEPLOY}/config/prompt.md"
+cp -p -- "${TEST_ROOT}/capacity-workspace.saved" "$WORKSPACE_PROMPT_FILE"
+jq '.prompt.sha256=("0"*64)' "${TEST_ROOT}/capacity-materials.saved" > "${DEPLOY}/config/materials-applied.json"
+invoke --local
+assert_result provider.prompt_capacity FAIL
+(( LAST_RC == 1 )) || fail '无效提示词摘要不能标记容量通过'
+cp -p -- "${TEST_ROOT}/capacity-materials.saved" "${DEPLOY}/config/materials-applied.json"
+pass '资料摘要无效时不使用未经核验的提示词宣称可用'
+invoke --offline
+assert_result provider.prompt_capacity SKIP
+pass '离线检查不冒充运行容器容量核验'
+if [[ "${CRISPAI_DOCTOR_CAPACITY_ONLY:-0}" == 1 ]]; then
+  printf '容量定向检查结束；未执行其后的其它主备自检场景。\n'
+  exit 0
+fi
 
 env_set "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 8192
 invoke --local

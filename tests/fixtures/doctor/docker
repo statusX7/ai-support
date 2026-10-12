@@ -94,7 +94,13 @@ case "$command" in
     ;;
   exec)
     joined=" $* "
-    if [[ $# == 4 && "$1" == -T && "$2" == n8n && "$3" == node && "$4" == /opt/crisp-ai/n8n/admin-query.js ]]; then
+    if [[ "$joined" == *CRISPAI_PROMPT_CAPACITY* ]]; then
+      [[ $# == 6 && "$1" == -T && "$2" == provider-adapter && "$3" == node && "$4" == -e && "$6" == /opt/crisp-ai ]] || exit 1
+      service_stopped provider-adapter && exit 1
+      # Execute the production calculation and real estimator against fixture files.
+      # This branch never manufactures a capacity or health result.
+      node -e "$5" "${DOCTOR_FIXTURE_DEPLOY:?}"
+    elif [[ $# == 4 && "$1" == -T && "$2" == n8n && "$3" == node && "$4" == /opt/crisp-ai/n8n/admin-query.js ]]; then
       [[ "$project_directory" == "${DOCTOR_FIXTURE_DEPLOY:?}" \
         && "$compose_env_file" == "${DOCTOR_FIXTURE_DEPLOY}/.env" ]] || exit 1
       service_stopped n8n && exit 1

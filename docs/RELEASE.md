@@ -1,18 +1,18 @@
 # 正式发布与回滚
 
-本仓库 `statusX7/ai-support` 自 2026-09-06 起保持 Public。本轮唯一获授权版本为 v1.3.0；维护者复用现有 GitHub CLI 身份与 SSH origin。公开读取无需登录，提交/tag/Release 仍需真实写权限。v1.2.1 及全部既有历史对象保持不可变；历史报告的 private 是当时事实，不改写历史 tag 或覆盖旧资产。本页是操作流程，不表示这些发布动作已经执行。
+本仓库 `statusX7/ai-support` 自 2026-09-06 起保持 Public。本轮唯一获授权版本为 v1.3.1；维护者复用现有 GitHub CLI 身份与 SSH origin。公开读取无需登录，提交/tag/Release 仍需真实写权限。v1.2.1 及全部既有历史对象保持不可变；历史报告的 private 是当时事实，不改写历史 tag 或覆盖旧资产。本页是操作流程，不表示这些发布动作已经执行。
 
 ## 发布门槛
 
-在线入口、自检、中文菜单、资料/接口池应用、评价停用、主备路由、日志及既有客服行为必须有当前版本证据。v1.3.0 的全部产品测试必须在 TARGET-A 执行；开发机结果不替代目标机证据。额外硬门槛是：**完整冻结候选先通过 TARGET-A，之后才可 push、tag、创建 draft 或上传任何 Release 资产。** 不能先发布待验证版，再补目标机验收。
+在线入口、自检、中文菜单、资料/接口池应用、评价停用、主备路由、日志及既有客服行为必须有当前版本证据。v1.3.1 的全部产品测试必须在 TARGET-A 执行；开发机结果不替代目标机证据。额外硬门槛是：**完整冻结候选先通过 TARGET-A，之后才可 push、tag、创建 draft 或上传任何 Release 资产。** 不能先发布待验证版，再补目标机验收。
 
 真实后台人工操作不可得等外部边界需单列，不能构造真人事件冒称通过；也不能用 `External Validation Pending` 豁免已经授权的目标机往返、欢迎状态、同包升级或故障切换检查。真实备用资源不足时准确报告验证层级，不把同一账号的多个模型当成独立账号。公共匿名取包和空机安装仍是发布后的独立门槛。
 
-先确认 main、工作树、既有 tag/Release 与独立核验回执，检查 v1.3.0 未被其他内容占用。`config/release-policy.json` 只允许 v1.3.0，目标占用时必须停止，不得自动选择下一版本。允许开发阶段正常本地 commit，不 force push，不移动或删除已发布 tag。详情见 [项目断点规范](PROJECT-WORKFLOW.md)、[测试说明](TESTING.md)、[本轮发布说明](releases/v1.3.0.md)和公开仓库保留的 [v1.2.1 报告](https://github.com/statusX7/ai-support/blob/main/docs/reports/v1.2.1-report.md)。
+先确认 main、工作树、既有 tag/Release 与独立核验回执，检查 v1.3.1 未被其他内容占用。`config/release-policy.json` 只允许 v1.3.1，目标占用时必须停止，不得自动选择下一版本。允许开发阶段正常本地 commit，不 force push，不移动或删除已发布 tag。详情见 [项目断点规范](PROJECT-WORKFLOW.md)、[测试说明](TESTING.md)、[本轮发布说明](releases/v1.3.1.md)和公开仓库保留的 [v1.2.1 报告](https://github.com/statusX7/ai-support/blob/main/docs/reports/v1.2.1-report.md)。
 
 ## 公开面与秘密检查
 
-扫描当前树、index、新增未忽略文件及远端可达分支/tag 历史、Release 说明/全部附件、Actions 日志/制品与实际存在的协作内容。通用控制和证据索引留 `.work/v1.3.0/`；实机材料留其 0700 的 `private/`，文件 0600，不覆盖历史现场原件。受限连接和 known_hosts 原位复用，敏感对照只在内存合并本轮增量。扫描字面值及常见编码只输出命中数/文件位置；不公开连接、业务端点、会话身份、秘密、数据库、完整备份及 Prompt/知识。含连接附录的任务书全文不能提交。发现真实秘密先处理撤销/轮换，不能只改 HEAD 后继续公开。
+扫描当前树、index、新增未忽略文件及远端可达分支/tag 历史、Release 说明/全部附件、Actions 日志/制品与实际存在的协作内容。通用控制和证据索引留 `.work/v1.3.1/`；实机材料留其 0700 的 `private/`，文件 0600，不覆盖历史现场原件。受限连接和 known_hosts 原位复用，敏感对照只在内存合并本轮增量。扫描字面值及常见编码只输出命中数/文件位置；不公开连接、业务端点、会话身份、秘密、数据库、完整备份及 Prompt/知识。含连接附录的任务书全文不能提交。发现真实秘密先处理撤销/轮换，不能只改 HEAD 后继续公开。
 
 使用默认 gh 配置，不创建空 `GH_CONFIG_DIR`，不打印 Token。已是 public 时幂等确认，未来版本不改回 private：
 
@@ -26,7 +26,7 @@ GitHub 的[可见性说明](https://docs.github.com/en/repositories/managing-you
 
 ## 固定源码与可重复打包
 
-同步 `config/release-policy.json`、`VERSION`、`config/app.yaml`、get.sh、工作流 meta 版本、CHANGELOG、发布说明和报告；在 TARGET-A 运行 `node n8n/build-workflow.js` 生成并核对工作流。出站只使用 Crisp 支持的消息字段，不为写版本添加任意 properties。报告记录已验收代码 commit，最终 tag 用 `git rev-parse 'v1.3.0^{commit}'` 解析，避免报告包含自己的 hash。
+同步 `config/release-policy.json`、`VERSION`、`config/app.yaml`、get.sh、工作流 meta 版本、CHANGELOG、发布说明和报告；在 TARGET-A 运行 `node n8n/build-workflow.js` 生成并核对工作流。出站只使用 Crisp 支持的消息字段，不为写版本添加任意 properties。报告记录已验收代码 commit，最终 tag 用 `git rev-parse 'v1.3.1^{commit}'` 解析，避免报告包含自己的 hash。
 
 ```bash
 AI_SUPPORT_INTEGRATION_DEPLOY_DIR=/绝对路径/隔离验收实例 \
@@ -38,7 +38,7 @@ bash scripts/package-release.sh
 
 正式发布模式禁止 TARGET-A 上的 STATIC、UNIT/CONTRACT、固定组件和真实业务门槛跳过。本轮不允许用 `AI_SUPPORT_EXTERNAL_VALIDATION_PENDING=1` 豁免 TARGET-A 的漏答或知识正确性验收。
 
-正式打包只允许干净提交和固定已跟踪清单，产物为 `dist/ai-support-v1.3.0.tar.gz`、只含该包一条记录的 `dist/SHA256SUMS`，以及供审计的 `dist/get.sh`。包须包含发布政策、provider pool/router/envelope、中文呈现/主备菜单模块、安装续跑、消息责任/REST 补偿及知识链完整生产文件与回归；排除 .git、.work、真实配置/知识、秘密代次、日志、数据、备份和测试工具二进制。两次构建应得到相同 SHA。
+正式打包只允许干净提交和固定已跟踪清单，产物为 `dist/ai-support-v1.3.1.tar.gz`、只含该包一条记录的 `dist/SHA256SUMS`，以及供审计的 `dist/get.sh`。包须包含发布政策、provider pool/router/envelope、中文呈现/主备菜单模块、安装续跑、消息责任/REST 补偿及知识链完整生产文件与回归；排除 .git、.work、真实配置/知识、秘密代次、日志、数据、备份和测试工具二进制。两次构建应得到相同 SHA。
 
 main/get.sh 是公共入口，默认解析一次 Latest 正式 tag，再固定同版归档和清单；不得分别使用两个 latest/download 地址或回退 main 归档。主推荐命令从 README 的标记后提取，与 INSTALL 和该版 release notes 逐字一致。
 
@@ -58,35 +58,35 @@ main/get.sh 是公共入口，默认解析一次 Latest 正式 tag，再固定�
 
 ```bash
 set -euo pipefail
-scripts/publish-release.sh --publish v1.3.0 \
+scripts/publish-release.sh --publish v1.3.1 \
   --artifacts dist \
-  --target-receipt .work/v1.3.0/private/target-release-gate.json \
+  --target-receipt .work/v1.3.1/private/target-release-gate.json \
   --dry-run
-scripts/publish-release.sh --publish v1.3.0 \
+scripts/publish-release.sh --publish v1.3.1 \
   --artifacts dist \
-  --target-receipt .work/v1.3.0/private/target-release-gate.json
+  --target-receipt .work/v1.3.1/private/target-release-gate.json
 ```
 
 该入口把 HEAD 提交与归档 SHA 固定在一次进程内，反复执行本地门禁后才创建 annotated tag 并原子推送 main/tag；随后建立 draft，回下载归档、`SHA256SUMS` 和 `get.sh`，逐成员复核 Git blob/执行位、校验远端 peeled tag 与资产集合，全部一致才转成 Latest 正式版。任何一步失败都不会把未核验 draft 发布为正式版。失败后可用完全相同的命令续跑，但只复用指向同一提交、对象身份一致的 annotated tag，以及资产名称受控的同版 draft；同版已正式发布时只做不可变身份复核，任何提交、tag 对象、远端 main、资产集合或资产内容冲突都会阻止，不覆盖历史。使用当前 gh 的 [create](https://cli.github.com/manual/gh_release_create) / [edit](https://cli.github.com/manual/gh_release_edit) 契约。
 
 ## 匿名验收与回执
 
-已登录 gh 下载只用于发布者核验。正式发布后必须从 TARGET-A 的无登录、Cookie、netrc 或额外认证头环境用 `curl -q` 读取 repo、main/get.sh、Release 页面和固定 tag 资产。检查非 draft、非 prerelease、Latest=v1.3.0、包内 VERSION、安全路径、关键脚本与 --help/--version。
+已登录 gh 下载只用于发布者核验。正式发布后必须从 TARGET-A 的无登录、Cookie、netrc 或额外认证头环境用 `curl -q` 读取 repo、main/get.sh、Release 页面和固定 tag 资产。检查非 draft、非 prerelease、Latest=v1.3.1、包内 VERSION、安全路径、关键脚本与 --help/--version。
 
-在线入口与十项初始化的产品回归也在 TARGET-A 的受限副本执行，不删除或重装其现有 Docker/业务实例。记录真实运行范围，不能把宿主现有依赖冒充空机；本轮不建设第二台验证主机。
+在线入口与十项初始化的产品回归在 TARGET-A 的受限副本执行，不删除或重装其现有 Docker/业务实例。仅按已授权空机例外，在 Codex 本机隔离 VM 验证初始无 Docker 的完整安装及发布后匿名命令；结束保留脱敏结果并销毁本次虚拟机、磁盘和密钥。其它开发及业务测试仍只在 TARGET-A。
 
 TARGET-A 也必须通过正式包的维护路径运行相同生产文件；候选或临时救援不能代替最终逐文件对齐。断开排障连接后新登录核验命令、组件、资料/日志与真实访客往返；不为测试卸载用户目标机。临时账号由用户在整体验收后自行撤销，运行组件不得依赖它。
 
-发布后事实写入独立 `v1.3.0-verification.md` 并附加到同一 Release，包含 SHA、tag commit、public/Latest、TARGET-A 匿名回下载和目标机正式内容核验的非敏感结论。首次 draft/正式发布的资产集合严格只有归档、`SHA256SUMS` 与 `get.sh`；只有已正式发布后，才可用同一入口显式追加该版本唯一的验证附件：
+发布后事实写入独立 `v1.3.1-verification.md` 并附加到同一 Release，包含 SHA、tag commit、public/Latest、TARGET-A 匿名回下载和目标机正式内容核验的非敏感结论。首次 draft/正式发布的资产集合严格只有归档、`SHA256SUMS` 与 `get.sh`；只有已正式发布后，才可用同一入口显式追加该版本唯一的验证附件：
 
 ```bash
-scripts/publish-release.sh --publish v1.3.0 \
+scripts/publish-release.sh --publish v1.3.1 \
   --artifacts dist \
-  --target-receipt .work/v1.3.0/private/target-release-gate.json \
-  --verification .work/v1.3.0/artifacts/v1.3.0-verification.md
+  --target-receipt .work/v1.3.1/private/target-release-gate.json \
+  --verification .work/v1.3.1/artifacts/v1.3.1-verification.md
 ```
 
-入口会重新核对 TARGET-A 回执、本地冻结包、远端 tag、main、Latest 和三项核心资产；无 `--verification` 的已发布重跑也允许三项或加上这一项验证附件，但仍会回下载并核对三项核心资产。附件 basename 必须精确为 `v1.3.0-verification.md`，是受当前用户拥有的普通非链接 UTF-8 文件（不超过 256 KiB、以换行结束、不可组/其他人写）；首行必须是只含 `schema_version`、`version`、`commit`、`archive_sha256`、`release_url` 的精确 JSON 身份注释，正文还须给出非空的公开核验结论。不得包含凭据、会话值、IP/IPv6、TARGET-A 或其他目标别名、目标主机/账户字段，URL 只可指向本公开仓库；同名远端附件必须字节相同，绝不覆盖。它不要求移动已发布 tag，也不能在未拿到远端结果前写“已发布”。私密交付说明留受限工作区，不能作为 Release 附件。
+入口会重新核对 TARGET-A 回执、本地冻结包、远端 tag、main、Latest 和三项核心资产；无 `--verification` 的已发布重跑也允许三项或加上这一项验证附件，但仍会回下载并核对三项核心资产。附件 basename 必须精确为 `v1.3.1-verification.md`，是受当前用户拥有的普通非链接 UTF-8 文件（不超过 256 KiB、以换行结束、不可组/其他人写）；首行必须是只含 `schema_version`、`version`、`commit`、`archive_sha256`、`release_url` 的精确 JSON 身份注释，正文还须给出非空的公开核验结论。不得包含凭据、会话值、IP/IPv6、TARGET-A 或其他目标别名、目标主机/账户字段，URL 只可指向本公开仓库；同名远端附件必须字节相同，绝不覆盖。它不要求移动已发布 tag，也不能在未拿到远端结果前写“已发布”。私密交付说明留受限工作区，不能作为 Release 附件。
 
 ## 管理员更新与恢复
 

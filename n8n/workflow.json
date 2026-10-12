@@ -326,7 +326,7 @@
   "versionId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
   "meta": {
     "templateCredsSetupCompleted": true,
-    "aiSupportVersion": "v1.3.0",
+    "aiSupportVersion": "v1.3.1",
     "n8nRunnerConcurrency": 10,
     "backgroundProcessingPermits": 8,
     "ordinaryProcessingPermits": 7,

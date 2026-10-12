@@ -30,8 +30,8 @@ case "$EXTERNAL_PENDING_MODE" in
   *) printf '失败：[STATIC] AI_SUPPORT_EXTERNAL_VALIDATION_PENDING 只能是 0 或 1\n' >&2; exit 1 ;;
 esac
 CURRENT_TEST_VERSION=$(<"${PROJECT_ROOT}/VERSION")
-if (( RELEASE_MODE && EXTERNAL_PENDING_MODE )) && [[ "$CURRENT_TEST_VERSION" == v1.3.0 ]]; then
-  printf '失败：[STATIC] v1.3.0 发布验收不允许 External Validation Pending\n' >&2
+if (( RELEASE_MODE && EXTERNAL_PENDING_MODE )) && [[ "$CURRENT_TEST_VERSION" == v1.3.1 ]]; then
+  printf '失败：[STATIC] v1.3.1 发布验收不允许 External Validation Pending\n' >&2
   exit 1
 fi
 if (( EXTERNAL_PENDING_MODE && RELEASE_MODE == 0 )); then
@@ -2460,7 +2460,7 @@ UPDATE_RECOVERY_JOURNAL="${DEPLOY_DIR}/backups/update-recovery.json"
   && "$(stat -c '%a:%h:%u' "$UPDATE_RECOVERY_JOURNAL")" == "600:1:${EUID}" ]] \
   || fail '恢复中断未保留0600普通单链接journal'
 jq -e '.schema_version == 1 and .kind == "failed-update-recovery" and
-  .old_version == "v1.2.1" and .new_version == "v1.3.0" and .phase == "recovering" and
+  .old_version == "v1.2.1" and .new_version == "v1.3.1" and .phase == "recovering" and
   (.token | test("^[a-f0-9]{64}$")) and (.snapshot_manifest_sha256 | test("^[a-f0-9]{64}$")) and
   (.snapshot_archive_sha256 | test("^[a-f0-9]{64}$")) and
   (.source_candidate_sha256 | test("^[a-f0-9]{64}$"))' "$UPDATE_RECOVERY_JOURNAL" >/dev/null \
@@ -2602,7 +2602,7 @@ grep -Fq '已自动恢复到更新前版本：v1.2.1' "${TEST_ROOT}/update-recov
 [[ -z "$(find "${DEPLOY_DIR}/backups" -mindepth 1 -maxdepth 1 \
   \( -name 'update-candidate-*' -o -name '.update-candidate-*.tmp' \) -print -quit)" ]] \
   || fail 'copy/config后自动恢复遗留了只读冻结候选'
-pass 'v1.2.1到v1.3.0在copy/config后失败自动恢复同次完整快照'
+pass 'v1.2.1到v1.3.1在copy/config后失败自动恢复同次完整快照'
 
 ENV_HASH_BEFORE=$(sha256sum "${DEPLOY_DIR}/.env" | awk '{print $1}')
 UPDATE_ENV_BASELINE="${TEST_ROOT}/update-env-before.env"
@@ -2657,7 +2657,7 @@ unset MOCK_DOCKER_SERVICE_STATE
 [[ ! -e "$UPDATE_RM_TRIGGER" ]] || fail 'update_committed清理故障没有精确命中一次'
 grep -Fq '新版本已到提交点，正在核验当前健康并收口恢复 journal；不得倒回旧版本' \
   "${TEST_ROOT}/update.log" || fail 'update_committed清理失败未进入只收口新版本的finalizer'
-grep -Fq '更新提交已完成：v1.3.0' "${TEST_ROOT}/update.log" \
+grep -Fq '更新提交已完成：v1.3.1' "${TEST_ROOT}/update.log" \
   || fail 'update_committed finalizer没有返回成功'
 ! grep -Fq '开始按同次更新前快照自动恢复' "${TEST_ROOT}/update.log" \
   || fail 'update_committed错误倒回旧快照'

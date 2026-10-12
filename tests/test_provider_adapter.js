@@ -16,7 +16,8 @@ async function main() {
   const configurationPath = path.join(work, 'provider.json');
   fs.writeFileSync(configurationPath, JSON.stringify({schema_version:2,provider:{}}));
   let calls = [], mode='responses', delay=0, answer='协议验证回答';
-  let responseEncoding='identity', chatFields={};
+  let responseEncoding='identity', chatFields={}, probeNeedsReasoning=false;
+  let temperatureFailure=null, temperatureStatus=400, temperatureBlockConfiguration=false;
   const upstream = http.createServer(async (request, response) => {
     let text=''; for await (const chunk of request) text += chunk;
     const body=JSON.parse(text || '{}');
@@ -46,7 +47,19 @@ async function main() {
       }
       response.end(encoded);
     };
-    if (request.url === '/proxy/v1/responses' && mode === 'responses') await sendJson({id:'synthetic-response',output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}});
+    if (temperatureFailure && Object.hasOwn(body,'temperature')) {
+      if (temperatureBlockConfiguration) {
+        fs.mkdirSync(path.join(work,'config'),{recursive:true});
+        fs.writeFileSync(path.join(work,'config/provider-pool-transaction.json'),'{}');
+      }
+      await sendJson({error:temperatureFailure},temperatureStatus);return;
+    }
+    if (probeNeedsReasoning && (body.max_output_tokens || body.max_tokens) < 128) {
+      if (mode === 'responses') await sendJson({status:'incomplete',incomplete_details:{reason:'max_output_tokens'},
+        output:[{type:'reasoning',summary:[]}],usage:{output_tokens:64,output_tokens_details:{reasoning_tokens:64}}});
+      else await sendJson({choices:[{message:{role:'assistant',content:'',reasoning_content:'合成推理'},finish_reason:'length'}]});
+    }
+    else if (request.url === '/proxy/v1/responses' && mode === 'responses') await sendJson({id:'synthetic-response',output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}});
     else if (request.url === '/proxy/v1/chat/completions' && mode === 'chat') await sendJson({id:'synthetic-chat',choices:[{message:{content:answer,...chatFields},finish_reason:'stop'}]});
     else if (mode === 'redirect') {response.writeHead(302,{location:'http://127.0.0.1:1/leak'});response.end();}
     else if (mode === 'empty') await sendJson({choices:[]});
@@ -106,6 +119,94 @@ async function main() {
     assert.equal((await post(body)).status,504,'压缩半流超时必须保持timeout分类');
     responseEncoding='identity';answer='Chat 协议验证回答';
     pass('U01 gzip/deflate/br按解压后容量读取，未知、多重、损坏及炸弹拒绝');
+    environment.PROVIDER_POOL_REQUIRED='true';environment.PROVIDER_ADAPTER_KEY='synthetic-management-key';
+    probeNeedsReasoning=true;
+    try {
+      for (const protocol of ['responses','chat_completions']) {
+        mode=protocol==='responses'?'responses':'chat';
+        const provider={base_url:environment.AI_API_BASE_URL,model:'synthetic-reasoning-model',api_mode:protocol,
+          context_window:65535,max_output_tokens:1200,capabilities:{chat_completions:true,responses:true,vision:true}};
+        const probe=async (maximum,vision=true)=>fetch(`${base}/internal/provider/probe`,{method:'POST',
+          headers:{authorization:'Bearer '+environment.PROVIDER_ADAPTER_KEY,'content-type':'application/json'},
+          body:JSON.stringify({provider:{...provider,max_output_tokens:maximum},api_key:'synthetic-probe-key',vision})});
+        const accepted=await probe(1200);assert.equal(accepted.status,200);
+        assert.equal((await accepted.json()).verified,true);
+        const budgetField=protocol==='responses'?'max_output_tokens':'max_tokens';
+        assert.equal(calls.at(-1).body[budgetField],1200);
+        assert.equal(calls.at(-1).body.model,provider.model);
+        assert.equal(calls.at(-1).headers.authorization,'Bearer synthetic-probe-key');
+        const beforeRejected=calls.length;
+        const rejected=await probe(64);assert.equal(rejected.ok,false);
+        assert.equal((await rejected.json()).error.code,'invalid_response');
+        assert.equal(calls.at(-1).body[budgetField],64,'不得擅自超过管理员配置的输出额度');
+        assert.equal(calls.length,beforeRejected+1,'预算不足必须明确失败，不能无限重试');
+        const bounded=await probe(9000,false);assert.equal(bounded.status,200);
+        assert.equal(calls.at(-1).body[budgetField],1200,'探针不能继承无限放大的输出额度');
+      }
+      pass('管理探针保留推理输出预算，Chat/Responses及图片遵守候选额度与1200上限，空正文仍拒绝');
+    } finally {
+      delete environment.PROVIDER_POOL_REQUIRED;delete environment.PROVIDER_ADAPTER_KEY;
+      probeNeedsReasoning=false;environment.AI_API_MODE='chat_completions';mode='chat';
+    }
+    const originalModel=environment.AI_MODEL,originalKey=environment.AI_API_KEY;
+    const unsupportedTemperature={type:'invalid_request_error',param:'temperature',message:'Unsupported parameter: temperature is not supported with this model.'};
+    try {
+      temperatureFailure=unsupportedTemperature;
+      for (const protocol of ['responses','chat_completions']) {
+        environment.AI_API_MODE=protocol;mode=protocol==='responses'?'responses':'chat';
+        environment.AI_MODEL='temperature-'+protocol;
+        const input={...body,temperature:0.7},beforeInput=JSON.stringify(input),before=calls.length;
+        const adapted=await post(input);assert.equal(adapted.status,200);
+        const attempts=calls.slice(before);assert.equal(attempts.length,2);
+        assert.equal(attempts[0].body.temperature,0.7);assert.equal(Object.hasOwn(attempts[1].body,'temperature'),false);
+        assert.deepEqual(attempts[0].body.input||attempts[0].body.messages,attempts[1].body.input||attempts[1].body.messages);
+        assert.equal(attempts[0].body.model,attempts[1].body.model);assert.equal(JSON.stringify(input),beforeInput);
+        const beforeCached=calls.length;assert.equal((await post(input)).status,200);
+        assert.equal(calls.length,beforeCached+1);assert.equal(Object.hasOwn(calls.at(-1).body,'temperature'),false);
+        environment.AI_API_KEY=originalKey+'-rotated';
+        const beforeRotated=calls.length;assert.equal((await post(input)).status,200);
+        assert.equal(calls.length,beforeRotated+2,'新认证身份不能继承旧能力假设');
+        assert.equal(calls[beforeRotated].body.temperature,0.7);
+        environment.AI_API_KEY=originalKey;
+      }
+      temperatureFailure=null;environment.AI_MODEL='temperature-supported';
+      const supportedBefore=calls.length;assert.equal((await post({...body,temperature:0.7})).status,200);
+      assert.equal(calls.length,supportedBefore+1);assert.equal(calls.at(-1).body.temperature,0.7);
+      pass('显式温度不兼容只在同候选省略该参数重试一次，双协议、缓存和认证隔离保留正常模型温度');
+
+      for(const [status,param] of [[400,'input'],[401,'temperature']]) {
+        environment.AI_MODEL='rejected-parameter-'+status;
+        temperatureStatus=status;temperatureFailure={...unsupportedTemperature,param};
+        const before=calls.length;assert.equal((await post({...body,temperature:0.7})).status,status);
+        assert.equal(calls.length,before+1,'认证或真正输入错误不能被兼容重试掩盖');
+      }
+      pass('认证失败和非温度输入错误不触发参数删除或额外请求');
+
+      temperatureStatus=400;temperatureFailure=unsupportedTemperature;
+      environment.AI_MODEL='bounded-parameter';delay=600;
+      const beforeTimeout=calls.length;assert.equal((await post({...body,temperature:0.7})).status,504);
+      assert.equal(calls.length,beforeTimeout+2);delay=0;
+      pass('参数兼容的第二次请求只使用首轮剩余时间，不重置总期限');
+
+      environment.PROVIDER_POOL_REQUIRED='true';environment.PROVIDER_ADAPTER_KEY='synthetic-management-key';
+      temperatureBlockConfiguration=true;
+      const beforeConfiguration=calls.length;
+      const blocked=await fetch(`${base}/internal/provider/probe`,{method:'POST',
+        headers:{authorization:'Bearer '+environment.PROVIDER_ADAPTER_KEY,'content-type':'application/json'},
+        body:JSON.stringify({provider:{base_url:environment.AI_API_BASE_URL,model:'configuration-parameter',
+          api_mode:'chat_completions',context_window:8192,max_output_tokens:1200,
+          capabilities:{chat_completions:true,responses:false,vision:false}},api_key:'synthetic-probe-key'})});
+      assert.equal(blocked.status,400);assert.equal((await blocked.json()).error.code,'configuration_applying');
+      assert.equal(calls.length,beforeConfiguration+1,'配置应用中不得启动参数兼容第二请求');
+      pass('保存探针携带业务温度，配置变化仍立即阻止第二次请求');
+    } finally {
+      delete environment.PROVIDER_POOL_REQUIRED;delete environment.PROVIDER_ADAPTER_KEY;
+      environment.AI_MODEL=originalModel;environment.AI_API_KEY=originalKey;
+      environment.AI_API_MODE='chat_completions';mode='chat';delay=0;
+      temperatureFailure=null;temperatureStatus=400;temperatureBlockConfiguration=false;
+      const marker=path.join(work,'config/provider-pool-transaction.json');
+      if(fs.existsSync(marker))fs.unlinkSync(marker);
+    }
     const mechanical = ['暂时无法回复，请稍后再试。', '  抱歉，暂时无法回复，请稍后再试。谢谢理解！  ',
       '系\u200b统　正忙，请稍后再试，谢谢理解。', '当前暂时不能答复，建议过一会儿再试。',
       '服务开了小差，请过会儿再试。', '很抱歉，我们目前没有办法为您提供帮助，请您耐心等待。',

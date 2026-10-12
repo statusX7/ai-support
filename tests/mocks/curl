@@ -153,7 +153,10 @@ case "$URL" in
     fi
     ;;
   */responses)
-    if [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
+    if [[ "${MOCK_PROVIDER_CHAT_ONLY:-0}" == 1 ]]; then
+      STATUS=404
+      BODY='{"error":{"message":"测试服务仅支持 Chat Completions"}}'
+    elif [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
       STATUS=503
       BODY='{"error":{"message":"测试 Provider 不可用"}}'
     elif [[ "${MOCK_PROVIDER_SOFT_ERROR:-0}" == 1 ]]; then
@@ -169,6 +172,9 @@ case "$URL" in
     if [[ "${MOCK_PROVIDER_RESPONSES_ONLY:-0}" == 1 ]]; then
       STATUS=404
       BODY='{"error":{"message":"测试服务仅支持 Responses"}}'
+    elif [[ "${MOCK_PROVIDER_CHAT_REASONING_MINIMUM:-0}" == 1 ]] \
+      && [[ "$(jq -r '.max_tokens // 0' <<< "$REQUEST_BODY")" -lt 64 ]]; then
+      BODY='{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"synthetic reasoning"},"finish_reason":"length"}]}'
     elif [[ "${MOCK_PROVIDER_FAIL:-0}" == 1 ]]; then
       STATUS=503
       BODY='{"error":{"message":"测试 Provider 不可用"}}'

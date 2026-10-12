@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CrispAI 公共发行包引导器。此文件必须能够脱离 Git 仓库和其他相邻文件独立运行。
-GET_VERSION="v1.3.0"
+GET_VERSION="v1.3.1"
 REPOSITORY="statusX7/ai-support"
 REPOSITORY_URL="https://github.com/${REPOSITORY}"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
@@ -51,7 +51,7 @@ usage() {
 从公开 GitHub Release 下载并校验完整正式包，然后调用包内生产安装器。
 
 选项：
-  --release VERSION  安装指定正式版本，例如 v1.3.0
+  --release VERSION  安装指定正式版本，例如 v1.3.1
   --deploy-dir PATH  指定部署目录，默认 /opt/crisp-ai
   --update           更新一个已完成的旧版本实例
   --repair           用已安装版本的校验包恢复受管命令入口，不启动服务或重装业务程序

@@ -1789,10 +1789,62 @@ doctor_pool_rag_context_check() {
   : > "$response"
 }
 
+doctor_pool_prompt_capacity_check() {
+  local start output values input count fitting maximum required
+  start=$(doctor_now_ms)
+  if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )); then
+    doctor_skip provider.prompt_capacity '完整提示词基础容量' '因有效接口池或 Docker 不可验证，本次未检查' docker
+    return
+  fi
+  output="${DOCTOR_TEMP_ROOT}/prompt-capacity.json"
+  # Reuse the running Router estimator. This lower bound excludes history,
+  # retrieved knowledge and the current question; it is not an inference test.
+  if doctor_compose_timeout 5 exec -T provider-adapter node -e '
+    const marker="CRISPAI_PROMPT_CAPACITY",fs=require("fs"),crypto=require("crypto");
+    const root=process.argv[1],read=name=>JSON.parse(fs.readFileSync(root+name,"utf8"));
+    const {estimateTextTokens}=require(root+"/scripts/provider-router.js");
+    const applied=read("/config/materials-applied.json"),pool=read("/config/provider-pool-applied.json");
+    const prompt=applied.prompt?.text;
+    if(!marker||applied.state!=="applied"||applied.schema_version!==2||typeof prompt!=="string"||!prompt.trim()
+      ||Buffer.byteLength(prompt)!==applied.prompt.bytes
+      ||crypto.createHash("sha256").update(prompt).digest("hex")!==applied.prompt.sha256)process.exit(1);
+    const entries=pool.entries.filter(entry=>entry.enabled===true&&entry.draft!==true&&entry.capabilities?.[entry.api_mode]===true);
+    if(!entries.length||entries.some(entry=>!Number.isSafeInteger(entry.context_window)||entry.context_window<256
+      ||!Number.isSafeInteger(entry.max_output_tokens)||entry.max_output_tokens<1||entry.max_output_tokens>=entry.context_window))process.exit(1);
+    const input=256+16+estimateTextTokens(prompt);
+    process.stdout.write(JSON.stringify({input,count:entries.length,
+      fitting:entries.filter(entry=>input+entry.max_output_tokens<=entry.context_window).length,
+      maximum:Math.max(...entries.map(entry=>entry.context_window)),
+      required:Math.min(...entries.map(entry=>input+entry.max_output_tokens))}));
+  ' /opt/crisp-ai > "$output" 2>/dev/null \
+    && values=$(jq -er '[.input,.count,.fitting,.maximum,.required] |
+      if all(.[]; type == "number" and floor == . and . >= 0) then @tsv else error("invalid capacity result") end' "$output" 2>/dev/null); then
+    read -r input count fitting maximum required <<< "$values"
+    if (( fitting == 0 )); then
+      doctor_add provider.prompt_capacity '完整提示词基础容量' FAIL critical \
+        "完整提示词基础输入估算 ${input}；含输出额度至少需要 ${required}，已启用接口最大窗口 ${maximum}，${fitting}/${count} 个候选可容纳；尚未计入问题、历史和知识，未调用模型" \
+        docker '核对中转商实际支持的上下文上限，再从菜单 3 调整并应用；不要截断提示词或绕过容量保护' "$start"
+    elif (( fitting < count )); then
+      doctor_add provider.prompt_capacity '完整提示词基础容量' WARN warning \
+        "基础输入估算 ${input}；仅 ${fitting}/${count} 个启用候选可容纳完整提示词及各自输出额度，部分候选会被跳过；尚未计入问题、历史和知识，未调用模型" \
+        docker '核对各接口实际容量；短探针通过不能证明完整客服请求可用' "$start"
+    else
+      doctor_add provider.prompt_capacity '完整提示词基础容量' PASS critical \
+        "基础输入估算 ${input}；${fitting}/${count} 个启用候选可容纳完整提示词及各自输出额度；尚未计入问题、历史和知识，具体请求仍由 Router 复核，未调用模型" docker '' "$start"
+    fi
+  elif ! doctor_remaining >/dev/null 2>&1; then
+    doctor_deadline_add provider.prompt_capacity '完整提示词基础容量' docker "$start"
+  else
+    doctor_add provider.prompt_capacity '完整提示词基础容量' FAIL critical '未能读取并核验运行容器的完整提示词及候选容量，不能认定客服推理可用' docker \
+      '检查资料应用状态、Prompt 摘要及接口池运行代；不要用短连接测试替代' "$start"
+  fi
+}
+
 doctor_pool_adapter_check() {
   local start output count healthy cooling unknown hook_secret plugin_secret vision_count vision_cooling vision_unknown
   start=$(doctor_now_ms)
   doctor_pool_rag_context_check
+  doctor_pool_prompt_capacity_check
   if (( DOCTOR_POOL_READY == 0 || DOCTOR_DOCKER_READY == 0 )); then
     for output in provider.adapter provider.adapter_binding anything.provider_binding n8n.runtime_binding provider.pool_health provider.pool_vision; do
       doctor_skip "$output" '主备接口运行检查' '因接口池或 Docker 上游故障未检查' docker
@@ -4048,6 +4100,7 @@ doctor_run_checks() {
     doctor_skip n8n.runtime 'n8n Code runner' '离线范围未检查' local-api
     doctor_skip n8n.execution_backlog 'n8n 生产执行积压' '离线范围不访问数据库' docker
     doctor_skip provider.adapter 'Provider adapter' '离线范围未检查' docker
+    doctor_skip provider.prompt_capacity '完整提示词基础容量' '离线范围未检查运行容器' docker
     doctor_skip provider.adapter_code_binding 'Provider adapter 程序运行代' '离线范围未检查单文件挂载' docker
     if (( DOCTOR_VISITOR_OUTPUT_ENABLED )); then
       doctor_skip provider.visitor_output_code_binding '访客输出策略运行代' '离线范围未检查单文件挂载' docker

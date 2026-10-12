@@ -35,7 +35,7 @@ METRICS = {
 }
 
 STRICT_ARCHIVE_VERSION = (1, 2, 2)
-AUTHORIZED_RELEASE = "v1.3.0"
+AUTHORIZED_RELEASE = "v1.3.1"
 MANIFEST_PATH = "scripts/release-manifest.txt"
 POLICY_PATH = "config/release-policy.json"
 ESSENTIAL_RELEASE_FILES = {

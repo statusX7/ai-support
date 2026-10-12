@@ -1127,6 +1127,7 @@ caddy_configuration_file_is_safe() {
 
 caddy_validate_configuration_file() {
   local deploy_dir=$1 candidate=$2 env_file=${3:-${1}/.env} container_path=/etc/caddy/Caddyfile
+  local output status
   local -a compose_command=(docker compose --project-directory "$deploy_dir"
     --env-file "$env_file" -f "${deploy_dir}/docker-compose.yml")
   local -a volume=()
@@ -1138,9 +1139,21 @@ caddy_validate_configuration_file() {
     volume=(--volume "${candidate}:${container_path}:ro")
   fi
   # 必须早于可能重建 Caddy 的第一次 up，而不只在刷新旧 inode 时校验。
-  COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
-    "${compose_command[@]}" --profile managed-https run --rm --no-deps --entrypoint caddy \
-    "${volume[@]}" caddy validate --config "$container_path" --adapter caddyfile >/dev/null 2>&1
+  # 预检不读用户输入。继承安装终端会使 timeout 的后台进程组触发 SIGTTIN，
+  # 即使 Caddy 已验证成功，Compose 仍可能挂到超时而被误判为配置失败。
+  if output=$(COMPOSE_PROGRESS=plain timeout --signal=TERM --kill-after=10s 60 \
+    "${compose_command[@]}" --profile managed-https run -T --interactive=false \
+    --rm --no-deps --entrypoint caddy "${volume[@]}" caddy validate \
+    --config "$container_path" --adapter caddyfile </dev/null 2>&1); then
+    return 0
+  else
+    status=$?
+  fi
+  warn "Caddy 配置预检失败（退出码 ${status}）；以下为脱敏诊断"
+  printf '%s\n' "$output" | python3 "${COMMON_DIR}/log-redact.py" \
+    --env "$env_file" --mode export >&2 \
+    || warn '未能安全输出预检详情；请检查配置和受限凭据文件'
+  return "$status"
 }
 
 caddy_install_configuration_copy() {
