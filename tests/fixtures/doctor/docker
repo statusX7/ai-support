@@ -97,6 +97,8 @@ case "$command" in
     if [[ "$joined" == *CRISPAI_PROMPT_CAPACITY* ]]; then
       [[ $# == 6 && "$1" == -T && "$2" == provider-adapter && "$3" == node && "$4" == -e && "$6" == /opt/crisp-ai ]] || exit 1
       service_stopped provider-adapter && exit 1
+      # The read-only probe must not inherit the administrator TTY.
+      [[ "${DOCTOR_FIXTURE_CAPACITY_REQUIRE_NON_TTY:-0}" != 1 || ! -t 0 ]] || exit 1
       # Execute the production calculation and real estimator against fixture files.
       # This branch never manufactures a capacity or health result.
       node -e "$5" "${DOCTOR_FIXTURE_DEPLOY:?}"

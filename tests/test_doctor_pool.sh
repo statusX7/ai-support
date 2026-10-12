@@ -121,6 +121,49 @@ invoke --local
 assert_result provider.pool_health PASS
 pass '当前代主接口真实成功证据与未检测状态区分'
 
+# The native Docker/TTY failure is reproduced on TARGET-A separately; this
+# fixture covers the production doctor's stdin contract without Docker.
+fixture_env python3 - "$PROJECT_ROOT" "$DEPLOY" <<'PY'
+import errno
+import json
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+source, deploy = sys.argv[1:]
+pid, descriptor = pty.fork()
+if pid == 0:
+    os.environ['DOCTOR_FIXTURE_CAPACITY_REQUIRE_NON_TTY'] = '1'
+    os.execv('/bin/bash', ['bash', source + '/scripts/doctor.sh', '--deploy-dir', deploy, '--local', '--json'])
+raw = bytearray()
+deadline = time.monotonic() + 45
+status = None
+while status is None:
+    ready, _, _ = select.select([descriptor], [], [], .1)
+    if ready:
+        try:
+            raw.extend(os.read(descriptor, 65536))
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+    found, value = os.waitpid(pid, os.WNOHANG)
+    if found:
+        status = value
+    elif time.monotonic() > deadline:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        raise AssertionError('终端自检超时')
+os.close(descriptor)
+assert os.waitstatus_to_exitcode(status) == 0, '终端自检未正常完成'
+report = json.loads(raw.decode())
+rows = [row for row in report['results'] if row['id'] == 'provider.prompt_capacity']
+assert len(rows) == 1 and rows[0]['status'] == 'PASS', '容量探针继承终端输入或未通过'
+PY
+pass '真实PTY下的只读容量探针关闭stdin，终端自检不误报故障'
+
 # Minimal capacity regression reuses the existing complete doctor fixture.
 cp -p -- "${DEPLOY}/config/materials-applied.json" "${TEST_ROOT}/capacity-materials.saved"
 cp -p -- "${DEPLOY}/config/prompt.md" "${TEST_ROOT}/capacity-prompt.saved"

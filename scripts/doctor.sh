@@ -1816,7 +1816,7 @@ doctor_pool_prompt_capacity_check() {
       fitting:entries.filter(entry=>input+entry.max_output_tokens<=entry.context_window).length,
       maximum:Math.max(...entries.map(entry=>entry.context_window)),
       required:Math.min(...entries.map(entry=>input+entry.max_output_tokens))}));
-  ' /opt/crisp-ai > "$output" 2>/dev/null \
+  ' /opt/crisp-ai < /dev/null > "$output" 2>/dev/null \
     && values=$(jq -er '[.input,.count,.fitting,.maximum,.required] |
       if all(.[]; type == "number" and floor == . and . >= 0) then @tsv else error("invalid capacity result") end' "$output" 2>/dev/null); then
     read -r input count fitting maximum required <<< "$values"
