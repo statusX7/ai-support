@@ -1272,6 +1272,51 @@ def signal_menu_cases():
     passing("SIGINT 提示瞬间30轮、多行首提示单INT 120轮及子菜单/隐藏/确认的INT/TERM/双信号/EOF，2秒内退出且TTY/秘密/配置保持")
 
 
+def review_responsibility_cases():
+    website = "11111111-1111-1111-1111-111111111111"
+    session = "session_review-menu-owned"
+    key = hashlib.sha256((website + ":" + session).encode()).hexdigest()
+    # 使用真实 stateKey 和事务建立本测试独有待复核记录，不写实际会话。
+    seed = r"""
+const path=require('path'),crypto=require('crypto');
+const root=process.argv[1],{createRuntime}=require(path.join(root,'n8n/runtime.js'));
+const website=process.argv[2],session=process.argv[3],runtime=createRuntime({CRISP_WEBSITE_ID:website},{root});
+const key=runtime.stateKey(website,session),id=crypto.createHash('sha256').update('review-menu-owned').digest('hex');
+runtime.transaction(key,state=>{state.jobs.push({id,control:false,event:'message:send',event_time:Date.now()-7200000,
+  received_at:Date.now(),status:'failed',responsibility_status:'unresolved_failure',failure_code:'operator_window_review_required',
+  recovery_requires_review:true,data:{session_id:session,from:'user',type:'text',content:'不应在列表输出的虚构正文'}});},website,session)
+  .then(()=>process.stdout.write(key));
+"""
+    created = invoke(["node", "-e", seed, str(DEPLOY), website, session])
+    assert created.returncode == 0, created.stdout
+    key = created.stdout.strip(); assert re.fullmatch(r"[a-f0-9]{64}", key)
+    state_file = DEPLOY / "data/runtime" / ("session-" + key + ".json")
+    original = state_file.read_bytes()
+    try:
+        terminal = Terminal("review-cancel")
+        terminal.expect("请选择："); terminal.send("7"); terminal.expect("请选择："); terminal.send("6")
+        terminal.expect("请选择序号"); terminal.send("1")
+        terminal.expect("确认关闭这一条咨询且不补发？"); terminal.send("0")
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+        output = terminal.finish()
+        assert "不应在列表输出的虚构正文" not in output
+        assert state_file.read_bytes() == original
+        passing("复核列表不输出正文；取消确认不改真实状态文件")
+        terminal = Terminal("review-close")
+        terminal.expect("请选择："); terminal.send("7"); terminal.expect("请选择："); terminal.send("6")
+        terminal.expect("请选择序号"); terminal.send("1")
+        terminal.expect("确认关闭这一条咨询且不补发？"); terminal.send("1")
+        terminal.expect("已按管理员确认关闭该咨询；没有发送答案")
+        terminal.expect("请选择："); terminal.send("0"); terminal.expect("请选择："); terminal.send("0"); terminal.finish()
+        state = json.loads(state_file.read_text()); job = state["jobs"][0]
+        assert job["status"] == "cancelled" and job["responsibility_status"] == "intentional_silence"
+        assert job["review_resolution"]["previous_failure_code"] == "operator_window_review_required"
+        assert state["mode"] == "ai" and state["generation"] == 0 and state["outgoing"] == {}
+        passing("菜单明确确认通过生产CLI及真实runtime关闭单条责任，不发送、不伪称已回答")
+    finally:
+        state_file.unlink(missing_ok=True)
+
+
 def main():
     global ENV
     for name in ("config", "scripts", "n8n", "docs"):
@@ -1320,6 +1365,11 @@ def main():
     assert adapter_port.isdecimal() and adapter.poll() is None
     ENV["PROVIDER_ADAPTER_MANAGEMENT_URL"] = f"http://127.0.0.1:{adapter_port}"
     try:
+        if os.environ.get("MENU_TEST_FOCUS") == "review":
+            review_responsibility_cases()
+            assert COUNT == 2
+            print(f"待复核菜单专项：{COUNT} 通过，0 失败；只运行定向入口。")
+            return
         if os.environ.get("MENU_TEST_FOCUS") == "welcome":
             welcome_presentation_cases()
             return
@@ -1427,6 +1477,7 @@ def main():
         assert result.returncode != 0, result.stdout
         assert json.loads((DEPLOY / "config/runtime.yaml").read_text())["enabled"] == json.loads(before)["enabled"]
         passing("运行时回读失败时CLI非零且保留旧总开关")
+        review_responsibility_cases()
         terminal = Terminal("welcome-resume")
         terminal.expect("请选择："); terminal.send("7"); terminal.expect("请选择："); terminal.send("2")
         terminal.expect("新恢复秒数"); terminal.send("0"); terminal.expect('设置已保存并完成实际回读')

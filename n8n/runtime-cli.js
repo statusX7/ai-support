@@ -3,12 +3,17 @@
 const fs = require('fs');
 const { createRuntime } = require('./runtime');
 const runtime = createRuntime(process.env);
-const [command = 'status', key, value] = process.argv.slice(2);
+const [command = 'status', key, value, token, confirmation] = process.argv.slice(2);
 (async () => {
   let result;
   if (command === 'list') result = await runtime.list();
   else if (command === 'observations') result = await runtime.observations();
   else if (command === 'status') result = { configuration: runtime.settings(), sessions: (await runtime.list()).map(({ key: id, mode, resume_at, pause_reason }) => ({ key: id, mode, resume_at, pause_reason })) };
+  else if (command === 'review-list') result = await runtime.reviewJobs();
+  else if (command === 'review-close') {
+    if (confirmation !== '--confirm-no-reply') throw new Error('关闭咨询必须显式确认 --confirm-no-reply；不会补发答案');
+    result = await runtime.closeReview(key, value, token);
+  }
   else if (command === 'resume') result = await runtime.resume(key);
   else if (command === 'adjust-resume') result = await runtime.adjustResume(key, value);
   else if (command === 'clear-analytics') result = await runtime.clearAnalytics();
@@ -24,6 +29,6 @@ const [command = 'status', key, value] = process.argv.slice(2);
     const escape = (value) => String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
     result = { instructions: '将片段放在站点已有 Crisp 初始化代码之后；无需重复安装 Crisp，不含 API 凭据。', html: '<script src="' + escape(script.href) + '" data-config-url="' + escape(configuration.href) + '" defer></script>', events: ['message:send', 'message:received', 'message:updated', 'session:sync:events'] };
   }
-  else throw new Error('未知操作：支持 status / list / resume / adjust-resume / validate-config / preview-rule / public-config');
+  else throw new Error('未知操作：支持 status / list / review-list / review-close / resume / adjust-resume / validate-config / preview-rule / public-config');
   process.stdout.write(JSON.stringify(result) + '\n');
 })().catch((error) => { process.stderr.write('操作失败：' + error.message + '\n'); process.exitCode = 1; });

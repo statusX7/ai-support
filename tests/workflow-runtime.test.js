@@ -1532,6 +1532,88 @@ const abortablePending = (signal, started) => {
       publishConfiguration('handoff', originalHandoff); publishConfiguration('runtime', originalRuntime);
     }
   });
+  await test('OW04 待复核列表只读，管理员明确关闭不补发、幂等并保留其它咨询', async () => {
+    const session = 'session_window-admin-close';
+    const config = readConfig('handoff');
+    const original = structuredClone(config); config.handoff.resume_after_seconds = 3600;
+    publishConfiguration('handoff', config);
+    try {
+      now += 100; const ambiguous = windowOperator(session);
+      const control = await receive(ambiguous); histories.set(session, [ambiguous.data]);
+      now += 1; const input = message(session, '需要管理员复核的旧咨询');
+      const visitor = await receive(input);
+      now += 3600001; await runtime.scan();
+      const fresh = await receive(message(session, '控制窗口结束后的新咨询'));
+      const file = path.join(root, 'data/runtime/session-' + visitor.key + '.json');
+      const originalBytes = fs.readFileSync(file);
+      const reviews = await runtime.reviewJobs();
+      assert.deepEqual(fs.readFileSync(file), originalBytes, '查看列表不得落盘归一化或处置');
+      const review = reviews.find((entry) => entry.job_id === visitor.jobId);
+      assert.equal(review.closable, true); assert.equal(review.failure_code, 'operator_window_review_required');
+      assert(!JSON.stringify(review).includes(input.data.content), '列表不包含客户正文');
+      const models = modelRequests.length; const posts = sendAttempts; const before = state(session);
+      await assert.rejects(runtime.closeReview(visitor.key, visitor.jobId, '0'.repeat(64)), /状态已变化/);
+      assert.deepEqual(fs.readFileSync(file), originalBytes);
+      const result = await runtime.closeReview(visitor.key, visitor.jobId, review.review_token);
+      assert.deepEqual(result, { closed: true, already_closed: false, reply_sent: false });
+      let snapshot = state(session); let closed = snapshot.jobs.find((job) => job.id === visitor.jobId);
+      assert.equal(closed.status, 'cancelled'); assert.equal(closed.responsibility_status, 'intentional_silence');
+      assert.equal(closed.responsibility_reason, 'administrator_closed');
+      assert.equal(closed.review_resolution.previous_failure_code, 'operator_window_review_required');
+      assert.equal(snapshot.generation, before.generation); assert.equal(snapshot.mode, before.mode);
+      assert.equal(snapshot.jobs.find((job) => job.id === fresh.jobId).status, 'received');
+      assert.deepEqual(snapshot.jobs.find((job) => job.id === control.jobId).operator_resolution,
+        before.jobs.find((job) => job.id === control.jobId).operator_resolution);
+      runtime = createRuntime(env, runtimeOptions); await runtime.scan();
+      assert.deepEqual(await runtime.closeReview(visitor.key, visitor.jobId, review.review_token),
+        { closed: true, already_closed: true, reply_sent: false });
+      assert.equal(modelRequests.length, models); assert.equal(sendAttempts, posts);
+      assert.equal((await receive(input)).reason, '重复事件已忽略');
+      assert.equal((await runtime.process(fresh.key, fresh.jobId)).status, 'sent');
+      assert.equal(modelRequests.length, models + 1); assert.equal(sendAttempts, posts + 1);
+      closed = state(session).jobs.find((job) => job.id === visitor.jobId);
+      assert.equal(closed.review_resolution.action, 'close_without_reply');
+      assert(!(await runtime.reviewJobs()).some((entry) => entry.job_id === visitor.jobId));
+    } finally { removeSessionState(session); histories.delete(session); publishConfiguration('handoff', original); }
+  });
+  await test('OW05 复核拒绝未知送达、推理责任和过期选择，关闭旧咨询不解除永久人工', async () => {
+    const session = 'session_window-admin-guards';
+    const config = readConfig('handoff'); const original = structuredClone(config);
+    config.handoff.resume_after_seconds = 3600; publishConfiguration('handoff', config);
+    try {
+      now += 100; const body = windowOperator(session); await receive(body); histories.set(session, [body.data]);
+      now += 1; const visitor = await receive(message(session, '保持复核的旧咨询'));
+      now += 3600001; await runtime.scan();
+      const file = path.join(root, 'data/runtime/session-' + visitor.key + '.json');
+      const first = (await runtime.reviewJobs()).find((entry) => entry.job_id === visitor.jobId);
+      const models = modelRequests.length; const posts = sendAttempts;
+      for (const variant of ['outgoing', 'provider', 'plan']) {
+        await runtime.transaction(visitor.key, (state) => {
+          const job = state.jobs.find((entry) => entry.id === visitor.jobId);
+          if (variant === 'outgoing') state.outgoing['97531001'] = { job_id: job.id, status: 'unknown', created_at: now };
+          if (variant === 'provider') job.provider_question_id = 'do-not-retire';
+          if (variant === 'plan') job.plan = { purpose: 'keyword_reply', type: 'text', content: '待核对正文' };
+        });
+        const before = fs.readFileSync(file);
+        const review = (await runtime.reviewJobs()).find((entry) => entry.job_id === visitor.jobId);
+        assert.equal(review.closable, false, variant);
+        await assert.rejects(runtime.closeReview(visitor.key, visitor.jobId, review.review_token), /不能直接关闭/);
+        assert.deepEqual(fs.readFileSync(file), before, variant);
+        await runtime.transaction(visitor.key, (state) => {
+          const job = state.jobs.find((entry) => entry.id === visitor.jobId);
+          delete state.outgoing['97531001']; delete job.provider_question_id; delete job.plan;
+        });
+      }
+      config.handoff.resume_after_seconds = 0; publishConfiguration('handoff', config); await operator(session);
+      await assert.rejects(runtime.closeReview(visitor.key, visitor.jobId, first.review_token), /状态已变化/);
+      const review = (await runtime.reviewJobs()).find((entry) => entry.job_id === visitor.jobId);
+      const before = state(session); assert.equal(before.mode, 'human'); assert.equal(before.resume_at, null);
+      await runtime.closeReview(visitor.key, visitor.jobId, review.review_token);
+      assert.equal(state(session).mode, 'human'); assert.equal(state(session).resume_at, null);
+      assert.equal(state(session).generation, before.generation);
+      assert.equal(modelRequests.length, models); assert.equal(sendAttempts, posts);
+    } finally { removeSessionState(session); histories.delete(session); publishConfiguration('handoff', original); }
+  });
   await test('P0 同一时间戳按持久 sequence 判断先后，控制后的访客消息仍处理一次', async () => {
     const before = sent.length;
     const item = await deferredOperatorCase('same-timestamp', { automated: true }, 0);

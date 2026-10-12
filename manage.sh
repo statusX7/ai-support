@@ -743,10 +743,32 @@ rules_menu() {
 
 runtime_cli() { docker_compose "$DEPLOY_DIR" exec -T n8n node /opt/crisp-ai/n8n/runtime-cli.js "$@"; }
 
+review_responsibility_menu() {
+  local listing selected key job token
+  manager_temporary || return; listing=$MANAGE_FILE
+  if ! runtime_cli review-list > "$listing"; then warn '无法读取待复核任务，未修改任何咨询'; return; fi
+  if ! jq -e 'type=="array"' "$listing" >/dev/null; then warn '待复核列表无效，未修改任何咨询'; return; fi
+  if [[ $(jq 'length' "$listing") == 0 ]]; then printf '当前没有待人工复核的咨询。\n'; return; fi
+  jq -M 'to_entries | map(.value + {id:(.key|tostring),name:("会话 "+(.value.session_id|gsub("[^A-Za-z0-9_-]";""))+"；原因 "+.value.failure_code+(if .value.closable then "；可人工关闭" else "；须先核对推理或送达状态" end))})' "$listing" > "$listing.array"
+  printf '请选择已由管理员核实不再需要自动回答的咨询；原身份仍未知，历史不会伪报为已回答。\n'
+  menu_pick_json "$listing.array" id name || return 0; selected=$MENU_SELECTED_ID
+  if ! jq -e --arg id "$selected" '.[] | select(.id==$id) | .closable==true' "$listing.array" >/dev/null; then
+    warn '该任务含其它待核对责任，本入口不会关闭或补发'; return
+  fi
+  key=$(jq -r --arg id "$selected" '.[] | select(.id==$id) | .key' "$listing.array")
+  job=$(jq -r --arg id "$selected" '.[] | select(.id==$id) | .job_id' "$listing.array")
+  token=$(jq -r --arg id "$selected" '.[] | select(.id==$id) | .review_token' "$listing.array")
+  menu_confirm '确认关闭这一条咨询且不补发？保留关闭原因，不改变人工状态或其它任务。' || return 0
+  if runtime_cli review-close "$key" "$job" "$token" --confirm-no-reply > "$listing.closed" \
+    && jq -e '.closed==true and .reply_sent==false' "$listing.closed" >/dev/null; then
+    printf '已按管理员确认关闭该咨询；没有发送答案，原失败原因与关闭记录保留。\n'
+  else warn '未能确认关闭；请重新查看状态，不要直接修改会话文件'; fi
+}
+
 handoff_menu() {
   local choice seconds candidate listing key
   while (( MANAGE_EOF == 0 )); do
-    printf '\n1. 查看恢复设置\n2. 修改恢复秒数\n3. 查看当前人工会话\n4. 手动恢复指定会话\n5. 调整指定会话倒计时\n0. 返回\n'
+    printf '\n1. 查看恢复设置\n2. 修改恢复秒数\n3. 查看当前人工会话\n4. 手动恢复指定会话\n5. 调整指定会话倒计时\n6. 复核待处理咨询（可明确关闭、不补发）\n0. 返回\n'
     menu_read choice '请选择：' || return
     case "$choice" in
       1) manager_action manager_tool configuration get handoff; printf '0 秒表示不自动恢复；正整数从最后有效真人回复或首次确认按钮点击计时。\n' ;;
@@ -757,6 +779,7 @@ handoff_menu() {
         jq -M --argjson seconds "$((10#$seconds))" '.handoff.resume_after_seconds=$seconds' "$candidate" > "$candidate.new"
         mv -f -- "$candidate.new" "$candidate"; printf '只影响后续新接管或真人回复，现有截止时间保留。\n'; manager_apply handoff "$candidate" ;;
       3) manager_action runtime_cli list ;;
+      6) review_responsibility_menu ;;
       4|5)
         manager_temporary || return; listing=$MANAGE_FILE
         if ! runtime_cli list > "$listing"; then warn '无法读取会话状态'; continue; fi

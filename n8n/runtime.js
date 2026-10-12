@@ -10751,6 +10751,54 @@ function createRuntime(env = {}, options = {}) {
     } catch (_) { /* 统计维护不能阻断客服与人工状态处理。 */ }
     finally { if (locked) { try { fs.rmdirSync(analytics + '/.events.lock'); } catch (_) {} } }
   };
+  const reviewJobToken = (state, job) => hash(canonical({
+    key: stateKey(state.website_id, state.session_id), generation: state.generation, job,
+  }));
+  const operatorReviewClosable = (state, job) => Boolean(job && job.control === false
+    && job.status === 'failed' && job.responsibility_status === 'unresolved_failure'
+    && job.failure_code === 'operator_window_review_required' && job.recovery_requires_review === true
+    && !job.plan && !job.inference && !job.execution_token && state.worker?.job !== job.id
+    && !Object.keys(job).some((name) => name.startsWith('provider_'))
+    && !job.delivery_receipt_unknown && !uncertainDeliveryFor(state, job)
+    && !Object.values(state.outgoing || {}).some((record) => !record || !record.job_id || record.job_id === job.id));
+  const reviewJobs = async () => {
+    ensureDirectory();
+    const result = [];
+    for (const filename of fs.readdirSync(directory).filter((name) => /^session-[a-f0-9]{64}\.json$/.test(name))) {
+      const key = filename.slice(8, -5);
+      const state = safeRead(statePath(key), null);
+      if (!stateIdentityMatchesKey(key, state)) throw stateIdentityMismatchError(key);
+      if (state.website_id !== env.CRISP_WEBSITE_ID) continue;
+      for (const job of state.jobs || []) {
+        if (job.control || job.responsibility_status !== 'unresolved_failure' || job.recovery_requires_review !== true) continue;
+        result.push({ key, job_id: job.id, session_id: state.session_id, event_time: job.event_time,
+          failure_code: /^[a-z0-9_]{1,80}$/.test(job.failure_code || '') ? job.failure_code : 'unknown',
+          closable: operatorReviewClosable(state, job), review_token: reviewJobToken(state, job) });
+      }
+    }
+    return result;
+  };
+  const closeReview = (key, jobId, token) => transaction(key, (state) => {
+    if (state.website_id !== env.CRISP_WEBSITE_ID || !/^[a-f0-9]{64}$/.test(jobId || '')
+      || !/^[a-f0-9]{64}$/.test(token || '')) throw new Error('待复核任务标识无效');
+    const job = state.jobs.find((entry) => entry.id === jobId);
+    if (job?.review_resolution?.action === 'close_without_reply'
+      && job.review_resolution.review_token === token && job.status === 'cancelled'
+      && job.responsibility_status === 'intentional_silence'
+      && job.responsibility_reason === 'administrator_closed') {
+      return { closed: true, already_closed: true, reply_sent: false };
+    }
+    if (!operatorReviewClosable(state, job)) throw new Error('该责任不能直接关闭：仅支持未进入推理或出站的过期身份窗口咨询');
+    if (reviewJobToken(state, job) !== token) throw new Error('任务状态已变化，请重新查看后确认');
+    // 管理员明确结束责任，不证明身份或业务已回答，也不解除其它任务的保护。
+    job.review_resolution = { schema_version: 1, action: 'close_without_reply', closed_at: clock(),
+      previous_failure_code: job.failure_code, failure_since: job.failure_since ?? null,
+      review_token: token };
+    job.status = 'cancelled'; job.retry_at = null; job.lease_until = 0;
+    markIntentionalSilence(job, 'administrator_closed');
+    delete job.recovery_requires_review;
+    return { closed: true, already_closed: false, reply_sent: false };
+  });
   const resume = (key) => transaction(key, (state) => {
     if (!state.website_id) throw new Error('会话不存在');
     // 已是 AI 时恢复是幂等操作，不取消新问题或作废仍有效的按钮。
@@ -10818,7 +10866,7 @@ function createRuntime(env = {}, options = {}) {
     } finally { fs.rmdirSync(lock); }
     return { removed_files: removed, conversation_control_preserved: true };
   };
-  return { receive, process, scan, catchup, list, resume, adjustResume, publicConfig, observations, clearAnalytics, settings, validateConfig, matchRule, stateKey, readState, transaction, imageContent, transcript, administratorQuery };
+  return { receive, process, scan, catchup, list, reviewJobs, closeReview, resume, adjustResume, publicConfig, observations, clearAnalytics, settings, validateConfig, matchRule, stateKey, readState, transaction, imageContent, transcript, administratorQuery };
 }
 
 if (typeof module !== 'undefined') module.exports = { createRuntime, prepareKnowledgeContext, mechanicalFailureAnswer };
