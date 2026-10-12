@@ -281,6 +281,7 @@ prepare_fixture() {
   cp -p -- "${PROJECT_ROOT}/config/prompt.md.example" "${DEPLOY}/config/prompt.md"
   cp -p -- "${PROJECT_ROOT}/config/app.yaml" "${DEPLOY}/config/app.yaml"
   cp -p -- "${PROJECT_ROOT}/config/Caddyfile.example" "${DEPLOY}/config/Caddyfile.example"
+  cp -p -- "${PROJECT_ROOT}/config/vision-probe.json" "${DEPLOY}/config/vision-probe.json"
   jq -M '.applied_revision=.revision' "${DEPLOY}/config/runtime.yaml" > "${DEPLOY}/config/runtime.yaml.new"
   mv -f -- "${DEPLOY}/config/runtime.yaml.new" "${DEPLOY}/config/runtime.yaml"
   jq -M '.provider.base_url="https://provider.example.test/v1" |

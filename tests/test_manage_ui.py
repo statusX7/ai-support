@@ -1317,6 +1317,85 @@ runtime.transaction(key,state=>{state.jobs.push({id,control:false,event:'message
         state_file.unlink(missing_ok=True)
 
 
+
+def navigation_cancel_cases():
+    """真实PTY的取消不应冒充操作错误，更不应退出整层管理菜单。"""
+    observations=[]
+    for variant in ('option-empty','option-invalid','title-empty','menu-target-cancel','rule-target-cancel','rule-paste-cancel'):
+        before={name:(DEPLOY / ('config/'+name+'.yaml')).read_bytes() for name in ('menu','keyword')}
+        terminal=Terminal('navigation-'+variant)
+        error=None
+        try:
+            terminal.expect('请选择：')
+            if variant.startswith('rule-'):
+                terminal.send('6');terminal.expect('1. 查看规则');terminal.expect('请选择：');terminal.send('2')
+                terminal.expect('规则名称');terminal.send('隔离取消回归')
+                terminal.expect('关键词（逗号分隔');terminal.send('::PASTE::' if variant=='rule-paste-cancel' else '合成菜单词')
+                if variant=='rule-paste-cancel':
+                    terminal.expect('::CANCEL:: 取消');terminal.send('::CANCEL::')
+                else:
+                    for prompt,answer in [('排除词（逗号分隔',''),('匹配：1 包含','1'),('动作：1 人工确认按钮','3'),
+                                         ('优先级整数',''),('重复展示冷却秒数',''),('按钮有效期秒数',''),('提示或固定回复文案','')]:
+                        terminal.expect(prompt);terminal.send(answer)
+                    terminal.expect('请选择这条规则打开的菜单：');terminal.expect('请选择序号');terminal.send('0')
+                terminal.expect('1. 查看规则',timeout=5)
+                depth=2
+            else:
+                terminal.send('9');terminal.expect('请选择：');terminal.send('8')
+                terminal.expect('1. 查看/预览菜单');terminal.expect('请选择：');terminal.send('4')
+                terminal.expect('请选择序号');terminal.send('1')
+                terminal.expect('选项数字（0 为返回选项，回车取消）：')
+                if variant in ('option-empty','option-invalid'):
+                    terminal.send('' if variant=='option-empty' else 'invalid')
+                else:
+                    terminal.send('99');terminal.expect('按钮标题：')
+                    terminal.send('' if variant=='title-empty' else '取消目标')
+                    if variant=='menu-target-cancel':
+                        terminal.expect('动作：1 下级菜单');terminal.send('1')
+                        terminal.expect('请选择目标菜单：');terminal.expect('请选择序号');terminal.send('0')
+                terminal.expect('1. 查看/预览菜单',timeout=5)
+                depth=3
+            for _ in range(depth):terminal.expect('请选择：');terminal.send('0')
+            terminal.finish()
+            assert all((DEPLOY / ('config/'+name+'.yaml')).read_bytes()==data for name,data in before.items())
+            passing('正常取消返回且原配置保持：'+variant)
+        except AssertionError as exc:
+            error=str(exc)[-1400:]
+            if terminal.process.poll() is None:
+                os.killpg(terminal.process.pid,signal.SIGTERM);terminal.process.wait(timeout=5)
+            for _ in range(3):terminal.read()
+            try:os.close(terminal.master)
+            except OSError:pass
+            (WORK / (terminal.name+'.log')).write_text(terminal.output,encoding='utf-8')
+        observations.append({'case':variant,'passed':error is None,'exit_code':terminal.process.returncode,
+            'configuration_preserved':all((DEPLOY / ('config/'+name+'.yaml')).read_bytes()==data for name,data in before.items()),'error':error})
+    (WORK / 'navigation-results.json').write_text(json.dumps(observations,ensure_ascii=False,indent=2)+'\n')
+    print(json.dumps({'navigation_cancel_observations':observations},ensure_ascii=False),flush=True)
+    assert all(item['passed'] is True for item in observations),'取消路径失败，原记录保留于 '+str(WORK)
+    original=json.loads((DEPLOY / 'config/menu.yaml').read_text())
+    root_number=str(sorted(original['menus']).index(original['root'])+1)
+    terminal=Terminal('navigation-option-save')
+    terminal.expect('请选择：');terminal.send('9');terminal.expect('请选择：');terminal.send('8')
+    terminal.expect('请选择：');terminal.send('4');terminal.expect('请选择序号');terminal.send(root_number)
+    for prompt,answer in [('选项数字','99'),('按钮标题：','隔离固定步骤'),('动作：1 下级菜单','2'),
+                         ('固定回复文案：','仅用于隔离回归的固定业务步骤。'),('显示顺序','99')]:
+        terminal.expect(prompt);terminal.send(answer)
+    try:
+        terminal.expect('设置已保存并完成实际回读',timeout=45)
+    except AssertionError:
+        (WORK / (terminal.name+'.log')).write_text(terminal.output,encoding='utf-8')
+        if terminal.process.poll() is None:
+            os.killpg(terminal.process.pid,signal.SIGTERM);terminal.process.wait(timeout=5)
+        os.close(terminal.master)
+        raise
+    for _ in range(3):terminal.expect('请选择：');terminal.send('0')
+    terminal.finish()
+    current=json.loads((DEPLOY / 'config/menu.yaml').read_text())
+    assert current['menus'][current['root']]['options']['99']['action']=={'type':'reply','text':'仅用于隔离回归的固定业务步骤。'}
+    passing('相同编辑入口仍实际保存固定业务步骤并完成回读')
+    neutral_rule_defaults_case()
+
+
 def main():
     global ENV
     for name in ("config", "scripts", "n8n", "docs"):
@@ -1365,6 +1444,10 @@ def main():
     assert adapter_port.isdecimal() and adapter.poll() is None
     ENV["PROVIDER_ADAPTER_MANAGEMENT_URL"] = f"http://127.0.0.1:{adapter_port}"
     try:
+        if os.environ.get("MENU_TEST_FOCUS") == "navigation-cancel":
+            navigation_cancel_cases()
+            assert COUNT == 8
+            return
         if os.environ.get("MENU_TEST_FOCUS") == "review":
             review_responsibility_cases()
             assert COUNT == 2
@@ -1409,7 +1492,7 @@ def main():
         log_menu_cases()
         material_menu_cases()
         welcome_presentation_cases()
-        neutral_rule_defaults_case()
+        navigation_cancel_cases()
         presentation_cases()
         renderer_cases()
         for name, width, extra in (("wide", 110, {}), ("narrow", 42, {}), ("dumb", 110, {"TERM": "dumb", "NO_COLOR": "1"}), ("plain", 110, {"CRISPAI_NO_EMOJI": "1"}), ("nonutf8", 110, {"LC_ALL": "C"})):

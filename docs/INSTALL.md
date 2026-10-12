@@ -60,6 +60,8 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 验证：向导检查 Chat Completions / Responses 的实际回答，装好后 `3 → 9` 选择接口，再选文本或图片测试。填错用 `3 → 2 → 4` 获取/选择主接口模型，或 `3 → 2 → 5` 手填，最后选编辑页 `9` 验证保存。
 
+图片测试要求模型识别内置色块图的实际顺序；任意文字、“无法查看图片”或被截断的输出都不能确认图片能力。向导和管理入口使用同一份受管样例。通过只证明该样例可识别，不保证所有业务图片都能读懂。
+
 ### 4/10：Crisp Website ID
 
 这是目标工作区的唯一 ID，从 Crisp 的 `Settings → Workspace Settings → Setup Instructions` 取得。虚构格式例子：`11111111-1111-4111-8111-111111111111`；它不是邮箱、域名或 Token。ID 本身通常会出现在网页初始化代码中，但关联信息仍按私密部署资料保管。

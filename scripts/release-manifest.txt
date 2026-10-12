@@ -24,6 +24,7 @@ config/provider.yaml.example
 config/tags.yaml.example
 config/runtime.yaml.example
 config/logging.yaml.example
+config/vision-probe.json
 knowledge/README.md
 n8n/workflow.json
 n8n/runtime.js

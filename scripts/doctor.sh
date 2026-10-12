@@ -594,6 +594,7 @@ doctor_files_and_config_check() {
     scripts/knowledge-profile.py scripts/knowledge-profile.sh scripts/knowledge-component.js
     scripts/knowledge-lexical.py n8n/knowledge-lexical.js)
   installed_version=$(sed -n '1p' "${DOCTOR_DEPLOY_DIR}/VERSION" 2>/dev/null || true)
+  if version_at_least "$installed_version" v1.3.1; then required+=(config/vision-probe.json); fi
   DOCTOR_POOL_ENABLED=0
   if [[ -e "${DOCTOR_DEPLOY_DIR}/config/provider-pool-applied.json" \
     || $(env_get "${DOCTOR_DEPLOY_DIR}/.env" PROVIDER_POOL_REQUIRED 2>/dev/null || true) == true ]] \

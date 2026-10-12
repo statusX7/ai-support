@@ -48,13 +48,24 @@ function visitorFallbackFor(purpose, context = 'text') {
 // 只识别“整条可见答复主要在说当前不能回答，并要求等待或重试”的机械兜底。
 // 不能用这个函数扫描或改写用户 Prompt、知识、历史；包含真实排障步骤或业务事实
 // 的说明会留下实质残余，因此不会因为引用了相同词语而被误判。
+const TRADITIONAL_FAILURE_CHARACTERS = Object.freeze({
+  '暫':'暂','時':'时','無':'无','覆':'复','復':'复','請':'请','後':'后','試':'试','統':'统',
+  '務':'务','機':'机','網':'网','絡':'络','當':'当','為':'为','幫':'帮','應':'应','來':'来',
+  '這':'这','對':'对','謝':'谢','諒':'谅','錯':'错','誤':'误','現':'现','過':'过','會':'会',
+});
+
 function mechanicalFailureAnswer(value) {
   if (typeof value !== 'string') return false;
   const visible = value.trim().slice(0, 8000);
   if (!visible) return false;
+  // 只在判定副本中规范化；正文、引用和实际业务步骤不得被翻译或改写。
   const compact = visible.normalize('NFKC').toLowerCase().replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/[暫時無覆復請後試統務機網絡當為幫應來這對謝諒錯誤現過會]/gu,
+      (character) => TRADITIONAL_FAILURE_CHARACTERS[character])
     .replace(/[\p{P}\p{S}\s]+/gu, '');
   if (!compact) return false;
+  // 英文只匹配整条“模型/系统暂不可用＋重试”，不匹配拒绝、引述或排障步骤。
+  if (/^(?:(?:(?:im|iam|were|weare)?sorry(?:but)?)|apologies(?:fortheinconvenience)?)?(?:(?:the|our|this)?(?:ai(?:assistant|model|service|system)?|assistant|model|system|server))(?:is|are)?(?:(?:currently|temporarily|presently)){0,2}(?:unavailable|notavailable|busy|overloaded)(?:rightnow|atthemoment)?(?:please)?(?:tryagain|retry)(?:later|shortly|inamoment|inafewminutes)?(?:thankyouforyour(?:patience|understanding))?$/.test(compact)) return true;
   // 常见的非结构化安全拒绝是有效模型结果，不得通过换源绕过。
   if (/^(?:(?:真的|非常|十分|实在|很)?(?:抱歉|对不起|不好意思))?我(?:无法|不能|不便)(?:回答|答复)(?:(?:这个|该|此)?问题|(?:关于|针对|对于)?(?:您|你)?(?:的)?[\p{L}\p{N}]{1,64}(?:的)?(?:问题|咨询|请求))(?:了|呢)?$/u.test(compact)) return false;
   // 平台、业务服务或接口的单纯可用性陈述可能就是用户询问的事实；没有

@@ -420,7 +420,7 @@ async function recoverOnce(f,event,result){
   await test('主接口200机械故障切到备用，备用200机械故障继续切下一备用且仅出站业务答案',async f=>{
     const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
     f.behavior=async(call,response)=>{
-      if(call.index===0){send(response,{choices:[{message:{role:'assistant',content:'AI暂时无法回复，请稍后再试。'}}]});return true;}
+      if(call.index===0){send(response,{choices:[{message:{role:'assistant',content:'暫時無法回覆，請稍後再試。'}}]});return true;}
       return false;
     };
     await f.deliver(f.event('session_pool_mechanical-primary','合成主接口故障问题'));
@@ -432,7 +432,7 @@ async function recoverOnce(f,event,result){
     const send=(response,value)=>{response.setHeader('content-type','application/json');response.end(JSON.stringify(value));};
     f.behavior=async(call,response)=>{
       if(call.index===0){response.writeHead(503,{'content-type':'application/json'});response.end('{}');return true;}
-      if(call.index===1){send(response,{choices:[{message:{role:'assistant',content:'模型繁忙，请稍后再试，谢谢理解。'}}]});return true;}
+      if(call.index===1){send(response,{choices:[{message:{role:'assistant',content:'The AI assistant is temporarily unavailable. Please try again later.'}}]});return true;}
       return false;
     };
     await f.deliver(f.event('session_pool_mechanical-backup','合成备用接口故障问题'));

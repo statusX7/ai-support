@@ -351,10 +351,21 @@ function createAdapter(environment = process.env, fetchFunction) {
           if (!models.length) throw terminal('models_unavailable','接口未提供可用模型列表，可以手动填写模型');
           sendJson(response,200,{ok:true,models}); return;
         }
-        const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
-        const testBody = {temperature:0.7,messages:[{role:'user',content:body.vision ? [{type:'text',text:'请描述图片。'},{type:'image_url',image_url:{url:image}}]:'只回复：测试正常'}]};
+        const probe = body.vision ? JSON.parse(fs.readFileSync(path.join(__dirname,'../config/vision-probe.json'),'utf8')) : null;
+        if (probe && (probe.schema_version !== 1 || typeof probe.prompt !== 'string' || !probe.prompt.trim()
+          || !/^data:image\/png;base64,[A-Za-z0-9+/=]{1,12000}$/.test(probe.image_url || '')
+          || !/^[a-z]+(?:,[a-z]+){3}$/.test(probe.expected_answer || ''))) {
+          throw terminal('invalid_response','内置图片探测样例无效，未更新能力');
+        }
+        const testBody = {temperature:0.7,messages:[{role:'user',content:probe
+          ? [{type:'text',text:probe.prompt},{type:'image_url',image_url:{url:probe.image_url}}]:'只回复：测试正常'}]};
         const result = await invoke(testBody,settings,controller.signal);
         if (result.choices[0].message.refusal || result.choices[0].finish_reason === 'content_filter') throw terminal('safety_refusal','模型拒绝了测试内容，未更新能力');
+        if (result.choices[0].finish_reason === 'length') throw terminal('invalid_response','探测输出被截断，未更新能力');
+        const normalizeProbeAnswer = (value) => String(value || '').toLowerCase().replace(/[\s,，、。.!！]/gu,'');
+        if (probe && normalizeProbeAnswer(result.choices[0].message.content) !== normalizeProbeAnswer(probe.expected_answer)) {
+          throw terminal('invalid_response','图片识别结果与测试图不符，未确认图片能力');
+        }
         sendJson(response,200,{ok:true,id:body.entry_id || null,verified:true,api_mode:entry.mode,capabilities:{chat_completions:entry.mode === 'chat_completions',responses:entry.mode === 'responses',vision:body.vision === true}}); return;
       }
       if (request.url !== '/v1/chat/completions') { sendJson(response,404,{error:{message:'不支持的协议路由'}}); return; }

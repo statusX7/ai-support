@@ -103,6 +103,18 @@ pool_rag_context=$(env_get "${DEPLOY}/.env" PROVIDER_RAG_CONTEXT_WINDOW 2>/dev/n
   || fail '主备迁移夹具没有生成扣除候选输出额度后的共同输入预算 6992'
 export DOCTOR_FIXTURE_RAG_CONTEXT="$pool_rag_context"
 export DOCTOR_FIXTURE_RAG_API_CONTEXT="$pool_rag_context"
+if [[ "${CRISPAI_DOCTOR_VISION_ASSET_ONLY:-0}" == 1 ]]; then
+  invoke --offline; assert_result installation.files PASS
+  mv -- "$DEPLOY/config/vision-probe.json" "$TEST_ROOT/vision-probe.saved"
+  invoke --offline; assert_result installation.files FAIL
+  pass '当前版缺少实际视觉探测资源时明确安装不完整，不允许用连接通过代替'
+  printf 'v1.3.0\n' > "$DEPLOY/VERSION"
+  invoke --offline; assert_result installation.files PASS
+  mv -- "$TEST_ROOT/vision-probe.saved" "$DEPLOY/config/vision-probe.json"
+  cp -- "$PROJECT_ROOT/VERSION" "$DEPLOY/VERSION"
+  pass '旧版未提供新视觉资源不被跨版本自检误判缺失；原文件恢复'
+  exit 0
+fi
 before=$(business_hash)
 invoke --local
 if (( LAST_RC != 2 )); then

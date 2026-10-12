@@ -671,7 +671,7 @@ wizard_probe_json_endpoint() {
 
 wizard_probe_selected_model() {
   local work_dir=$1
-  local chat_payload responses_payload vision_payload tiny_image
+  local chat_payload responses_payload vision_payload probe_file probe_image probe_prompt expected vision_filter
 
   # 中转推理模型的输出额度包含 reasoning。实测16 token只有推理、没有正文，
   # 不能据此误判Chat不受支持；与Responses采用相同的有界64-token探针。
@@ -698,19 +698,36 @@ wizard_probe_selected_model() {
   fi
   [[ "$WIZARD_CHAT_CAPABILITY" == true || "$WIZARD_RESPONSES_CAPABILITY" == true ]] || return 1
 
-  tiny_image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+  probe_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../config" && pwd -P)/vision-probe.json"
+  if ! jq -e '.schema_version==1 and (.prompt|type=="string" and length>0) and
+    (.image_url|type=="string" and test("^data:image/png;base64,[A-Za-z0-9+/=]{1,12000}$")) and
+    (.expected_answer|type=="string" and test("^[a-z]+(,[a-z]+){3}$"))' "$probe_file" >/dev/null; then
+    wizard_error '内置图片探测样例缺失或无效，请使用完整程序包'; return 1
+  fi
+  probe_image=$(jq -r '.image_url' "$probe_file")
+  probe_prompt=$(jq -r '.prompt' "$probe_file")
+  expected=$(jq -r '.expected_answer | gsub(",";"")' "$probe_file")
+  # 探针必须回答图片事实。输出额度包含reasoning，不把OK或任意正文当识图成功。
+  vision_filter="ascii_downcase | gsub(\"[[:space:],，、。.!！]\";\"\") == \"${expected}\""
   if [[ "$WIZARD_API_MODE" == responses ]]; then
-    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
-      '{model:$model,input:[{role:"user",content:[{type:"input_text",text:"Reply only OK."},{type:"input_image",image_url:$image}]}],max_output_tokens:64}')
+    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$probe_image" --arg prompt "$probe_prompt" \
+      '{model:$model,input:[{role:"user",content:[{type:"input_text",text:$prompt},{type:"input_image",image_url:$image}]}],max_output_tokens:1200}')
     if wizard_probe_json_endpoint "$work_dir" responses "$vision_payload" \
-      '((has("error") | not) or .error == null or .error == false) and (((.output_text // "") | length > 0) or any(.output[]?.content[]?; .type=="output_text" and (.text | type=="string" and length>0)))'; then
+      "((has(\"error\") | not) or .error == null or .error == false) and
+        ((.status // \"completed\") == \"completed\") and
+        (any(.output[]?.content[]?; .type==\"refusal\") | not) and
+        ((.output_text // ([.output[]?.content[]? | select(.type==\"output_text\") | .text] | join(\"\"))) | ${vision_filter})"; then
       WIZARD_VISION_CAPABILITY=true
     else WIZARD_VISION_CAPABILITY=false; fi
   else
-    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$tiny_image" \
-      '{model:$model,messages:[{role:"user",content:[{type:"text",text:"Reply only OK."},{type:"image_url",image_url:{url:$image}}]}],max_tokens:64}')
+    vision_payload=$(jq -cn --arg model "$WIZARD_MODEL" --arg image "$probe_image" --arg prompt "$probe_prompt" \
+      '{model:$model,messages:[{role:"user",content:[{type:"text",text:$prompt},{type:"image_url",image_url:{url:$image}}]}],max_tokens:1200}')
     if wizard_probe_json_endpoint "$work_dir" chat/completions "$vision_payload" \
-      '((has("error") | not) or .error == null or .error == false) and (.choices[0].message.content | type == "string" and length > 0)'; then
+      "((has(\"error\") | not) or .error == null or .error == false) and
+        ((.choices[0].finish_reason // \"stop\") == \"stop\") and
+        ((.choices[0].message.refusal // \"\") == \"\") and
+        ((.choices[0].message.tool_calls // []) | length==0) and .choices[0].message.function_call == null and
+        (.choices[0].message.content | type == \"string\" and (${vision_filter}))"; then
       WIZARD_VISION_CAPABILITY=true
     else WIZARD_VISION_CAPABILITY=false; fi
   fi

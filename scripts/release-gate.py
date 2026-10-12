@@ -35,7 +35,7 @@ AUTHORIZED_RELEASE = "v1.3.1"
 MANIFEST_PATH = "scripts/release-manifest.txt"
 POLICY_PATH = "config/release-policy.json"
 ESSENTIAL_RELEASE_FILES = {
-    "VERSION", "get.sh", "install.sh", "manage.sh", "update.sh", "uninstall.sh",
+    "VERSION", "get.sh", "install.sh", "manage.sh", "update.sh", "uninstall.sh", "config/vision-probe.json",
     "docker-compose.yml", "config/app.yaml", POLICY_PATH, "n8n/workflow.json", "n8n/runtime.js",
     "n8n/knowledge-lexical.js", "n8n/build-workflow.js", "scripts/doctor.sh",
     "scripts/package-release.sh", "scripts/visitor-output.js",

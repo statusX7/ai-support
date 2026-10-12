@@ -132,6 +132,8 @@ if grep -Eq '(^| )(pull|up|stop|restart)( |$)' "$MOCK_DOCKER_LOG"; then
 fi
 [[ -f "${DEPLOY}/config/provider-pool-applied.json" ]] \
   || fail 'staged 部署缺少有效接口池投影'
+cmp -s -- "${PROJECT_ROOT}/config/vision-probe.json" "${DEPLOY}/config/vision-probe.json" \
+  || fail 'staged 部署没有复制同版视觉探测资源'
 [[ ! -e "$POOL_READBACK" && ! -L "$POOL_READBACK" ]] \
   || fail '首次 --skip-start 在组件启动前错误生成了 Provider 运行回读'
 install -m 0600 -- "${DEPLOY}/.env" "${WORK}/staged.env"

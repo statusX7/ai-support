@@ -443,6 +443,32 @@ jq -e '.status == "confirmed" and .provider.api_mode == "chat_completions" and
   || fail '仅支持Chat的推理模型仍因探测额度不足被误判为不可用'
 pass '仅支持 Chat 的推理型中转模型在有界探测后可完成配置'
 
+# 不重填十项，直接执行同一个生产探针；外部HTTP由既有curl夹具提供。
+for mode in responses chat_completions; do
+  for variant in correct cannot_see wrong_order truncated; do
+    vision_answer='blue,yellow,red,green'; expected_vision=true
+    vision_status=completed; vision_finish=stop
+    case "$variant" in
+      cannot_see) vision_answer='我无法查看图片，请描述截图内容。'; expected_vision=false ;;
+      wrong_order) vision_answer='red,green,blue,yellow'; expected_vision=false ;;
+      truncated) vision_status=incomplete; vision_finish=length; expected_vision=false ;;
+    esac
+    actual=$(PATH="${MOCK_DIR}:$PATH" MOCK_PROVIDER_CHAT_ONLY="$([[ "$mode" == chat_completions ]] && printf 1 || printf 0)" \
+      MOCK_PROVIDER_RESPONSES_ONLY="$([[ "$mode" == responses ]] && printf 1 || printf 0)" \
+      MOCK_PROVIDER_VISION_ANSWER="$vision_answer" MOCK_PROVIDER_VISION_STATUS="$vision_status" MOCK_PROVIDER_VISION_FINISH="$vision_finish" \
+      bash -euo pipefail -c '
+        source "$1"
+        WIZARD_BASE_URL=https://provider.invalid/v1
+        WIZARD_API_KEY=synthetic-vision-probe-key
+        WIZARD_MODEL=synthetic-vision-probe-model
+        wizard_probe_selected_model "$2"
+        printf "%s %s" "$WIZARD_API_MODE" "$WIZARD_VISION_CAPABILITY"
+      ' -- "$WIZARD" "$TEST_ROOT")
+    [[ "$actual" == "$mode $expected_vision" ]] || fail "视觉探测错误：$mode / $variant"
+  done
+done
+pass 'F03安装Chat/Responses图片探针必须识别正确色序，不能靠任意正文或截断声明能力'
+
 # 已确认配置只需要一次“复用”选择，不重新询问十项。
 REUSE_TRANSCRIPT="${TEST_ROOT}/reuse-transcript.log"
 REUSE_COUNT="${TEST_ROOT}/reuse-count"

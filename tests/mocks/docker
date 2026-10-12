@@ -619,7 +619,12 @@ case "$COMMAND" in
     fi
     ;;
   exec)
-    if [[ "${1:-}" == -T && "${2:-}" == anythingllm && "${3:-}" == node && "${4:-}" == - \
+    if [[ "$*" == *CRISPAI_PROMPT_CAPACITY* ]]; then
+      [[ $# == 6 && "$1" == -T && "$2" == provider-adapter && "$3" == node && "$4" == -e && "$6" == /opt/crisp-ai ]] || exit 1
+      [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 && -d "${MOCK_PROJECT_DIR:?}" ]] || exit 1
+      # 与 doctor 专项一致：执行实际只读估算器，不构造成功容量结果。
+      node -e "$5" "$MOCK_PROJECT_DIR"
+    elif [[ "${1:-}" == -T && "${2:-}" == anythingllm && "${3:-}" == node && "${4:-}" == - \
       && "${5:-}" =~ ^(observe|probe|configure-chunks)$ ]]; then
       mock_anything_runtime "knowledge-${5}" "${6:-}" "${7:-}" "${8:-}"
     elif [[ "$*" == *' anythingllm '* && "$*" == *'CRISPAI_EXPECTED_RAG_CONTEXT'* ]]; then

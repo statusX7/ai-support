@@ -660,7 +660,7 @@ rule_edit() {
   menu_read words '关键词（逗号分隔；::PASTE:: 逐行粘贴；回车保留）：' || return
   manager_temporary || return; lines=$MANAGE_FILE
   if [[ "$words" == ::PASTE:: ]]; then
-    menu_multiline "$lines" 32768 || return; words=$(jq -M -Rs 'split("\n") | map(select(length>0))' "$lines")
+    menu_multiline "$lines" 32768 || return 0; words=$(jq -M -Rs 'split("\n") | map(select(length>0))' "$lines")
   elif [[ -n "$words" ]]; then words=$(printf '%s' "$words" | jq -M -Rs 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')
   else words=$(jq -M -c '.keywords // ["人工","转人工","人工客服"]' <<< "$existing"); fi
   menu_read exclusions '排除词（逗号分隔；回车保留，::CLEAR:: 清空）：' || return
@@ -693,7 +693,7 @@ rule_edit() {
     menu|prompt)
       if [[ "$rule_action" == menu ]]; then
         field=target; manager_candidate menu || return; menus=$MANAGE_FILE
-        printf '请选择这条规则打开的菜单：\n'; menus_select_node "$menus" || return; value=$MENU_SELECTED_ID
+        printf '请选择这条规则打开的菜单：\n'; menus_select_node "$menus" || return 0; value=$MENU_SELECTED_ID
       else field=prompt; menu_read value '知识问答引导（回车保留）：' || return; fi
       if [[ -n "$value" ]]; then jq -M --arg field "$field" --arg value "$value" '.[$field]=$value' "$temp" > "$temp.new"; mv -f -- "$temp.new" "$temp"; fi ;;
   esac
@@ -822,11 +822,11 @@ menus_select_node() {
 
 menus_edit_option() {
   local candidate=$1 node_id=$2 number title action value position is_back=false
-  menu_read number '选项数字（0 为返回选项，回车取消）：' || return; [[ "$number" =~ ^[0-9]{1,2}$ ]] || return; number=$((10#$number))
-  menu_read title '按钮标题：' || return; [[ -n "$title" ]] || return
+  menu_read number '选项数字（0 为返回选项，回车取消）：' || return; [[ "$number" =~ ^[0-9]{1,2}$ ]] || return 0; number=$((10#$number))
+  menu_read title '按钮标题：' || return; [[ -n "$title" ]] || return 0
   menu_read action '动作：1 下级菜单 / 2 固定回复 / 3 知识问答 / 4 人工确认 / 5 返回父级：' || return
   case "$action" in
-    1) action=menu; printf '请选择目标菜单：\n'; menus_select_node "$candidate" || return; value=$MENU_SELECTED_ID ;;
+    1) action=menu; printf '请选择目标菜单：\n'; menus_select_node "$candidate" || return 0; value=$MENU_SELECTED_ID ;;
     2) action=reply; menu_read value '固定回复文案：' || return ;;
     3) action=prompt; menu_read value '知识问答引导：' || return ;; 4) action=show_handoff_offer; value='' ;;
     5) action=menu; is_back=true; value=$(jq -M -r --arg node "$node_id" '.menus[$node].parent // .root' "$candidate") ;; *) return ;;

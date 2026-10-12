@@ -1617,7 +1617,7 @@ copy_project_files() {
     config/app.yaml config/provider.yaml.example config/prompt.md.example
     config/keyword.yaml.example config/menu.yaml.example config/handoff.yaml.example
     config/tags.yaml.example config/feedback.yaml.example config/Caddyfile.example config/runtime.yaml.example
-    config/logging.yaml.example
+    config/logging.yaml.example config/vision-probe.json
     n8n/workflow.json n8n/runtime.js n8n/runtime-cli.js n8n/admin-query.js n8n/knowledge-lexical.js n8n/build-workflow.js n8n/web-chat.js
     scripts/provider-adapter.js scripts/visitor-output.js scripts/provider-router.js scripts/provider-envelope.js scripts/provider-pool.py
     scripts/knowledge-component.js

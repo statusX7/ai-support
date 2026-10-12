@@ -43,7 +43,7 @@ def main():
         digest = hashlib.sha256(original).hexdigest()
         checksum = artifacts / "SHA256SUMS"
         assert checksum.read_text(encoding="ascii") == digest + "  " + archive.name + "\n"
-        for required in ("scripts/materials-recovery.py", "scripts/atomic-config.py"):
+        for required in ("scripts/materials-recovery.py", "scripts/atomic-config.py", "config/vision-probe.json"):
             broken = identity.create_repository(
                 temporary / ("missing-" + Path(required).stem),
             )

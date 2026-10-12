@@ -5,6 +5,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
+const visionProbe = require('../config/vision-probe.json');
 const {createAdapter, parseHeaders, chatToResponses, mechanicalFailureAnswer} = require('../scripts/provider-adapter.js');
 const {VISITOR_FALLBACKS, visitorFallbackFor, mechanicalFailureAnswer: sharedMechanicalFailureAnswer,
   legacyGenericNonAnswer, sanitizeVisitorText} = require('../scripts/visitor-output.js');
@@ -16,7 +17,7 @@ async function main() {
   const configurationPath = path.join(work, 'provider.json');
   fs.writeFileSync(configurationPath, JSON.stringify({schema_version:2,provider:{}}));
   let calls = [], mode='responses', delay=0, answer='协议验证回答';
-  let responseEncoding='identity', chatFields={}, probeNeedsReasoning=false;
+  let responseEncoding='identity', chatFields={}, probeNeedsReasoning=false, responseFinish='stop';
   let temperatureFailure=null, temperatureStatus=400, temperatureBlockConfiguration=false;
   const upstream = http.createServer(async (request, response) => {
     let text=''; for await (const chunk of request) text += chunk;
@@ -59,8 +60,8 @@ async function main() {
         output:[{type:'reasoning',summary:[]}],usage:{output_tokens:64,output_tokens_details:{reasoning_tokens:64}}});
       else await sendJson({choices:[{message:{role:'assistant',content:'',reasoning_content:'合成推理'},finish_reason:'length'}]});
     }
-    else if (request.url === '/proxy/v1/responses' && mode === 'responses') await sendJson({id:'synthetic-response',output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}});
-    else if (request.url === '/proxy/v1/chat/completions' && mode === 'chat') await sendJson({id:'synthetic-chat',choices:[{message:{content:answer,...chatFields},finish_reason:'stop'}]});
+    else if (request.url === '/proxy/v1/responses' && mode === 'responses') await sendJson({id:'synthetic-response',...(responseFinish==='length'?{status:'incomplete',incomplete_details:{reason:'max_output_tokens'}}:{}),output:[{type:'message',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:4,output_tokens:3,total_tokens:7}});
+    else if (request.url === '/proxy/v1/chat/completions' && mode === 'chat') await sendJson({id:'synthetic-chat',choices:[{message:{content:answer,...chatFields},finish_reason:responseFinish}]});
     else if (mode === 'redirect') {response.writeHead(302,{location:'http://127.0.0.1:1/leak'});response.end();}
     else if (mode === 'empty') await sendJson({choices:[]});
     else await sendJson({error:{message:'secret-do-not-echo'}},401);
@@ -120,6 +121,17 @@ async function main() {
     responseEncoding='identity';answer='Chat 协议验证回答';
     pass('U01 gzip/deflate/br按解压后容量读取，未知、多重、损坏及炸弹拒绝');
     environment.PROVIDER_POOL_REQUIRED='true';environment.PROVIDER_ADAPTER_KEY='synthetic-management-key';
+    const png=Buffer.from(visionProbe.image_url.split(',')[1],'base64');
+    assert.equal(png.subarray(0,8).toString('hex'),'89504e470d0a1a0a');
+    assert.equal(png.readUInt32BE(16),320);assert.equal(png.readUInt32BE(20),96);
+    let offset=8;const idat=[];
+    while(offset<png.length){const size=png.readUInt32BE(offset),kind=png.subarray(offset+4,offset+8).toString();
+      if(kind==='IDAT')idat.push(png.subarray(offset+8,offset+8+size));offset+=12+size;}
+    const pixels=zlib.inflateSync(Buffer.concat(idat));
+    for(let row=0;row<96;row++)assert.equal(pixels[row*961],0);
+    assert.deepEqual([40,120,200,280].map(x=>[...pixels.subarray(1+x*3,1+x*3+3)]),
+      [[0,0,255],[255,255,0],[255,0,0],[0,255,0]],'独立核对PNG真实像素与颜色顺序');
+    assert.equal(visionProbe.expected_answer,'blue,yellow,red,green');
     probeNeedsReasoning=true;
     try {
       for (const protocol of ['responses','chat_completions']) {
@@ -129,6 +141,7 @@ async function main() {
         const probe=async (maximum,vision=true)=>fetch(`${base}/internal/provider/probe`,{method:'POST',
           headers:{authorization:'Bearer '+environment.PROVIDER_ADAPTER_KEY,'content-type':'application/json'},
           body:JSON.stringify({provider:{...provider,max_output_tokens:maximum},api_key:'synthetic-probe-key',vision})});
+        answer='Blue, Yellow, Red, Green.';
         const accepted=await probe(1200);assert.equal(accepted.status,200);
         assert.equal((await accepted.json()).verified,true);
         const budgetField=protocol==='responses'?'max_output_tokens':'max_tokens';
@@ -140,10 +153,23 @@ async function main() {
         assert.equal((await rejected.json()).error.code,'invalid_response');
         assert.equal(calls.at(-1).body[budgetField],64,'不得擅自超过管理员配置的输出额度');
         assert.equal(calls.length,beforeRejected+1,'预算不足必须明确失败，不能无限重试');
+        for(const wrong of ['我无法查看图片，请描述截图内容。','red,green,blue,yellow','任意可读正文']) {
+          answer=wrong;const failed=await probe(1200);assert.equal(failed.status,400);
+          assert.equal((await failed.json()).error.code,'invalid_response');
+        }
+        answer=visionProbe.expected_answer;responseFinish='length';
+        const truncated=await probe(1200);assert.equal(truncated.status,400);
+        assert.equal((await truncated.json()).error.code,'invalid_response');responseFinish='stop';
+        const content=protocol==='responses'?calls.at(-1).body.input[0].content:calls.at(-1).body.messages[0].content;
+        assert.equal(content[0].text,visionProbe.prompt);
+        assert.equal(protocol==='responses'?content[1].image_url:content[1].image_url.url,visionProbe.image_url);
+        assert(!content[0].text.includes(visionProbe.expected_answer),'问题不能把答案直接告诉模型');
+        answer='测试正常';
         const bounded=await probe(9000,false);assert.equal(bounded.status,200);
         assert.equal(calls.at(-1).body[budgetField],1200,'探针不能继承无限放大的输出额度');
       }
       pass('管理探针保留推理输出预算，Chat/Responses及图片遵守候选额度与1200上限，空正文仍拒绝');
+      pass('F03真实HTTP探测核对图片像素和顺序，拒绝无法识图、错误顺序、任意正文及截断');
     } finally {
       delete environment.PROVIDER_POOL_REQUIRED;delete environment.PROVIDER_ADAPTER_KEY;
       probeNeedsReasoning=false;environment.AI_API_MODE='chat_completions';mode='chat';
@@ -220,13 +246,22 @@ async function main() {
       'AI暂时无法回答您的曜石展柜问题，请稍后再试。', '客服暂时无法回答关于月桥通行牌的问题，请稍后再试。',
       '我现在没法回答这个，过一会儿再问吧。', '这会儿答不了，晚点再问我。',
       '服务开小差，待会再试一次。', '我暂时回答不了你的问题，请等一下再问。',
-      '抱歉，我现在答不上来，晚点再问吧。', '目前没办法回复你，待会儿再问。'];
+      '抱歉，我现在答不上来，晚点再问吧。', '目前没办法回复你，待会儿再问。',
+      '暫時無法回覆，請稍後再試。','目前系統繁忙，請稍後再試。','抱歉，AI暫時無法回應，請稍後再試。',
+      'The AI assistant is temporarily unavailable. Please try again later.',
+      "I'm sorry, but the AI model is currently unavailable. Please retry in a few minutes.",
+      'The system is busy. Please try again later.'];
     const substantive = ['网站显示“系统繁忙，请稍后再试”时，请检查网络设置并刷新页面。',
       '设置保存后可能需要几十秒生效；如页面仍显示旧值，刷新后再试。',
       '虚构月桥暂时不开放东门，请从西门进入。', '虚构蓝羽核验口当前不可用，请改用南侧人工检票口。',
       '抱歉，我无法回答这个问题。', '抱歉，我无法回答关于制造武器的问题。', '我不能回答您的账户问题。',
       '当前平台不可用。', '当前服务不可用，预计十分钟恢复。',
       '当前平台升级中。', '当前服务超时。', '请求人数较多。',
+      '請在 Windows 客戶端複製訂閱地址，然後點擊匯入。','當前服務維護中，預計十分鐘恢復。',
+      '抱歉，我無法回答這個問題。','Open Settings and import your subscription URL.',
+      'The service is under maintenance until 03:00. Please try again after that.',
+      'The AI service is unavailable.',"I'm sorry, I cannot help with that request.",
+      'If you see "The AI assistant is temporarily unavailable", open Settings and check the connection.',
       '你最希望先解决哪一处？可以把具体情况、相关提示和已经尝试的方法一起告诉我。'];
     assert.equal(mechanicalFailureAnswer,sharedMechanicalFailureAnswer,'adapter 必须直接复用公共分类函数');
     assert(mechanical.every(mechanicalFailureAnswer));assert(substantive.every(value=>!mechanicalFailureAnswer(value)));
@@ -247,8 +282,11 @@ async function main() {
         answer=failure;assert.equal((await post(body)).status,502,protocol+' 机械故障正文必须按无效响应拒绝');
       }
       answer=retiredGeneric;assert.equal((await post(body)).status,502,protocol+' 旧泛问正文必须在 adapter 出口拒绝');
-      answer=substantive[protocol==='responses'?0:1];const allowed=await post(body);assert.equal(allowed.status,200);
-      assert.equal((await allowed.json()).choices[0].message.content,answer);
+      for(const normal of substantive) {
+        if(legacyGenericNonAnswer(normal))continue;
+        answer=normal;const allowed=await post(body);assert.equal(allowed.status,200);
+        assert.equal((await allowed.json()).choices[0].message.content,answer,'正常多语言正文必须逐字保留');
+      }
       answer=mixed;const sanitized=await post(body);assert.equal(sanitized.status,200);
       assert.equal((await sanitized.json()).choices[0].message.content,mixed);
       answer='页面若显示“系统维护中，请稍后再试”，请先核对虚构蓝灯是否常亮。\n蓝灯常亮时改用南侧入口。';
