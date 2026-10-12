@@ -15,23 +15,19 @@ import sys
 import tarfile
 
 
+# v1.3.1 按维护者明确批准的增量验收收口，旧版回执不得自动升级。
 CHECKS = {
-    "candidate_installed", "production_files_match", "command_menu_doctor",
-    "fresh_install_resume", "runner_capacity_preserved",
-    "text_knowledge_image_no_rating", "exact_knowledge_answer_verified",
-    "welcome_state_verified", "failover_real_upstream",
-    "handoff_isolation_cancellation", "restart_new_login", "fixtures_removed_settings_restored",
-    "services_running", "privacy_scan_passed", "neutral_display_no_bot_badge",
-    "crisp_rest_catchup_verified", "doctor_soft_deleted_backlog_verified",
-    "eligible_messages_accounted", "knowledge_case_set_passed",
-    "generic_clarification_zero", "catchup_quarantine_budget_verified",
-    "observation_15_minutes",
+    "candidate_installed", "production_files_match", "installed_diagnostics_reviewed",
+    "fresh_install_resume", "managed_caddy_fresh_install", "token_input_visible_logs_private",
+    "gpt_relay_business_verified", "claude_relay_business_verified", "deepseek_relay_business_verified",
+    "crisp_exact_delivery_verified", "affected_regressions_passed", "unchanged_features_evidence_reused",
+    "configuration_data_preserved", "restart_new_login", "fixtures_removed_settings_restored",
+    "services_running", "privacy_scan_passed",
 }
 
 METRICS = {
-    "eligible_messages_total", "eligible_messages_accounted",
-    "unexplained_missing", "knowledge_cases_total", "knowledge_cases_passed",
-    "generic_clarifications", "observation_seconds", "duplicate_visible_answers",
+    "eligible_messages_total", "eligible_messages_accounted", "unexplained_missing",
+    "relay_models_total", "relay_models_passed", "generic_clarifications", "duplicate_visible_answers",
 }
 
 STRICT_ARCHIVE_VERSION = (1, 2, 2)
@@ -305,7 +301,7 @@ def verify(root, artifacts, receipt):
     fields = {"schema_version", "version", "commit", "archive_sha256", "target_alias", "checked_at", "checks", "metrics"}
     if not isinstance(record, dict) or set(record) != fields:
         raise ValueError("receipt")
-    if type(record["schema_version"]) is not int or record["schema_version"] != 2 \
+    if type(record["schema_version"]) is not int or record["schema_version"] != 3 \
             or record["version"] != version or record["commit"] != commit \
             or record["archive_sha256"] != digest or record["target_alias"] != "TARGET-A":
         raise ValueError("identity")
@@ -330,10 +326,9 @@ def verify(root, artifacts, receipt):
     if metrics["eligible_messages_total"] < 1 \
             or metrics["eligible_messages_accounted"] != metrics["eligible_messages_total"] \
             or metrics["unexplained_missing"] != 0 \
-            or metrics["knowledge_cases_total"] < 12 \
-            or metrics["knowledge_cases_passed"] != metrics["knowledge_cases_total"] \
+            or metrics["relay_models_total"] < 3 \
+            or metrics["relay_models_passed"] != metrics["relay_models_total"] \
             or metrics["generic_clarifications"] != 0 \
-            or metrics["observation_seconds"] < 900 \
             or metrics["duplicate_visible_answers"] != 0:
         raise ValueError("metrics")
     final_commit, final_version = source_identity(root, commit)

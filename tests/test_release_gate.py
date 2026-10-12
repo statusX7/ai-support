@@ -62,7 +62,7 @@ def main():
             print(f"通过：[UNIT/CONTRACT] 发布门禁拒绝遗漏 {required}", flush=True)
         receipt = temporary / "receipt.json"
         accepted = {
-            "schema_version": 2, "version": "v1.3.1", "commit": commit,
+            "schema_version": 3, "version": "v1.3.1", "commit": commit,
             "archive_sha256": digest, "target_alias": "TARGET-A",
             "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "checks": dict.fromkeys(gate.CHECKS, True),
@@ -70,21 +70,17 @@ def main():
                 "eligible_messages_total": 1,
                 "eligible_messages_accounted": 1,
                 "unexplained_missing": 0,
-                "knowledge_cases_total": 12,
-                "knowledge_cases_passed": 12,
+                "relay_models_total": 3,
+                "relay_models_passed": 3,
                 "generic_clarifications": 0,
-                "observation_seconds": 900,
                 "duplicate_visible_answers": 0,
             },
         }
         assert {
-            "crisp_rest_catchup_verified",
-            "doctor_soft_deleted_backlog_verified",
-            "eligible_messages_accounted",
-            "knowledge_case_set_passed",
-            "generic_clarification_zero",
-            "catchup_quarantine_budget_verified",
-            "observation_15_minutes",
+            "fresh_install_resume", "managed_caddy_fresh_install", "token_input_visible_logs_private",
+            "gpt_relay_business_verified", "claude_relay_business_verified", "deepseek_relay_business_verified",
+            "crisp_exact_delivery_verified", "affected_regressions_passed", "configuration_data_preserved",
+            "production_files_match", "privacy_scan_passed",
         }.issubset(gate.CHECKS)
         called = temporary / "publish-called"
         invoke = [
@@ -120,7 +116,9 @@ def main():
         save()
         check("同提交同资产且全部真实验收项通过的回执允许后续动作", True)
         save({**accepted, "schema_version": True})
-        check("布尔 true 不能冒充整数 schema_version 2")
+        check("布尔 true 不能冒充整数 schema_version 3")
+        save({**accepted, "schema_version": 2})
+        check("旧版回执不能冒充本轮增量验收")
         serialized = json.dumps(accepted)
         save_raw(serialized[:-1] + ', "version": "v1.3.1"}')
         check("顶层重复字段即使值相同也被拒绝")
@@ -138,16 +136,15 @@ def main():
             "eligible_messages_total": 0,
             "eligible_messages_accounted": 0,
             "unexplained_missing": 1,
-            "knowledge_cases_total": 11,
-            "knowledge_cases_passed": 11,
+            "relay_models_total": 2,
+            "relay_models_passed": 2,
             "generic_clarifications": 1,
-            "observation_seconds": 899,
             "duplicate_visible_answers": 1,
         }
         for field, value in invalid_metrics.items():
             save({**accepted, "metrics": {**accepted["metrics"], field: value}})
-            check(f"实机 P0 指标 {field} 未达到门槛时阻止发布")
-        save({**accepted, "metrics": {**accepted["metrics"], "observation_seconds": True}})
+            check(f"实机增量指标 {field} 未达到门槛时阻止发布")
+        save({**accepted, "metrics": {**accepted["metrics"], "relay_models_total": True}})
         check("布尔 true 不能冒充数值验收指标")
         now = datetime.datetime.now(datetime.timezone.utc)
         for time_value in (None, "invalid", "2020-01-01T00:00:00Z", "2999-01-01T00:00:00Z",

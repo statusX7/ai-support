@@ -198,7 +198,7 @@ def write_receipt(path, repository, archive, checks, *, valid=True):
     commit_id = run(["git", "rev-parse", "HEAD"], repository).stdout.strip()
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     record = {
-        "schema_version": 2,
+        "schema_version": 3,
         "version": VERSION,
         "commit": commit_id,
         "archive_sha256": digest,
@@ -209,10 +209,9 @@ def write_receipt(path, repository, archive, checks, *, valid=True):
             "eligible_messages_total": 1,
             "eligible_messages_accounted": 1,
             "unexplained_missing": 0,
-            "knowledge_cases_total": 12,
-            "knowledge_cases_passed": 12,
+            "relay_models_total": 3,
+            "relay_models_passed": 3,
             "generic_clarifications": 0,
-            "observation_seconds": 900,
             "duplicate_visible_answers": 0,
         },
     }
