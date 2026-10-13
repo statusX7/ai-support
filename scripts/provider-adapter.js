@@ -96,8 +96,13 @@ function upstreamFailure(status, body, headers) {
   const unsupportedTemperature = status === 400 && failure.kind === 'invalid_request'
     && body?.error?.param === 'temperature'
     && /unsupported|not support/i.test(String(body.error.message || ''));
+  const unsupportedMaxTokens = status === 400 && failure.kind === 'invalid_request'
+    && body?.error?.param === 'max_tokens'
+    && /not supported/i.test(String(body.error.message || ''))
+    && /use\s+['"]?max_completion_tokens['"]?\s+instead/i.test(String(body.error.message || ''));
   return new RouterError(failure.kind,'Provider 请求未返回可用结果',{failure,status:failure.status || 502,
-    ...(unsupportedTemperature ? {unsupportedParameter:'temperature'} : {})});
+    ...(unsupportedTemperature ? {unsupportedParameter:'temperature'}
+      : unsupportedMaxTokens ? {unsupportedParameter:'max_tokens'} : {})});
 }
 
 function responseToChat(body, model) {
@@ -241,7 +246,7 @@ function writeChatStream(response,result) {
 
 function createAdapter(environment = process.env, fetchFunction) {
   let router;
-  const unsupportedTemperatures = new Map();
+  const parameterOverrides = new Map();
   const root = environment.PROVIDER_ROOT || '/opt/crisp-ai';
   const pooled = () => environment.PROVIDER_POOL_REQUIRED === 'true' || !!environment.PROVIDER_POOL_PATH || fs.existsSync(path.join(environment.PROVIDER_ROOT || '/opt/crisp-ai','config/provider-pool-applied.json'));
   const configurationPending = () => {
@@ -260,24 +265,37 @@ function createAdapter(environment = process.env, fetchFunction) {
     const base = new URL(settings.base);
     if (environment.PROVIDER_HOST_GATEWAY && ['127.0.0.1','localhost'].includes(base.hostname)) base.hostname = environment.PROVIDER_HOST_GATEWAY;
     const endpoint = base.href.replace(/\/$/,'') + '/' + (settings.mode === 'responses' ? 'responses':'chat/completions');
-    if ((unsupportedTemperatures.get(parameterScope) || 0) > Date.now()) delete outbound.temperature;
-    else unsupportedTemperatures.delete(parameterScope);
+    const applyOverride = parameter => {
+      if (parameter === 'temperature') delete outbound.temperature;
+      else if (parameter === 'max_tokens' && settings.mode === 'chat_completions' && Object.hasOwn(outbound,'max_tokens')) {
+        outbound.max_completion_tokens = outbound.max_tokens;
+        delete outbound.max_tokens;
+      }
+    };
+    const cached = parameterOverrides.get(parameterScope);
+    if (cached?.expiresAt > Date.now()) {
+      for (const parameter of ['temperature','max_tokens']) if (cached[parameter]) applyOverride(parameter);
+    } else parameterOverrides.delete(parameterScope);
     let result;
-    try { result = await requestUpstream(endpoint,settings,outbound,signal,fetchFunction); }
-    catch (error) {
-      // An explicit parameter rejection is not an invalid customer question.
-      // Only retry this one optional field, on the same candidate and remaining budget.
-      if (error.unsupportedParameter !== 'temperature' || !Object.hasOwn(outbound,'temperature') || signal?.aborted) throw error;
-      if (pooled()) requireApplied();
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) { const timeoutError = new Error('请求超时'); timeoutError.name = 'AbortError'; throw timeoutError; }
-      delete outbound.temperature;
-      if (unsupportedTemperatures.size >= 128) unsupportedTemperatures.delete(unsupportedTemperatures.keys().next().value);
-      unsupportedTemperatures.set(parameterScope,Date.now()+3600000);
-      console.warn(JSON.stringify({event:'provider_parameter_compatibility',entry_id:settings.id || null,
-        protocol:settings.mode,parameter:'temperature',action:'use_provider_default',
-        message:'当前接口明确拒绝温度参数，使用接口默认值有界重试一次'}));
-      result = await requestUpstream(endpoint,{...settings,timeout:remaining},outbound,signal,fetchFunction);
+    // 两种明确参数拒绝可以依次出现；每项最多适配一次，共享原请求剩余预算。
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) { const error = new Error('请求超时'); error.name = 'AbortError'; throw error; }
+        result = await requestUpstream(endpoint,{...settings,timeout:remaining},outbound,signal,fetchFunction);
+        break;
+      } catch (error) {
+        const parameter = error.unsupportedParameter;
+        if (attempt >= 2 || signal?.aborted || !['temperature','max_tokens'].includes(parameter)
+          || !Object.hasOwn(outbound,parameter) || parameter === 'max_tokens' && settings.mode !== 'chat_completions') throw error;
+        if (pooled()) requireApplied();
+        applyOverride(parameter);
+        if (!parameterOverrides.has(parameterScope) && parameterOverrides.size >= 128) parameterOverrides.delete(parameterOverrides.keys().next().value);
+        parameterOverrides.set(parameterScope,{...parameterOverrides.get(parameterScope),[parameter]:true,expiresAt:Date.now()+3600000});
+        console.warn(JSON.stringify({event:'provider_parameter_compatibility',entry_id:settings.id || null,
+          protocol:settings.mode,parameter,action:parameter === 'max_tokens' ? 'use_max_completion_tokens':'use_provider_default',
+          message:'当前接口明确拒绝参数，在原输出额度和剩余时间内适配重试'}));
+      }
     }
     if (pooled()) requireApplied();
     return settings.mode === 'responses' ? responseToChat(result,settings.model):validChat(result,settings.model);

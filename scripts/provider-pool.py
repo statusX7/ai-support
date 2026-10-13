@@ -37,6 +37,7 @@ ADAPTER_FAILURES = {
     "authentication_failed": ("authentication_failed", 3, "接口鉴权失败；请核对本接口的地址、Key 与调用权限，原配置未更改"),
     "model_unavailable": ("model_unavailable", 1, "所选模型或对应推理端点不可用；请核对模型原名、请求协议与接口地址，原配置未更改"),
     "model_not_found": ("model_unavailable", 1, "所选模型或对应推理端点不可用；请核对模型原名、请求协议与接口地址，原配置未更改"),
+    "invalid_request": ("invalid_request", 1, "接口明确拒绝请求参数；请核对所选模型及上下文、输出限制，原配置未更改"),
     "protocol_error": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
     "protocol_mismatch": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
     "unsupported_protocol": ("protocol_error", 1, "接口响应不符合所选 Chat Completions 或 Responses 协议；请核对协议与地址路径，原配置未更改"),
@@ -791,8 +792,6 @@ class Manager:
             if action == "models" and (code in ("provider_error", "model_unavailable", "protocol_error")
                                        or unsafe_code == "invalid_request"):
                 code = "models_unavailable"
-            elif code == "provider_error" and unsafe_code == "invalid_request":
-                code = "protocol_error"
             canonical, status, message = ADAPTER_FAILURES.get(
                 code, ("provider_error", 1, "接口验证未通过；未采用上游返回的非受信任错误内容，原配置未更改"))
             failure = PoolError(canonical, message, status)

@@ -15,6 +15,7 @@ declare -A EXPECTED=(
   [authentication_failed]='鉴权'
   [model_unavailable]='模型'
   [protocol_error]='协议'
+  [invalid_request]='参数'
   [invalid_response]='响应'
   [rate_limited]='频率'
   [quota_exhausted]='额度'
@@ -30,7 +31,7 @@ for code in "${!EXPECTED[@]}"; do
 done
 [[ $(provider_error_message 'Bearer synthetic-secret https://upstream.invalid/?token=synthetic') == *'未能分类'* ]] \
   || fail '未知上游分类没有收敛为安全中文说明'
-pass '九类安全错误码均有独立中文说明，未知错误不回显原值'
+pass '各类安全错误码均有独立中文说明，未知错误不回显原值'
 
 generic_404=$(provider_error_message protocol_error)
 [[ "$generic_404" == *'请求协议不匹配'* && "$generic_404" == *'Base URL 路径'* ]] \
@@ -60,6 +61,7 @@ for value in \
   'authentication_failed:3:鉴权' \
   'model_unavailable:1:模型' \
   'protocol_error:1:协议' \
+  'invalid_request:1:参数' \
   'invalid_response:1:响应' \
   'rate_limited:4:频率' \
   'quota_exhausted:4:额度' \
@@ -101,3 +103,11 @@ doctor_provider_inference_failure protocol_error
   && "$DOCTOR_PROVIDER_FAILURE_SUGGESTION" == *'Chat Completions / Responses'* ]] \
   || fail 'doctor protocol_error 未显示独立中文分类'
 pass 'configuration 与 doctor 全链保留 protocol_error，并显示协议、地址路径和请求格式说明'
+status=0
+output=$(CRISPAI_DIAGNOSTIC_JSON=1 configuration_query_failure invalid_request 1) || status=$?
+(( status == 1 )) || fail 'configuration 参数错误返回码错误'
+jq -e '.verified == false and .error.code == "invalid_request"' <<< "$output" >/dev/null \
+  || fail 'configuration 参数错误被错误归类'
+doctor_provider_inference_failure invalid_request
+[[ "$DOCTOR_PROVIDER_FAILURE_SUMMARY" == '接口明确拒绝请求参数' ]] || fail 'doctor 参数错误被错误归类'
+pass '明确参数错误在菜单、管理员查询和自检中保持独立分类'

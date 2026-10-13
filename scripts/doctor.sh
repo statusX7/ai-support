@@ -4025,6 +4025,7 @@ doctor_provider_inference_failure() {
     quota_exhausted) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回额度或余额不足'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='处理该授权范围的额度，或配置有独立授权的备用接口' ;;
     upstream_timeout) DOCTOR_PROVIDER_FAILURE_SUMMARY='实际推理在限定时间内未完成'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='检查容器到上游的网络、接口响应时间及主备总预算' ;;
     upstream_unavailable|connection_failed) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游服务或容器网络连接不可用'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='检查 DNS/TLS、上游状态和容器实际地址；宿主可连不等于容器可连' ;;
+    invalid_request) DOCTOR_PROVIDER_FAILURE_SUMMARY='接口明确拒绝请求参数'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对模型原名及上下文、输出限制；参数拒绝不等于地址或响应协议错误' ;;
     protocol_error) DOCTOR_PROVIDER_FAILURE_SUMMARY='接口协议、地址路径或请求格式不兼容'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='从菜单 3 核对该接口的 Chat Completions / Responses 模式、Base URL 前缀及实际推理端点' ;;
     invalid_response) DOCTOR_PROVIDER_FAILURE_SUMMARY='上游返回空正文、非 JSON 或与所选协议不符'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='核对 Chat/Responses 协议及地址路径；不要只依据 /models 判定可用' ;;
     question_result_rejected) DOCTOR_PROVIDER_FAILURE_SUMMARY='旧推理结果未通过当前访客输出规则'; DOCTOR_PROVIDER_FAILURE_SUGGESTION='原问题已保留并进入受控恢复；若持续出现，请检查知识输入与 Provider 原始结果类别' ;;

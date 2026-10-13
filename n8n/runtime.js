@@ -1366,7 +1366,7 @@ function createRuntime(env = {}, options = {}) {
       'no_capable_provider', 'question_budget_exhausted', 'question_timeout', 'question_interrupted',
       'question_cancelled', 'question_result_absent', 'question_result_rejected', 'question_owner_changed', 'question_settled',
       'question_conflict', 'question_persistence_failed', 'provider_request_identity_unknown', 'provider_response_unknown',
-      'provider_receipt_identity_unresolved', 'safety_refusal', 'protocol_error']);
+      'provider_receipt_identity_unresolved', 'safety_refusal', 'protocol_error', 'invalid_request']);
     const upstream = String(response?.body?.error?.code || '');
     if (allowed.has(upstream)) return upstream;
     if (allowed.has(String(error?.code || ''))) return String(error.code);

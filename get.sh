@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CrispAI 公共发行包引导器。此文件必须能够脱离 Git 仓库和其他相邻文件独立运行。
-GET_VERSION="v1.3.2"
+GET_VERSION="v1.3.3"
 REPOSITORY="statusX7/ai-support"
 REPOSITORY_URL="https://github.com/${REPOSITORY}"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"

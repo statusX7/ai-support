@@ -26,7 +26,7 @@ const {createRuntime} = require('./runtime');
     'configuration_applying', 'pool_cooling', 'pool_exhausted', 'no_capable_provider',
     'question_budget_exhausted', 'question_timeout', 'question_interrupted', 'question_cancelled',
     'question_result_rejected',
-    'safety_refusal', 'protocol_error',
+    'safety_refusal', 'protocol_error', 'invalid_request',
     'provider_inference_failed',
   ]);
   const code = allowed.has(error?.code) ? error.code : 'admin_query_failed';

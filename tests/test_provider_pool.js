@@ -6,6 +6,7 @@ const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
+const visionProbe = require('../config/vision-probe.json');
 const {spawn} = require('node:child_process');
 const {createAdapter} = require('../scripts/provider-adapter.js');
 const {signEnvelope,envelopeMarker,verifyEnvelope,requestContract} = require('../scripts/provider-envelope.js');
@@ -45,7 +46,11 @@ async function fixture(count=1,policy={}) {
     const call={index,path:request.url,method:request.method,headers:request.headers,body}; f.calls.push(call);
     if (f.behavior && await f.behavior(call,response) === true) return;
     response.setHeader('content-type','application/json');
-    response.end(JSON.stringify(request.url.endsWith('/models') ? {data:[{id:'fixture-b'},{id:'fixture-a'},{id:'fixture-b'}]} : request.url.endsWith('/responses') ? {status:'completed',output:[{type:'message',content:[{type:'output_text',text:'Responses 回答'}]}],usage:{input_tokens:3,output_tokens:2}}:chat()));
+    const content=(body.messages || body.input)?.[0]?.content;
+    const isVisionProbe=Array.isArray(content) && content.some(part=>part.text===visionProbe.prompt)
+      && content.some(part=>part.image_url===visionProbe.image_url || part.image_url?.url===visionProbe.image_url);
+    const probeAnswer=isVisionProbe ? visionProbe.expected_answer : null;
+    response.end(JSON.stringify(request.url.endsWith('/models') ? {data:[{id:'fixture-b'},{id:'fixture-a'},{id:'fixture-b'}]} : request.url.endsWith('/responses') ? {status:'completed',output:[{type:'message',content:[{type:'output_text',text:probeAnswer || 'Responses 回答'}]}],usage:{input_tokens:3,output_tokens:2}}:chat(probeAnswer || undefined)));
   });
   await new Promise(resolve=>f.upstream.listen(0,'127.0.0.1',resolve));
   f.upstreamBase = `http://127.0.0.1:${f.upstream.address().port}`;
@@ -105,7 +110,9 @@ async function fixture(count=1,policy={}) {
 }
 
 let count=0;
-async function test(name,work) { await work();count++;process.stdout.write('通过 UNIT/PROTOCOL：'+name+'\n'); }
+const resumeAt = process.env.CRISPAI_PROVIDER_POOL_TEST_FROM || '';
+let resumed = !resumeAt;
+async function test(name,work) { if (!resumed && name === resumeAt) resumed = true; if (!resumed) return; await work();count++;process.stdout.write('通过 UNIT/PROTOCOL：'+name+'\n'); }
 
 function testCooldownJitter() {
   assert.equal(normalizeApiBase('https://EXAMPLE.invalid/'),'https://example.invalid/v1');
@@ -532,7 +539,7 @@ async function testManagementErrorClassification() {
   const managementBase=`http://127.0.0.1:${management.address().port}`;
   try {
     const cases=new Map([
-      ['authentication_failed',3],['model_unavailable',1],['protocol_error',1],['invalid_response',1],
+      ['authentication_failed',3],['model_unavailable',1],['protocol_error',1],['invalid_request',1],['invalid_response',1],
       ['rate_limited',4],['quota_exhausted',4],['upstream_timeout',4],['upstream_unavailable',4],['connection_failed',4]
     ]);
     for(const [code,status] of cases) {
@@ -557,11 +564,13 @@ async function testManagementErrorClassification() {
 }
 
 async function main() {
-  testCooldownJitter();
-  testLegacyEnvelopeBoundary();
-  await testMaintenanceTransactions();
-  await testRagContextTransactions();
-  await testManagementErrorClassification();
+  if (!resumeAt) {
+    testCooldownJitter();
+    testLegacyEnvelopeBoundary();
+    await testMaintenanceTransactions();
+    await testRagContextTransactions();
+    await testManagementErrorClassification();
+  }
   await test('幂等单接口迁移、独立内部Key、非敏感池与同代秘密',async()=>{
     const f=await fixture();try {
       const before=fs.readFileSync(f.poolFile,'utf8');const result=await f.cli(['migrate']);assert.equal(result.code,0);assert.equal(fs.readFileSync(f.poolFile,'utf8'),before);
@@ -1837,6 +1846,7 @@ async function main() {
       }finally{release();await f.close();}
     }
   });
+  assert(resumed && count > 0, '起始用例名称没有匹配，不能将零执行记为通过');
   process.stdout.write(`UNIT/PROTOCOL 主备协议合计 ${count} 组通过，0 失败\n`);
 }
 function copy(value){return JSON.parse(JSON.stringify(value));}

@@ -447,6 +447,7 @@ configuration_query_failure() {
     rate_limited) message='Provider 当前限流；该接口会按策略冷却，可检查备用接口状态' ;;
     quota_exhausted) message='Provider 返回额度或余额不足；不会立即重复请求同一授权范围' ;;
     model_unavailable) message='当前接口的模型或推理端点不可用；请核对模型原名、协议和 Base URL' ;;
+    invalid_request) message='Provider 明确拒绝请求参数；请核对模型及上下文、输出限制，未将参数错误误报为地址错误' ;;
     protocol_error) message='Provider 协议、地址路径或请求格式不兼容；请核对 Chat Completions / Responses 模式、Base URL 前缀及实际推理端点' ;;
     upstream_timeout) message='Provider 请求在本次限定时间内未完成；请检查网络、上游状态或超时策略' ;;
     upstream_unavailable|connection_failed) message='Provider 上游或容器到接口的网络连接不可用；请检查服务状态、DNS/TLS 和容器地址' ;;

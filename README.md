@@ -2,7 +2,7 @@
 
 自用 Crisp AI 客服：n8n + AnythingLLM + PostgreSQL，提供中文快速初始化与 Shell 管理。
 
-v1.3.2 修复安装失败后的初始化编辑、上下文容量配置、事务残留恢复和管理入口不可用；持续维护既有消息应答责任、知识正确性与中转兼容。评价停用、1 主 20 备、中文菜单、人工会话隔离和一条命令安装继续保留。
+v1.3.3 修复 OhMyGPT 等中转对输出参数的兼容问题，以及参数拒绝被误报为协议或地址错误；保留 v1.3.2 的安装恢复修复。评价停用、1 主 20 备、中文菜单、人工会话隔离和一条命令安装继续保留。
 
 在 Debian 12/13 或 Ubuntu 22.04/24.04 服务器终端执行唯一推荐命令（普通用户会调用 `sudo`）：
 
@@ -17,4 +17,4 @@ bash -c 'set -euo pipefail; u=https://raw.githubusercontent.com/statusX7/ai-supp
 
 装好后，在任意目录运行 `crispai`。日常检查用 `crispai doctor`；查看日志用 `crispai logs status`；编辑资料后先 `crispai apply --check`，再 `crispai apply`。资料路径和完整操作见[配置说明](docs/CONFIG.md)。
 
-[新手安装](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布说明与验收状态](docs/releases/v1.3.2.md)
+[新手安装](docs/INSTALL.md) · [18 项菜单](docs/MENU.md) · [Crisp 接入](docs/CRISP.md) · [配置](docs/CONFIG.md) · [排障](docs/TROUBLESHOOTING.md) · [安全](docs/SECURITY.md) · [发布说明与验收状态](docs/releases/v1.3.3.md)

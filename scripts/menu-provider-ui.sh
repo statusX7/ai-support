@@ -6,6 +6,7 @@ provider_error_message() {
     authentication_failed) printf '%s\n' '接口鉴权失败：请核对本接口的地址、API Key 与模型调用权限。' ;;
     model_unavailable|model_not_found) printf '%s\n' '所选模型或对应推理端点不可用：请核对模型原名、请求协议与接口地址。' ;;
     protocol_error|protocol_mismatch|unsupported_protocol) printf '%s\n' '请求协议不匹配：请核对该接口应使用 Chat Completions 还是 Responses，以及 Base URL 路径。' ;;
+    invalid_request) printf '%s\n' '接口拒绝请求参数：请核对所选模型及上下文、输出限制；这不等于地址或响应协议错误。' ;;
     invalid_response) printf '%s\n' '接口响应无效：上游返回了空正文、非 JSON 或不符合所选协议的结构。' ;;
     rate_limited) printf '%s\n' '接口触发请求频率限制：请按服务端要求等待冷却，或核对独立授权的备用接口。' ;;
     quota_exhausted) printf '%s\n' '接口额度或余额不足：不会立即重复请求同一授权范围，可补充额度或使用独立授权的备用接口。' ;;
@@ -24,7 +25,7 @@ provider_error_code_from_file() {
     (.error.code // $fallback) as $code |
     if $code == "authentication_failed" or $code == "model_unavailable" or $code == "model_not_found"
       or $code == "protocol_error" or $code == "protocol_mismatch" or $code == "unsupported_protocol"
-      or $code == "invalid_response" or $code == "rate_limited" or $code == "quota_exhausted"
+      or $code == "invalid_request" or $code == "invalid_response" or $code == "rate_limited" or $code == "quota_exhausted"
       or $code == "upstream_timeout" or $code == "upstream_unavailable" or $code == "connection_failed"
       or $code == "temporarily_unavailable" or $code == "models_unavailable"
     then $code else $fallback end

@@ -19,6 +19,7 @@ async function main() {
   let calls = [], mode='responses', delay=0, answer='协议验证回答';
   let responseEncoding='identity', chatFields={}, probeNeedsReasoning=false, responseFinish='stop';
   let temperatureFailure=null, temperatureStatus=400, temperatureBlockConfiguration=false;
+  let outputParameterFailure=null, outputParameterStatus=400;
   const upstream = http.createServer(async (request, response) => {
     let text=''; for await (const chunk of request) text += chunk;
     const body=JSON.parse(text || '{}');
@@ -48,6 +49,9 @@ async function main() {
       }
       response.end(encoded);
     };
+    if (outputParameterFailure && Object.hasOwn(body,'max_tokens')) {
+      await sendJson({error:outputParameterFailure},outputParameterStatus);return;
+    }
     if (temperatureFailure && Object.hasOwn(body,'temperature')) {
       if (temperatureBlockConfiguration) {
         fs.mkdirSync(path.join(work,'config'),{recursive:true});
@@ -232,6 +236,53 @@ async function main() {
       temperatureFailure=null;temperatureStatus=400;temperatureBlockConfiguration=false;
       const marker=path.join(work,'config/provider-pool-transaction.json');
       if(fs.existsSync(marker))fs.unlinkSync(marker);
+    }
+    try {
+      outputParameterFailure={type:'invalid_request_error',code:'unsupported_parameter',param:'max_tokens',
+        message:"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."};
+      temperatureFailure={type:'invalid_request_error',code:'unsupported_value',param:'temperature',
+        message:"Unsupported value: 'temperature' does not support 0.7 with this model. Only the default (1) value is supported."};
+      environment.AI_MODEL='explicit-output-parameter';answer='参数适配后的完整答复';
+      const input={...body,temperature:0.7},snapshot=JSON.stringify(input),before=calls.length;
+      const adapted=await post(input);assert.equal(adapted.status,200);
+      assert.equal((await adapted.json()).choices[0].message.content,answer);
+      const attempts=calls.slice(before);assert.equal(attempts.length,3);
+      assert.equal(attempts[0].body.max_tokens,16384);
+      assert.equal(attempts[1].body.max_completion_tokens,16384);
+      assert.equal(attempts[1].body.temperature,0.7);
+      assert.equal(attempts[2].body.max_completion_tokens,16384);
+      assert.equal(Object.hasOwn(attempts[2].body,'temperature'),false);
+      for(const attempt of attempts.slice(1))assert.equal(Object.hasOwn(attempt.body,'max_tokens'),false);
+      for(const attempt of attempts)assert.deepEqual(attempt.body.messages,input.messages);
+      assert.equal(JSON.stringify(input),snapshot);
+      const cachedBefore=calls.length;assert.equal((await post(input)).status,200);assert.equal(calls.length,cachedBefore+1);
+      environment.AI_API_KEY=originalKey+'-output-rotated';
+      const rotated=calls.length;assert.equal((await post(input)).status,200);assert.equal(calls.length,rotated+3);
+      environment.AI_API_KEY=originalKey;
+      pass('明确max_tokens拒绝保留额度改用max_completion_tokens，可串联温度适配，缓存按凭据隔离');
+      temperatureFailure=null;
+      for(const [status,param,message] of [[401,'max_tokens',outputParameterFailure.message],
+        [400,'messages',outputParameterFailure.message],[400,'max_tokens','max_tokens must be a positive integer']]) {
+        environment.AI_MODEL='no-compat-'+status+'-'+param+'-'+message.length;
+        outputParameterStatus=status;outputParameterFailure={...outputParameterFailure,param,message};
+        const start=calls.length;assert.equal((await post(input)).status,status);assert.equal(calls.length,start+1);
+      }
+      pass('认证、其他字段和无明确替代建议的参数拒绝不重试，不擅自删除输出上限');
+      outputParameterStatus=400;outputParameterFailure={type:'invalid_request_error',param:'max_tokens',
+        message:"max_tokens is not supported. Use max_completion_tokens instead."};
+      environment.AI_MODEL='output-shared-deadline';delay=600;
+      assert.equal((await post(input)).status,504);delay=0;
+      pass('输出参数适配与初次请求共享超时预算');
+      environment.PROVIDER_POOL_REQUIRED='true';environment.PROVIDER_ADAPTER_KEY='synthetic-management-key';
+      outputParameterFailure=null;temperatureFailure={type:'invalid_request_error',param:'messages',message:'invalid secret-do-not-echo'};
+      const invalid=await fetch(`${base}/internal/provider/probe`,{method:'POST',headers:{authorization:'Bearer '+environment.PROVIDER_ADAPTER_KEY,'content-type':'application/json'},
+        body:JSON.stringify({provider:{base_url:environment.AI_API_BASE_URL,model:'invalid-parameters',api_mode:'chat_completions'},api_key:'synthetic-probe-key'})});
+      assert.equal((await invalid.json()).error.code,'invalid_request');
+      pass('管理探针保留明确请求参数错误分类');
+    } finally {
+      outputParameterFailure=null;outputParameterStatus=400;temperatureFailure=null;delay=0;
+      environment.AI_MODEL=originalModel;environment.AI_API_KEY=originalKey;
+      delete environment.PROVIDER_POOL_REQUIRED;delete environment.PROVIDER_ADAPTER_KEY;
     }
     const mechanical = ['暂时无法回复，请稍后再试。', '  抱歉，暂时无法回复，请稍后再试。谢谢理解！  ',
       '系\u200b统　正忙，请稍后再试，谢谢理解。', '当前暂时不能答复，建议过一会儿再试。',

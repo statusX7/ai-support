@@ -974,10 +974,11 @@ const deliverThroughHeldVectorFailure = async (fixture, event, control) => {
 };
 
 const selectedGroup = process.env.CRISPAI_PROVIDER_REPLY_TEST_GROUP || 'all';
-if (!['all', 'completeness'].includes(selectedGroup)) throw new Error('未支持的 Provider 回复专项');
+if (!['all', 'completeness', 'request-compatibility'].includes(selectedGroup)) throw new Error('未支持的 Provider 回复专项');
 let passed = 0;
 async function test(name, action) {
   if (selectedGroup === 'completeness' && !name.startsWith('F04 ')) return;
+  if (selectedGroup === 'request-compatibility' && !name.startsWith('参数兼容 ')) return;
   const instance = await fixture(`case-${passed}`, 'normal');
   try {
     await action(instance);
@@ -989,6 +990,31 @@ async function test(name, action) {
 }
 
 (async () => {
+  await test('参数兼容 同一主接口连续调整输出参数与温度后只送达一份答案', async (f) => {
+    f.setBehavior(async (call,response) => {
+      let error;
+      if(Object.hasOwn(call.body,'max_tokens'))error={type:'invalid_request_error',param:'max_tokens',
+        message:'max_tokens is not supported. Use max_completion_tokens instead.'};
+      else if(Object.hasOwn(call.body,'temperature'))error={type:'invalid_request_error',param:'temperature',message:'temperature not supported'};
+      if(!error)return false;
+      response.writeHead(400,{'content-type':'application/json'});response.end(JSON.stringify({error}));return true;
+    });
+    const event=f.event('parameter-success'),result=await f.deliver(event);
+    assert.equal(result.status,'sent');assert.deepEqual(f.calls.map(call=>call.index),[0,0,0]);
+    assert.equal(f.calls[0].body.max_tokens,f.calls[2].body.max_completion_tokens);
+    assert.equal(f.crispPostAttempts.length,1);assertSingleBusinessReply(f);
+    assert.equal(pendingJob(f,event,result.jobId).responsibility_status,'answered_confirmed');
+  });
+  await test('参数兼容 真正参数错误保留invalid_request且不伪造澄清或轰炸备用', async (f) => {
+    f.setBehavior(async (_call,response) => {
+      response.writeHead(400,{'content-type':'application/json'});
+      response.end(JSON.stringify({error:{type:'invalid_request_error',param:'messages',message:'invalid input'}}));return true;
+    });
+    const event=f.event('parameter-invalid'),result=await f.deliver(event);
+    assert.equal(result.status,'unresolved');assert.equal(f.calls.length,1);assert.equal(f.crispPostAttempts.length,0);
+    assert.equal(pendingJob(f,event,result.jobId).failure_code,'invalid_request');
+    assertNoVisibleFailureReply(f);
+  });
   for (const variant of ['backup-complete', 'all-truncated', 'valid-refusal']) {
     await test('F04 ' + variant, async (f) => {
       const partial = '第一步：打开客户端。第二步：';
