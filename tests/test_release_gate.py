@@ -37,7 +37,7 @@ def main():
         assert package_result.returncode == 0, (
             package_result.returncode, package_result.stdout, package_result.stderr,
         )
-        archive = artifacts / "ai-support-v1.3.1.tar.gz"
+        archive = artifacts / f"ai-support-{identity.VERSION}.tar.gz"
         original = archive.read_bytes()
         archive.write_bytes(original)
         digest = hashlib.sha256(original).hexdigest()
@@ -54,7 +54,7 @@ def main():
             identity.commit(broken, "fixture missing required helper")
             broken_commit = run(["git", "rev-parse", "HEAD"], broken).stdout.strip()
             try:
-                gate.release_manifest(broken, broken_commit, "v1.3.1")
+                gate.release_manifest(broken, broken_commit, identity.VERSION)
             except ValueError as error:
                 assert str(error) == "manifest"
             else:
@@ -62,7 +62,7 @@ def main():
             print(f"通过：[UNIT/CONTRACT] 发布门禁拒绝遗漏 {required}", flush=True)
         receipt = temporary / "receipt.json"
         accepted = {
-            "schema_version": 3, "version": "v1.3.1", "commit": commit,
+            "schema_version": 3, "version": identity.VERSION, "commit": commit,
             "archive_sha256": digest, "target_alias": "TARGET-A",
             "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "checks": dict.fromkeys(gate.CHECKS, True),
@@ -120,7 +120,7 @@ def main():
         save({**accepted, "schema_version": 2})
         check("旧版回执不能冒充本轮增量验收")
         serialized = json.dumps(accepted)
-        save_raw(serialized[:-1] + ', "version": "v1.3.1"}')
+        save_raw(serialized[:-1] + ', "version": ' + json.dumps(identity.VERSION) + '}')
         check("顶层重复字段即使值相同也被拒绝")
         duplicate_check = '"candidate_installed": true'
         assert duplicate_check in serialized
@@ -177,11 +177,11 @@ def main():
         (source / "untracked-file").write_text("uncommitted", encoding="utf-8")
         check("未提交文件存在时阻止发布")
         (source / "untracked-file").unlink()
-        (source / "VERSION").write_text("v1.3.1\n\n", encoding="utf-8")
+        (source / "VERSION").write_text(identity.VERSION + "\n\n", encoding="utf-8")
         check("已跟踪源码发生验收后修改时阻止发布")
         run_script = (ROOT / "tests/run.sh").read_text(encoding="utf-8")
-        assert "v1.3.1 发布验收不允许 External Validation Pending" in run_script
-        print("通过：[UNIT/CONTRACT] v1.3.1 发布测试入口禁止外部验收豁免", flush=True)
+        assert "发布验收不允许 External Validation Pending" in run_script
+        print("通过：[UNIT/CONTRACT] 当前发布测试入口禁止外部验收豁免", flush=True)
         print(f"发布门禁专项：{passed} 通过，0 失败；仅机制测试，不是 TARGET-A 验收回执。")
 
 

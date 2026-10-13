@@ -2226,7 +2226,8 @@ configure_provider_pool_primary() (
   umask 077
 
   local deploy_dir=$1 base=$2 api_key=$3 model=$4 api_mode=${5:-auto}
-  local vision=${6:-false} normalized primary before_layout after_layout message
+  local vision=${6:-false} context_window=${7:-} max_output_tokens=${8:-}
+  local normalized primary before_layout after_layout message
   local candidate result observed
 
   require_command jq
@@ -2261,7 +2262,8 @@ configure_provider_pool_primary() (
     || { warn '当前接口池顺序无法核对；原配置未更改'; return 1; }
 
   jq -n --arg base "$normalized" --arg key "$api_key" --arg model "$model" \
-    --arg mode "$api_mode" --argjson vision "$vision" '
+    --arg mode "$api_mode" --argjson vision "$vision" \
+    --arg context "$context_window" --arg output "$max_output_tokens" '
       {
         provider: {
           base_url: $base,
@@ -2274,7 +2276,10 @@ configure_provider_pool_primary() (
           }
         },
         api_key: $key
-      }
+      } |
+      if $context != "" and $output != "" then
+        .provider.context_window = ($context|tonumber) | .provider.max_output_tokens = ($output|tonumber)
+      else . end
     ' > "$candidate"
 
   if ! python3 "${deploy_dir}/scripts/provider-pool.py" --deploy-dir "$deploy_dir" \
@@ -2292,13 +2297,16 @@ configure_provider_pool_primary() (
   [[ "$after_layout" == "$before_layout" ]] \
     || { warn '主接口提交后的稳定 ID 或备用顺序不一致'; return 1; }
   if ! jq -e --arg id "$primary" --arg base "$normalized" --arg model "$model" \
-    --arg mode "$api_mode" --argjson vision "$vision" '
+    --arg mode "$api_mode" --argjson vision "$vision" \
+    --arg context "$context_window" --arg output "$max_output_tokens" '
       .ok == true and .primary_id == $id and
       (.entries[] | select(.id == $id) |
         .base_url == $base and .model == $model and
         (if $mode == "auto" then (.api_mode == "chat_completions" or .api_mode == "responses")
          else .api_mode == $mode end) and
-        .capabilities[.api_mode] == true and .capabilities.vision == $vision)
+        .capabilities[.api_mode] == true and .capabilities.vision == $vision and
+        (if $context != "" then .context_window == ($context|tonumber) else true end) and
+        (if $output != "" then .max_output_tokens == ($output|tonumber) else true end))
     ' "$observed" >/dev/null; then
     warn '主接口提交后的地址、模型、协议或能力回读不一致'
     return 1
@@ -2379,9 +2387,11 @@ provider_rag_context_apply() (
   deploy_dir=$(validate_deploy_dir "$deploy_dir") || return 1
   assert_managed_installation "$deploy_dir" || return 1
   case "$(installation_state "$deploy_dir")" in
-    ready|local-ready) ;;
-    *) warn '实例尚在安装或恢复阶段，不能单独重建 RAG 组件'; return 1 ;;
+    ready|local-ready|installing) ;;
+    *) warn '组件尚未启动，请先从快速初始化继续安装，再调整知识窗口'; return 1 ;;
   esac
+  # 安装器会先标 installing；是否可调整由下方真实容器归属、凭据和回读判断，
+  # 不能既要求窗口先修好才能完成安装，又要求安装完成才允许修窗口。
   for command_name in docker timeout jq curl; do require_command "$command_name"; done
   [[ -d "${deploy_dir}/tmp" && ! -L "${deploy_dir}/tmp" \
     && -f "${deploy_dir}/config/provider-pool-applied.json" \

@@ -77,8 +77,10 @@ done
 
 [[ "$PUBLISH_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
   || die '必须显式使用 --publish vX.Y.Z' 64
-[[ "$PUBLISH_VERSION" == v1.3.1 ]] \
-  || die '本轮发布政策只授权 v1.3.1；不会自动选择或发布其他版本' 64
+AUTHORIZED_VERSION=$(git -C "$PROJECT_ROOT" show 'HEAD:config/release-policy.json' | python3 -c 'import json,sys; print(json.load(sys.stdin)["authorized_release"])') \
+  || die '无法读取当前提交的发布授权' 64
+[[ "$PUBLISH_VERSION" == "$AUTHORIZED_VERSION" ]] \
+  || die "本轮发布政策只授权 ${AUTHORIZED_VERSION}；不会自动选择或发布其他版本" 64
 [[ -n "$TARGET_RECEIPT_REQUEST" ]] || die '必须提供 --target-receipt' 64
 if (( DRY_RUN )) && [[ -n "$VERIFICATION_REQUEST" ]]; then
   die '--verification 只能用于已正式发布版本，不能与 --dry-run 同时使用' 64
@@ -106,7 +108,7 @@ VERSION_VALUE=$(git -C "$PROJECT_ROOT" show 'HEAD:VERSION') || die '无法读取
 SOURCE_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --verify 'HEAD^{commit}') \
   || die '无法锁定当前提交'
 python3 "${PROJECT_ROOT}/scripts/release-gate.py" --verify-source --commit "$SOURCE_COMMIT" \
-  >/dev/null || die '当前提交未通过 v1.3.1 唯一版本与源码身份政策'
+  >/dev/null || die '当前提交未通过本轮授权版本与源码身份政策'
 ARCHIVE_NAME="ai-support-${VERSION_VALUE}.tar.gz"
 ARCHIVE_PATH="${ARTIFACTS_DIR}/${ARCHIVE_NAME}"
 RELEASE_NOTES="${PROJECT_ROOT}/docs/releases/${VERSION_VALUE}.md"

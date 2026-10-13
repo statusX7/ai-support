@@ -80,6 +80,7 @@ printf '{"documents":[]}\n' > "$MOCK_ANYTHING_STATE"
 : > "$MOCK_DOCKER_LOG"
 
 DEPLOY="${WORK}/deploy"
+export MOCK_DOCKER_RAG_DEPLOY="$DEPLOY"
 COMMAND="${WORK}/bin/crispai"
 POOL_SOURCE="${DEPLOY}/config/provider-pool.yaml"
 POOL_APPLIED="${DEPLOY}/config/provider-pool-applied.json"
@@ -144,6 +145,106 @@ generation=$(jq -er '.secrets_generation' "${DEPLOY}/config/provider-pool-applie
 secret_before=$(digest "${DEPLOY}/secrets/provider/generations/${generation}.json")
 adapter_key_before=$(sed -n 's/^PROVIDER_ADAPTER_KEY=//p' "${DEPLOY}/.env")
 [[ -n "$adapter_key_before" ]] || fail 'staged 部署缺少内部 Provider 认证'
+
+# 复用首个真实暂存夹具，定向验证本次新增恢复责任，不跑其余完整旧套件。
+if [[ "${AI_SUPPORT_INSTALL_RECOVERY_ONLY:-0}" == 1 ]]; then
+  for recovery_state in staged installing; do
+    bash -c 'source "$1/scripts/common.sh"; write_installation_marker "$2" "$1" "$(<"$1/VERSION")" "$3"' \
+      -- "$PROJECT_ROOT" "$DEPLOY" "$recovery_state"
+    install -m 0600 -- "$DEPLOY/.crisp-ai-installation" "$WORK/recovery-before.marker"
+    recovery_status=0
+    printf '0\n' | "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" --skip-start \
+      > "$WORK/recovery-${recovery_state}.log" 2>&1 || recovery_status=$?
+    (( recovery_status != 0 )) || fail '选择取消仍继续安装'
+    grep -Fq '1 使用现有配置 / 2 重新配置 / 0 取消' "$WORK/recovery-${recovery_state}.log" \
+      || fail '未完成安装没有提供明确的编辑与取消入口'
+    cmp -s -- "$WORK/recovery-before.marker" "$DEPLOY/.crisp-ai-installation" \
+      || fail '取消改变了安装状态'
+    cmp -s -- "$WORK/staged.env" "$DEPLOY/.env" || fail '取消改变了环境'
+    [[ "$(digest "$POOL_APPLIED")" == "$pool_before" ]] || fail '取消改变了接口池'
+  done
+  printf '通过：[UNIT/CONTRACT] staged/installing 两种未完成状态可明确取消，配置、接口池和状态保持。\n'
+  printf 'v1.3.0\n' > "$DEPLOY/VERSION"
+  bash -c 'source "$1/scripts/common.sh"; write_installation_marker "$2" "$1" v1.3.0 installing' -- "$PROJECT_ROOT" "$DEPLOY"
+  recovery_status=0
+  "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" --non-interactive --skip-start \
+    > "$WORK/recovery-unconfirmed-version.log" 2>&1 || recovery_status=$?
+  (( recovery_status != 0 )) || fail '未明确选择跨版续装就修改旧版本'
+  [[ "$(<"$DEPLOY/VERSION")" == v1.3.0 ]] || fail '拒绝跨版前已覆盖旧程序版本'
+  "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" --non-interactive --skip-start --resume-upgrade \
+    > "$WORK/recovery-version-applied.log" 2>&1
+  [[ "$(<"$DEPLOY/VERSION")" == "$(<"$PROJECT_ROOT/VERSION")" ]] || fail '明确跨版恢复没有复制新程序'
+  cmp -s -- "$WORK/staged.env" "$DEPLOY/.env" || fail '明确跨版续装破坏了原环境'
+  printf '通过：[UNIT/CONTRACT] 实际安装器拒绝未授权跨版，明确resume-upgrade可恢复未完成实例并保留环境。\n'
+  bash -c '
+    set -euo pipefail
+    source "$1/scripts/common.sh"
+    source "$1/scripts/wizard.sh"
+    wizard_defaults_from_installation "$2" "$2/tmp/quick-init.json"
+    WIZARD_EDIT_CONFIRMED=1
+    printf "3\n0\n1200\n65535\n1\n" | quick_init_wizard "$2/tmp/quick-init.json"
+  ' -- "$PROJECT_ROOT" "$DEPLOY" > "$WORK/recovery-window.log" 2>&1
+  jq -e '.provider.context_window==65535 and .provider.max_output_tokens==1200' \
+    "$DEPLOY/tmp/quick-init.json" >/dev/null || fail '返回修改没有保存合法模型窗口'
+  grep -Fq '上下文须为' "$WORK/recovery-window.log" || fail '错误容量未被拒绝'
+  cmp -s -- "$WORK/staged.env" "$DEPLOY/.env" || fail '尚未确认安装就改动了有效环境'
+  printf '通过：[UNIT/CONTRACT] 从已部署配置回填并修改窗口，非法值拒绝，确认前不改变有效配置。\n'
+  recovery_status=0
+  printf '2\n1\n' | "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" \
+    > "$WORK/recovery-applied.log" 2>&1 || recovery_status=$?
+  if (( recovery_status != 2 )); then
+    tail -n 60 "$WORK/recovery-applied.log" >&2
+    fail "重新配置后应完成本地安装，实际退出 ${recovery_status}"
+  fi
+  [[ -x "$COMMAND" ]] || fail '恢复后管理命令不存在'
+  jq -e '.primary_id as $id | .entries[]|select(.id==$id)|.context_window==65535 and .max_output_tokens==1200' \
+    "$POOL_APPLIED" >/dev/null || fail '上下文没有真正进入原主接口'
+  bash -c '
+    set -euo pipefail
+    source "$1/scripts/common.sh"
+    [[ "$(env_get "$2/.env" AI_MODEL_TOKEN_LIMIT)" == 65535 ]]
+    [[ "$(env_get "$2/.env" PROVIDER_RAG_CONTEXT_WINDOW)" == 64335 ]]
+    for key in ANYTHINGLLM_API_KEY N8N_ENCRYPTION_KEY POSTGRES_PASSWORD CRISP_TOKEN_IDENTIFIER CRISP_TOKEN_KEY; do
+      [[ "$(env_get "$2/.env" "$key")" == "$(env_get "$3/staged.env" "$key")" ]]
+    done
+  ' -- "$PROJECT_ROOT" "$DEPLOY" "$WORK" || fail '窗口投影不一致或重配置覆盖了内部凭据'
+  assert_provider_readback_current
+  printf '通过：[UNIT/CONTRACT] 实际安装入口修改65535，原主接口/环境/RAG回读一致，内部和Crisp凭据保留，管理入口可用。\n'
+  # 只注入组件应用故障；真实 Manager.commit 创建恢复记录，恢复时不替换该模块。
+  python3 - "$DEPLOY" <<'PY_RECOVERY'
+import importlib.util, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("pool", root / "scripts/provider-pool.py")
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+manager = module.Manager(str(root))
+value, secret = manager.load(); revision = value["revision"]
+value["entries"][0]["context_window"] += 1
+def unavailable(_window):
+    raise module.PoolError("rag_context_apply_failed", "合成组件故障，仅用于事务恢复测试")
+manager.apply_rag_window = unavailable
+try:
+    manager.commit(value, secret, revision)
+except module.PoolError as error:
+    assert error.code == "rag_context_restore_failed", error.code
+else:
+    raise AssertionError("故障注入未进入持久恢复路径")
+record = json.loads((root / "config/provider-pool-transaction.json").read_text())
+assert record["phase"] == "restore_failed"
+PY_RECOVERY
+  bash -c 'source "$1/scripts/common.sh"; write_installation_marker "$2" "$1" "$(<"$1/VERSION")" installing' -- "$PROJECT_ROOT" "$DEPLOY"
+  recovery_status=0
+  "$PROJECT_ROOT/install.sh" --deploy-dir "$DEPLOY" --command-path "$COMMAND" --non-interactive \
+    > "$WORK/recovery-residue.log" 2>&1 || recovery_status=$?
+  if (( recovery_status != 2 )); then
+    tail -n 60 "$WORK/recovery-residue.log" >&2
+    fail '安装入口没有从原窗口事务恢复后完成续装'
+  fi
+  [[ ! -e "$DEPLOY/config/provider-pool-transaction.json" ]] || fail '恢复后事务仍未结算'
+  assert_provider_readback_current
+  jq -e '.entries[0].context_window==65535' "$POOL_APPLIED" >/dev/null || fail '恢复采用了失败的新候选'
+  printf '通过：[UNIT/CONTRACT] 真实失败事务保留原代，原安装入口成套恢复并回读后继续，不清空配置掩盖冲突。\n'
+  exit 0
+fi
 
 # 使用完整生产校验函数检查原生内部密钥的恢复范围，不替换读取或校验逻辑。
 PRESERVED_VALIDATOR=$(sed -n '/^validate_preserved_installation() {$/,/^installation_config_is_reusable() {$/p' \

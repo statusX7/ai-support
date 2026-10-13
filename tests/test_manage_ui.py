@@ -520,6 +520,31 @@ def leave_provider(terminal, *, editing=False):
     return output
 
 
+def provider_recovery_cases():
+    marker = DEPLOY / ".crisp-ai-installation"
+    original = marker.read_bytes()
+    before = provider_snapshot()
+    requests_before = MODEL_LIST["chat_calls"]
+    try:
+        for state in ("installing", "staged", "local-ready"):
+            text = original.decode()
+            text = re.sub(r"(?m)^state=.*$", "state=" + state, text)
+            marker.write_text(text)
+            terminal = enter_provider("provider-recovery-" + state)
+            try:
+                terminal.send("0"); terminal.expect("请选择："); terminal.send("0")
+                terminal.finish()
+            finally:
+                if terminal.process.poll() is None:
+                    os.killpg(terminal.process.pid, signal.SIGTERM)
+                    terminal.process.wait(timeout=5)
+            assert marker.read_text() == text
+            assert provider_snapshot() == before and MODEL_LIST["chat_calls"] == requests_before
+            passing(f"{state} 可进入接口修复菜单，状态与配置保持且未调用模型")
+    finally:
+        marker.write_bytes(original)
+
+
 def provider_retry_cases():
     """真实 PTY → provider.sh → 本地生产 adapter → 虚构上游；不模拟保存回执。"""
     retry_prompt = "模型列表请求暂时失败：1 重试 / 2 返回修改接口 / 0 取消："
@@ -1444,6 +1469,10 @@ def main():
     assert adapter_port.isdecimal() and adapter.poll() is None
     ENV["PROVIDER_ADAPTER_MANAGEMENT_URL"] = f"http://127.0.0.1:{adapter_port}"
     try:
+        if os.environ.get("MENU_TEST_FOCUS") == "install-recovery":
+            provider_recovery_cases()
+            assert COUNT == 3
+            return
         if os.environ.get("MENU_TEST_FOCUS") == "navigation-cancel":
             navigation_cancel_cases()
             assert COUNT == 8
@@ -1525,6 +1554,7 @@ def main():
         assert (lock_path.read_bytes() if lock_path.exists() else None) == lock_before
         passing("回车/非法数字/EOF 安全退出，空闲菜单不持维护锁")
         signal_menu_cases()
+        provider_recovery_cases()
         provider_retry_cases()
         provider_pool_menu_cases()
         provider_file_menu_cases()

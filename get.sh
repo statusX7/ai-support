@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CrispAI 公共发行包引导器。此文件必须能够脱离 Git 仓库和其他相邻文件独立运行。
-GET_VERSION="v1.3.1"
+GET_VERSION="v1.3.2"
 REPOSITORY="statusX7/ai-support"
 REPOSITORY_URL="https://github.com/${REPOSITORY}"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
@@ -23,6 +23,8 @@ RELEASE_REQUEST=""
 DEPLOY_REQUEST=""
 UPDATE_REQUEST=0
 REPAIR_REQUEST=0
+RECONFIGURE_REQUEST=0
+RESUME_UPGRADE_REQUEST=0
 INTERNAL_CALLER_DIR=""
 WORK_DIR=""
 SELECTED_RELEASE=""
@@ -53,13 +55,14 @@ usage() {
 选项：
   --release VERSION  安装指定正式版本，例如 v1.3.1
   --deploy-dir PATH  指定部署目录，默认 /opt/crisp-ai
-  --update           更新一个已完成的旧版本实例
+  --update           更新已完成实例，或用较新完整包修复未完成安装
+  --reconfigure      重新编辑快速初始化配置（保留已有数据）
   --repair           用已安装版本的校验包恢复受管命令入口，不启动服务或重装业务程序
   --help             显示帮助，不安装依赖或访问网络
   --version          显示引导器版本，不安装依赖或访问网络
 
 无参数运行时：新实例安装当前 Latest 正式版；已有完整实例打开 crispai 管理菜单；
-未完成的安装会下载原版本正式包并继续。回滚仍在 crispai 的更新与回滚菜单中执行。
+未完成安装可选择原版本继续或获取最新正式修复版，再选择保留或修改配置。回滚仍在 crispai 菜单中执行。
 --repair 与 --update 互斥；发现业务程序缺失时会明确退出，请使用完整包恢复或受管更新。
 EOF
 }
@@ -650,7 +653,7 @@ directory_has_entries() {
 
 inspect_existing_installation() {
   local deploy_dir=$1 marker="${1}/.crisp-ai-installation"
-  local first_line state installed_version comparison
+  local first_line state installed_version comparison choice
   [[ -d "$deploy_dir" ]] || return 0
   if [[ ! -e "$marker" && ! -L "$marker" ]]; then
     directory_has_entries "$deploy_dir" \
@@ -688,6 +691,10 @@ inspect_existing_installation() {
             warn "当前为 ${installed_version}，指定版本为 ${RELEASE_REQUEST}；未使用 --update，不会静默升级"
           fi
         fi
+        if (( RECONFIGURE_REQUEST )); then
+          SELECTED_RELEASE=$installed_version
+          return 0
+        fi
         if [[ -f "${deploy_dir}/manage.sh" && ! -L "${deploy_dir}/manage.sh" ]]; then
           info "检测到已安装实例 ${installed_version:-未知版本}，正在打开管理菜单"
           exec bash "${deploy_dir}/manage.sh" --deploy-dir "$deploy_dir"
@@ -696,15 +703,35 @@ inspect_existing_installation() {
         [[ -z "$installed_version" ]] || SELECTED_RELEASE=$installed_version
       fi
       ;;
-    collecting|installing|staged|uninstalled-data-kept)
-      (( UPDATE_REQUEST == 0 )) \
-        || die "当前实例状态为 ${state}，请先不带 --update 继续或恢复安装"
-      if [[ -n "$RELEASE_REQUEST" && -n "$installed_version" \
-        && "$RELEASE_REQUEST" != "$installed_version" ]]; then
-        die "未完成实例必须先用原版本 ${installed_version} 恢复，不能混入 ${RELEASE_REQUEST}"
+    collecting|installing|staged)
+      if (( UPDATE_REQUEST )); then
+        RESUME_UPGRADE_REQUEST=1
+        UPDATE_REQUEST=0
+      elif [[ -n "$RELEASE_REQUEST" && -n "$installed_version" && "$RELEASE_REQUEST" != "$installed_version" ]]; then
+        RESUME_UPGRADE_REQUEST=1
+      elif [[ -z "$RELEASE_REQUEST" && -n "$installed_version" ]]; then
+        printf '检测到未完成安装 %s（%s），已有配置和数据将保留。\n' "$installed_version" "$state"
+        while true; do
+          printf '1 原版本继续 / 2 使用最新正式版修复 / 0 取消：'
+          IFS= read -r choice || die '输入结束，未更改安装'
+          case "$choice" in
+            1) break ;;
+            2) RESUME_UPGRADE_REQUEST=1; break ;;
+            0) info '已取消，安装配置与数据保持'; exit 0 ;;
+            *) warn '请选择 1、2 或 0' ;;
+          esac
+        done
       fi
+      if (( RESUME_UPGRADE_REQUEST == 0 )); then
+        [[ -z "$installed_version" ]] || SELECTED_RELEASE=$installed_version
+      fi
+      info "检测到 ${state} 状态，将保留配置并进入安装恢复"
+      ;;
+    uninstalled-data-kept)
+      (( UPDATE_REQUEST == 0 )) || die '保留数据实例请先恢复安装，再执行升级'
+      [[ -z "$RELEASE_REQUEST" || "$RELEASE_REQUEST" == "$installed_version" ]] \
+        || die "保留数据实例须先用 ${installed_version} 恢复"
       [[ -z "$installed_version" ]] || SELECTED_RELEASE=$installed_version
-      info "检测到 ${state} 状态，将从已保存进度继续"
       ;;
     *) die "现有安装状态无效：${state:-空}" ;;
   esac
@@ -762,6 +789,9 @@ write_release_metadata() {
 
 run_package_entry() {
   local package_root=$1 deploy_dir=$2 release=$3 archive_url=$4 status
+  local -a install_arguments=(--deploy-dir "$deploy_dir")
+  (( RECONFIGURE_REQUEST == 0 )) || install_arguments+=(--reconfigure)
+  (( RESUME_UPGRADE_REQUEST == 0 )) || install_arguments+=(--resume-upgrade)
   cd -- "$INTERNAL_CALLER_DIR"
   if (( UPDATE_REQUEST )); then
     if bash "${package_root}/update.sh" --deploy-dir "$deploy_dir" \
@@ -771,7 +801,7 @@ run_package_entry() {
       status=$?
     fi
   else
-    if bash "${package_root}/install.sh" --deploy-dir "$deploy_dir"; then
+    if bash "${package_root}/install.sh" "${install_arguments[@]}"; then
       status=0
     else
       status=$?
@@ -803,6 +833,10 @@ while (( $# > 0 )); do
       UPDATE_REQUEST=1
       shift
       ;;
+    --reconfigure)
+      RECONFIGURE_REQUEST=1
+      shift
+      ;;
     --repair)
       REPAIR_REQUEST=1
       shift
@@ -827,6 +861,7 @@ done
 if (( SHOW_HELP )); then usage; exit 0; fi
 if (( SHOW_VERSION )); then printf '%s\n' "$GET_VERSION"; exit 0; fi
 (( UPDATE_REQUEST == 0 || REPAIR_REQUEST == 0 )) || die '--repair 与 --update 不能同时使用' 64
+(( RECONFIGURE_REQUEST == 0 || (REPAIR_REQUEST == 0 && UPDATE_REQUEST == 0) )) || die '--reconfigure 不能与 --repair 或 --update 同时使用' 64
 [[ -z "$RELEASE_REQUEST" ]] || valid_release "$RELEASE_REQUEST" \
   || die "正式版本格式无效：${RELEASE_REQUEST}" 64
 
@@ -870,6 +905,17 @@ if [[ -z "$SELECTED_RELEASE" ]]; then
   fi
 fi
 valid_release "$SELECTED_RELEASE" || die '无法确定安全的正式版本'
+if (( RESUME_UPGRADE_REQUEST )); then
+  INSTALLED_VERSION=$(read_marker_value "${DEPLOY_DIR}/.crisp-ai-installation" installed_version) \
+    || die '无法读取未完成安装版本，未执行恢复'
+  COMPARISON=$(version_compare "$SELECTED_RELEASE" "$INSTALLED_VERSION")
+  (( COMPARISON >= 0 )) || die '安装恢复不允许降级；已有数据未更改'
+  if (( COMPARISON == 0 )); then
+    RESUME_UPGRADE_REQUEST=0
+  elif (( $(version_compare "$SELECTED_RELEASE" v1.3.2) < 0 )); then
+    die '所选旧版不支持跨版本续装修复；请继续原版本或选择 v1.3.2 及以上正式版'
+  fi
+fi
 
 if (( UPDATE_REQUEST )); then
   MARKER="${DEPLOY_DIR}/.crisp-ai-installation"

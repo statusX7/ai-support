@@ -180,6 +180,8 @@ wizard_init_values() {
   WIZARD_BASE_URL=''
   WIZARD_API_KEY=''
   WIZARD_MODEL=''
+  WIZARD_CONTEXT_WINDOW=${WIZARD_CONTEXT_DEFAULT:-8192}
+  WIZARD_MAX_OUTPUT_TOKENS=${WIZARD_OUTPUT_DEFAULT:-1200}
   WIZARD_MODEL_DISCOVERY=unknown
   WIZARD_MODELS_HTTP_STATUS=000
   WIZARD_API_MODE=chat_completions
@@ -201,6 +203,48 @@ wizard_init_values() {
   WIZARD_KNOWLEDGE_SOURCE=''
   WIZARD_KNOWLEDGE_FILES=0
   WIZARD_KNOWLEDGE_LIBRARIES='[]'
+}
+
+wizard_validate_context() {
+  [[ "$WIZARD_CONTEXT_WINDOW" =~ ^[1-9][0-9]{2,6}$ \
+    && "$WIZARD_MAX_OUTPUT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]] || return 1
+  (( 10#$WIZARD_CONTEXT_WINDOW >= 256 && 10#$WIZARD_CONTEXT_WINDOW <= 2000000 \
+    && 10#$WIZARD_MAX_OUTPUT_TOKENS < 10#$WIZARD_CONTEXT_WINDOW ))
+}
+
+wizard_collect_context() {
+  local value previous=$WIZARD_CONTEXT_WINDOW
+  while true; do
+    wizard_read_value value "模型上下文窗口（按中转实际限制，回车保留 ${previous}）：" || return $?
+    WIZARD_CONTEXT_WINDOW=${value:-$previous}
+    if wizard_validate_context; then return 0; fi
+    WIZARD_CONTEXT_WINDOW=$previous
+    wizard_warn "上下文须为 256～2000000 的整数，且大于最大输出 ${WIZARD_MAX_OUTPUT_TOKENS}；不要把未知容量当作已验证"
+  done
+}
+
+wizard_defaults_from_installation() {
+  local output_file=$2 env_file="$1/.env"
+  wizard_init_values
+  WIZARD_BASE_URL=$(env_get "$env_file" AI_API_PROBE_BASE_URL 2>/dev/null || env_get "$env_file" AI_API_BASE_URL) || return 1
+  WIZARD_API_KEY=$(env_get "$env_file" AI_API_KEY) || return 1
+  WIZARD_MODEL=$(env_get "$env_file" AI_MODEL) || return 1
+  WIZARD_API_MODE=$(env_get "$env_file" AI_API_MODE) || return 1
+  WIZARD_CONTEXT_WINDOW=$(env_get "$env_file" AI_MODEL_TOKEN_LIMIT) || return 1
+  WIZARD_MAX_OUTPUT_TOKENS=$(env_get "$env_file" AI_MAX_OUTPUT_TOKENS) || return 1
+  WIZARD_VISION_CAPABILITY=$(env_get "$env_file" AI_SUPPORTS_VISION) || return 1
+  case "$WIZARD_API_MODE" in responses) WIZARD_RESPONSES_CAPABILITY=true ;; chat_completions) WIZARD_CHAT_CAPABILITY=true ;; *) return 1 ;; esac
+  WIZARD_CRISP_WEBSITE_ID=$(env_get "$env_file" CRISP_WEBSITE_ID) || return 1
+  WIZARD_CRISP_IDENTIFIER=$(env_get "$env_file" CRISP_TOKEN_IDENTIFIER) || return 1
+  WIZARD_CRISP_TOKEN_KEY=$(env_get "$env_file" CRISP_TOKEN_KEY) || return 1
+  WIZARD_WEBHOOK_INPUT=$(env_get "$env_file" WEBHOOK_PRODUCTION_URL) || return 1
+  if [[ "$(env_get "$env_file" WEBHOOK_ACCESS_MODE)" == managed_https ]]; then
+    WIZARD_WEBHOOK_INPUT=$(env_get "$env_file" WEBHOOK_DOMAIN) || return 1
+  fi
+  wizard_parse_webhook_input "$WIZARD_WEBHOOK_INPUT" || return 1
+  wizard_validate_context || return 1
+  # 默认模式保留当前 Prompt/知识，不从旧向导路径再导入另一份副本。
+  wizard_write_state "$output_file" confirmed 10
 }
 
 wizard_load_state() {
@@ -236,6 +280,9 @@ wizard_load_state() {
   WIZARD_BASE_URL=$(jq -r '.provider.base_url // ""' "$state_file")
   WIZARD_API_KEY=$(jq -r '.provider.api_key // ""' "$state_file")
   WIZARD_MODEL=$(jq -r '.provider.model // ""' "$state_file")
+  WIZARD_CONTEXT_WINDOW=$(jq -r --argjson fallback "$WIZARD_CONTEXT_WINDOW" '.provider.context_window // $fallback' "$state_file")
+  WIZARD_MAX_OUTPUT_TOKENS=$(jq -r --argjson fallback "$WIZARD_MAX_OUTPUT_TOKENS" '.provider.max_output_tokens // $fallback' "$state_file")
+  wizard_validate_context || { wizard_error '保存的模型上下文或输出额度无效'; return 1; }
   WIZARD_MODEL_DISCOVERY=$(jq -r '.provider.model_discovery // "unknown"' "$state_file")
   WIZARD_MODELS_HTTP_STATUS=$(jq -r '.provider.models_http_status // "000"' "$state_file")
   WIZARD_API_MODE=$(jq -r '.provider.api_mode // "chat_completions"' "$state_file")
@@ -400,6 +447,8 @@ wizard_write_state() {
     --argjson responses "$WIZARD_RESPONSES_CAPABILITY" \
     --argjson vision "$WIZARD_VISION_CAPABILITY" \
     --argjson loopback "$WIZARD_PROVIDER_LOOPBACK" \
+    --argjson context "$WIZARD_CONTEXT_WINDOW" \
+    --argjson output "$WIZARD_MAX_OUTPUT_TOKENS" \
     --rawfile website "${temp_dir}/website_id" \
     --rawfile identifier "${temp_dir}/token_identifier" \
     --rawfile token_key "${temp_dir}/token_key" \
@@ -424,6 +473,8 @@ wizard_write_state() {
           base_url: $base_url,
           api_key: $api_key,
           model: $model,
+          context_window: $context,
+          max_output_tokens: $output,
           model_discovery: $discovery,
           models_http_status: $models_status,
           api_mode: $api_mode,
@@ -862,6 +913,7 @@ wizard_collect_step() {
         return 1
       fi
       WIZARD_NEXT_STEP=4
+      wizard_collect_context || return $?
       wizard_write_state "$output_file" collecting 4
       ;;
     4)
@@ -1078,7 +1130,7 @@ wizard_show_summary() {
   printf '\n[10/10] 核对并开始\n'
   printf '  AI API 地址：%s\n' "$WIZARD_BASE_URL"
   printf '  AI API Key：已填写（不显示）\n'
-  printf '  模型：%s\n' "$WIZARD_MODEL"
+  printf '  模型：%s；上下文窗口：%s；最大输出：%s\n' "$WIZARD_MODEL" "$WIZARD_CONTEXT_WINDOW" "$WIZARD_MAX_OUTPUT_TOKENS"
   printf '  Crisp Website ID：%s\n' "$(wizard_mask_website_id "$WIZARD_CRISP_WEBSITE_ID")"
   printf '  Crisp Token Identifier：已填写（不显示）\n'
   printf '  Crisp Token Key：已填写（不显示）\n'
@@ -1106,6 +1158,7 @@ wizard_confirm() {
 
   while true; do
     wizard_show_summary
+    printf '  3 修改模型上下文窗口（按中转实际限制，不是探针自动测得）\n'
     wizard_read_value choice '1 开始安装 / 2 返回修改 / 0 取消：' || return $?
     case "$choice" in
       1)
@@ -1121,6 +1174,10 @@ wizard_confirm() {
           return 3
         fi
         wizard_warn '请输入 1 到 9'
+        ;;
+      3)
+        wizard_collect_context || return $?
+        wizard_write_state "$output_file" collecting 10 || return 1
         ;;
       0)
         wizard_info '已取消安装；已填写内容保存在受限状态文件中'
@@ -1202,7 +1259,11 @@ quick_init_wizard() {
   fi
   if [[ -n "$source_file" ]]; then
     wizard_load_state "$source_file" || return 1
-    if [[ "$WIZARD_STATUS" == confirmed ]]; then
+    if [[ "$WIZARD_STATUS" == confirmed && "${WIZARD_EDIT_CONFIRMED:-0}" == 1 ]]; then
+      WIZARD_STATUS=collecting
+      WIZARD_NEXT_STEP=10
+      wizard_write_state "$output_file" collecting 10 || return 1
+    elif [[ "$WIZARD_STATUS" == confirmed ]]; then
       if wizard_offer_existing; then
         [[ "$source_file" == "$output_file" ]] || wizard_write_state "$output_file" confirmed 10
         return 0

@@ -173,6 +173,7 @@ write_mock_package() {
   elif [[ "$layout" != legacy ]]; then
     fail "未知测试包布局：${layout}"
   fi
+  if [[ "$release" == v1.3.1 || "$release" == v1.3.2 ]]; then required+=(config/vision-probe.json); fi
   package="${BUILD_ROOT}/ai-support-${release}"
   asset_dir="${SERVER_ROOT}/releases/download/${release}"
   mkdir -p -- "$package" "$asset_dir"
@@ -271,6 +272,8 @@ write_mock_package v1.2.0 v120
 write_mock_package v1.2.1 v121
 write_mock_package v1.2.2 v122
 write_mock_package v1.3.0 v130
+write_mock_package v1.3.1 v130
+write_mock_package v1.3.2 v130
 V120_REQUIRED=(scripts/materials.sh scripts/logs.sh scripts/log-redact.py config/logging.yaml.example)
 for entry_index in "${!V120_REQUIRED[@]}"; do
   missing_release="v1.2.$((entry_index + 40))"
@@ -367,7 +370,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             output.write(path + "\n")
         if path == "/latest":
             self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/tag/v1.1.1")
+            latest = (root / "latest-tag.txt").read_text().strip() if (root / "latest-tag.txt").exists() else "v1.1.1"
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/tag/{latest}")
             self.end_headers()
             return
         if path.startswith("/tag/"):
@@ -443,7 +447,7 @@ run_tty() {
   for argument in "$@"; do
     printf -v command '%s %q' "$command" "$argument"
   done
-  script -qefc "$command" "$log" >/dev/null 2>&1
+  printf "%s\n" "${TEST_GET_INPUT:-1}" | script -qefc "$command" "$log" >/dev/null 2>&1
 }
 
 cp -- "${PROJECT_ROOT}/get.sh" "${TEST_ROOT}/standalone-get.sh"
@@ -702,6 +706,39 @@ for legacy_state in collecting uninstalled-data-kept; do
     "${legacy_state} 没有锁定原安装版本"
 done
 pass 'v1.1.0 未完成/保留资料实例按旧包能力恢复，不要求新版 get/doctor 且不混代'
+
+# 修复版必须能接手未完成旧版本，且不能把普通恢复变成静默降级。
+for recovery_mode in explicit latest; do
+  RECOVERY_DEPLOY="$TEST_ROOT/recovery-$recovery_mode"
+  RECOVERY_CAPTURE="$TEST_ROOT/recovery-$recovery_mode.capture"
+  mkdir -p "$RECOVERY_DEPLOY/config"
+  printf 'ai-support\nstate=installing\ninstalled_version=v1.3.1\n' > "$RECOVERY_DEPLOY/.crisp-ai-installation"
+  printf 'v1.3.1\n' > "$RECOVERY_DEPLOY/VERSION"
+  printf 'synthetic-config-preserve\n' > "$RECOVERY_DEPLOY/config/original.txt"
+  : > "$RECOVERY_CAPTURE"
+  if [[ "$recovery_mode" == explicit ]]; then
+    run_tty "$CALLER_DIR" "$TEST_ROOT/recovery-explicit.log" "$RECOVERY_CAPTURE" --release v1.3.2 --deploy-dir "$RECOVERY_DEPLOY"
+  else
+    printf 'v1.3.2\n' > "$SERVER_ROOT/latest-tag.txt"
+    TEST_GET_INPUT=2 run_tty "$CALLER_DIR" "$TEST_ROOT/recovery-latest.log" "$RECOVERY_CAPTURE" --deploy-dir "$RECOVERY_DEPLOY"
+    rm -- "$SERVER_ROOT/latest-tag.txt"
+  fi
+  assert_contains "$RECOVERY_CAPTURE" 'action=install' '未完成升级错误调用已完成实例的更新入口'
+  assert_contains "$RECOVERY_CAPTURE" '--resume-upgrade' '没有向完整安装器传递明确的跨版续装选择'
+  [[ "$(<"$RECOVERY_DEPLOY/VERSION")" == v1.3.2 && "$(<"$RECOVERY_DEPLOY/config/original.txt")" == synthetic-config-preserve ]] \
+    || fail '没有进入新包或破坏原配置'
+done
+pass '未完成v1.3.1可明确选择v1.3.2或Latest修复包，原配置保持，使用安装恢复入口'
+
+printf 'ai-support\nstate=installing\ninstalled_version=v1.3.2\n' > "$RECOVERY_DEPLOY/.crisp-ai-installation"
+REQUESTS_BEFORE=$(wc -l < "$ACCESS_LOG")
+: > "$RECOVERY_CAPTURE"
+TEST_GET_INPUT=0 run_tty "$CALLER_DIR" "$TEST_ROOT/recovery-cancel.log" "$RECOVERY_CAPTURE" --deploy-dir "$RECOVERY_DEPLOY"
+[[ ! -s "$RECOVERY_CAPTURE" && "$(wc -l < "$ACCESS_LOG")" == "$REQUESTS_BEFORE" ]] || fail '取消仍下载或执行安装'
+status=0
+run_tty "$CALLER_DIR" "$TEST_ROOT/recovery-downgrade.log" "$RECOVERY_CAPTURE" --release v1.3.1 --deploy-dir "$RECOVERY_DEPLOY" || status=$?
+if (( status == 0 )) || [[ -s "$RECOVERY_CAPTURE" ]]; then fail '未完成安装被降级'; fi
+pass '取消未完成恢复没有下载/部署副作用，降级仍明确拒绝'
 
 V120_CAPTURE="${TEST_ROOT}/v120.capture"
 : > "$V120_CAPTURE"

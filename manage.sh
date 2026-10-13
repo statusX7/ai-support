@@ -201,6 +201,16 @@ require_installation() {
   fi
 }
 
+require_provider_configuration() {
+  # 修复接口配置不表示安装完成；其它管理操作仍使用完成状态门槛。
+  if ! (assert_managed_installation "$DEPLOY_DIR") \
+    || [[ ! -f "$DEPLOY_DIR/.env" || -L "$DEPLOY_DIR/.env" \
+      || ! -f "$DEPLOY_DIR/config/provider-pool-applied.json" || -L "$DEPLOY_DIR/config/provider-pool-applied.json" ]]; then
+    warn '接口配置尚未建立，请先选择 1 快速初始化 / 继续安装'
+    return 1
+  fi
+}
+
 manager_temporary() {
   if [[ -z "$MANAGE_TEMP" || ! -d "$MANAGE_TEMP" ]]; then
     [[ -d "$DEPLOY_DIR/tmp" && ! -L "$DEPLOY_DIR/tmp" ]] || return 1
@@ -1343,7 +1353,7 @@ while (( MANAGE_EOF == 0 )); do
   if ! menu_read CHOICE '请选择：'; then printf '\n输入结束，已退出。\n'; exit 0; fi
   case "$CHOICE" in
     1) manager_action quick_initialization ;; 2) status_menu ;;
-    3) if require_installation; then ai_config_menu; fi ;; 4) if require_installation; then prompt_menu; fi ;;
+    3) if require_provider_configuration; then ai_config_menu; fi ;; 4) if require_installation; then prompt_menu; fi ;;
     5) if require_installation; then knowledge_menu; fi ;; 6) if require_installation; then rules_menu; fi ;;
     7) if require_installation; then handoff_menu; fi ;; 8) if require_installation; then global_switch_menu; fi ;;
     9) if require_installation; then welcome_menu; fi ;; 10) if require_installation; then crisp_menu; fi ;;

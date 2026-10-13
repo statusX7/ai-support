@@ -297,6 +297,12 @@ def wait_for(text, timeout=20):
         read_once(0.1)
 
 try:
+    expanded = []
+    for row in steps:
+        if row[0].startswith("[4/10]"):
+            expanded.append(("模型上下文窗口", "65535", False))
+        expanded.append(row)
+    steps = expanded
     for expected, answer, hidden in steps:
         wait_for(expected)
         # 安装输入按用户要求回显；此处只有虚构凭据，仍等待输入读取器就绪。
@@ -354,7 +360,7 @@ NORMAL_TRANSCRIPT="${TEST_ROOT}/normal-transcript.log"
 NORMAL_COUNT="${TEST_ROOT}/normal-count"
 run_pty_case normal "$NORMAL_RESULT" "$NORMAL_TRANSCRIPT" "$NORMAL_COUNT"
 
-[[ "$(<"$NORMAL_COUNT")" == 10 ]] || fail '正常路径不是十次输入'
+[[ "$(<"$NORMAL_COUNT")" == 11 ]] || fail '正常路径应有十项主步骤及一个模型窗口输入'
 [[ "$(grep -o '\[[0-9]\+/10\]' "$NORMAL_TRANSCRIPT" | sort -u | wc -l)" == 10 ]] \
   || fail '正常路径没有显示完整的 1/10 至 10/10'
 grep -Fq '人工恢复 3600 秒' "$NORMAL_TRANSCRIPT" \
@@ -365,7 +371,7 @@ grep -Fq '人工恢复 3600 秒' "$NORMAL_TRANSCRIPT" \
 jq -e '
   .schema_version == 1 and .status == "confirmed" and .next_step == 10 and
   .provider.base_url == "https://provider.invalid/proxy/v1" and
-  .provider.model == "deepseek-test" and
+  .provider.model == "deepseek-test" and .provider.context_window == 65535 and .provider.max_output_tokens == 1200 and
   .provider.model_discovery == "models_api" and
   .provider.capabilities.chat_completions == true and
   .provider.capabilities.responses == true and
@@ -403,12 +409,12 @@ jq -e --arg expected $'## 中文 🙂\n\n$ # = " \\ 保留。\n::END::\n\n' '
 ' "$PASTE_RESULT" >/dev/null || fail '多行 Prompt 或三个命名库状态保存不正确'
 PASTED_SOURCE=$(jq -r '.knowledge.libraries[2].source' "$PASTE_RESULT")
 [[ -f "$PASTED_SOURCE" && "$(stat -c '%a' "$PASTED_SOURCE")" == 600 ]] || fail '粘贴知识未受限保存'
-[[ "$(<"$PASTE_COUNT")" == 28 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
+[[ "$(<"$PASTE_COUNT")" == 29 ]] || fail "粘贴分支真实输入行数错误：$(<"$PASTE_COUNT")"
 grep -Fq '知识库名称须为 1～100 个 UTF-8 字节' "$PASTE_TRANSCRIPT" || fail '超限中文库名未在向导中拒绝并重新输入'
 for secret in "$TEST_PROVIDER_SECRET" "$TEST_CRISP_IDENTIFIER" "$TEST_CRISP_SECRET"; do
   grep -Fq -- "$secret" "$PASTE_TRANSCRIPT" || fail '粘贴分支未回显输入的虚构凭据'
 done
-pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（含超限库名重试，真实输入 28 行）'
+pass '十项主步骤中的 Prompt 多行粘贴与三个命名库（含超限库名重试，真实输入 29 行）'
 
 RESPONSES_RESULT="${TEST_ROOT}/responses-only-result.json"
 export MOCK_PROVIDER_RESPONSES_ONLY=1
@@ -506,7 +512,7 @@ grep -Fq '1 继续上次 / 2 重新开始 / 0 取消' "${TEST_ROOT}/resume-eof.l
 RESUME_TRANSCRIPT="${TEST_ROOT}/resume-transcript.log"
 RESUME_COUNT="${TEST_ROOT}/resume-count"
 run_pty_case resume "$PARTIAL_RESULT" "$RESUME_TRANSCRIPT" "$RESUME_COUNT"
-[[ "$(<"$RESUME_COUNT")" == 9 ]] || fail '含明确选择的第三步恢复路径输入次数错误'
+[[ "$(<"$RESUME_COUNT")" == 10 ]] || fail '含明确选择的第三步恢复路径输入次数错误'
 grep -Fq '从第 3 步继续' "$RESUME_TRANSCRIPT" || fail '未提示恢复步骤'
 ! grep -Fq '[1/10]' "$RESUME_TRANSCRIPT" || fail '恢复时错误地重问第一步'
 jq -e '.status == "confirmed"' "$PARTIAL_RESULT" >/dev/null || fail '恢复后未确认配置'
@@ -650,7 +656,7 @@ AUTH_RESULT="${TEST_ROOT}/auth-result.json"
 AUTH_TRANSCRIPT="${TEST_ROOT}/auth-transcript.log"
 AUTH_INPUT_COUNT="${TEST_ROOT}/auth-input-count"
 run_pty_case auth "$AUTH_RESULT" "$AUTH_TRANSCRIPT" "$AUTH_INPUT_COUNT"
-[[ "$(<"$AUTH_INPUT_COUNT")" == 11 ]] || fail '401 纠错路径输入次数错误'
+[[ "$(<"$AUTH_INPUT_COUNT")" == 12 ]] || fail '401 纠错路径输入次数错误'
 [[ "$(jq -r '.provider.api_key' "$AUTH_RESULT")" == "$TEST_PROVIDER_REPLACEMENT" ]] \
   || fail '401 后的新 API Key 未保存'
 grep -Fq 'Provider 鉴权失败（HTTP 401）' "$AUTH_TRANSCRIPT" || fail '401 没有明确纠错提示'
@@ -712,7 +718,7 @@ PORT_RESULT="${TEST_ROOT}/port-result.json"
 PORT_TRANSCRIPT="${TEST_ROOT}/port-transcript.log"
 PORT_COUNT="${TEST_ROOT}/port-count"
 run_pty_case port_conflict "$PORT_RESULT" "$PORT_TRANSCRIPT" "$PORT_COUNT"
-[[ "$(<"$PORT_COUNT")" == 11 ]] || fail '端口冲突分流输入次数错误'
+[[ "$(<"$PORT_COUNT")" == 12 ]] || fail '端口冲突分流输入次数错误'
 jq -e '
   .webhook.mode == "existing_url" and
   .webhook.public_base_url == "https://proxy.example.invalid/team/" and

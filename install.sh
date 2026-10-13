@@ -18,6 +18,7 @@ DEPLOY_REQUEST=""
 NON_INTERACTIVE=0
 SKIP_START=0
 RECONFIGURE=0
+RESUME_UPGRADE=0
 COMMAND_PATH=""
 INSTALL_CONFIGURATION_TRANSACTION=""
 
@@ -284,6 +285,7 @@ usage() {
   --non-interactive   从环境变量读取配置，不进行交互
   --skip-start        只暂存新安装文件，不启动 Docker 服务
   --reconfigure       重复安装时重新配置 Provider 与 Crisp（不能与 --skip-start 同用）
+  --resume-upgrade    用较新完整包修复未完成安装，保留配置和业务数据
   --version           显示版本
   --help              显示帮助
 EOF
@@ -311,6 +313,10 @@ while (( $# > 0 )); do
       ;;
     --reconfigure)
       RECONFIGURE=1
+      shift
+      ;;
+    --resume-upgrade)
+      RESUME_UPGRADE=1
       shift
       ;;
     --help|-h)
@@ -399,6 +405,20 @@ fi
 umask 077
 mkdir -p -- "$DEPLOY_DIR"
 acquire_maintenance_lock "$DEPLOY_DIR"
+if (( NON_INTERACTIVE == 0 && REUSE_PRESERVED_CONFIG )) \
+  && [[ "$REUSE_CONFIG_REASON" == incomplete || "$REUSE_CONFIG_REASON" == staged ]]; then
+  info '检测到未完成安装；可继续原配置、修改快速初始化数据或取消，不删除已有数据'
+  if wizard_offer_existing; then
+    :
+  else
+    RECOVERY_CHOICE=$?
+    case "$RECOVERY_CHOICE" in
+      2) die '已取消续装；原配置、数据和安装状态保持' ;;
+      3) REUSE_PRESERVED_CONFIG=0; RECONFIGURE=1 ;;
+      *) die '未能读取续装选择；原配置与数据保持' ;;
+    esac
+  fi
+fi
 if (( REUSE_PRESERVED_CONFIG )); then
   validate_preserved_installation "$DEPLOY_DIR"
   EXISTING=1
@@ -414,8 +434,20 @@ if (( REUSE_PRESERVED_CONFIG )); then
       ;;
   esac
 fi
-if (( EXISTING == 1 )) && [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
-  die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；请使用 update.sh 创建一致性快照后升级"
+if [[ -n "$PREVIOUS_VERSION" && "$PREVIOUS_VERSION" != "$VERSION" ]]; then
+  if (( RESUME_UPGRADE )) && [[ "$PREVIOUS_STATE" =~ ^(collecting|installing|staged)$ ]] \
+    && python3 - "$PREVIOUS_VERSION" "$VERSION" <<'PY'
+import re, sys
+versions = sys.argv[1:]
+if not all(re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", value) for value in versions):
+    raise SystemExit(1)
+raise SystemExit(0 if tuple(map(int, versions[1][1:].split('.'))) > tuple(map(int, versions[0][1:].split('.'))) else 1)
+PY
+  then
+    info "将使用 ${VERSION} 修复未完成的 ${PREVIOUS_VERSION} 安装；保留已有配置、秘密和业务数据，不执行降级"
+  else
+    die "检测到不同版本的现有部署（${PREVIOUS_VERSION} -> ${VERSION}）；已完成实例请使用 update.sh，未完成实例须明确使用 --resume-upgrade 和较新完整包"
+  fi
 fi
 
 # 正在运行或待外部接入的实例不能走仅暂存路径。后续接口池迁移会主动
@@ -436,18 +468,32 @@ if (( SKIP_START && RECONFIGURE )) && [[ "$PREVIOUS_STATE" != new ]] \
 fi
 
 WIZARD_RESULT="${DEPLOY_DIR}/tmp/quick-init.json"
+# 已启动的自有 Caddy 不是外部站点冲突。仍须核对真实运行归属和配置。
+WIZARD_HTTPS_PORTS_MANAGED=0
+if [[ -f "${DEPLOY_DIR}/.env" && ! -L "${DEPLOY_DIR}/.env" ]] \
+  && [[ "$(env_get "${DEPLOY_DIR}/.env" WEBHOOK_ACCESS_MODE 2>/dev/null || true)" == managed_https ]] \
+  && caddy_runtime_matches_configuration "$DEPLOY_DIR"; then
+  WIZARD_HTTPS_PORTS_MANAGED=1
+fi
+WIZARD_CONTEXT_DEFAULT=${AI_MODEL_TOKEN_LIMIT:-$(env_get "${DEPLOY_DIR}/.env" AI_MODEL_TOKEN_LIMIT 2>/dev/null || printf 8192)}
+WIZARD_OUTPUT_DEFAULT=${AI_MAX_OUTPUT_TOKENS:-$(env_get "${DEPLOY_DIR}/.env" AI_MAX_OUTPUT_TOKENS 2>/dev/null || printf 1200)}
 if (( NON_INTERACTIVE == 0 && (EXISTING == 0 || RECONFIGURE == 1) )); then
   RESTORE_STATE=$PREVIOUS_STATE
-  case "$RESTORE_STATE" in ready|local-ready) ;; *) RESTORE_STATE=collecting ;; esac
-  write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" collecting
+  # 选择修改或取消尚未提交安装，不把原 installing/staged/ready 改成 collecting。
+  case "$RESTORE_STATE" in new|collecting)
+    write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" collecting ;;
+  esac
+  WIZARD_EDIT_CONFIRMED=$RECONFIGURE
+  if (( RECONFIGURE )) && [[ ! -e "$WIZARD_RESULT" ]] \
+    && installation_config_is_reusable "$DEPLOY_DIR"; then
+    wizard_defaults_from_installation "$DEPLOY_DIR" "$WIZARD_RESULT" \
+      || die '未能读取现有快速初始化数据；原配置未改'
+  fi
   if quick_init_wizard "$WIZARD_RESULT"; then
     :
   else
     WIZARD_STATUS_CODE=$?
     if (( WIZARD_STATUS_CODE == 2 )); then
-      if [[ "$RESTORE_STATE" == ready || "$RESTORE_STATE" == local-ready ]]; then
-        write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" "$RESTORE_STATE"
-      fi
       die "快速初始化已取消或输入结束；重新运行同一命令可继续"
     fi
     die "快速初始化未完成；修正提示的问题后重新运行同一命令"
@@ -506,6 +552,12 @@ N8N_PORT_VALUE=${N8N_PORT:-$(env_get "$ENV_FILE" N8N_PORT 2>/dev/null || printf 
 ANYTHINGLLM_PORT_VALUE=${ANYTHINGLLM_PORT:-$(env_get "$ENV_FILE" ANYTHINGLLM_PORT 2>/dev/null || printf '3001')}
 AI_MODEL_TOKEN_LIMIT_VALUE=${AI_MODEL_TOKEN_LIMIT:-$(env_get "$ENV_FILE" AI_MODEL_TOKEN_LIMIT 2>/dev/null || printf '8192')}
 AI_MAX_OUTPUT_TOKENS_VALUE=${AI_MAX_OUTPUT_TOKENS:-$(env_get "$ENV_FILE" AI_MAX_OUTPUT_TOKENS 2>/dev/null || printf '1200')}
+if (( NON_INTERACTIVE == 0 && (EXISTING == 0 || RECONFIGURE == 1) )); then
+  AI_MODEL_TOKEN_LIMIT_VALUE=$(jq -er --argjson fallback "$AI_MODEL_TOKEN_LIMIT_VALUE" \
+    '.provider.context_window // $fallback | select(type=="number" and floor==.)' "$WIZARD_RESULT")
+  AI_MAX_OUTPUT_TOKENS_VALUE=$(jq -er --argjson fallback "$AI_MAX_OUTPUT_TOKENS_VALUE" \
+    '.provider.max_output_tokens // $fallback | select(type=="number" and floor==.)' "$WIZARD_RESULT")
+fi
 ANYTHING_CHAT_MODE_VALUE=${ANYTHINGLLM_CHAT_MODE:-$(env_get "$ENV_FILE" ANYTHINGLLM_CHAT_MODE 2>/dev/null || printf 'chat')}
 validate_ipv4_address "$BIND_ADDRESS_VALUE" || die "BIND_ADDRESS 必须是有效 IPv4 地址"
 validate_port "$N8N_PORT_VALUE" || die "N8N_PORT 必须是 1 到 65535 的整数"
@@ -563,6 +615,41 @@ if is_placeholder "$WEBSITE_HOOK_SECRET"; then
   fi
 fi
 
+# 保留并消费原窗口事务的恢复材料，不删除标记来假装成功。
+if (( SKIP_START == 0 )) \
+  && [[ -e "$DEPLOY_DIR/config/provider-pool-transaction.json" || -L "$DEPLOY_DIR/config/provider-pool-transaction.json" ]]; then
+  info '发现未完成的接口窗口事务，将按原恢复记录恢复后再继续安装'
+  docker_compose "$DEPLOY_DIR" config --quiet
+  validate_managed_caddy_configuration "$DEPLOY_DIR" || die '恢复事务前的反代预检失败，未启动新服务'
+  docker_compose "$DEPLOY_DIR" up -d --remove-orphans
+  refresh_program_file_mounts "$DEPLOY_DIR" || die '恢复事务前未能确认程序挂载'
+  if ! python3 "$DEPLOY_DIR/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" recover-rag-context \
+    | jq -r 'if .ok == true then "信息：原接口窗口已恢复并完成组件回读" else "错误：" + (.error.message // "接口事务恢复失败") end'; then
+    die '接口事务未完成恢复，原材料保持；不会强行清空或进入下一配置代'
+  fi
+  wait_for_local_health "$DEPLOY_DIR"
+  set_installation_fact "$DEPLOY_DIR" local_services ready
+fi
+
+# 首次暂存/早期失败可能只有池文件而没有组件。用原有效配置补齐组件，
+# 然后沿同一候选事务应用新接口；不把未验证候选直接写成已应用。
+if (( SKIP_START == 0 && RECONFIGURE == 1 )) \
+  && [[ -f "$DEPLOY_DIR/config/provider-pool-applied.json" ]] \
+  && [[ "$(installation_fact "$DEPLOY_DIR" local_services)" != ready ]]; then
+  info '正在用原有效配置准备未完成安装的组件，随后验证并应用本次修改'
+  python3 "$DEPLOY_DIR/scripts/provider-pool.py" --deploy-dir "$DEPLOY_DIR" migrate --defer-runtime >/dev/null \
+    || die '原接口池无法安全恢复，未提交新候选'
+  docker_compose "$DEPLOY_DIR" config --quiet
+  validate_managed_caddy_configuration "$DEPLOY_DIR" || die '原受管反代预检失败，未启动新服务'
+  docker_compose "$DEPLOY_DIR" --parallel 1 pull --policy missing \
+    || die '恢复组件所需镜像未就绪；原配置保留'
+  docker_compose "$DEPLOY_DIR" up -d --remove-orphans
+  refresh_program_file_mounts "$DEPLOY_DIR" || die '恢复组件的程序挂载未确认'
+  wait_for_local_health "$DEPLOY_DIR"
+  bootstrap_anythingllm_api_key "$DEPLOY_DIR"
+  set_installation_fact "$DEPLOY_DIR" local_services ready
+fi
+
 if (( EXISTING == 0 || RECONFIGURE == 1 )); then
   if (( NON_INTERACTIVE )); then
     N8N_HOST_VALUE=${N8N_HOST:-localhost}
@@ -576,7 +663,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     CRISP_PLUGIN_SECRET_VALUE=${CRISP_PLUGIN_SIGNING_SECRET:-}
     CRISP_IDENTIFIER_VALUE=${CRISP_TOKEN_IDENTIFIER:-}
     CRISP_KEY_VALUE=${CRISP_TOKEN_KEY:-}
-    ANYTHING_KEY_VALUE=${ANYTHINGLLM_API_KEY:-pending-anythingllm-api-key}
+    ANYTHING_KEY_VALUE=${ANYTHINGLLM_API_KEY:-$(env_get "$ENV_FILE" ANYTHINGLLM_API_KEY 2>/dev/null || printf pending-anythingllm-api-key)}
   else
     [[ -f "$WIZARD_RESULT" && ! -L "$WIZARD_RESULT" ]] \
       || die "快速初始化结果缺失或不安全；请重新运行安装"
@@ -598,7 +685,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     CRISP_KEY_VALUE=$(jq -er '.crisp.token_key | select(type == "string" and length > 0)' "$WIZARD_RESULT")
     CRISP_HOOK_MODE_VALUE=website
     CRISP_PLUGIN_SECRET_VALUE=""
-    ANYTHING_KEY_VALUE=pending-anythingllm-api-key
+    ANYTHING_KEY_VALUE=$(env_get "$ENV_FILE" ANYTHINGLLM_API_KEY 2>/dev/null || printf pending-anythingllm-api-key)
   fi
 
   validate_hostname "$N8N_HOST_VALUE" || die "n8n 域名无效；只填写主机名，不含协议、端口或路径"
@@ -650,7 +737,7 @@ if (( EXISTING == 0 || RECONFIGURE == 1 )); then
     || -L "${DEPLOY_DIR}/config/provider-pool-applied.json" ]]; then
     configure_provider_pool_primary "$DEPLOY_DIR" "${AI_API_BASE_URL:-}" \
       "${AI_API_KEY:-}" "$AI_MODEL_CANDIDATE_VALUE" "${AI_API_MODE:-auto}" \
-      "${AI_SUPPORTS_VISION:-false}" \
+      "${AI_SUPPORTS_VISION:-false}" "$AI_MODEL_TOKEN_LIMIT_VALUE" "$AI_MAX_OUTPUT_TOKENS_VALUE" \
       || die '新主接口未通过真实适配器验证或运行回读；原接口池、秘密及兼容配置已保留'
   else
     [[ ! -e "${DEPLOY_DIR}/config/provider-pool.yaml" \
@@ -767,6 +854,9 @@ if (( SKIP_START == 0 )); then
   bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
     || die '配置或知识的运行时回读失败，安装进度已保留'
   install_log_maintenance "$DEPLOY_DIR" || die '日志维护调度安装失败；应用与已填写资料保留，可重试同一安装命令'
+  # 管理入口用于修复业务故障，不代表安装已通过。故障状态和退出码仍保留。
+  install_crispai_launcher "$DEPLOY_DIR" "$NON_INTERACTIVE" "$COMMAND_PATH" \
+    || die 'crispai 管理入口创建失败；未覆盖其它程序，请处理路径冲突后重试'
   "${DEPLOY_DIR}/scripts/healthcheck.sh" --deploy-dir "$DEPLOY_DIR" \
     --application --installation-in-progress
   set_installation_fact "$DEPLOY_DIR" app_config ready
@@ -775,8 +865,6 @@ if (( SKIP_START == 0 )); then
   set_installation_fact "$DEPLOY_DIR" webhook pending
   set_installation_fact "$DEPLOY_DIR" conversation pending
   write_installation_marker "$DEPLOY_DIR" "$SCRIPT_DIR" "$VERSION" local-ready
-  install_crispai_launcher "$DEPLOY_DIR" "$NON_INTERACTIVE" "$COMMAND_PATH" \
-    || die '本地服务已完成，但 crispai 管理入口安装失败；处理命令冲突后可重跑安装恢复'
   INITIAL_BACKUP="${DEPLOY_DIR}/backups/initial-${VERSION}.tar.gz"
   if [[ ! -f "$INITIAL_BACKUP" ]]; then
     "${DEPLOY_DIR}/scripts/backup.sh" --deploy-dir "$DEPLOY_DIR" --output "$INITIAL_BACKUP" \

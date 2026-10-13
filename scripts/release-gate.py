@@ -31,7 +31,6 @@ METRICS = {
 }
 
 STRICT_ARCHIVE_VERSION = (1, 2, 2)
-AUTHORIZED_RELEASE = "v1.3.1"
 MANIFEST_PATH = "scripts/release-manifest.txt"
 POLICY_PATH = "config/release-policy.json"
 ESSENTIAL_RELEASE_FILES = {
@@ -156,13 +155,13 @@ def verify_version_contract(root, commit, version, blobs):
         raise ValueError("release-policy") from error
     expected_policy = {
         "project": "ai-support",
-        "authorized_release": AUTHORIZED_RELEASE,
-        "allowed_new_release_tags": [AUTHORIZED_RELEASE],
+        "authorized_release": version,
+        "allowed_new_release_tags": [version],
         "allow_auto_version_bump": False,
         "max_new_releases": 1,
         "require_target_a_acceptance": True,
     }
-    if policy != expected_policy or version != AUTHORIZED_RELEASE:
+    if policy != expected_policy:
         raise ValueError("release-policy")
     expected_get = ('GET_VERSION="' + version + '"').encode("utf-8")
     get_lines = [line for line in blobs["get.sh"][1].splitlines() if line.startswith(b"GET_VERSION=")]
@@ -283,12 +282,9 @@ def verify_archive_matches_source(root, archive, commit, version, paths, blobs):
 
 
 def verify(root, artifacts, receipt):
-    commit, version = source_identity(root)
-    if version != AUTHORIZED_RELEASE:
-        raise ValueError("release-policy")
+    commit, version, paths, blobs = verify_source(root)
     archive_name = "ai-support-" + version + ".tar.gz"
     if parsed_version(version) >= STRICT_ARCHIVE_VERSION:
-        commit, version, paths, blobs = verify_source(root, commit)
         digest = verify_archive_matches_source(root, artifacts / archive_name, commit, version, paths, blobs)
     else:
         digest = hashlib.sha256(safe_file(artifacts / archive_name, 256 * 1024 * 1024)).hexdigest()

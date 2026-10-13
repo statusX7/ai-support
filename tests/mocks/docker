@@ -75,7 +75,10 @@ if [[ "${1:-}" == info ]]; then
 fi
 
 if [[ "${1:-}" == inspect ]]; then
-  if [[ "$*" == *'HostConfig.LogConfig'* ]]; then
+  if [[ "$*" == *'com.docker.compose.project.working_dir'* && "${!#}" == aaaaaaaaaaaa \
+    && -n "${MOCK_DOCKER_RAG_DEPLOY:-}" ]]; then
+    printf '%s|anythingllm\n' "$MOCK_DOCKER_RAG_DEPLOY"
+  elif [[ "$*" == *'HostConfig.LogConfig'* ]]; then
     printf '{"Type":"json-file","Config":{"max-size":"%s","max-file":"%s"}}\n' \
       "${MOCK_LOG_MAX_SIZE:-10m}" "${MOCK_LOG_MAX_FILES:-5}"
   else
@@ -560,6 +563,14 @@ case "$COMMAND" in
     exit 2
     ;;
   ps)
+    if [[ " $* " == *' --quiet '* && "${!#}" == anythingllm \
+      && "${MOCK_DOCKER_RAG_DEPLOY:-}" == "$MOCK_PROJECT_DIR" ]]; then
+      # 只有此前执行过本夹具的 up 并保存运行投影才返回容器，不伪造已启动。
+      if [[ "${MOCK_DOCKER_NO_RUNNING:-0}" != 1 ]] && mock_anything_runtime read >/dev/null; then
+        printf 'aaaaaaaaaaaa\n'
+      fi
+      exit 0
+    fi
     if [[ " $* " == *' -q '* ]]; then
       service=${!#}
       if [[ "$service" == caddy ]]; then
