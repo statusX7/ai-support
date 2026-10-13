@@ -691,6 +691,16 @@ knowledge_import_files() {
     projection=$(jq -M -r --arg id "$library_id" --arg doc "$document_id" '.libraries[] | select(.id == $id) | .documents[] | select(.id == $doc) | .projection' "${deploy_dir}/knowledge/catalog.json")
     [[ -n "$projection" ]] || projection="${library_id}_${document_id}.${extension}"
     hash=$(sha256sum -- "$file" | awk '{print $1}')
+    # 续装重新确认同一原文不构成知识变更；损坏或不同正文仍正常导入。
+    if [[ -f "${deploy_dir}/knowledge/${library_id}/${source}" && ! -L "${deploy_dir}/knowledge/${library_id}/${source}" ]] \
+      && cmp -s -- "$file" "${deploy_dir}/knowledge/${library_id}/${source}" \
+      && jq -M -e --arg library "$library_id" --arg doc "$document_id" --arg source "$source" \
+        --arg projection "$projection" --arg hash "$hash" '
+          any(.libraries[] | select(.id == $library) | .documents[];
+            .id == $doc and .source == $source and .projection == $projection and .sha256 == $hash)
+        ' "${deploy_dir}/knowledge/catalog.json" >/dev/null; then
+      continue
+    fi
     mkdir -p -- "${deploy_dir}/knowledge/${library_id}/sources"
     temporary=$(mktemp "${deploy_dir}/knowledge/${library_id}/sources/.import.XXXXXX")
     install -m 640 -- "$file" "$temporary"

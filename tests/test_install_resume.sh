@@ -148,6 +148,20 @@ adapter_key_before=$(sed -n 's/^PROVIDER_ADAPTER_KEY=//p' "${DEPLOY}/.env")
 
 # 复用首个真实暂存夹具，定向验证本次新增恢复责任，不跑其余完整旧套件。
 if [[ "${AI_SUPPORT_INSTALL_RECOVERY_ONLY:-0}" == 1 ]]; then
+  # 相同原文重导入不能制造资料代次，真正修改仍必须留下待应用责任。
+  mkdir -p "$WORK/import-idempotency"
+  cp "$PROJECT_ROOT/tests/fixtures/knowledge.md" "$WORK/import-idempotency/source.md"
+  bash -c 'set -euo pipefail; source "$1/scripts/knowledge.sh";
+    knowledge_bootstrap_source "$2/deploy" 默认知识库 "$2/source.md" >/dev/null
+    cp "$2/deploy/knowledge/catalog.json" "$2/before.json"
+    knowledge_bootstrap_source "$2/deploy" 默认知识库 "$2/source.md" >/dev/null
+    cmp -s "$2/before.json" "$2/deploy/knowledge/catalog.json"
+    printf "\n新增的合成知识。\n" >> "$2/source.md"
+    knowledge_bootstrap_source "$2/deploy" 默认知识库 "$2/source.md" >/dev/null
+    jq -e --slurpfile old "$2/before.json" ".revision == (\$old[0].revision + 1)" "$2/deploy/knowledge/catalog.json" >/dev/null
+  ' _ "$PROJECT_ROOT" "$WORK/import-idempotency" || fail '知识重导入幂等或真实变化记录失败'
+  printf '通过：[UNIT/CONTRACT] 相同知识原文重导入完全不变，实际修改保留新代次。\n'
+
   [[ "$(stat -c %g:%a "$DEPLOY/config/vision-probe.json")" == 1000:640 ]] || fail "复制后的图片资源运行组权限错误"
   for recovery_state in staged installing; do
     bash -c 'source "$1/scripts/common.sh"; write_installation_marker "$2" "$1" "$(<"$1/VERSION")" "$3"' \

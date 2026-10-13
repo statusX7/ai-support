@@ -847,8 +847,12 @@ if (( SKIP_START == 0 )); then
   esac
   docker_compose "$DEPLOY_DIR" up -d --force-recreate n8n
   wait_for_local_health "$DEPLOY_DIR"
-  sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"
-  knowledge_sync "$DEPLOY_DIR" || die "知识库同步未完全成功；保留安装进度供重试"
+  # 已有生效代必须由下方资料事务先冻结旧代，再同步候选。
+  # 不能先改索引，再要求旧投影通过同代校验。
+  if [[ ! -e "${DEPLOY_DIR}/config/materials-applied.json" && ! -L "${DEPLOY_DIR}/config/materials-applied.json" ]]; then
+    sync_prompt_to_anythingllm "$DEPLOY_DIR" || die "Prompt 同步失败；保留安装进度供重试"
+    knowledge_sync "$DEPLOY_DIR" || die "知识库同步未完全成功；保留安装进度供重试"
+  fi
   import_and_publish_workflow "$DEPLOY_DIR" || die "n8n 工作流导入或发布失败；保留安装进度供重试"
   wait_for_local_health "$DEPLOY_DIR"
   bash "${DEPLOY_DIR}/scripts/configuration.sh" --deploy-dir "$DEPLOY_DIR" mark-applied \
