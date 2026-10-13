@@ -1666,15 +1666,15 @@ copy_project_files() {
     if [[ "$file" == "knowledge/README.md" && -f "${deploy_dir}/${file}" ]]; then
       continue
     fi
-    install -D -m 0640 -- "${source_dir}/${file}" "${deploy_dir}/${file}"
+    install -D -m 0640 -g 1000 -- "${source_dir}/${file}" "${deploy_dir}/${file}"
   done
   for file in "${executable_files[@]}"; do
     [[ -f "${source_dir}/${file}" && ! -L "${source_dir}/${file}" ]] || die "源码脚本缺失或不安全：${file}"
-    install -D -m 0750 -- "${source_dir}/${file}" "${deploy_dir}/${file}"
+    install -D -m 0750 -g 1000 -- "${source_dir}/${file}" "${deploy_dir}/${file}"
   done
   if (( refresh_caddy )); then
     cp -p -- "${deploy_dir}/config/Caddyfile" "${deploy_dir}/config/Caddyfile.previous"
-    install -m 0640 -- "${source_dir}/config/Caddyfile.example" "${deploy_dir}/config/Caddyfile"
+    install -m 0640 -g 1000 -- "${source_dir}/config/Caddyfile.example" "${deploy_dir}/config/Caddyfile"
   elif [[ -f "${deploy_dir}/config/Caddyfile" ]] \
     && ! grep -Fq '/webhook/crispai-public-config' "${deploy_dir}/config/Caddyfile"; then
     warn '已保留定制的 Caddy 配置；可选网页欢迎需要放行 /webhook/crispai-public-config 与 /webhook/crispai-web-chat，模板已更新'

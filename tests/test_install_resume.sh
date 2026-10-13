@@ -148,6 +148,7 @@ adapter_key_before=$(sed -n 's/^PROVIDER_ADAPTER_KEY=//p' "${DEPLOY}/.env")
 
 # 复用首个真实暂存夹具，定向验证本次新增恢复责任，不跑其余完整旧套件。
 if [[ "${AI_SUPPORT_INSTALL_RECOVERY_ONLY:-0}" == 1 ]]; then
+  [[ "$(stat -c %g:%a "$DEPLOY/config/vision-probe.json")" == 1000:640 ]] || fail "复制后的图片资源运行组权限错误"
   for recovery_state in staged installing; do
     bash -c 'source "$1/scripts/common.sh"; write_installation_marker "$2" "$1" "$(<"$1/VERSION")" "$3"' \
       -- "$PROJECT_ROOT" "$DEPLOY" "$recovery_state"
